@@ -256,3 +256,4 @@ type ProviderTests() =
         Assert.That(response.Diffs.Contains("adminPort"), Is.True)
         Assert.That(response.DetailedDiff.ContainsKey("routers.example.backend"), Is.True)
         Assert.That(response.DetailedDiff.ContainsKey("adminPort"), Is.True)
+
