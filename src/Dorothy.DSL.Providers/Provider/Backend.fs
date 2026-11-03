@@ -428,25 +428,71 @@ module SshTransport =
         (cancellationToken: CancellationToken)
         =
         task {
-            let command =
+            let checkCommand =
                 "icu_libraries=$(/sbin/ldconfig -p 2>/dev/null || true)\nif printf '%s\\n' \"$icu_libraries\" | /usr/bin/grep -q 'libicuuc.so' && printf '%s\\n' \"$icu_libraries\" | /usr/bin/grep -q 'libicui18n.so'; then echo present; else echo missing; fi"
 
             let! status =
                 runRemoteCommand
                     connection
                     "native helper ICU prerequisite check"
-                    command
+                    checkCommand
                     None
                     cancellationToken
 
             match status.Trim() with
             | "present" -> ()
             | "missing" ->
-                raise (
-                    NativeHelperUnavailableException(
-                        "Compatible ICU runtime libraries (libicuuc and libicui18n) are required for full Unicode/IDN behavior; on Debian 13 install libicu76 before resource operations. The provider does not install packages."
+                let installCommand =
+                    String.concat
+                        "\n"
+                        [ "set -eu"
+                          "has_icu_runtime() {"
+                          "  icu_libraries=$(/sbin/ldconfig -p 2>/dev/null || true)"
+                          "  printf '%s\\n' \"$icu_libraries\" | /usr/bin/grep -q 'libicuuc.so' && printf '%s\\n' \"$icu_libraries\" | /usr/bin/grep -q 'libicui18n.so'"
+                          "}"
+                          "if has_icu_runtime; then echo present; exit 0; fi"
+                          "if [ ! -r /etc/os-release ]; then echo unsupported; exit 0; fi"
+                          ". /etc/os-release"
+                          "if [ \"${ID:-}\" != debian ] || [ \"${VERSION_ID:-}\" != 13 ]; then echo unsupported; exit 0; fi"
+                          "if ! command -v apt-get >/dev/null 2>&1; then echo unavailable; exit 0; fi"
+                          "export DEBIAN_FRONTEND=noninteractive"
+                          "apt-get update 1>&2"
+                          "apt-get install -y --no-install-recommends --no-remove libicu76 1>&2"
+                          "/sbin/ldconfig"
+                          "if has_icu_runtime; then echo installed; else echo missing; fi" ]
+                    |> runPrivilegedShell connection
+
+                let! installStatus =
+                    runRemoteCommand
+                        connection
+                        "native helper ICU prerequisite installation"
+                        installCommand
+                        None
+                        cancellationToken
+
+                match installStatus.Trim() with
+                | "present"
+                | "installed" -> ()
+                | "unsupported" ->
+                    raise (
+                        NativeHelperUnavailableException(
+                            "Compatible ICU runtime libraries (libicuuc and libicui18n) are required for full Unicode/IDN behavior. Automatic installation is supported only on Debian 13 (libicu76); install a compatible runtime manually on this host before resource operations."
+                        )
                     )
-                )
+                | "unavailable" ->
+                    raise (
+                        NativeHelperUnavailableException(
+                            "A compatible ICU runtime is missing; automatic Debian 13 installation requires apt-get to install libicu76."
+                        )
+                    )
+                | "missing" ->
+                    raise (
+                        NativeHelperUnavailableException(
+                            "The Debian 13 libicu76 package was installed, but ldconfig still cannot find both required ICU runtime libraries."
+                        )
+                    )
+                | _ ->
+                    raise (NativeHelperUnavailableException("Could not verify or install the required ICU runtime package."))
             | _ ->
                 raise (NativeHelperUnavailableException("Could not verify the required Debian ICU runtime package."))
         }
@@ -499,7 +545,7 @@ module SshTransport =
         (cancellationToken: CancellationToken)
         =
         task {
-            if helperCommand <> "apt" && helperCommand <> "ufw" && helperCommand <> "traefik" && helperCommand <> "docker" then
+            if helperCommand <> "apt" && helperCommand <> "ufw" && helperCommand <> "traefik" && helperCommand <> "docker" && helperCommand <> "swapfile" then
                 invalidArg "helperCommand" "Unsupported native helper operation."
 
             validateConnection connection

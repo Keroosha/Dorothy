@@ -15,9 +15,10 @@ module private ProviderSchema =
             use ufwDocument = JsonDocument.Parse(UfwProvider.Schema)
             use traefikDocument = JsonDocument.Parse(TraefikProvider.Schema)
             use dockerEngineDocument = JsonDocument.Parse(DockerEngineProvider.Schema)
+            use swapfileDocument = JsonDocument.Parse(SwapfileProvider.Schema)
             use stream = new MemoryStream()
             use writer = new Utf8JsonWriter(stream)
-            let documents = [ aptDocument; ufwDocument; traefikDocument; dockerEngineDocument ]
+            let documents = [ aptDocument; ufwDocument; traefikDocument; dockerEngineDocument; swapfileDocument ]
 
             let writeMergedObject (propertyName: string) =
                 writer.WritePropertyName(propertyName)
@@ -47,6 +48,7 @@ type DorothyProvider() =
     let ufw = UfwProvider()
     let traefik = TraefikProvider()
     let dockerEngine = DockerEngineProvider()
+    let swapfile = SwapfileProvider()
 
     static member Version = AptProvider.Version
 
@@ -66,34 +68,40 @@ type DorothyProvider() =
         if request.Type = UfwProvider.ResourceToken then ufw.Check(request, ct)
         elif request.Type = TraefikProvider.ResourceToken then traefik.Check(request, ct)
         elif request.Type = DockerEngineProvider.ResourceToken then dockerEngine.Check(request, ct)
+        elif request.Type = SwapfileProvider.ResourceToken then swapfile.Check(request, ct)
         else apt.Check(request, ct)
 
     override _.Diff(request: DiffRequest, ct: CancellationToken) =
         if request.Type = UfwProvider.ResourceToken then ufw.Diff(request, ct)
         elif request.Type = TraefikProvider.ResourceToken then traefik.Diff(request, ct)
         elif request.Type = DockerEngineProvider.ResourceToken then dockerEngine.Diff(request, ct)
+        elif request.Type = SwapfileProvider.ResourceToken then swapfile.Diff(request, ct)
         else apt.Diff(request, ct)
 
     override _.Create(request: CreateRequest, ct: CancellationToken) =
         if request.Type = UfwProvider.ResourceToken then ufw.Create(request, ct)
         elif request.Type = TraefikProvider.ResourceToken then traefik.Create(request, ct)
         elif request.Type = DockerEngineProvider.ResourceToken then dockerEngine.Create(request, ct)
+        elif request.Type = SwapfileProvider.ResourceToken then swapfile.Create(request, ct)
         else apt.Create(request, ct)
 
     override _.Read(request: ReadRequest, ct: CancellationToken) =
         if request.Type = UfwProvider.ResourceToken then ufw.Read(request, ct)
         elif request.Type = TraefikProvider.ResourceToken then traefik.Read(request, ct)
         elif request.Type = DockerEngineProvider.ResourceToken then dockerEngine.Read(request, ct)
+        elif request.Type = SwapfileProvider.ResourceToken then swapfile.Read(request, ct)
         else apt.Read(request, ct)
 
     override _.Update(request: UpdateRequest, ct: CancellationToken) =
         if request.Type = UfwProvider.ResourceToken then ufw.Update(request, ct)
         elif request.Type = TraefikProvider.ResourceToken then traefik.Update(request, ct)
         elif request.Type = DockerEngineProvider.ResourceToken then dockerEngine.Update(request, ct)
+        elif request.Type = SwapfileProvider.ResourceToken then swapfile.Update(request, ct)
         else apt.Update(request, ct)
 
     override _.Delete(request: DeleteRequest, ct: CancellationToken) =
         if request.Type = UfwProvider.ResourceToken then ufw.Delete(request, ct)
         elif request.Type = TraefikProvider.ResourceToken then traefik.Delete(request, ct)
         elif request.Type = DockerEngineProvider.ResourceToken then dockerEngine.Delete(request, ct)
+        elif request.Type = SwapfileProvider.ResourceToken then swapfile.Delete(request, ct)
         else apt.Delete(request, ct)

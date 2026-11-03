@@ -16,7 +16,8 @@ type DebianSpec =
     { Packages: Map<string, string option>
       Ufw: UfwSpec option
       Traefik: TraefikSpec option
-      Docker: DockerSpec option }
+      Docker: DockerSpec option
+      Swapfile: SwapfileSpec option }
 
 [<RequireQualifiedAccess>]
 type DebianDeclaration =
@@ -24,6 +25,7 @@ type DebianDeclaration =
     | UfwConfiguration of UfwSpec
     | TraefikConfiguration of TraefikSpec
     | DockerConfiguration of DockerSpec
+    | SwapfileConfiguration of SwapfileSpec
 
 /// A complete immutable description of one named SSH host.
 ///
@@ -38,7 +40,8 @@ type HostSpec internal (
     packages: Map<string, string option>,
     ufw: UfwSpec option,
     traefik: TraefikSpec option,
-    docker: DockerSpec option
+    docker: DockerSpec option,
+    swapfile: SwapfileSpec option
 ) =
     member _.Name = name
     member _.Address = address
@@ -49,7 +52,7 @@ type HostSpec internal (
     member _.Ufw = ufw
     member _.Traefik = traefik
     member _.Docker = docker
-
+    member _.Swapfile = swapfile
 type HostDeclaration =
     | Address of string
     | User of string
@@ -171,12 +174,13 @@ type AptBuilder() =
     member _.Run(packages: PackageSpec list) : AptSpec =
         { Packages = DomainValidation.mergePackages packages }
 
-/// Merges APT blocks and optional UFW, Traefik, and Docker declarations into one Debian environment.
+/// Merges APT blocks and optional UFW, Traefik, Docker, and swapfile declarations into one Debian environment.
 type DebianBuilder() =
     member _.Yield(aptBlock: AptSpec) = [ DebianDeclaration.AptPackages aptBlock ]
     member _.Yield(firewall: UfwSpec) = [ DebianDeclaration.UfwConfiguration firewall ]
     member _.Yield(proxy: TraefikSpec) = [ DebianDeclaration.TraefikConfiguration proxy ]
     member _.Yield(containers: DockerSpec) = [ DebianDeclaration.DockerConfiguration containers ]
+    member _.Yield(swapfile: SwapfileSpec) = [ DebianDeclaration.SwapfileConfiguration swapfile ]
 
     member _.YieldFrom(aptBlocks: seq<AptSpec>) =
         aptBlocks |> Seq.map DebianDeclaration.AptPackages |> Seq.toList
@@ -189,6 +193,8 @@ type DebianBuilder() =
 
     member _.YieldFrom(configurations: seq<DockerSpec>) =
         configurations |> Seq.map DebianDeclaration.DockerConfiguration |> Seq.toList
+    member _.YieldFrom(swapfiles: seq<SwapfileSpec>) =
+        swapfiles |> Seq.map DebianDeclaration.SwapfileConfiguration |> Seq.toList
 
     member _.YieldFrom(declarations: seq<DebianDeclaration>) = Seq.toList declarations
     member _.Zero() = []
@@ -205,7 +211,8 @@ type DebianBuilder() =
                 | DebianDeclaration.AptPackages block -> Some block
                 | DebianDeclaration.UfwConfiguration _
                 | DebianDeclaration.DockerConfiguration _
-                | DebianDeclaration.TraefikConfiguration _ -> None)
+                | DebianDeclaration.TraefikConfiguration _
+                | DebianDeclaration.SwapfileConfiguration _ -> None)
 
         let firewall =
             declarations
@@ -213,7 +220,8 @@ type DebianBuilder() =
                 | DebianDeclaration.UfwConfiguration value -> Some value
                 | DebianDeclaration.AptPackages _
                 | DebianDeclaration.DockerConfiguration _
-                | DebianDeclaration.TraefikConfiguration _ -> None)
+                | DebianDeclaration.TraefikConfiguration _
+                | DebianDeclaration.SwapfileConfiguration _ -> None)
             |> function
                 | [] -> None
                 | [ value ] -> Some value
@@ -225,7 +233,8 @@ type DebianBuilder() =
                 | DebianDeclaration.TraefikConfiguration value -> Some value
                 | DebianDeclaration.AptPackages _
                 | DebianDeclaration.DockerConfiguration _
-                | DebianDeclaration.UfwConfiguration _ -> None)
+                | DebianDeclaration.UfwConfiguration _
+                | DebianDeclaration.SwapfileConfiguration _ -> None)
             |> function
                 | [] -> None
                 | [ value ] -> Some value
@@ -240,6 +249,15 @@ type DebianBuilder() =
                 | [] -> None
                 | [ value ] -> Some value
                 | _ -> invalidArg "debian" "A Debian environment may declare Docker only once."
+        let swapfile =
+            declarations
+            |> List.choose (function
+                | DebianDeclaration.SwapfileConfiguration value -> Some value
+                | _ -> None)
+            |> function
+                | [] -> None
+                | [ value ] -> Some value
+                | _ -> invalidArg "debian" "A Debian environment may declare a swapfile only once."
 
         let packages =
             aptBlocks
@@ -252,7 +270,8 @@ type DebianBuilder() =
             { Packages = DomainValidation.mergePackages packages
               Ufw = firewall
               Traefik = traefik
-              Docker = docker }
+              Docker = docker
+              Swapfile = swapfile }
 /// Collects the singleton SSH settings and the required Debian environment.
 type HostBuilder(name: string) =
     member _.Yield(declaration: HostDeclaration) = [ declaration ]
@@ -320,7 +339,7 @@ type HostBuilder(name: string) =
             | Some value -> value
             | None -> invalidArg "host" "A Debian environment is required."
 
-        let result = HostSpec(name, address, user, port, identityFile, debian.Packages, debian.Ufw, debian.Traefik, debian.Docker)
+        let result = HostSpec(name, address, user, port, identityFile, debian.Packages, debian.Ufw, debian.Traefik, debian.Docker, debian.Swapfile)
         result
 
 [<AutoOpen>]

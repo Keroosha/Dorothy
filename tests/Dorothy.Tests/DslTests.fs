@@ -113,6 +113,46 @@ type DslTests() =
         Assert.That(host.Packages.ContainsKey("nginx"), Is.True)
 
     [<Test>]
+    member _.``Swapfile DSL requires one safe absolute path and positive measured size``() =
+        let specification = swapfile { path "/swapfile"; size 64<MiB> }
+        let missingPath = fun () -> swapfile { size 64<MiB> }
+        let missingSize = fun () -> swapfile { path "/swapfile" }
+        let duplicatePath = fun () -> swapfile { path "/swapfile"; path "/var/swap"; size 64<MiB> }
+        let duplicateSize = fun () -> swapfile { path "/swapfile"; size 64<MiB>; size 128<MiB> }
+        let relativePath = fun () -> swapfile { path "swapfile"; size 64<MiB> }
+        let traversalPath = fun () -> swapfile { path "/tmp/../swapfile"; size 64<MiB> }
+
+        Assert.That(specification.Path, Is.EqualTo("/swapfile"))
+        Assert.That(specification.Size, Is.EqualTo(64<MiB>))
+        Assert.Throws<ArgumentException>(TestDelegate(fun () -> missingPath () |> ignore)) |> ignore
+        Assert.Throws<ArgumentException>(TestDelegate(fun () -> missingSize () |> ignore)) |> ignore
+        Assert.Throws<ArgumentException>(TestDelegate(fun () -> duplicatePath () |> ignore)) |> ignore
+        Assert.Throws<ArgumentException>(TestDelegate(fun () -> duplicateSize () |> ignore)) |> ignore
+        Assert.Throws<ArgumentException>(TestDelegate(fun () -> relativePath () |> ignore)) |> ignore
+        Assert.Throws<ArgumentException>(TestDelegate(fun () -> traversalPath () |> ignore)) |> ignore
+
+    [<Test>]
+    member _.``Swapfile is carried through one Debian host declaration``() =
+        let host =
+            sshHost "swap-host" {
+                Address "192.0.2.10"
+                User "debian"
+                debian {
+                    swapfile { path "/swapfile"; size 64<MiB> }
+                }
+            }
+
+        Assert.That(host.Swapfile.IsSome, Is.True)
+        Assert.That(host.Swapfile.Value.Path, Is.EqualTo("/swapfile"))
+        Assert.That(host.Swapfile.Value.Size, Is.EqualTo(64<MiB>))
+        Assert.Throws<ArgumentException>(TestDelegate(fun () ->
+            debian {
+                swapfile { path "/swapfile"; size 64<MiB> }
+                swapfile { path "/var/swap"; size 128<MiB> }
+            }
+            |> ignore)) |> ignore
+
+    [<Test>]
     member _.``UFW typed rules preserve ordered argv and expand TCP plus UDP``() =
         // Arrange
         let actual =

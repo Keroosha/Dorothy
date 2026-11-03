@@ -25,6 +25,7 @@
     <Compile Include="CertificateTests.fs" />
     <Compile Include="DockerDslTests.fs" />
     <Compile Include="DockerEngineTests.fs" />
+    <Compile Include="SwapfileTests.fs" />
     <Compile Include="PulumiCliTests.fs" />
   </ItemGroup>
 </Project>
