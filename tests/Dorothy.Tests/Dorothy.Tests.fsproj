@@ -1,0 +1,30 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <TargetFramework>net10.0</TargetFramework>
+    <IsTestProject>true</IsTestProject>
+    <IsPackable>false</IsPackable>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../src/Dorothy.DSL/Dorothy.DSL.fsproj" />
+    <ProjectReference Include="../../src/Dorothy.DSL.Providers/Dorothy.DSL.Providers.fsproj" />
+    <ProjectReference Include="../../src/Dorothy.HostHelper/Dorothy.HostHelper.fsproj" />
+    <ProjectReference Include="../Dorothy.TestFixture/Dorothy.TestFixture.fsproj" ReferenceOutputAssembly="false" />
+  </ItemGroup>
+  <ItemGroup>
+    <PackageReference Include="Microsoft.NET.Test.Sdk" Version="17.14.1" />
+    <PackageReference Include="NUnit" Version="4.4.0" />
+    <PackageReference Include="NUnit3TestAdapter" Version="5.1.0" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="TestSupport.fs" />
+    <Compile Include="NativeCoreTests.fs" />
+    <Compile Include="AptTests.fs" />
+    <Compile Include="UfwBackendTests.fs" />
+    <Compile Include="TraefikBackendTests.fs" />
+    <Compile Include="DslTests.fs" />
+    <Compile Include="CertificateTests.fs" />
+    <Compile Include="DockerDslTests.fs" />
+    <Compile Include="DockerEngineTests.fs" />
+    <Compile Include="PulumiCliTests.fs" />
+  </ItemGroup>
+</Project>

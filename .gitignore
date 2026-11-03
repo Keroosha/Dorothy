@@ -1,0 +1,8 @@
+bin/
+obj/
+.pulumi/
+.fake/
+.idea/
+.vs/
+TestResults/
+/src/Dorothy.DSL.Providers/Provider/helper/linux-*/

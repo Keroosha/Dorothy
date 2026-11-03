@@ -1,0 +1,7 @@
+<Solution>
+  <Project Path="src/Dorothy.HostHelper/Dorothy.HostHelper.fsproj" />
+  <Project Path="src/Dorothy.DSL/Dorothy.DSL.fsproj" />
+  <Project Path="src/Dorothy.DSL.Providers/Dorothy.DSL.Providers.fsproj" />
+  <Project Path="tests/Dorothy.TestFixture/Dorothy.TestFixture.fsproj" />
+  <Project Path="tests/Dorothy.Tests/Dorothy.Tests.fsproj" />
+</Solution>

@@ -1,0 +1,26 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>pulumi-resource-keroosha</AssemblyName>
+    <RootNamespace>Dorothy.DSL.Provider</RootNamespace>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../Dorothy.DSL/Dorothy.DSL.fsproj" />
+    <Compile Include="Provider/Backend.fs" />
+    <Compile Include="Provider/UfwBackend.fs" />
+    <Compile Include="Provider/TraefikBackend.fs" />
+    <Compile Include="Provider/DockerEngineBackend.fs" />
+    <Compile Include="Provider/AptProvider.fs" />
+    <Compile Include="Provider/UfwProvider.fs" />
+    <Compile Include="Provider/TraefikProvider.fs" />
+    <Compile Include="Provider/DockerEngineProvider.fs" />
+    <Compile Include="Provider/Provider.fs" />
+    <Compile Include="Provider/Program.fs" />
+    <Content Include="Provider/helper/**/keroosha-iac-helper">
+      <Link>helper/%(RecursiveDir)%(Filename)%(Extension)</Link>
+      <CopyToOutputDirectory>PreserveNewest</CopyToOutputDirectory>
+      <CopyToPublishDirectory>PreserveNewest</CopyToPublishDirectory>
+    </Content>
+  </ItemGroup>
+</Project>
