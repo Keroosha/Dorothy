@@ -45,6 +45,19 @@ type DockerEngineArgs() =
     [<Input("connection", true)>]
     member val Connection: Input<AptConnectionArgs> = Unchecked.defaultof<_> with get, set
 
+/// Native Pulumi arguments for keroosha:debian:Swapfile.
+type SwapfileArgs() =
+    inherit ResourceArgs()
+
+    [<Input("connection", true)>]
+    member val Connection: Input<AptConnectionArgs> = Unchecked.defaultof<_> with get, set
+
+    [<Input("path", true)>]
+    member val Path: Input<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("sizeMiB", true)>]
+    member val SizeMiB: Input<int> = Unchecked.defaultof<_> with get, set
+
 /// Native Pulumi arguments for keroosha:debian:Ufw.
 type UfwArgs() =
     inherit ResourceArgs()
@@ -209,6 +222,9 @@ module private ProviderContract =
     [<Literal>]
     let DockerEngineResourceToken = "keroosha:debian:DockerEngine"
 
+    [<Literal>]
+    let SwapfileResourceToken = "keroosha:debian:Swapfile"
+
 
     let resourceOptions () =
         let options = CustomResourceOptions()
@@ -232,6 +248,21 @@ type DockerEngine(name: string, args: DockerEngineArgs, options: CustomResourceO
         with get () = this.inSync
         and private set value = this.inSync <- value
 
+
+/// Manages one owned swap file and its persistent systemd swap unit.
+type Swapfile(name: string, args: SwapfileArgs, options: CustomResourceOptions) =
+    inherit CustomResource(ProviderContract.SwapfileResourceToken, name, args, options)
+
+    [<DefaultValue>]
+    val mutable private inSync: Output<bool>
+
+    new(name: string, args: SwapfileArgs) =
+        Swapfile(name, args, ProviderContract.resourceOptions ())
+
+    [<Output("inSync")>]
+    member this.InSync
+        with get () = this.inSync
+        and private set value = this.inSync <- value
 /// Manages the owned APT package set on one SSH host.
 type AptPackageSet(name: string, args: AptPackageSetArgs, options: CustomResourceOptions) =
     inherit CustomResource(ProviderContract.ResourceToken, name, args, options)
@@ -492,6 +523,23 @@ module Host =
                     else Map.add packageName None packages) declared
             | None -> declared
         let mainApt = createAptPackageSet host.Name mainPackages [] false
+
+        let swapfilePackage =
+            if host.Swapfile.IsSome && not (Map.containsKey "util-linux" host.Packages) then
+                // Keep the helper's util-linux prerequisite installed after swapfile removal.
+                Some(createAptPackageSet (host.Name + "-swapfile-package") (Map.ofList [ "util-linux", None ]) [ mainApt :> Resource ] true)
+            else
+                None
+
+        match host.Swapfile with
+        | Some specification ->
+            let packageSet = defaultArg swapfilePackage mainApt
+            let args = SwapfileArgs()
+            args.Connection <- Input<AptConnectionArgs>.op_Implicit connection
+            args.Path <- Input<string>.op_Implicit specification.Path
+            args.SizeMiB <- Input<int>.op_Implicit (int specification.Size)
+            Swapfile(host.Name + "-swapfile", args, ProviderContract.resourceOptionsWithDependencies [ packageSet :> Resource ]) |> ignore
+        | None -> ()
 
         let dockerPackage =
             if host.Docker.IsSome && not (Map.containsKey "docker.io" host.Packages) then

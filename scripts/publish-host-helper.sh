@@ -12,7 +12,7 @@ project="$repo_root/src/Dorothy.HostHelper/Dorothy.HostHelper.fsproj"
 output="$repo_root/src/Dorothy.DSL.Providers/Provider/helper/$rid"
 
 # Run this on the matching Linux build host/toolchain; native AOT output is not part of normal builds.
-# Debian 13 hosts must provide libc, OpenSSL, and libicu76; AOT removes the .NET runtime, not OS libraries.
+# On Debian 13, the provider bootstraps missing libicu76 before helper dispatch; targets still need libc/OpenSSL and ICU. AOT removes the target .NET runtime, not OS libraries.
 dotnet publish "$project" \
   --configuration Release \
   --runtime "$rid" \
