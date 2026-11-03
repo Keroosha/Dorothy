@@ -225,9 +225,11 @@ type TraefikBackendTests() =
         use services = JsonDocument.Parse($"""[
           {{"name":"{serviceName}@file","provider":"file","status":"enabled","type":"loadbalancer","loadBalancer":{{"servers":[{{"url":"http://127.0.0.1:9000"}}]}}}}
         ]""")
+        use middlewares = JsonDocument.Parse("[]")
         let api: Traefik.ApiConfiguration =
             { Routers = routers.RootElement.Clone()
-              Services = services.RootElement.Clone() }
+              Services = services.RootElement.Clone()
+              Middlewares = middlewares.RootElement.Clone() }
 
         // Act
         let matches = Traefik.apiMatchesDynamic (Some api) (Some dynamicBytes)
@@ -250,15 +252,208 @@ type TraefikBackendTests() =
           {{"name":"site@file","rule":"Host(`site.example.test`)","entryPoints":["web"],"service":"{serviceName}@file","status":"enabled","middlewares":[]}}
         ]""")
         use services = JsonDocument.Parse($"""[{{"name":"{serviceName}@file","status":"enabled","type":"loadbalancer","loadBalancer":{{"servers":[{{"url":"http://127.0.0.1:9000"}}]}}}}]""")
+        use middlewares = JsonDocument.Parse("[]")
         let api: Traefik.ApiConfiguration =
             { Routers = routers.RootElement.Clone()
-              Services = services.RootElement.Clone() }
+              Services = services.RootElement.Clone()
+              Middlewares = middlewares.RootElement.Clone() }
 
         // Act
         let matches = Traefik.apiMatchesDynamic (Some api) (Some dynamicBytes)
 
         // Assert
         Assert.That(matches, Is.False)
+
+    [<Test>]
+    member _.``Redirect renderer uses a deterministic noop route and preserves raw path and query``() =
+        // Arrange
+        let origin = "HTTPS://DESTINATION.TEST:443"
+        let route = JsonObject()
+        route["host"] <- JsonValue.Create("redirect.example.test")
+        route["entryPoint"] <- JsonValue.Create("web")
+        let redirect = JsonObject()
+        redirect["kind"] <- JsonValue.Create("permanentToOrigin")
+        redirect["origin"] <- JsonValue.Create(origin)
+        route["redirect"] <- redirect
+        let tls = JsonObject()
+        tls["kind"] <- JsonValue.Create("acme")
+        tls["name"] <- JsonValue.Create("le")
+        route["tls"] <- tls
+        let routers = JsonObject()
+        routers["site"] <- route
+        let request = JsonObject()
+        request["operation"] <- JsonValue.Create("apply")
+        request["ownerId"] <- JsonValue.Create("unit-test-traefik")
+        let entryPoints = JsonObject()
+        entryPoints["web"] <- JsonValue.Create(31080)
+        request["entryPoints"] <- entryPoints
+        let resolver = JsonObject()
+        resolver["email"] <- JsonValue.Create("ops@example.test")
+        resolver["httpChallengeEntryPoint"] <- JsonValue.Create("web")
+        let resolvers = JsonObject()
+        resolvers["le"] <- resolver
+        request["resolvers"] <- resolvers
+        request["routers"] <- routers
+        request["certificates"] <- JsonObject()
+        request["adminPort"] <- JsonValue.Create(19080)
+        use requestDocument = JsonDocument.Parse(request.ToJsonString())
+        let dynamicText = Traefik.renderDynamicConfig requestDocument.RootElement paths
+        use dynamic = JsonDocument.Parse(dynamicText)
+        let http = dynamic.RootElement.GetProperty("http")
+        let renderedRoute = http.GetProperty("routers").GetProperty("site")
+        let middlewareNames = renderedRoute.GetProperty("middlewares")
+        let middlewareName = middlewareNames[0].GetString()
+        let middleware = http.GetProperty("middlewares").GetProperty(middlewareName).GetProperty("redirectRegex")
+        let regex = middleware.GetProperty("regex").GetString()
+        let replacement = middleware.GetProperty("replacement").GetString()
+        let canonicalOrigin = Uri(origin, UriKind.Absolute).GetLeftPart(UriPartial.Authority)
+
+        // Act
+        let renderedAgain = Traefik.renderDynamicConfig requestDocument.RootElement paths
+        let preservedSuffixes =
+            [ "/a%2Fb/%25?empty=&repeat=a+b&repeat=two%2Fwords"
+              "/?next=https%3A%2F%2Felsewhere.test%2Fa%3Fx%3D1" ]
+            |> List.map (fun suffix ->
+                let requestUrl = "http://redirect.example.test" + suffix
+                System.Text.RegularExpressions.Regex.Replace(requestUrl, regex, replacement), canonicalOrigin + suffix)
+
+        // Assert
+        Assert.That(renderedAgain, Is.EqualTo(dynamicText))
+        Assert.That(renderedRoute.GetProperty("service").GetString(), Is.EqualTo("noop@internal"))
+        Assert.That(renderedRoute.GetProperty("tls").GetProperty("certResolver").GetString(), Is.EqualTo("le"))
+        Assert.That(http.EnumerateObject() |> Seq.exists (fun property -> property.Name = "services"), Is.False)
+        Assert.That(middlewareNames.GetArrayLength(), Is.EqualTo(1))
+        Assert.That(System.Text.RegularExpressions.Regex.IsMatch(middlewareNames[0].GetString(), "^keroosha-redirect-[0-9a-f]{64}$"), Is.True)
+        Assert.That(middleware.GetProperty("permanent").GetBoolean(), Is.True)
+        Assert.That(replacement, Is.EqualTo(canonicalOrigin + "${1}"))
+        for actual, expected in preservedSuffixes do
+            Assert.That(actual, Is.EqualTo(expected))
+
+    [<Test>]
+    member _.``Redirect validation rejects non-origin values and requires exactly one target``() =
+        // Arrange
+        let renderTarget (backend: string option) (redirectOrigin: string option) =
+            let route = JsonObject()
+            route["host"] <- JsonValue.Create("redirect.example.test")
+            route["entryPoint"] <- JsonValue.Create("web")
+            let tls = JsonObject()
+            tls["kind"] <- JsonValue.Create("none")
+            tls["name"] <- JsonValue.Create("")
+            route["tls"] <- tls
+            match backend with
+            | Some value -> route["backend"] <- JsonValue.Create(value)
+            | None -> ()
+            match redirectOrigin with
+            | Some value ->
+                let redirect = JsonObject()
+                redirect["kind"] <- JsonValue.Create("permanentToOrigin")
+                redirect["origin"] <- JsonValue.Create(value)
+                route["redirect"] <- redirect
+            | None -> ()
+            let routers = JsonObject()
+            routers["site"] <- route
+            let request = JsonObject()
+            request["operation"] <- JsonValue.Create("apply")
+            request["ownerId"] <- JsonValue.Create("unit-test-traefik")
+            let entryPoints = JsonObject()
+            entryPoints["web"] <- JsonValue.Create(31080)
+            request["entryPoints"] <- entryPoints
+            request["resolvers"] <- JsonObject()
+            request["routers"] <- routers
+            request["certificates"] <- JsonObject()
+            request["adminPort"] <- JsonValue.Create(19080)
+            use document = JsonDocument.Parse(request.ToJsonString())
+            Traefik.renderDynamicConfig document.RootElement paths |> ignore
+        let invalidOrigins =
+            [ ""; "ftp://target.example.test"; "https://"; "https://target.example.test/path"
+              "https://target.example.test/"; "https://user@target.example.test"
+              "https://target.example.test?"; "https://target.example.test#"
+              "https://target.example.test?x=1"; "https://target.example.test#fragment"
+              "https://target.example.test\\path"; "https://target.example.test "
+              "https://target.example.test\t" ]
+
+        // Act
+        let invalidFailures =
+            invalidOrigins
+            |> List.map (fun origin -> TestDelegate(fun () -> renderTarget None (Some origin)))
+        let bothTargetsFailure = TestDelegate(fun () -> renderTarget (Some "http://127.0.0.1:9000") (Some "https://target.example.test"))
+        let noTargetFailure = TestDelegate(fun () -> renderTarget None None)
+
+        // Assert
+        for failure in invalidFailures do
+            Assert.Throws<Traefik.BackendError>(failure) |> ignore
+        Assert.Throws<Traefik.BackendError>(bothTargetsFailure) |> ignore
+        Assert.Throws<Traefik.BackendError>(noTargetFailure) |> ignore
+
+    [<Test>]
+    member _.``API comparison detects redirect middleware config and route association drift``() =
+        // Arrange
+        use request = JsonDocument.Parse("""{
+          "operation":"apply","ownerId":"unit-test-traefik","entryPoints":{"web":31080},"resolvers":{},
+          "routers":{"site":{"host":"redirect.example.test","entryPoint":"web","redirect":{"kind":"permanentToOrigin","origin":"https://destination.example.test"},"tls":{"kind":"none","name":""}}},
+          "certificates":{},"adminPort":19080
+        }""")
+        let dynamicBytes = Encoding.UTF8.GetBytes(Traefik.renderDynamicConfig request.RootElement paths)
+        let middlewareName = "keroosha-redirect-" + digest "site\nhttps://destination.example.test"
+        let regex = "^https?://[^/?#]+(.*)$"
+        let replacement = "https://destination.example.test${1}"
+        let makeRouter (name: string) (rule: string) (entryPoint: string) (service: string) (middlewareNames: string list) =
+            let router = JsonObject()
+            router["name"] <- JsonValue.Create(name)
+            router["provider"] <- JsonValue.Create("file")
+            router["status"] <- JsonValue.Create("enabled")
+            router["rule"] <- JsonValue.Create(rule)
+            let entryPoints = JsonArray()
+            entryPoints.Add(JsonValue.Create(entryPoint))
+            router["entryPoints"] <- entryPoints
+            router["service"] <- JsonValue.Create(service)
+            let middlewares = JsonArray()
+            for middlewareName in middlewareNames do middlewares.Add(JsonValue.Create(middlewareName))
+            router["middlewares"] <- middlewares
+            router
+        let buildApi (includeMiddleware: bool) (actualReplacement: string) (actualPermanent: bool option) (routeAssociation: bool) (middlewareUsers: string[]) : Traefik.ApiConfiguration =
+            let routers = JsonArray()
+            routers.Add(makeRouter "keroosha-admin@file" "PathPrefix(`/api`) || PathPrefix(`/dashboard`)" "keroosha-admin" "api@internal" [])
+            let routeMiddlewares = if routeAssociation then [ middlewareName + "@file" ] else []
+            routers.Add(makeRouter "site@file" "Host(`redirect.example.test`)" "web" "noop@internal" routeMiddlewares)
+            let middlewares = JsonArray()
+            if includeMiddleware then
+                let middleware = JsonObject()
+                middleware["name"] <- JsonValue.Create(middlewareName + "@file")
+                middleware["provider"] <- JsonValue.Create("file")
+                middleware["status"] <- JsonValue.Create("enabled")
+                middleware["type"] <- JsonValue.Create("RedirectRegex")
+                let usedBy = JsonArray()
+                for user in middlewareUsers do usedBy.Add(JsonValue.Create(user))
+                middleware["usedBy"] <- usedBy
+                let redirectRegex = JsonObject()
+                redirectRegex["regex"] <- JsonValue.Create(regex)
+                redirectRegex["replacement"] <- JsonValue.Create(actualReplacement)
+                match actualPermanent with
+                | Some value -> redirectRegex["permanent"] <- JsonValue.Create(value)
+                | None -> ()
+                middleware["redirectRegex"] <- redirectRegex
+                middlewares.Add(middleware)
+            use routerDocument = JsonDocument.Parse(routers.ToJsonString())
+            use serviceDocument = JsonDocument.Parse("[]")
+            use middlewareDocument = JsonDocument.Parse(middlewares.ToJsonString())
+            { Routers = routerDocument.RootElement.Clone()
+              Services = serviceDocument.RootElement.Clone()
+              Middlewares = middlewareDocument.RootElement.Clone() }
+
+        // Act
+        let correct = buildApi true replacement (Some true) true [| "site@file" |]
+        let missingMiddleware = buildApi false replacement (Some true) true [| "site@file" |]
+        let tamperedMiddleware = buildApi true (replacement + "/tampered") (Some true) true [| "site@file" |]
+        let falsePermanent = buildApi true replacement (Some false) true [| "site@file" |]
+        let missingPermanent = buildApi true replacement None true [| "site@file" |]
+        let missingRouteAssociation = buildApi true replacement (Some true) false [| "site@file" |]
+        let wrongMiddlewareUser = buildApi true replacement (Some true) true [| "other@file" |]
+
+        // Assert
+        Assert.That(Traefik.apiMatchesDynamic (Some correct) (Some dynamicBytes), Is.True)
+        for drifted in [ missingMiddleware; tamperedMiddleware; falsePermanent; missingPermanent; missingRouteAssociation; wrongMiddlewareUser ] do
+            Assert.That(Traefik.apiMatchesDynamic (Some drifted) (Some dynamicBytes), Is.False)
 
     [<Test>]
     member _.``ACME certificate lookup is resolver-keyed and honors the host clock``() =
@@ -360,7 +555,7 @@ type TraefikBackendTests() =
         Assert.Throws<Traefik.BackendError>(failure) |> ignore
 
     [<Test; Explicit("Runs a real Traefik lifecycle only on the dedicated Sandbox host."); Category("Sandbox")>]
-    member _.``Sandbox apply rollback read and Delete retain ACME storage and prove SNI``() =
+    member _.``Sandbox apply redirect-only transition rollback read and Delete retain ACME storage and prove SNI``() =
         // Arrange
         if Environment.GetEnvironmentVariable("KEROOSHA_RUN_SANDBOX_TRAEFIK_TESTS") <> "1" then
             Assert.Ignore("Set KEROOSHA_RUN_SANDBOX_TRAEFIK_TESTS=1 to run the explicit Sandbox integration test.")
@@ -372,7 +567,7 @@ type TraefikBackendTests() =
         let nextWebPort = RandomNumberGenerator.GetInt32(38001, 44000)
         let securePort = RandomNumberGenerator.GetInt32(50001, 60000)
         let certificate = TestSupport.createValidCertificateFixture "sandbox.example.test" [ "sandbox.example.test" ]
-        let makeRequest (operation: string) (httpPort: int) (tlsPort: int) (backend: string) : JsonObject =
+        let makeRequest (operation: string) (httpPort: int) (tlsPort: int) (backend: string option) (redirectOrigin: string option) : JsonObject =
             let entryPoints = JsonObject()
             entryPoints["web"] <- JsonValue.Create(httpPort)
             entryPoints["websecure"] <- JsonValue.Create(tlsPort)
@@ -382,7 +577,14 @@ type TraefikBackendTests() =
             let router = JsonObject()
             router["host"] <- JsonValue.Create("sandbox.example.test")
             router["entryPoint"] <- JsonValue.Create("websecure")
-            router["backend"] <- JsonValue.Create(backend)
+            match backend, redirectOrigin with
+            | Some value, None -> router["backend"] <- JsonValue.Create(value)
+            | None, Some origin ->
+                let redirect = JsonObject()
+                redirect["kind"] <- JsonValue.Create("permanentToOrigin")
+                redirect["origin"] <- JsonValue.Create(origin)
+                router["redirect"] <- redirect
+            | _ -> invalidOp "Sandbox Traefik route must have exactly one target."
             router["tls"] <- tls
             let routers = JsonObject()
             routers["site"] <- router
@@ -401,11 +603,12 @@ type TraefikBackendTests() =
             request["certificates"] <- certificates
             request["adminPort"] <- JsonValue.Create(adminPort)
             request
-        let applyRequest = makeRequest "apply" webPort securePort "http://127.0.0.1:1"
-        let dynamicUpdate = makeRequest "apply" webPort securePort "http://127.0.0.1:2"
-        let startupUpdate = makeRequest "apply" nextWebPort securePort "http://127.0.0.1:2"
-        let readRequest = makeRequest "read" nextWebPort securePort "http://127.0.0.1:2"
-        let failedUpdate = makeRequest "apply" nextWebPort 22 "http://127.0.0.1:2"
+        let applyRequest = makeRequest "apply" webPort securePort (Some "http://127.0.0.1:1") None
+        let redirectRequest = makeRequest "apply" webPort securePort None (Some "https://destination.example.test")
+        let dynamicUpdate = makeRequest "apply" webPort securePort (Some "http://127.0.0.1:2") None
+        let startupUpdate = makeRequest "apply" nextWebPort securePort (Some "http://127.0.0.1:2") None
+        let readRequest = makeRequest "read" nextWebPort securePort (Some "http://127.0.0.1:2") None
+        let failedUpdate = makeRequest "apply" nextWebPort 22 (Some "http://127.0.0.1:2") None
         let deleteRequest = JsonObject()
         deleteRequest["operation"] <- JsonValue.Create("delete")
         deleteRequest["ownerId"] <- JsonValue.Create(ownerId)
@@ -495,6 +698,11 @@ type TraefikBackendTests() =
             let writeAcme =
                 "set -eu; umask 077; temporary=$(mktemp /var/lib/keroosha-traefik/.acme.XXXXXX); trap 'rm -f -- \"$temporary\"' EXIT; cat > \"$temporary\"; chown keroosha-traefik:keroosha-traefik -- \"$temporary\"; chmod 0600 -- \"$temporary\"; mv -f -- \"$temporary\" '" + acmePath + "'; trap - EXIT"
             runSandboxSsh connection writeAcme (Some acmeContents) |> ignore
+            let redirectResult = invoke redirectRequest
+            Assert.That(redirectResult.GetProperty("inSync").GetBoolean(), Is.True)
+            Assert.That(redirectResult.GetProperty("actualConfigHash").GetString(), Is.Not.EqualTo(applied.GetProperty("actualConfigHash").GetString()))
+            Assert.That(mainPid (), Is.EqualTo(initialPid), "A redirect-only dynamic update must not restart Traefik.")
+
 
             let dynamicResult = invoke dynamicUpdate
             Assert.That(dynamicResult.GetProperty("inSync").GetBoolean(), Is.True)

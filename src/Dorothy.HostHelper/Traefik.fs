@@ -137,10 +137,14 @@ module Traefik =
         { Kind: string
           Name: string }
 
+    type private Redirect =
+        { Origin: string }
+
     type private Router =
         { Host: string
           EntryPoint: string
-          Backend: string
+          Backend: string option
+          Redirect: Redirect option
           Tls: RouterTls }
 
     type private Request =
@@ -166,7 +170,8 @@ module Traefik =
 
     type ApiConfiguration =
         { Routers: JsonElement
-          Services: JsonElement }
+          Services: JsonElement
+          Middlewares: JsonElement }
 
     type private PendingTransaction =
         { Static: byte[] option
@@ -289,6 +294,43 @@ module Traefik =
             | :? BackendError -> reraise()
             | _ -> fail message
 
+    let private validateRedirectOrigin (value: string) =
+        let message = "redirect origin must be an HTTP or HTTPS origin without a path, userinfo, query, or fragment"
+        try
+            if String.IsNullOrEmpty(value)
+               || value.Length > 2048
+               || (value |> Seq.exists (fun character -> Char.IsWhiteSpace(character) || Char.IsControl(character) || character = '\\')) then
+                fail message
+
+            let separator = value.IndexOf("://", StringComparison.Ordinal)
+            if separator < 0 then fail message
+            let scheme = value.Substring(0, separator)
+            if not (scheme.Equals(Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
+                    || scheme.Equals(Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)) then
+                fail message
+
+            let authority = value.Substring(separator + 3)
+            if String.IsNullOrEmpty(authority)
+               || authority.IndexOfAny([| '/'; '?'; '#'; '@'; '\\'; '%' |]) >= 0 then
+                fail message
+
+            let mutable uri = Unchecked.defaultof<Uri>
+            if not (Uri.TryCreate(value, UriKind.Absolute, &uri))
+               || (uri.Scheme <> Uri.UriSchemeHttp && uri.Scheme <> Uri.UriSchemeHttps)
+               || String.IsNullOrEmpty(uri.Host)
+               || not (String.IsNullOrEmpty(uri.UserInfo))
+               || uri.Port < 1 || uri.Port > 65535 then
+                fail message
+            match uri.HostNameType with
+            | UriHostNameType.Dns -> validateDnsName uri.DnsSafeHost |> ignore
+            | UriHostNameType.IPv4
+            | UriHostNameType.IPv6 -> ()
+            | _ -> fail message
+            uri.GetLeftPart(UriPartial.Authority)
+        with
+        | :? BackendError -> reraise()
+        | _ -> fail message
+
     let private parseInt32 (field: string) (element: JsonElement) =
         let mutable number = 0
         if element.ValueKind <> JsonValueKind.Number || not (element.TryGetInt32(&number)) || number < 1 || number > 65535 then
@@ -381,7 +423,10 @@ module Traefik =
                 parseStringMap "routers" (fun name value ->
                     validateName "router" [ "keroosha-admin" ] name |> ignore
                     requireObject "router" value |> ignore
-                    if objectNames value <> set [ "host"; "entryPoint"; "backend"; "tls" ] then fail "router configuration is invalid"
+                    let fields = objectNames value
+                    if not (Set.isSubset (set [ "host"; "entryPoint"; "tls" ]) fields)
+                       || not (Set.isEmpty (Set.difference fields (set [ "host"; "entryPoint"; "backend"; "redirect"; "tls" ]))) then
+                        fail "router configuration is invalid"
                     let host = requiredProperty value "host" "router host must be a DNS name or IP address" |> stringValue "router host must be a DNS name or IP address" |> validateDnsName
                     let entryPoint = requiredProperty value "entryPoint" "router entryPoint contains an unsafe name" |> stringValue "router entryPoint contains an unsafe name"
                     validateName "router entryPoint" [] entryPoint |> ignore
@@ -400,9 +445,21 @@ module Traefik =
                         validateName "TLS certificate" [] tlsName |> ignore
                         if not (certificates.ContainsKey(tlsName)) then fail "router references an undeclared certificate"
                     | _ -> fail "router TLS kind is invalid"
-                    let backend = requiredProperty value "backend" "router backend must be an HTTP or HTTPS URL" |> stringValue "router backend must be an HTTP or HTTPS URL"
-                    validateNetworkUrl "router backend must be an HTTP or HTTPS URL" 2048 false backend |> ignore
-                    { Host = host; EntryPoint = entryPoint; Backend = backend; Tls = { Kind = kind; Name = tlsName } }) (requiredProperty request "routers" "request is missing routers")
+                    let backend, redirect =
+                        match tryProperty value "backend", tryProperty value "redirect" with
+                        | Some backend, None ->
+                            let backend = stringValue "router backend must be an HTTP or HTTPS URL" backend
+                            validateNetworkUrl "router backend must be an HTTP or HTTPS URL" 2048 false backend |> ignore
+                            Some backend, None
+                        | None, Some redirect ->
+                            requireObject "router redirect" redirect |> ignore
+                            if objectNames redirect <> set [ "kind"; "origin" ] then fail "router redirect configuration is invalid"
+                            let redirectKind = requiredProperty redirect "kind" "router redirect kind is invalid" |> stringValue "router redirect kind is invalid"
+                            if redirectKind <> "permanentToOrigin" then fail "router redirect kind is invalid"
+                            let origin = requiredProperty redirect "origin" "router redirect origin is invalid" |> stringValue "router redirect origin is invalid"
+                            None, Some { Origin = validateRedirectOrigin origin }
+                        | _ -> fail "router must specify exactly one of backend or redirect"
+                    { Host = host; EntryPoint = entryPoint; Backend = backend; Redirect = redirect; Tls = { Kind = kind; Name = tlsName } }) (requiredProperty request "routers" "request is missing routers")
 
             { Operation = operation
               OwnerId = ownerId
@@ -444,6 +501,11 @@ module Traefik =
         Encoding.UTF8.GetString(stream.ToArray()) + "\n"
 
     let private serviceNameForBackend backend = "keroosha-backend-" + sha256Text backend
+    let private redirectMiddlewareName routerName origin = "keroosha-redirect-" + sha256Text (routerName + "\n" + origin)
+    let private redirectRegex = "^https?://[^/?#]+(.*)$"
+
+    let private redirectReplacement (origin: string) =
+        origin.Replace("$", "$$") + "${1}"
 
     let private materialDigest (certificate: Certificate) =
         let certificateBytes = Encoding.UTF8.GetBytes(certificate.CertificatePem)
@@ -510,14 +572,40 @@ module Traefik =
         admin["priority"] <- JsonValue.Create(1000000)
         routers["keroosha-admin"] <- admin
         let services = JsonObject()
+        let middlewares = JsonObject()
         for KeyValue(name, router) in normalized.Routers do
-            let serviceName = serviceNameForBackend router.Backend
             let dynamicRouter = JsonObject()
             dynamicRouter["rule"] <- JsonValue.Create("Host(`" + hostRuleValue router.Host + "`)") 
             let entryPoints = JsonArray()
             entryPoints.Add(JsonValue.Create(router.EntryPoint))
             dynamicRouter["entryPoints"] <- entryPoints
-            dynamicRouter["service"] <- JsonValue.Create(serviceName)
+            match router.Backend, router.Redirect with
+            | Some backend, None ->
+                let serviceName = serviceNameForBackend backend
+                dynamicRouter["service"] <- JsonValue.Create(serviceName)
+                let loadBalancer = JsonObject()
+                let servers = JsonArray()
+                let server = JsonObject()
+                server["url"] <- JsonValue.Create(backend)
+                servers.Add(server)
+                loadBalancer["servers"] <- servers
+                let service = JsonObject()
+                service["loadBalancer"] <- loadBalancer
+                services[serviceName] <- service
+            | None, Some redirect ->
+                let middlewareName = redirectMiddlewareName name redirect.Origin
+                let redirectRegexConfig = JsonObject()
+                redirectRegexConfig["regex"] <- JsonValue.Create(redirectRegex)
+                redirectRegexConfig["replacement"] <- JsonValue.Create(redirectReplacement redirect.Origin)
+                redirectRegexConfig["permanent"] <- JsonValue.Create(true)
+                let middleware = JsonObject()
+                middleware["redirectRegex"] <- redirectRegexConfig
+                middlewares[middlewareName] <- middleware
+                let routeMiddlewares = JsonArray()
+                routeMiddlewares.Add(JsonValue.Create(middlewareName))
+                dynamicRouter["middlewares"] <- routeMiddlewares
+                dynamicRouter["service"] <- JsonValue.Create("noop@internal")
+            | _ -> fail "router must specify exactly one of backend or redirect"
             match router.Tls.Kind with
             | "acme" ->
                 let tls = JsonObject()
@@ -526,17 +614,9 @@ module Traefik =
             | "provided" -> dynamicRouter["tls"] <- JsonObject()
             | _ -> ()
             routers[name] <- dynamicRouter
-            let loadBalancer = JsonObject()
-            let servers = JsonArray()
-            let server = JsonObject()
-            server["url"] <- JsonValue.Create(router.Backend)
-            servers.Add(server)
-            loadBalancer["servers"] <- servers
-            let service = JsonObject()
-            service["loadBalancer"] <- loadBalancer
-            services[serviceName] <- service
         http["routers"] <- routers
-        http["services"] <- services
+        if services.Count > 0 then http["services"] <- services
+        if middlewares.Count > 0 then http["middlewares"] <- middlewares
         dynamicConfig["http"] <- http
         let tlsRoot = JsonObject()
         let certificates = JsonArray()
@@ -1290,8 +1370,10 @@ module Traefik =
         task {
             let! routers = readApiEndpoint adminPort "routers"
             let! services = readApiEndpoint adminPort "services"
-            match routers, services with
-            | Some routerValues, Some serviceValues -> return Some { Routers = routerValues; Services = serviceValues }
+            let! middlewares = readApiEndpoint adminPort "middlewares"
+            match routers, services, middlewares with
+            | Some routerValues, Some serviceValues, Some middlewareValues ->
+                return Some { Routers = routerValues; Services = serviceValues; Middlewares = middlewareValues }
             | _ -> return None
         }
 
@@ -1317,15 +1399,30 @@ module Traefik =
         | None -> true
         | Some value -> value.ValueKind = JsonValueKind.String && value.GetString() = "file"
 
+    let private withoutProviderSuffix (provider: string) (name: string) =
+        let suffix = "@" + provider
+        if name.EndsWith(suffix, StringComparison.Ordinal) then name.Substring(0, name.Length - suffix.Length)
+        elif name.Contains("@", StringComparison.Ordinal) then null
+        else name
+
     let apiMatchesDynamic (apiConfiguration: ApiConfiguration option) (dynamicData: byte[] option) : bool =
         match apiConfiguration, dynamicData with
         | None, _ | _, None -> false
         | Some api, Some bytes ->
             try
                 use document = JsonDocument.Parse(bytes)
-                let dynamic = document.RootElement
-                let expectedRouters = dynamic.GetProperty("http").GetProperty("routers")
-                let expectedServices = dynamic.GetProperty("http").GetProperty("services")
+                let http = document.RootElement.GetProperty("http")
+                let expectedRouters = http.GetProperty("routers")
+                let expectedServiceEntries =
+                    match tryProperty http "services" with
+                    | None -> Some [||]
+                    | Some value when value.ValueKind = JsonValueKind.Object -> Some(value.EnumerateObject() |> Seq.toArray)
+                    | _ -> None
+                let expectedMiddlewareEntries =
+                    match tryProperty http "middlewares" with
+                    | None -> Some [||]
+                    | Some value when value.ValueKind = JsonValueKind.Object -> Some(value.EnumerateObject() |> Seq.toArray)
+                    | _ -> None
                 let actualRouters =
                     api.Routers.EnumerateArray()
                     |> Seq.choose (fun item ->
@@ -1338,10 +1435,9 @@ module Traefik =
                     |> Seq.filter (fun name -> name.EndsWith("@file", StringComparison.Ordinal))
                     |> Set.ofSeq
                 let expectedRouterNames = expectedRouters.EnumerateObject() |> Seq.map (fun item -> item.Name + "@file") |> Set.ofSeq
-                if fileRouterNames <> expectedRouterNames then false
-                else
-                    let routersMatch =
-                        expectedRouters.EnumerateObject()
+                let routersMatch =
+                    fileRouterNames = expectedRouterNames
+                    && (expectedRouters.EnumerateObject()
                         |> Seq.forall (fun property ->
                             match actualRouters.TryFind(property.Name + "@file") with
                             | None -> false
@@ -1369,35 +1465,55 @@ module Traefik =
                                         optionsMatches
                                         && (if not (String.IsNullOrEmpty(wantedResolver)) then wantedResolver = foundResolver else String.IsNullOrEmpty(foundResolver))
                                 let expectedService = tryString expected "service"
-                                let middlewaresMatch =
+                                let actualService = tryString actual "service"
+                                let serviceMatches =
+                                    if expectedService.EndsWith("@internal", StringComparison.Ordinal) then
+                                        actualService = expectedService
+                                        || actualService = expectedService.Substring(0, expectedService.Length - "@internal".Length)
+                                    else actualService = expectedService
+                                let expectedMiddlewareNames =
+                                    match tryProperty expected "middlewares" with
+                                    | None -> Some [||]
+                                    | Some value when value.ValueKind = JsonValueKind.Null -> Some [||]
+                                    | Some value -> jsonArrayStrings value
+                                let actualMiddlewareNames =
                                     match tryProperty actual "middlewares" with
-                                    | None -> true
-                                    | Some value when value.ValueKind = JsonValueKind.Null -> true
-                                    | Some value when value.ValueKind = JsonValueKind.Array -> Seq.isEmpty (value.EnumerateArray())
+                                    | None -> Some [||]
+                                    | Some value when value.ValueKind = JsonValueKind.Null -> Some [||]
+                                    | Some value -> jsonArrayStrings value
+                                let routeMiddlewaresMatch =
+                                    match expectedMiddlewareNames, actualMiddlewareNames with
+                                    | Some wanted, Some found when wanted.Length = found.Length ->
+                                        Array.forall2 (fun expectedName actualName ->
+                                            actualName = expectedName
+                                            || actualName = expectedName + "@file") wanted found
                                     | _ -> false
                                 tryString actual "rule" = tryString expected "rule"
                                 && actualEntryPoints = expectedEntryPoints
-                                && tryString actual "service" = expectedService
+                                && serviceMatches
                                 && tryString actual "status" = "enabled"
                                 && providerIsFile actual
-                                && middlewaresMatch
-                                && tlsMatches)
-                    if not routersMatch then false
-                    else
-                        let actualServices =
-                            api.Services.EnumerateArray()
-                            |> Seq.choose (fun item ->
-                                let name = tryString item "name"
-                                if String.IsNullOrEmpty(name) then None else Some(name, item))
-                            |> Map.ofSeq
-                        let fileServiceNames =
-                            actualServices
-                            |> Seq.map (fun (KeyValue(name, _)) -> name)
-                            |> Seq.filter (fun name -> name.EndsWith("@file", StringComparison.Ordinal))
-                            |> Set.ofSeq
-                        let expectedServiceNames = expectedServices.EnumerateObject() |> Seq.map (fun item -> item.Name + "@file") |> Set.ofSeq
+                                && routeMiddlewaresMatch
+                                && tlsMatches))
+
+                let actualServices =
+                    api.Services.EnumerateArray()
+                    |> Seq.choose (fun item ->
+                        let name = tryString item "name"
+                        if String.IsNullOrEmpty(name) then None else Some(name, item))
+                    |> Map.ofSeq
+                let fileServiceNames =
+                    actualServices
+                    |> Seq.map (fun (KeyValue(name, _)) -> name)
+                    |> Seq.filter (fun name -> name.EndsWith("@file", StringComparison.Ordinal))
+                    |> Set.ofSeq
+                let servicesMatch =
+                    match expectedServiceEntries with
+                    | None -> false
+                    | Some entries ->
+                        let expectedServiceNames = entries |> Array.map (fun item -> item.Name + "@file") |> Set.ofArray
                         fileServiceNames = expectedServiceNames
-                        && (expectedServices.EnumerateObject() |> Seq.forall (fun property ->
+                        && (entries |> Array.forall (fun property ->
                             match actualServices.TryFind(property.Name + "@file") with
                             | None -> false
                             | Some actual ->
@@ -1416,6 +1532,63 @@ module Traefik =
                                 && providerIsFile actual
                                 && passHostHeader
                                 && actualUrls = expectedUrls))
+
+                let actualMiddlewareEntries =
+                    api.Middlewares.EnumerateArray()
+                    |> Seq.choose (fun item ->
+                        let name = tryString item "name"
+                        if String.IsNullOrEmpty(name) || not (providerIsFile item) then None
+                        else
+                            let unqualifiedName = withoutProviderSuffix "file" name
+                            if String.IsNullOrEmpty(unqualifiedName) then None
+                            else Some(unqualifiedName, item))
+                    |> Seq.toArray
+                let actualMiddlewares = actualMiddlewareEntries |> Map.ofArray
+                let actualFileMiddlewareNames = actualMiddlewareEntries |> Seq.map fst |> Set.ofSeq
+                let expectedMiddlewareNames =
+                    expectedMiddlewareEntries
+                    |> Option.map (Array.map (fun property -> property.Name) >> Set.ofArray)
+                    |> Option.defaultValue Set.empty
+                let middlewaresMatch =
+                    match expectedMiddlewareEntries with
+                    | None -> false
+                    | Some entries ->
+                        actualFileMiddlewareNames = expectedMiddlewareNames
+                        && (entries
+                            |> Array.forall (fun property ->
+                                match actualMiddlewares.TryFind(property.Name) with
+                                | None -> false
+                                | Some actual ->
+                                    let expectedConfig = property.Value.GetProperty("redirectRegex")
+                                    let actualConfig = tryProperty actual "redirectRegex"
+                                    let redirectConfigMatches =
+                                        match actualConfig with
+                                        | Some found when found.ValueKind = JsonValueKind.Object ->
+                                            tryString found "regex" = tryString expectedConfig "regex"
+                                            && tryString found "replacement" = tryString expectedConfig "replacement"
+                                            && (match tryProperty found "permanent" with
+                                                | Some value -> value.ValueKind = JsonValueKind.True
+                                                | None -> false)
+                                        | _ -> false
+                                    let expectedUsers =
+                                        expectedRouters.EnumerateObject()
+                                        |> Seq.choose (fun router ->
+                                            match tryProperty router.Value "middlewares" |> Option.bind jsonArrayStrings with
+                                            | Some names when names |> Array.contains property.Name -> Some(router.Name)
+                                            | _ -> None)
+                                        |> Set.ofSeq
+                                    let actualUsers =
+                                        tryProperty actual "usedBy"
+                                        |> Option.bind jsonArrayStrings
+                                        |> Option.map (Array.map (withoutProviderSuffix "file"))
+                                        |> Option.filter (fun names -> names |> Array.forall (String.IsNullOrEmpty >> not))
+                                        |> Option.map Set.ofArray
+                                    tryString actual "status" = "enabled"
+                                    && String.Equals(tryString actual "type", "RedirectRegex", StringComparison.OrdinalIgnoreCase)
+                                    && providerIsFile actual
+                                    && redirectConfigMatches
+                                    && actualUsers = Some expectedUsers))
+                routersMatch && servicesMatch && middlewaresMatch
             with _ -> false
 
     let private certificateFingerprint (pem: byte[]) : string option =

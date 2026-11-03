@@ -87,6 +87,16 @@ type TraefikRouterTlsArgs() =
     [<Input("name", true)>]
     member val Name: Input<string> = Unchecked.defaultof<_> with get, set
 
+/// Redirect target fields accepted by the native Traefik provider.
+type TraefikRouterRedirectArgs() =
+    inherit ResourceArgs()
+
+    [<Input("kind", true)>]
+    member val Kind: Input<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("origin", true)>]
+    member val Origin: Input<string> = Unchecked.defaultof<_> with get, set
+
 /// Router fields accepted by the native Traefik provider.
 type TraefikRouterArgs() =
     inherit ResourceArgs()
@@ -97,12 +107,14 @@ type TraefikRouterArgs() =
     [<Input("entryPoint", true)>]
     member val EntryPoint: Input<string> = Unchecked.defaultof<_> with get, set
 
-    [<Input("backend", true)>]
+    [<Input("backend")>]
     member val Backend: Input<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("redirect")>]
+    member val Redirect: Input<TraefikRouterRedirectArgs> = Unchecked.defaultof<_> with get, set
 
     [<Input("tls", true)>]
     member val Tls: Input<TraefikRouterTlsArgs> = Unchecked.defaultof<_> with get, set
-
 /// Normalized certificate fields accepted by the native Traefik provider.
 type TraefikCertificateArgs() =
     inherit ResourceArgs()
@@ -152,12 +164,25 @@ type TraefikRouterTlsOutput [<OutputConstructor>] (kind: string, name: string) =
     member _.Kind = kind
     member _.Name = name
 
+/// Native output DTO for one redirect target.
+[<OutputType>]
+type TraefikRouterRedirectOutput [<OutputConstructor>] (kind: string, origin: string) =
+    member _.Kind = kind
+    member _.Origin = origin
+
 /// Native output DTO for one router.
 [<OutputType>]
-type TraefikRouterOutput [<OutputConstructor>] (host: string, entryPoint: string, backend: string, tls: TraefikRouterTlsOutput) =
+type TraefikRouterOutput [<OutputConstructor>] (
+    host: string,
+    entryPoint: string,
+    backend: string,
+    redirect: TraefikRouterRedirectOutput,
+    tls: TraefikRouterTlsOutput
+) =
     member _.Host = host
     member _.EntryPoint = entryPoint
     member _.Backend = backend
+    member _.Redirect = redirect
     member _.Tls = tls
 
 /// Native output DTO for one normalized certificate; the map key carries its name.
@@ -406,7 +431,14 @@ module private TraefikResourceMappings =
         let args = TraefikRouterArgs()
         args.Host <- Input<string>.op_Implicit value.Host
         args.EntryPoint <- Input<string>.op_Implicit value.EntryPoint
-        args.Backend <- Input<string>.op_Implicit value.Backend
+        match value.Target with
+        | TraefikRouterTarget.Backend backend ->
+            args.Backend <- Input<string>.op_Implicit backend
+        | TraefikRouterTarget.PermanentToOrigin origin ->
+            let redirect = TraefikRouterRedirectArgs()
+            redirect.Kind <- Input<string>.op_Implicit "permanentToOrigin"
+            redirect.Origin <- Input<string>.op_Implicit origin
+            args.Redirect <- Input<TraefikRouterRedirectArgs>.op_Implicit redirect
         args.Tls <- Input<TraefikRouterTlsArgs>.op_Implicit tls
         args
 

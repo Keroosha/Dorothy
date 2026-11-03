@@ -1,8 +1,14 @@
 namespace Dorothy.Tests
 
 open System
+open System.Collections.Immutable
+open System.Threading
+open System.Threading.Tasks
 open Dorothy.DSL
+open Dorothy.DSL.Provider
 open NUnit.Framework
+open Pulumi.Experimental
+open Pulumi.Experimental.Provider
 
 [<TestFixture>]
 type DslTests() =
@@ -253,6 +259,13 @@ type DslTests() =
                 tls (Acme resolver)
             }
 
+        let redirected =
+            router "redirected" {
+                host "www.example.test"
+                entryPoint "web"
+                redirect (Redirect.permanentToOrigin "https://ovsianikov-history.ru")
+                tls noTls
+            }
         // Act
         let certificateName =
             match secure.Tls with
@@ -270,10 +283,40 @@ type DslTests() =
         Assert.That(websecure.Listen, Is.EqualTo(8443))
         Assert.That(plain.Host, Is.EqualTo(LiteralString "plain.example.test"))
         Assert.That(plain.EntryPoint, Is.EqualTo(LiteralString "web"))
-        Assert.That(plain.Backend, Is.EqualTo(LiteralString "http://127.0.0.1:8080"))
+        Assert.That(plain.Target, Is.EqualTo(RouterTargetInput.Backend(LiteralString "http://127.0.0.1:8080")))
         Assert.That(plain.Tls, Is.EqualTo(NoTls))
+        Assert.That(
+            redirected.Target,
+            Is.EqualTo(RouterTargetInput.PermanentToOrigin(LiteralString "https://ovsianikov-history.ru"))
+        )
         Assert.That(certificateName, Is.EqualTo("wildcard"))
         Assert.That(acmeResolverName, Is.EqualTo(resolver.Name))
+
+    [<Test>]
+    member _.``Traefik redirect output origin retains canonical value and secrecy``() : Task =
+        task {
+            // Arrange
+            let origin = Pulumi.Output.CreateSecret<string>("HTTPS://OVSIANIKOV-HISTORY.RU:443")
+            let canonicalOrigin = Uri("HTTPS://OVSIANIKOV-HISTORY.RU:443").GetLeftPart(UriPartial.Authority)
+            let specification =
+                traefik {
+                    entryPoint "web" { listen 8080 }
+                    router "redirected" {
+                        host "www.example.test"
+                        entryPoint "web"
+                        redirect (Redirect.permanentToOrigin origin)
+                    }
+                }
+
+            // Act
+            let resolved = specification.Resolve(System.Threading.CancellationToken.None)
+            let! routers = Pulumi.Utilities.OutputUtilities.GetValueAsync(resolved.Routers)
+            let! isSecret = Pulumi.Output.IsSecretAsync(resolved.Routers)
+
+            // Assert
+            Assert.That(routers["redirected"].Target, Is.EqualTo(TraefikRouterTarget.PermanentToOrigin canonicalOrigin))
+            Assert.That(isSecret, Is.True)
+        }
 
     [<Test>]
     member _.``Traefik builders reject duplicate declarations and invalid ports or names``() =
@@ -299,9 +342,9 @@ type DslTests() =
         Assert.Throws<ArgumentException>(portAction) |> ignore
 
     [<Test>]
-    member _.``Traefik router builder requires host entry point and backend exactly once``() =
+    member _.``Traefik router builder requires host entry point and exactly one target``() =
         // Arrange
-        let missingBackend = fun () -> traefik {
+        let missingTarget = fun () -> traefik {
             entryPoint "web" { listen 8080 }
             router "incomplete" {
                 host "example.test"
@@ -314,11 +357,229 @@ type DslTests() =
             entryPoint "web"
             backend "http://127.0.0.1:8080"
         }
+        let duplicateTarget = fun () -> router "duplicate-target" {
+            host "example.test"
+            entryPoint "web"
+            backend "http://127.0.0.1:8080"
+            redirect (Redirect.permanentToOrigin "https://example.test")
+        }
 
         // Act
-        let missingBackendAction = TestDelegate(fun () -> missingBackend () |> ignore)
+        let missingTargetAction = TestDelegate(fun () -> missingTarget () |> ignore)
         let duplicateHostAction = TestDelegate(fun () -> duplicateHost () |> ignore)
+        let duplicateTargetAction = TestDelegate(fun () -> duplicateTarget () |> ignore)
 
         // Assert
-        Assert.Throws<ArgumentException>(missingBackendAction) |> ignore
+        Assert.Throws<ArgumentException>(missingTargetAction) |> ignore
         Assert.Throws<ArgumentException>(duplicateHostAction) |> ignore
+        Assert.Throws<ArgumentException>(duplicateTargetAction) |> ignore
+
+[<RequireQualifiedAccess>]
+module private TraefikRedirectProviderTestValues =
+    let map (entries: seq<string * PropertyValue>) =
+        let builder = ImmutableDictionary.CreateBuilder<string, PropertyValue>(StringComparer.Ordinal)
+        for key, value in entries do
+            builder.Add(key, value)
+        PropertyValue(builder.ToImmutable())
+
+    let inputMap (entries: seq<string * PropertyValue>) =
+        let builder = ImmutableDictionary.CreateBuilder<string, PropertyValue>(StringComparer.Ordinal)
+        for key, value in entries do
+            builder.Add(key, value)
+        builder.ToImmutable()
+
+    let string (value: string) = PropertyValue(value)
+    let number (value: int) = PropertyValue(float value)
+    let boolean (value: bool) = PropertyValue(value)
+
+    let mapContents (value: PropertyValue) =
+        let mutable values = ImmutableDictionary<string, PropertyValue>.Empty
+        if value.TryGetMap(&values) then values else failwith "Expected a map property value."
+
+    let private connection =
+        map [
+            "address", string "192.0.2.1"
+            "user", string "root"
+        ]
+
+    let traefikInputWithTarget (target: (string * PropertyValue) list) (adminPort: int) =
+        let router =
+            map (
+                [
+                    "host", string "example.org"
+                    "entryPoint", string "websecure"
+                ]
+                @ target
+                @ [
+                    "tls", map [
+                        "kind", string "none"
+                        "name", string ""
+                    ]
+                ]
+            )
+        inputMap [
+            "connection", connection
+            "entryPoints", map [ "websecure", number 443 ]
+            "resolvers", map Seq.empty
+            "routers", map [ "example", router ]
+            "certificates", map Seq.empty
+            "adminPort", number adminPort
+        ]
+
+    let traefikBackendInput backend adminPort =
+        traefikInputWithTarget [ "backend", string backend ] adminPort
+
+    let traefikRedirectInput origin adminPort =
+        traefikInputWithTarget [
+            "redirect",
+            map [
+                "kind", string "permanentToOrigin"
+                "origin", string origin
+            ]
+        ] adminPort
+
+    let check (provider: DorothyProvider) (inputs: ImmutableDictionary<string, PropertyValue>) =
+        let request =
+            CheckRequest(
+                Pulumi.Urn("urn:pulumi:unit::unit::keroosha:debian:Traefik::test-resource"),
+                ImmutableDictionary<string, PropertyValue>.Empty,
+                inputs,
+                ImmutableArray<byte>.Empty
+            )
+        provider.Check(request, CancellationToken.None).GetAwaiter().GetResult()
+
+    let diff
+        (provider: DorothyProvider)
+        (oldInputs: ImmutableDictionary<string, PropertyValue>)
+        (oldOutputs: ImmutableDictionary<string, PropertyValue>)
+        (newInputs: ImmutableDictionary<string, PropertyValue>)
+        =
+        let request =
+            DiffRequest(
+                Pulumi.Urn("urn:pulumi:unit::unit::keroosha:debian:Traefik::test-resource"),
+                "owned-id",
+                oldOutputs,
+                newInputs,
+                ImmutableArray<string>.Empty,
+                oldInputs
+            )
+        provider.Diff(request, CancellationToken.None).GetAwaiter().GetResult()
+
+[<TestFixture>]
+type TraefikRedirectProviderTests() =
+    [<Test>]
+    member _.``Provider Check canonicalizes redirect origins and requires one target``() =
+        // Arrange
+        let provider = DorothyProvider()
+        let canonicalOrigin = Uri("HTTPS://OVSIANIKOV-HISTORY.RU:443").GetLeftPart(UriPartial.Authority)
+        let canonicalInput = TraefikRedirectProviderTestValues.traefikRedirectInput "HTTPS://OVSIANIKOV-HISTORY.RU:443" 19080
+        let missingTarget = TraefikRedirectProviderTestValues.traefikInputWithTarget [] 19080
+        let bothTargets =
+            TraefikRedirectProviderTestValues.traefikInputWithTarget [
+                "backend", TraefikRedirectProviderTestValues.string "http://127.0.0.1:8080"
+                "redirect",
+                TraefikRedirectProviderTestValues.map [
+                    "kind", TraefikRedirectProviderTestValues.string "permanentToOrigin"
+                    "origin", TraefikRedirectProviderTestValues.string "https://example.org"
+                ]
+            ] 19080
+
+        // Act
+        let canonicalResponse = TraefikRedirectProviderTestValues.check provider canonicalInput
+        let missingResponse = TraefikRedirectProviderTestValues.check provider missingTarget
+        let bothResponse = TraefikRedirectProviderTestValues.check provider bothTargets
+        let routers = TraefikRedirectProviderTestValues.mapContents canonicalResponse.Inputs["routers"]
+        let router = TraefikRedirectProviderTestValues.mapContents routers["example"]
+        let redirect = TraefikRedirectProviderTestValues.mapContents router["redirect"]
+
+        // Assert
+        Assert.That(canonicalResponse.Failures, Is.Empty)
+        Assert.That(
+            redirect["origin"],
+            Is.EqualTo(TraefikRedirectProviderTestValues.string canonicalOrigin)
+        )
+        Assert.That(missingResponse.Failures, Is.Not.Empty)
+        Assert.That(bothResponse.Failures, Is.Not.Empty)
+
+    [<Test>]
+    member _.``Provider Check rejects raw redirect paths credentials markers and unsafe characters``() =
+        // Arrange
+        let provider = DorothyProvider()
+        let invalidOrigins = [
+            "https://"
+            "https://example.org/"
+            "https://example.org/a/../"
+            "https://example.org?"
+            "https://example.org#"
+            "https://user:secret@example.org"
+            "https://example.org\\path"
+            "https://example.org "
+            "https://example.org\u0009"
+        ]
+
+        // Act
+        let responses =
+            invalidOrigins
+            |> List.map (fun origin ->
+                origin,
+                TraefikRedirectProviderTestValues.check
+                    provider
+                    (TraefikRedirectProviderTestValues.traefikRedirectInput origin 19080))
+
+        // Assert
+        for origin, response in responses do
+            Assert.That(response.Failures, Is.Not.Empty, origin)
+
+    [<Test>]
+    member _.``Provider Create preview preserves unknown redirect origin``() =
+        // Arrange
+        let provider = DorothyProvider()
+        let redirect =
+            TraefikRedirectProviderTestValues.map [
+                "kind", TraefikRedirectProviderTestValues.string "permanentToOrigin"
+                "origin", PropertyValue.Computed
+            ]
+        let inputs = TraefikRedirectProviderTestValues.traefikInputWithTarget [ "redirect", redirect ] 19080
+        let request =
+            CreateRequest(
+                Pulumi.Urn("urn:pulumi:unit::unit::keroosha:debian:Traefik::unknown-redirect"),
+                inputs,
+                TimeSpan.FromSeconds(1.0),
+                true
+            )
+
+        // Act
+        let preview = provider.Create(request, CancellationToken.None).GetAwaiter().GetResult()
+        let routers = TraefikRedirectProviderTestValues.mapContents preview.Outputs["routers"]
+        let router = TraefikRedirectProviderTestValues.mapContents routers["example"]
+        let previewRedirect = TraefikRedirectProviderTestValues.mapContents router["redirect"]
+
+        // Assert
+        Assert.That(preview.Id, Is.Empty)
+        Assert.That(previewRedirect["origin"].IsComputed, Is.True)
+
+    [<Test>]
+    member _.``Provider Diff reports transitions between backend and redirect targets``() =
+        // Arrange
+        let provider = DorothyProvider()
+        let backend = TraefikRedirectProviderTestValues.traefikBackendInput "http://127.0.0.1:12345" 19080
+        let redirect = TraefikRedirectProviderTestValues.traefikRedirectInput "https://ovsianikov-history.ru" 19080
+        let oldOutputs =
+            TraefikRedirectProviderTestValues.inputMap [
+                "inSync", TraefikRedirectProviderTestValues.boolean true
+            ]
+
+        // Act
+        let toRedirect = TraefikRedirectProviderTestValues.diff provider backend oldOutputs redirect
+        let toBackend = TraefikRedirectProviderTestValues.diff provider redirect oldOutputs backend
+
+        // Assert
+        Assert.That(toRedirect.Changes.HasValue, Is.True)
+        Assert.That(toRedirect.Changes.Value, Is.True)
+        Assert.That(toRedirect.Diffs.Contains("routers"), Is.True)
+        Assert.That(toRedirect.DetailedDiff["routers.example.backend"].Kind, Is.EqualTo(PropertyDiffKind.Delete))
+        Assert.That(toRedirect.DetailedDiff["routers.example.redirect"].Kind, Is.EqualTo(PropertyDiffKind.Add))
+        Assert.That(toBackend.Changes.HasValue, Is.True)
+        Assert.That(toBackend.Changes.Value, Is.True)
+        Assert.That(toBackend.DetailedDiff["routers.example.backend"].Kind, Is.EqualTo(PropertyDiffKind.Add))
+        Assert.That(toBackend.DetailedDiff["routers.example.redirect"].Kind, Is.EqualTo(PropertyDiffKind.Delete))

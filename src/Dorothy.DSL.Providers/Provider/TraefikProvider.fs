@@ -58,6 +58,14 @@ module private TraefikProviderLogic =
               "host": { "type": "string" },
               "entryPoint": { "type": "string" },
               "backend": { "type": "string" },
+              "redirect": {
+                "type": "object",
+                "properties": {
+                  "kind": { "type": "string", "enum": ["permanentToOrigin"] },
+                  "origin": { "type": "string" }
+                },
+                "required": ["kind", "origin"]
+              },
               "tls": {
                 "type": "object",
                 "properties": {
@@ -67,7 +75,7 @@ module private TraefikProviderLogic =
                 "required": ["kind", "name"]
               }
             },
-            "required": ["host", "entryPoint", "backend", "tls"]
+            "required": ["host", "entryPoint", "tls"]
           }
         },
         "certificates": {
@@ -108,6 +116,14 @@ module private TraefikProviderLogic =
               "host": { "type": "string" },
               "entryPoint": { "type": "string" },
               "backend": { "type": "string" },
+              "redirect": {
+                "type": "object",
+                "properties": {
+                  "kind": { "type": "string", "enum": ["permanentToOrigin"] },
+                  "origin": { "type": "string" }
+                },
+                "required": ["kind", "origin"]
+              },
               "tls": {
                 "type": "object",
                 "properties": {
@@ -197,6 +213,95 @@ module private TraefikProviderLogic =
 
     let private stringWithMetadata (source: PropertyValue) (text: string) =
         PropertyValue(text, IsSecret = source.IsSecret, Dependencies = source.Dependencies)
+
+    let private canonicalRedirectOrigin (value: string) =
+        let fail () =
+            invalidOp "A Traefik redirect origin must be an absolute HTTP or HTTPS origin without a path, credentials, query, fragment, backslash, or whitespace."
+
+        if String.IsNullOrWhiteSpace(value)
+           || value.Length > 2048
+           || (value |> Seq.exists (fun character -> Char.IsWhiteSpace(character) || Char.IsControl(character)))
+           || value.Contains('\\') then
+            fail ()
+
+        let schemeDelimiter = value.IndexOf("://", StringComparison.Ordinal)
+        if schemeDelimiter <= 0 then fail ()
+
+        let scheme = value.Substring(0, schemeDelimiter)
+        if not (String.Equals(scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
+                || String.Equals(scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)) then
+            fail ()
+
+        let authorityStart = schemeDelimiter + 3
+        if authorityStart >= value.Length then fail ()
+        if value.IndexOfAny([| '/'; '?'; '#' |], authorityStart) >= 0 then fail ()
+        let authority = value.Substring(authorityStart)
+        if String.IsNullOrEmpty(authority) || authority.Contains('@') then fail ()
+
+        let mutable uri = Unchecked.defaultof<Uri>
+        if not (Uri.TryCreate(value, UriKind.Absolute, &uri)) then fail ()
+        let validScheme =
+            String.Equals(uri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
+            || String.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)
+        let validPort = uri.IsDefaultPort || (uri.Port >= 1 && uri.Port <= 65535)
+        if not validScheme
+           || String.IsNullOrWhiteSpace(uri.Host)
+           || Uri.CheckHostName(uri.Host) = UriHostNameType.Unknown
+           || not (String.IsNullOrEmpty(uri.UserInfo))
+           || not (String.IsNullOrEmpty(uri.Query))
+           || not (String.IsNullOrEmpty(uri.Fragment))
+           || not validPort then
+            fail ()
+        uri.GetLeftPart(UriPartial.Authority)
+
+    let private normalizeRouterTargets (source: PropertyValue) =
+        match tryGetMap source with
+        | None -> source
+        | Some routers ->
+            let normalized = ImmutableDictionary.CreateBuilder<string, PropertyValue>(StringComparer.Ordinal)
+            let mutable changed = false
+            for entry in routers do
+                let mutable route = entry.Value
+                match tryGetMap entry.Value with
+                | Some routeFields ->
+                    let routeBuilder = ImmutableDictionary.CreateBuilder<string, PropertyValue>(StringComparer.Ordinal)
+                    let mutable routeChanged = false
+                    for field in routeFields do
+                        if (field.Key = "backend" || field.Key = "redirect") && field.Value.IsNull then
+                            routeChanged <- true
+                        elif field.Key = "redirect" then
+                            let redirect =
+                                match tryGetMap field.Value with
+                                | Some redirectFields ->
+                                    match redirectFields.TryGetValue("origin") with
+                                    | true, originSource when not originSource.IsComputed && not originSource.IsNull ->
+                                        match tryGetString originSource with
+                                        | Some origin ->
+                                            let canonical =
+                                                try canonicalRedirectOrigin origin
+                                                with _ -> origin
+                                            if not (String.Equals(origin, canonical, StringComparison.Ordinal)) then
+                                                let redirectBuilder = ImmutableDictionary.CreateBuilder<string, PropertyValue>(StringComparer.Ordinal)
+                                                for redirectField in redirectFields do
+                                                    redirectBuilder[redirectField.Key] <- redirectField.Value
+                                                redirectBuilder["origin"] <- stringWithMetadata originSource canonical
+                                                routeChanged <- true
+                                                mapWithMetadata field.Value (redirectBuilder.ToImmutable())
+                                            else
+                                                field.Value
+                                        | None -> field.Value
+                                    | _ -> field.Value
+                                | None -> field.Value
+                            routeBuilder[field.Key] <- redirect
+                        else
+                            routeBuilder[field.Key] <- field.Value
+                    if routeChanged then
+                        route <- mapWithMetadata entry.Value (routeBuilder.ToImmutable())
+                        changed <- true
+                | None -> ()
+                normalized[entry.Key] <- route
+            if changed then mapWithMetadata source (normalized.ToImmutable()) else source
+
     let private normalizeKnownDefaults (normalized: Dictionary<string, PropertyValue>) =
         match normalized.TryGetValue("connection") with
         | true, source ->
@@ -232,6 +337,9 @@ module private TraefikProviderLogic =
                     | None -> resolvers[entry.Key] <- entry.Value
                 normalized["resolvers"] <- mapWithMetadata source (resolvers.ToImmutable())
             | None -> ()
+        | false, _ -> ()
+        match normalized.TryGetValue("routers") with
+        | true, source -> normalized["routers"] <- normalizeRouterTargets source
         | false, _ -> ()
 
     let private failIfFailures (failures: ResizeArray<CheckFailure>) =
@@ -469,6 +577,18 @@ module private TraefikProviderLogic =
         && String.IsNullOrEmpty(uri.Query)
         && String.IsNullOrEmpty(uri.Fragment)
 
+
+    let private parseRedirect (value: PropertyValue) =
+        let fields = tryMap value
+        for field in fields do
+            if field.Key <> "kind" && field.Key <> "origin" then
+                invalidOp "A Traefik redirect contains an unsupported property."
+        let kind = requiredString "kind" fields
+        if kind <> "permanentToOrigin" then
+            invalidOp "A Traefik redirect kind must be permanentToOrigin."
+        let origin = requiredString "origin" fields |> canonicalRedirectOrigin
+        TraefikRouterTarget.PermanentToOrigin origin
+
     let private parseRouters
         (value: PropertyValue)
         (entryPoints: ImmutableDictionary<string, int>)
@@ -481,15 +601,36 @@ module private TraefikProviderLogic =
             requireIdentifier "routers" entry.Key
             let fields = tryMap entry.Value
             for field in fields do
-                if field.Key <> "host" && field.Key <> "entryPoint" && field.Key <> "backend" && field.Key <> "tls" then
+                if field.Key <> "host"
+                   && field.Key <> "entryPoint"
+                   && field.Key <> "backend"
+                   && field.Key <> "redirect"
+                   && field.Key <> "tls" then
                     invalidOp "A Traefik router contains an unsupported property."
             let host = requiredString "host" fields
             if not (validateRouterHost host) then invalidOp "A Traefik router host is invalid."
             let entryPoint = requiredString "entryPoint" fields
             if not (entryPoints.ContainsKey(entryPoint)) then
                 invalidOp "A Traefik router references an undeclared entryPoint."
-            let backend = requiredString "backend" fields
-            if not (validateBackend backend) then invalidOp "A Traefik router backend must be an HTTP or HTTPS URL."
+            let backend =
+                match fields.TryGetValue("backend") with
+                | true, value when not value.IsNull -> Some value
+                | _ -> None
+            let redirect =
+                match fields.TryGetValue("redirect") with
+                | true, value when not value.IsNull -> Some value
+                | _ -> None
+            let target =
+                match backend, redirect with
+                | Some _, None ->
+                    let backend = requiredString "backend" fields
+                    if not (validateBackend backend) then
+                        invalidOp "A Traefik router backend must be an HTTP or HTTPS URL."
+                    TraefikRouterTarget.Backend backend
+                | None, Some redirectValue ->
+                    parseRedirect redirectValue
+                | _ ->
+                    invalidOp "A Traefik router must declare exactly one backend or redirect target."
             let tls =
                 match fields.TryGetValue("tls") with
                 | true, tlsValue when not tlsValue.IsComputed -> parseTls tlsValue
@@ -502,7 +643,7 @@ module private TraefikProviderLogic =
                 entry.Key,
                 { Host = host
                   EntryPoint = entryPoint
-                  Backend = backend
+                  Target = target
                   Tls = tls }
             )
         builder.ToImmutable()

@@ -55,7 +55,14 @@ module TraefikBackend =
             json.WriteStartObject()
             json.WriteString("host", router.Host)
             json.WriteString("entryPoint", router.EntryPoint)
-            json.WriteString("backend", router.Backend)
+            match router.Target with
+            | TraefikRouterTarget.Backend backend ->
+                json.WriteString("backend", backend)
+            | TraefikRouterTarget.PermanentToOrigin origin ->
+                json.WriteStartObject("redirect")
+                json.WriteString("kind", "permanentToOrigin")
+                json.WriteString("origin", origin)
+                json.WriteEndObject()
             json.WriteStartObject("tls")
             json.WriteString("kind", router.Tls.Kind)
             json.WriteString("name", router.Tls.Name)

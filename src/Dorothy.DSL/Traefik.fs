@@ -19,11 +19,17 @@ type TraefikRouterTls =
     { Kind: string
       Name: string }
 
-/// One host-matched Traefik router and its backend URL.
+/// One host-matched Traefik router target.
+[<RequireQualifiedAccess>]
+type TraefikRouterTarget =
+    | Backend of string
+    | PermanentToOrigin of origin: string
+
+/// One host-matched Traefik router and its target.
 type TraefikRouter =
     { Host: string
       EntryPoint: string
-      Backend: string
+      Target: TraefikRouterTarget
       Tls: TraefikRouterTls }
 
 /// Independently resolved provider maps preserve their Pulumi dependencies and secret boundaries.
@@ -74,10 +80,19 @@ type EntryPointPart =
     | Listen of int
 
 [<RequireQualifiedAccess>]
+type TraefikRedirect =
+    | PermanentToOrigin of TraefikStringInput
+
+[<RequireQualifiedAccess>]
+type RouterTargetInput =
+    | Backend of TraefikStringInput
+    | PermanentToOrigin of TraefikStringInput
+
+[<RequireQualifiedAccess>]
 type RouterPart =
     | Host of TraefikStringInput
     | EntryPoint of TraefikStringInput
-    | Backend of TraefikStringInput
+    | Target of RouterTargetInput
     | Tls of TraefikTlsMode
 
 [<RequireQualifiedAccess>]
@@ -97,7 +112,7 @@ type RouterDefinition =
     { Name: string
       Host: TraefikStringInput
       EntryPoint: TraefikStringInput
-      Backend: TraefikStringInput
+      Target: RouterTargetInput
       Tls: TraefikTlsMode }
 
 [<RequireQualifiedAccess>]
@@ -143,17 +158,17 @@ type RouterBuilder internal (name: string) =
 
         let host = select "host" (function RouterPart.Host value -> Some value | _ -> None)
         let entryPoint = select "entryPoint" (function RouterPart.EntryPoint value -> Some value | _ -> None)
-        let backend = select "backend" (function RouterPart.Backend value -> Some value | _ -> None)
+        let target = select "target" (function RouterPart.Target value -> Some value | _ -> None)
         let tls = select "tls" (function RouterPart.Tls value -> Some value | _ -> None) |> Option.defaultValue TraefikTlsMode.NoTls
 
-        match host, entryPoint, backend with
-        | Some hostValue, Some entryPointValue, Some backendValue ->
+        match host, entryPoint, target with
+        | Some hostValue, Some entryPointValue, Some targetValue ->
             { Name = name
               Host = hostValue
               EntryPoint = entryPointValue
-              Backend = backendValue
+              Target = targetValue
               Tls = tls }
-        | _ -> invalidArg "router" "A router requires host, entryPoint, and backend."
+        | _ -> invalidArg "router" "A router requires host, entryPoint, and exactly one backend or redirect target."
 
 [<Sealed>]
 type AcmeResolverBuilder internal (name: string) =
@@ -331,6 +346,46 @@ module private TraefikValidation =
                || not validPort then
                 invalidArg parameterName "Traefik URLs must be absolute HTTP or HTTPS URLs without credentials, queries, or fragments."
         | _ -> invalidArg parameterName "Traefik URLs must be absolute HTTP or HTTPS URLs."
+    let canonicalRedirectOrigin parameterName (value: string) =
+        let fail () =
+            invalidArg parameterName "A redirect origin must be an absolute HTTP or HTTPS origin without a path, credentials, query, fragment, backslash, or whitespace."
+
+        if String.IsNullOrWhiteSpace(value)
+           || value.Length > 2048
+           || (value |> Seq.exists (fun character -> Char.IsWhiteSpace(character) || Char.IsControl(character)))
+           || value.Contains('\\') then
+            fail ()
+
+        let schemeDelimiter = value.IndexOf("://", StringComparison.Ordinal)
+        if schemeDelimiter <= 0 then fail ()
+
+        let scheme = value.Substring(0, schemeDelimiter)
+        if not (String.Equals(scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
+                || String.Equals(scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)) then
+            fail ()
+
+        let authorityStart = schemeDelimiter + 3
+        if authorityStart >= value.Length then fail ()
+        let forbiddenDelimiter = value.IndexOfAny([| '/'; '?'; '#' |], authorityStart)
+        if forbiddenDelimiter >= 0 then fail ()
+        let authority = value.Substring(authorityStart)
+        if String.IsNullOrEmpty(authority) || authority.Contains('@') then fail ()
+
+        let mutable uri = Unchecked.defaultof<Uri>
+        if not (Uri.TryCreate(value, UriKind.Absolute, &uri)) then fail ()
+        let validScheme =
+            String.Equals(uri.Scheme, Uri.UriSchemeHttp, StringComparison.OrdinalIgnoreCase)
+            || String.Equals(uri.Scheme, Uri.UriSchemeHttps, StringComparison.OrdinalIgnoreCase)
+        let validPort = uri.IsDefaultPort || (uri.Port >= 1 && uri.Port <= 65535)
+        if not validScheme
+           || String.IsNullOrWhiteSpace(uri.Host)
+           || Uri.CheckHostName(uri.Host) = UriHostNameType.Unknown
+           || not (String.IsNullOrEmpty(uri.UserInfo))
+           || not (String.IsNullOrEmpty(uri.Query))
+           || not (String.IsNullOrEmpty(uri.Fragment))
+           || not validPort then
+            fail ()
+        uri.GetLeftPart(UriPartial.Authority)
 
     let validateHost (value: string) =
         if String.IsNullOrWhiteSpace value
@@ -385,7 +440,12 @@ type TraefikSpec internal (
 
         let routerInputs =
             routers
-            |> List.collect (fun router -> [ router.Host; router.EntryPoint; router.Backend ])
+            |> List.collect (fun router ->
+                let targetInput =
+                    match router.Target with
+                    | RouterTargetInput.Backend value
+                    | RouterTargetInput.PermanentToOrigin value -> value
+                [ router.Host; router.EntryPoint; targetInput ])
 
         let routersOutput =
             TraefikOutput.outputFromInputs routerInputs (fun values ->
@@ -395,13 +455,22 @@ type TraefikSpec internal (
                     |> Seq.map (fun router ->
                         let host = values[offset]
                         let entryPoint = values[offset + 1]
-                        let backend = values[offset + 2]
+                        let targetValue = values[offset + 2]
                         offset <- offset + 3
 
                         TraefikValidation.validateHost host
-                        TraefikValidation.validateUri "backend" backend [ "http"; "https" ]
                         if not (Set.contains entryPoint entryPointNames) then
                             invalidArg "router" "A router must reference a declared entry point."
+
+                        let target =
+                            match router.Target with
+                            | RouterTargetInput.Backend _ ->
+                                TraefikValidation.validateUri "backend" targetValue [ "http"; "https" ]
+                                TraefikRouterTarget.Backend targetValue
+                            | RouterTargetInput.PermanentToOrigin _ ->
+                                TraefikRouterTarget.PermanentToOrigin(
+                                    TraefikValidation.canonicalRedirectOrigin "redirect" targetValue
+                                )
 
                         let tls =
                             match router.Tls with
@@ -418,7 +487,7 @@ type TraefikSpec internal (
                         router.Name,
                         { Host = host
                           EntryPoint = entryPoint
-                          Backend = backend
+                          Target = target
                           Tls = tls })
                 TraefikOutput.immutableDictionary resolved)
 
@@ -561,12 +630,27 @@ type TraefikBuilder() =
 
 
 
+/// Constructs redirect targets without requiring an upstream service.
+[<AbstractClass; Sealed>]
+type Redirect private () =
+    /// Redirects to an HTTP(S) origin, retaining the request path and query.
+    /// Uses Traefik's permanent redirect semantics: GET 301, other methods 308.
+    /// The origin must not contain a path, userinfo, query, or fragment.
+    static member permanentToOrigin(value: string) =
+        TraefikRedirect.PermanentToOrigin(LiteralString value)
+
+    /// Resolves the origin through Pulumi without losing unknowns, dependencies, or secrecy.
+    static member permanentToOrigin(value: Output<string>) =
+        TraefikRedirect.PermanentToOrigin(OutputString value)
+
 [<AbstractClass; Sealed>]
 type TraefikFields private () =
     static member Host(value: string) = RouterPart.Host(LiteralString value)
     static member Host(value: Output<string>) = RouterPart.Host(OutputString value)
-    static member Backend(value: string) = RouterPart.Backend(LiteralString value)
-    static member Backend(value: Output<string>) = RouterPart.Backend(OutputString value)
+    static member Backend(value: string) =
+        RouterPart.Target(RouterTargetInput.Backend(LiteralString value))
+    static member Backend(value: Output<string>) =
+        RouterPart.Target(RouterTargetInput.Backend(OutputString value))
     static member EntryPoint(value: string) =
         TraefikValidation.validateNameWithReserved "entryPoint" [ "keroosha-admin"; "traefik" ] value
         EntryPointBuilder(value)
@@ -595,6 +679,12 @@ module TraefikBuilders =
     /// Sets a router's Host rule value.
     let inline host (value: ^T) : RouterPart =
         ((^T or TraefikFields) : (static member Host : ^T -> RouterPart) value)
+
+    /// Selects a permanent redirect to an absolute HTTP or HTTPS origin.
+    let redirect (value: TraefikRedirect) =
+        match value with
+        | TraefikRedirect.PermanentToOrigin origin ->
+            RouterPart.Target(RouterTargetInput.PermanentToOrigin origin)
 
     /// Sets a router's backend server URL.
     let inline backend (value: ^T) : RouterPart =
