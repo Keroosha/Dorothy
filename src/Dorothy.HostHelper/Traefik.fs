@@ -1034,70 +1034,177 @@ module Traefik =
         | Architecture.Arm64 -> "arm64"
         | _ -> fail "Traefik binary is supported only on Linux amd64 and arm64"
 
-    let private downloadArchive (architecture: string) : Task<byte[]> =
+    let private createTemporaryFile () =
+        let path = Path.Combine(Path.GetTempPath(), "dorothy-traefik-" + Guid.NewGuid().ToString("N"))
+        let options = FileStreamOptions()
+        options.Mode <- FileMode.CreateNew
+        options.Access <- FileAccess.ReadWrite
+        options.Share <- FileShare.None
+        options.BufferSize <- 65536
+        options.Options <- FileOptions.DeleteOnClose ||| FileOptions.SequentialScan
+        options.UnixCreateMode <- Nullable<UnixFileMode>(UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+        new FileStream(path, options)
+
+    /// Copies a release archive with bounded buffers and verifies its compressed size and SHA-256.
+    /// Leaves both streams open; callers must discard the destination if verification fails.
+    let copyVerifiedArchive
+        (source: Stream)
+        (destination: Stream)
+        (maximumBytes: int64)
+        (expectedChecksum: string)
+        (readTimeout: CancellationTokenSource)
+        : Task<int64> =
+        if isNull source then nullArg "source"
+        if isNull destination then nullArg "destination"
+        if isNull readTimeout then nullArg "readTimeout"
+        if maximumBytes < 0L then invalidArg "maximumBytes" "The archive size limit cannot be negative."
+        if not source.CanRead then invalidArg "source" "The archive stream must be readable."
+        if not destination.CanWrite then invalidArg "destination" "The archive destination must be writable."
+
         task {
+            use hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256)
+            let buffer = Array.zeroCreate<byte> 65536
+            let mutable total = 0L
+            let mutable finished = false
+
+            while not finished do
+                readTimeout.CancelAfter(TimeSpan.FromSeconds(30.0))
+                let! count = source.ReadAsync(buffer.AsMemory(0, buffer.Length), readTimeout.Token).ConfigureAwait(false)
+                readTimeout.CancelAfter(Timeout.InfiniteTimeSpan)
+
+                if count = 0 then
+                    finished <- true
+                else
+                    if int64 count > maximumBytes - total then
+                        fail "pinned Traefik release archive exceeds the size limit"
+
+                    hash.AppendData(buffer, 0, count)
+                    destination.Write(buffer, 0, count)
+                    total <- total + int64 count
+
+            let checksum =
+                hash.GetHashAndReset()
+                |> Convert.ToHexString
+                |> fun value -> value.ToLowerInvariant()
+
+            if checksum <> expectedChecksum then
+                fail "pinned Traefik release archive checksum does not match"
+
+            return total
+        }
+
+    let private downloadArchive (architecture: string) (cancellationToken: CancellationToken) : Task<FileStream> =
+        task {
+            let output = createTemporaryFile ()
+
             try
                 use client = new HttpClient(Timeout = TimeSpan.FromSeconds(30.0))
                 use request = new HttpRequestMessage(HttpMethod.Get, releaseUrl architecture)
                 request.Headers.UserAgent.ParseAdd("keroosha-iac-traefik/1")
-                use! response = client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead).ConfigureAwait(false)
-                if not response.IsSuccessStatusCode then fail "cannot download the pinned Traefik release archive"
+                use! response =
+                    client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
+                        .ConfigureAwait(false)
+
+                if not response.IsSuccessStatusCode then
+                    fail "cannot download the pinned Traefik release archive"
+
                 if response.Content.Headers.ContentLength.HasValue
                    && response.Content.Headers.ContentLength.Value > int64 MaximumArchiveBytes then
                     fail "pinned Traefik release archive exceeds the size limit"
-                use! stream = response.Content.ReadAsStreamAsync().ConfigureAwait(false)
-                use output = new MemoryStream()
-                use readTimeout = new CancellationTokenSource()
-                let buffer = Array.zeroCreate<byte> 65536
-                let mutable total = 0
-                let mutable finished = false
-                while not finished do
-                    readTimeout.CancelAfter(TimeSpan.FromSeconds(30.0))
-                    let! count = stream.ReadAsync(buffer.AsMemory(0, buffer.Length), readTimeout.Token).ConfigureAwait(false)
-                    readTimeout.CancelAfter(Timeout.InfiniteTimeSpan)
-                    if count = 0 then finished <- true
-                    else
-                        total <- total + count
-                        if total > MaximumArchiveBytes then fail "pinned Traefik release archive exceeds the size limit"
-                        output.Write(buffer, 0, count)
-                let archive = output.ToArray()
-                if sha256Bytes archive <> archiveChecksums[architecture] then fail "pinned Traefik release archive checksum does not match"
-                return archive
+
+                use! stream = response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false)
+                use readTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
+                let! _ =
+                    (copyVerifiedArchive stream output (int64 MaximumArchiveBytes) archiveChecksums[architecture] readTimeout)
+                        .ConfigureAwait(false)
+                output.Flush(true)
+                output.Position <- 0L
+                return output
             with
-            | :? BackendError as error -> return raise error
-            | _ -> return fail "cannot download the pinned Traefik release archive"
+            | :? BackendError as error ->
+                output.Dispose()
+                return raise error
+            | :? OperationCanceledException as error ->
+                output.Dispose()
+                return raise error
+            | _ ->
+                output.Dispose()
+                return fail "cannot download the pinned Traefik release archive"
         }
 
-    let extractBinary (archive: byte[]) =
+    let private maximumBinaryBytes = 512L * 1024L * 1024L
+
+    let private safeArchiveMemberName (name: string) =
+        not (String.IsNullOrWhiteSpace name)
+        && not (name.StartsWith("/", StringComparison.Ordinal))
+        && not (name.StartsWith("\\", StringComparison.Ordinal))
+        && not (name.Contains(':'))
+        && not (name.Split([| '/'; '\\' |], StringSplitOptions.None)
+                |> Array.exists (fun segment -> segment = "." || segment = ".."))
+
+    /// Streams the single regular traefik member into a staging stream and returns its length/hash.
+    /// Rewinds the seekable archive; does not install or execute unverified staging content.
+    let extractBinary (archive: Stream) (destination: Stream) : int64 * string =
         try
-            use compressed = new MemoryStream(archive, false)
-            use gzip = new GZipStream(compressed, CompressionMode.Decompress, false)
+            if not archive.CanRead || not archive.CanSeek then fail "pinned Traefik archive is invalid"
+            if not destination.CanWrite then fail "pinned Traefik archive is invalid"
+            archive.Position <- 0L
+            use gzip = new GZipStream(archive, CompressionMode.Decompress, true)
             use tarReader = new TarReader(gzip, true)
             let mutable exactNameCount = 0
-            let mutable selected: byte[] option = None
+            let mutable selected: (int64 * string) option = None
             let mutable entry = tarReader.GetNextEntry()
+
             while not (isNull entry) do
+                if not (safeArchiveMemberName entry.Name) then
+                    fail "pinned Traefik archive has an invalid layout"
+
                 if entry.Name = "traefik" then
                     exactNameCount <- exactNameCount + 1
-                    if entry.EntryType <> TarEntryType.RegularFile || entry.Length <= 0L || entry.Length > 512L * 1024L * 1024L then
+
+                    if entry.EntryType <> TarEntryType.RegularFile
+                       || entry.Length <= 0L
+                       || entry.Length > maximumBinaryBytes then
                         fail "pinned Traefik archive has an invalid layout"
+
                     match entry.DataStream with
                     | null -> fail "pinned Traefik archive is incomplete"
                     | dataStream ->
-                        use binaryStream = new MemoryStream()
+                        use hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256)
                         let buffer = Array.zeroCreate<byte> 65536
+                        let mutable total = 0L
                         let mutable read = dataStream.Read(buffer, 0, buffer.Length)
-                        while read > 0 do binaryStream.Write(buffer, 0, read); read <- dataStream.Read(buffer, 0, buffer.Length)
-                        if int64 binaryStream.Length <> entry.Length then fail "pinned Traefik archive is incomplete"
-                        selected <- Some(binaryStream.ToArray())
+
+                        while read > 0 do
+                            if int64 read > maximumBinaryBytes - total then
+                                fail "pinned Traefik archive has an invalid layout"
+
+                            destination.Write(buffer, 0, read)
+                            hash.AppendData(buffer, 0, read)
+                            total <- total + int64 read
+                            read <- dataStream.Read(buffer, 0, buffer.Length)
+
+                        if total <> entry.Length then
+                            fail "pinned Traefik archive is incomplete"
+
+                        let checksum =
+                            hash.GetHashAndReset()
+                            |> Convert.ToHexString
+                            |> fun value -> value.ToLowerInvariant()
+                        selected <- Some(total, checksum)
+
                 entry <- tarReader.GetNextEntry()
-            if exactNameCount <> 1 then fail "pinned Traefik archive has an invalid layout"
+
+            if exactNameCount <> 1 then
+                fail "pinned Traefik archive has an invalid layout"
+
             match selected with
-            | Some binary -> binary
+            | Some result -> result
             | None -> fail "pinned Traefik archive is incomplete"
         with
         | :? BackendError -> reraise()
         | _ -> fail "pinned Traefik archive is invalid"
+
 
     let private binaryVersion (environment: HostEnvironment) (binaryPath: string) : bool =
         try
@@ -1109,27 +1216,61 @@ module Traefik =
 
     let private binarySha256 (environment: HostEnvironment) (binaryPath: string) : string =
         if not (assertRegular environment binaryPath "Traefik binary") then fail "cannot hash installed Traefik binary"
-        readBytes environment binaryPath |> sha256Bytes
+        let descriptor = openChecked binaryPath false
+        try
+            let handle = new SafeFileHandle(nativeint descriptor, false)
+            use stream = new FileStream(handle, FileAccess.Read)
+            SHA256.HashData(stream)
+            |> Convert.ToHexString
+            |> fun value -> value.ToLowerInvariant()
+        finally
+            nativeClose descriptor |> ignore
 
     let private installBinary (environment: HostEnvironment) (paths: RuntimePaths) (ownerId: string) (architecture: string) : bool =
-        let archive = downloadArchive architecture |> fun work -> work.GetAwaiter().GetResult()
-        let binary = extractBinary archive
-        let _, rootGid = hostOwner environment
-        createOwnedDirectory environment paths.InstallDir ownerId 0o755 (Some rootGid) |> ignore
-        let versionDir = Path.GetDirectoryName(paths.BinaryPath)
-        ensureDirectory environment versionDir 0o755 (Some rootGid)
-        writeAtomic environment paths.BinaryPath binary 0o755 (Some rootGid)
-        if not (binaryVersion environment paths.BinaryPath) then
-            try File.Delete(paths.BinaryPath) with _ -> ()
-            fail "installed Traefik binary version could not be verified"
-        let marker = JsonObject()
-        marker["owner"] <- JsonValue.Create(ownerDigest ownerId)
-        marker["version"] <- JsonValue.Create(Version)
-        marker["architecture"] <- JsonValue.Create(architecture)
-        marker["archiveSha256"] <- JsonValue.Create(archiveChecksums[architecture])
-        marker["binarySha256"] <- JsonValue.Create(sha256Bytes binary)
-        writeAtomic environment (Path.Combine(paths.InstallDir, ".keroosha-release.json")) (Encoding.UTF8.GetBytes(jsonText marker)) 0o644 (Some rootGid)
-        true
+        let archive =
+            downloadArchive architecture CancellationToken.None
+            |> fun work -> work.GetAwaiter().GetResult()
+
+        use archive = archive
+        let temporaryBinary = createTemporaryFile ()
+        let mutable stagedBinaryPath: string option = None
+
+        try
+            use temporaryBinary = temporaryBinary
+            let _, binaryHash = extractBinary archive temporaryBinary
+            temporaryBinary.Flush(true)
+
+            let rootUid, rootGid = hostOwner environment
+            createOwnedDirectory environment paths.InstallDir ownerId 0o755 (Some rootGid) |> ignore
+            let versionDir = Path.GetDirectoryName(paths.BinaryPath)
+            ensureDirectory environment versionDir 0o755 (Some rootGid)
+            let stagedBinary = Path.Combine(versionDir, ".traefik-install-" + Guid.NewGuid().ToString("N"))
+            stagedBinaryPath <- Some stagedBinary
+            temporaryBinary.Position <- 0L
+            HostFiles.atomicWriteStream stagedBinary temporaryBinary (unixMode 0o700)
+
+            if not (binaryVersion environment stagedBinary) then
+                fail "installed Traefik binary version could not be verified"
+
+            chown environment stagedBinary rootUid rootGid
+            chmod environment stagedBinary 0o755
+            assertRegular environment paths.BinaryPath "Traefik binary" |> ignore
+            File.Move(stagedBinary, paths.BinaryPath, true)
+            stagedBinaryPath <- None
+            fsyncDirectory versionDir
+
+            let marker = JsonObject()
+            marker["owner"] <- JsonValue.Create(ownerDigest ownerId)
+            marker["version"] <- JsonValue.Create(Version)
+            marker["architecture"] <- JsonValue.Create(architecture)
+            marker["archiveSha256"] <- JsonValue.Create(archiveChecksums[architecture])
+            marker["binarySha256"] <- JsonValue.Create(binaryHash)
+            writeAtomic environment (Path.Combine(paths.InstallDir, ".keroosha-release.json")) (Encoding.UTF8.GetBytes(jsonText marker)) 0o644 (Some rootGid)
+            true
+        finally
+            match stagedBinaryPath with
+            | Some path -> try File.Delete path with _ -> ()
+            | None -> ()
 
     let private ensureInstalledBinary (environment: HostEnvironment) (paths: RuntimePaths) (ownerId: string) : bool =
         let arch = architecture ()

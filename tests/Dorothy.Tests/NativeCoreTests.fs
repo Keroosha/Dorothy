@@ -6,6 +6,32 @@ open System.Text
 open Dorothy.HostHelper
 open NUnit.Framework
 
+type private FailingReadStream() =
+    inherit Stream()
+
+    let mutable firstRead = true
+
+    override _.CanRead = true
+    override _.CanSeek = false
+    override _.CanWrite = false
+    override _.Length = raise (NotSupportedException())
+    override _.Position
+        with get () = raise (NotSupportedException())
+        and set _ = raise (NotSupportedException())
+    override _.Flush() = ()
+    override _.Read(buffer: byte[], offset: int, count: int) =
+        if firstRead then
+            firstRead <- false
+            let payload = Encoding.UTF8.GetBytes("partial replacement")
+            let copied = min count payload.Length
+            Array.Copy(payload, 0, buffer, offset, copied)
+            copied
+        else
+            raise (IOException("simulated source read failure"))
+    override _.Seek(_, _) = raise (NotSupportedException())
+    override _.SetLength(_) = raise (NotSupportedException())
+    override _.Write(_, _, _) = raise (NotSupportedException())
+
 [<TestFixture>]
 type NativeCoreTests() =
     [<Test>]
@@ -69,6 +95,21 @@ type NativeCoreTests() =
             Assert.That(File.GetUnixFileMode(target), Is.EqualTo(mode))
         finally
             Directory.Delete(root, true)
+
+    [<Test>]
+    member _.``Atomic stream writes preserve the old binary when the source fails``() =
+        // Arrange
+        use temporary = new TemporaryDirectory("keroosha-native-stream-write-")
+        let target = Path.Combine(temporary.Path, "traefik")
+        File.WriteAllText(target, "old binary")
+        let mode = UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute
+        use source = new FailingReadStream()
+        let failure = TestDelegate(fun () -> HostFiles.atomicWriteStream target source mode)
+
+        // Act and Assert
+        Assert.Throws<IOException>(failure) |> ignore
+        Assert.That(File.ReadAllText(target), Is.EqualTo("old binary"))
+        Assert.That(Directory.GetFiles(temporary.Path), Is.EquivalentTo([| target |]))
 
     [<Test>]
     member _.``Atomic writes refuse symbolic links without changing their targets``() =

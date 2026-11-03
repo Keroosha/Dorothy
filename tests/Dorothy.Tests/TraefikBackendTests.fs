@@ -6,11 +6,87 @@ open System.Security.Cryptography
 open System.Text
 open System.Text.Json
 open System.Text.Json.Nodes
+open System.IO.Compression
 open Dorothy.HostHelper
 open NUnit.Framework
 open System.Diagnostics
 open System.Threading
 open Dorothy.DSL.Provider
+
+[<RequireQualifiedAccess>]
+module private TraefikArchiveTestData =
+    let private writeText (header: byte[]) offset (value: string) =
+        let bytes = Encoding.ASCII.GetBytes(value)
+        Array.Copy(bytes, 0, header, offset, bytes.Length)
+
+    let private writeOctal (header: byte[]) offset width (value: int64) =
+        let encoded = Convert.ToString(value, 8).PadLeft(width - 1, '0') + "\000"
+        writeText header offset encoded
+
+    let private header (name: string) (length: int64) =
+        let result = Array.zeroCreate<byte> 512
+        writeText result 0 name
+        writeOctal result 100 8 0o755L
+        writeOctal result 108 8 0L
+        writeOctal result 116 8 0L
+        writeOctal result 124 12 length
+        writeOctal result 136 12 0L
+        Array.fill result 148 8 (byte ' ')
+        result[156] <- byte '0'
+        writeText result 257 "ustar\000"
+        writeText result 263 "00"
+        let checksum = result |> Array.sumBy int
+        writeText result 148 (Convert.ToString(checksum, 8).PadLeft(6, '0') + "\000 ")
+        result
+
+    let private compress (tar: MemoryStream) =
+        use compressed = new MemoryStream()
+        do
+            use gzip = new GZipStream(compressed, CompressionLevel.Optimal, true)
+            tar.Position <- 0L
+            tar.CopyTo(gzip)
+        compressed.ToArray()
+
+    let archive (entries: (string * byte[]) list) =
+        use tar = new MemoryStream()
+
+        for name, payload in entries do
+            let entryHeader = header name (int64 payload.Length)
+            tar.Write(entryHeader, 0, entryHeader.Length)
+            tar.Write(payload, 0, payload.Length)
+            let padding = (512 - payload.Length % 512) % 512
+            if padding > 0 then
+                let zeroes = Array.zeroCreate<byte> padding
+                tar.Write(zeroes, 0, zeroes.Length)
+
+        let terminator = Array.zeroCreate<byte> 1024
+        tar.Write(terminator, 0, terminator.Length)
+        compress tar
+
+    let archiveWithDeclaredBinaryLength (length: int64) =
+        use tar = new MemoryStream()
+        let entryHeader = header "traefik" length
+        tar.Write(entryHeader, 0, entryHeader.Length)
+        let terminator = Array.zeroCreate<byte> 1024
+        tar.Write(terminator, 0, terminator.Length)
+        compress tar
+
+    let checksum (bytes: byte[]) =
+        SHA256.HashData(bytes)
+        |> Convert.ToHexString
+        |> fun value -> value.ToLowerInvariant()
+
+    let extract (archiveBytes: byte[]) =
+        use archive = new MemoryStream(archiveBytes, false)
+        use binary = new MemoryStream()
+        let length, checksum = Traefik.extractBinary archive binary
+        length, checksum, binary.ToArray()
+
+    let assertInvalidArchive (archiveBytes: byte[]) =
+        let failure =
+            TestDelegate(fun () ->
+                extract archiveBytes |> ignore)
+        Assert.Throws<Traefik.BackendError>(failure) |> ignore
 
 [<TestFixture>]
 type TraefikBackendTests() =
@@ -81,6 +157,60 @@ type TraefikBackendTests() =
             (request.ToJsonString())
             CancellationToken.None
         |> fun operation -> operation.GetAwaiter().GetResult()
+
+    [<Test>]
+    member _.``Traefik archive extraction streams the exact binary and rejects unsafe or malformed members``() =
+        // Arrange
+        let payload = Encoding.UTF8.GetBytes("traefik-binary-payload")
+        let archiveBytes = TraefikArchiveTestData.archive [ "traefik", payload ]
+
+        // Act
+        let length, binaryHash, extracted = TraefikArchiveTestData.extract archiveBytes
+
+        // Assert
+        Assert.That(length, Is.EqualTo(int64 payload.Length))
+        Assert.That(binaryHash, Is.EqualTo(TraefikArchiveTestData.checksum payload))
+        Assert.That(extracted, Is.EqualTo(payload :> obj))
+
+        TraefikArchiveTestData.assertInvalidArchive (Encoding.UTF8.GetBytes("not a gzip tar archive"))
+        TraefikArchiveTestData.assertInvalidArchive (TraefikArchiveTestData.archive [ "traefik", payload; "traefik", payload ])
+        TraefikArchiveTestData.assertInvalidArchive (TraefikArchiveTestData.archive [ "../escape", payload; "traefik", payload ])
+
+    [<Test>]
+    member _.``Traefik archive extraction rejects an oversized declared binary before reading it``() =
+        // Arrange
+        let archiveBytes =
+            TraefikArchiveTestData.archiveWithDeclaredBinaryLength (512L * 1024L * 1024L + 1L)
+
+        // Act and Assert
+        TraefikArchiveTestData.assertInvalidArchive archiveBytes
+
+    [<Test>]
+    member _.``Traefik archive streaming enforces compressed size and checksum including truncation``() =
+        // Arrange
+        let archiveBytes = TraefikArchiveTestData.archive [ "traefik", Encoding.UTF8.GetBytes("binary") ]
+        let expected = TraefikArchiveTestData.checksum archiveBytes
+        let truncated = Array.take (archiveBytes.Length - 4) archiveBytes
+        let tooLarge = Array.init 9 (fun index -> byte index)
+
+        let copyFailure (bytes: byte[]) (limit: int64) (checksum: string) =
+            TestDelegate(fun () ->
+                use source = new MemoryStream(bytes, false)
+                use destination = new MemoryStream()
+                use timeout = new CancellationTokenSource()
+                Traefik.copyVerifiedArchive source destination limit checksum timeout
+                |> fun operation -> operation.GetAwaiter().GetResult()
+                |> ignore)
+
+        // Act
+        let truncatedFailure = copyFailure truncated (int64 archiveBytes.Length) expected
+        let oversizedFailure = copyFailure tooLarge 8L (TraefikArchiveTestData.checksum tooLarge)
+        let checksumFailure = copyFailure archiveBytes (int64 archiveBytes.Length) (String.replicate 64 "0")
+
+        // Assert
+        Assert.Throws<Traefik.BackendError>(truncatedFailure) |> ignore
+        Assert.Throws<Traefik.BackendError>(oversizedFailure) |> ignore
+        Assert.Throws<Traefik.BackendError>(checksumFailure) |> ignore
 
     [<Test>]
     member _.``Rendering keeps the admin API loopback and ACME state persistent``() =
