@@ -8,6 +8,11 @@ open System.Runtime.InteropServices
 open System.Text
 open System.Text.Json
 open System.Text.Json.Nodes
+open System.Collections.Immutable
+open System.Threading
+open Dorothy.DSL.Provider
+open Pulumi.Experimental
+open Pulumi.Experimental.Provider
 open Dorothy.HostHelper
 open NUnit.Framework
 
@@ -527,3 +532,123 @@ type SwapfileTests() =
         let parentAction = TestDelegate(fun () -> SwapfileTestHelpers.apply host "/linked-parent/swapfile" SwapfileTestHelpers.size1 |> ignore)
         Assert.Throws<Swapfile.BackendError>(parentAction) |> ignore
         Assert.That(Directory.GetFiles(outside), Is.Empty)
+
+[<RequireQualifiedAccess>]
+module private SwapfileProviderTestValues =
+    let private resourceToken = "keroosha:debian:Swapfile"
+
+    let private map (entries: seq<string * PropertyValue>) =
+        let builder = ImmutableDictionary.CreateBuilder<string, PropertyValue>(StringComparer.Ordinal)
+        for key, value in entries do builder.Add(key, value)
+        PropertyValue(builder.ToImmutable())
+
+    let private inputMap (entries: seq<string * PropertyValue>) =
+        let builder = ImmutableDictionary.CreateBuilder<string, PropertyValue>(StringComparer.Ordinal)
+        for key, value in entries do builder.Add(key, value)
+        builder.ToImmutable()
+
+    let private string (value: string) = PropertyValue(value)
+    let private number (value: int) = PropertyValue(float value)
+    let boolean (value: bool) = PropertyValue(value)
+
+    let private requestUrn name =
+        Pulumi.Urn(sprintf "urn:pulumi:unit::unit::%s::%s" resourceToken name)
+
+    let input path sizeMiB =
+        inputMap [
+            "connection",
+            map [
+                "address", string "192.0.2.1"
+                "user", string "root"
+            ]
+            "path", string path
+            "sizeMiB", number sizeMiB
+        ]
+
+    let check (provider: DorothyProvider) inputs =
+        let request =
+            CheckRequest(
+                requestUrn "swapfile-check",
+                ImmutableDictionary<string, PropertyValue>.Empty,
+                inputs,
+                ImmutableArray<byte>.Empty
+            )
+        provider.Check(request, CancellationToken.None).GetAwaiter().GetResult()
+
+    let create (provider: DorothyProvider) inputs =
+        let request = CreateRequest(requestUrn "swapfile-preview", inputs, TimeSpan.FromSeconds(1.0), true)
+        provider.Create(request, CancellationToken.None).GetAwaiter().GetResult()
+
+    let diff (provider: DorothyProvider) id oldInputs oldOutputs newInputs =
+        let request =
+            DiffRequest(
+                requestUrn "swapfile-diff",
+                id,
+                oldOutputs,
+                newInputs,
+                ImmutableArray<string>.Empty,
+                oldInputs
+            )
+        provider.Diff(request, CancellationToken.None).GetAwaiter().GetResult()
+
+    let outputs (entries: seq<string * PropertyValue>) = inputMap entries
+
+[<TestFixture>]
+type SwapfileProviderTests() =
+    [<Test>]
+    member _.``Provider Check validates swapfile path and measured size without host access``() =
+        let provider = DorothyProvider()
+        let valid = SwapfileProviderTestValues.input "/swapfile" 64
+        let checkedInputs = SwapfileProviderTestValues.check provider valid
+        let invalidPath =
+            SwapfileProviderTestValues.check provider (SwapfileProviderTestValues.input "/tmp/../swapfile" 64)
+        let invalidSize = SwapfileProviderTestValues.check provider (SwapfileProviderTestValues.input "/swapfile" 0)
+
+        Assert.That(checkedInputs.Failures, Is.Empty)
+        Assert.That(invalidPath.Failures |> Seq.exists (fun failure -> failure.Property = "path"), Is.True)
+        Assert.That(invalidSize.Failures |> Seq.exists (fun failure -> failure.Property = "sizeMiB"), Is.True)
+
+        let preview = SwapfileProviderTestValues.create provider valid
+        Assert.That(preview.Id, Is.Empty)
+        Assert.That(preview.Outputs["inSync"].IsComputed, Is.True)
+
+    [<Test>]
+    member _.``Provider Diff applies safe path and size updates and repairs activation drift``() =
+        let provider = DorothyProvider()
+        let oldInputs = SwapfileProviderTestValues.input "/swapfile" 64
+        let newInputs = SwapfileProviderTestValues.input "/var/swapfile" 128
+        let oldOutputs =
+            SwapfileProviderTestValues.outputs [
+                "owned", SwapfileProviderTestValues.boolean true
+                "actualPath", PropertyValue("/swapfile")
+                "actualSizeBytes", PropertyValue(float (64 * 1024 * 1024))
+                "mode", PropertyValue(384.0)
+                "enabled", SwapfileProviderTestValues.boolean true
+                "active", SwapfileProviderTestValues.boolean true
+                "inSync", SwapfileProviderTestValues.boolean true
+            ]
+        let unchanged = SwapfileProviderTestValues.diff provider "owned-id" oldInputs oldOutputs oldInputs
+        let updated = SwapfileProviderTestValues.diff provider "owned-id" oldInputs oldOutputs newInputs
+        let activationDrift =
+            SwapfileProviderTestValues.diff
+                provider
+                "owned-id"
+                oldInputs
+                (SwapfileProviderTestValues.outputs [
+                    "owned", SwapfileProviderTestValues.boolean true
+                    "actualPath", PropertyValue("/swapfile")
+                    "actualSizeBytes", PropertyValue(float (64 * 1024 * 1024))
+                    "mode", PropertyValue(384.0)
+                    "enabled", SwapfileProviderTestValues.boolean true
+                    "active", SwapfileProviderTestValues.boolean false
+                    "inSync", SwapfileProviderTestValues.boolean false
+                ])
+                oldInputs
+
+        Assert.That(updated.Changes.Value, Is.True)
+        Assert.That(unchanged.Changes.Value, Is.False)
+        Assert.That(updated.Diffs.Contains("path"), Is.True)
+        Assert.That(updated.Diffs.Contains("sizeMiB"), Is.True)
+        Assert.That(updated.Replaces, Is.Empty)
+        Assert.That(activationDrift.Changes.Value, Is.True)
+        Assert.That(activationDrift.Diffs.Contains("inSync"), Is.True)

@@ -220,6 +220,56 @@ module HostFiles =
                     File.Delete temporaryPath
                 with _ -> ()
 
+    /// Copies a readable stream through a same-directory temporary file before atomic replacement.
+    /// Keeps the source open and preserves the previous destination when copying fails.
+    let atomicWriteStream (path: string) (contents: Stream) (mode: UnixFileMode) =
+        ensureLinux ()
+
+        if String.IsNullOrWhiteSpace path || not (Path.IsPathRooted path) then
+            invalidArg "path" "Atomic-write paths must be absolute."
+
+        if isNull contents then
+            nullArg "contents"
+
+        if not contents.CanRead then
+            invalidArg "contents" "Atomic-write streams must be readable."
+
+        let fullPath = Path.GetFullPath path
+        let parent = Path.GetDirectoryName fullPath
+
+        if String.IsNullOrEmpty parent then
+            invalidArg "path" "Atomic-write paths must have a parent directory."
+
+        requireDirectory parent
+        requireRegularOrAbsent fullPath
+
+        let temporaryPath = Path.Combine(parent, ".keroosha-iac-" + Guid.NewGuid().ToString("N"))
+        let mutable temporaryExists = false
+
+        try
+            let options = FileStreamOptions()
+            options.Mode <- FileMode.CreateNew
+            options.Access <- FileAccess.Write
+            options.Share <- FileShare.None
+            options.BufferSize <- 4096
+            options.Options <- FileOptions.WriteThrough
+            options.UnixCreateMode <- Nullable<UnixFileMode>(UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
+            use output = new FileStream(temporaryPath, options)
+            temporaryExists <- true
+            contents.CopyTo(output, 65536)
+            output.Flush(true)
+            File.SetUnixFileMode(temporaryPath, mode)
+            output.Flush(true)
+            requireRegularOrAbsent fullPath
+            File.Move(temporaryPath, fullPath, true)
+            temporaryExists <- false
+            syncDirectory parent
+        finally
+            if temporaryExists then
+                try
+                    File.Delete temporaryPath
+                with _ -> ()
+
     let lockFile (path: string) : IDisposable =
         ensureLinux ()
 

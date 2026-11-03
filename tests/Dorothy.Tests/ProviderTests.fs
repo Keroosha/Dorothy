@@ -126,12 +126,6 @@ type ProviderTests() =
             "adminPort", ProviderTestValues.number adminPort
         ]
 
-    let swapfileInput path sizeMiB =
-        ProviderTestValues.inputMap [
-            "connection", connection "192.0.2.1" "root"
-            "path", ProviderTestValues.string path
-            "sizeMiB", ProviderTestValues.number sizeMiB
-        ]
 
     [<Test>]
     member _.``Provider Check normalizes APT connection defaults without host access``() =
@@ -264,67 +258,3 @@ type ProviderTests() =
         Assert.That(response.DetailedDiff.ContainsKey("routers.example.backend"), Is.True)
         Assert.That(response.DetailedDiff.ContainsKey("adminPort"), Is.True)
 
-    [<Test>]
-    member _.``Provider Check validates swapfile path and measured size without host access``() =
-        let provider = DorothyProvider()
-        let valid = swapfileInput "/swapfile" 64
-        let checkedInputs = check provider "keroosha:debian:Swapfile" valid
-        let invalidPath = check provider "keroosha:debian:Swapfile" (swapfileInput "/tmp/../swapfile" 64)
-        let invalidSize = check provider "keroosha:debian:Swapfile" (swapfileInput "/swapfile" 0)
-
-        Assert.That(checkedInputs.Failures, Is.Empty)
-        Assert.That(invalidPath.Failures |> Seq.exists (fun failure -> failure.Property = "path"), Is.True)
-        Assert.That(invalidSize.Failures |> Seq.exists (fun failure -> failure.Property = "sizeMiB"), Is.True)
-
-        let createRequest =
-            CreateRequest(
-                ProviderTestValues.requestUrn "keroosha:debian:Swapfile" "swapfile",
-                valid,
-                TimeSpan.FromSeconds(1.0),
-                true
-            )
-        let preview = provider.Create(createRequest, CancellationToken.None).GetAwaiter().GetResult()
-        Assert.That(preview.Id, Is.Empty)
-        Assert.That(preview.Outputs["inSync"].IsComputed, Is.True)
-
-    [<Test>]
-    member _.``Provider Diff applies safe path and size updates and repairs activation drift``() =
-        let provider = DorothyProvider()
-        let oldInputs = swapfileInput "/swapfile" 64
-        let newInputs = swapfileInput "/var/swapfile" 128
-        let oldOutputs =
-            ProviderTestValues.inputMap [
-                "owned", ProviderTestValues.boolean true
-                "actualPath", ProviderTestValues.string "/swapfile"
-                "actualSizeBytes", ProviderTestValues.number (64 * 1024 * 1024)
-                "mode", ProviderTestValues.number 384
-                "enabled", ProviderTestValues.boolean true
-                "active", ProviderTestValues.boolean true
-                "inSync", ProviderTestValues.boolean true
-            ]
-        let unchanged = diff provider "keroosha:debian:Swapfile" "owned-id" oldInputs oldOutputs oldInputs
-        let updated = diff provider "keroosha:debian:Swapfile" "owned-id" oldInputs oldOutputs newInputs
-        let activationDrift =
-            diff
-                provider
-                "keroosha:debian:Swapfile"
-                "owned-id"
-                oldInputs
-                (ProviderTestValues.inputMap [
-                    "owned", ProviderTestValues.boolean true
-                    "actualPath", ProviderTestValues.string "/swapfile"
-                    "actualSizeBytes", ProviderTestValues.number (64 * 1024 * 1024)
-                    "mode", ProviderTestValues.number 384
-                    "enabled", ProviderTestValues.boolean true
-                    "active", ProviderTestValues.boolean false
-                    "inSync", ProviderTestValues.boolean false
-                ])
-                oldInputs
-
-        Assert.That(updated.Changes.Value, Is.True)
-        Assert.That(unchanged.Changes.Value, Is.False)
-        Assert.That(updated.Diffs.Contains("path"), Is.True)
-        Assert.That(updated.Diffs.Contains("sizeMiB"), Is.True)
-        Assert.That(updated.Replaces, Is.Empty)
-        Assert.That(activationDrift.Changes.Value, Is.True)
-        Assert.That(activationDrift.Diffs.Contains("inSync"), Is.True)
