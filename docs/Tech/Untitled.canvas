@@ -1,0 +1,9 @@
+{
+	"nodes":[
+		{"id":"479f94df938684af","type":"group","x":-700,"y":-680,"width":1580,"height":1000,"label":"Debian hosts (Feature Map)"},
+		{"id":"c78a17b490fe8299","type":"text","text":"Tested on Debian 13","x":-680,"y":-660,"width":250,"height":60},
+		{"id":"fdaff09064bb936e","type":"file","file":"Tech/features/APT.md","x":-680,"y":-560,"width":400,"height":400},
+		{"id":"f06bb76f28501718","x":-260,"y":-560,"width":400,"height":400,"type":"file","file":"Tech/features/swapfile.md"}
+	],
+	"edges":[]
+}
