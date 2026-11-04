@@ -31,6 +31,10 @@
     <Compile Include="SshProviderTests.fs" />
     <Compile Include="SshdDslTests.fs" />
     <Compile Include="FullConfigDslTests.fs" />
+    <Compile Include="UsersTests.fs" />
+    <Compile Include="SudoTests.fs" />
+    <Compile Include="AccessDslTests.fs" />
+    <Compile Include="AccessProviderTests.fs" />
     <Compile Include="PulumiCliTests.fs" />
   </ItemGroup>
 </Project>

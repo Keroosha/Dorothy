@@ -8,7 +8,7 @@ open System.Text.Json.Nodes
 
 module Program =
     let private usage () =
-        Console.Error.WriteLine("Usage: keroosha-iac-helper apt|ufw|traefik|docker|swapfile|sshd|fail2ban|--version")
+        Console.Error.WriteLine("Usage: keroosha-iac-helper apt|ufw|traefik|docker|swapfile|sshd|fail2ban|users|sudo|--version")
         64
 
     let private dispatch (command: string) (request: JsonElement) =
@@ -20,6 +20,8 @@ module Program =
         | "swapfile" -> Swapfile.handle HostEnvironment.system request
         | "sshd" -> Sshd.handle HostEnvironment.system request
         | "fail2ban" -> Fail2Ban.handle HostEnvironment.system request
+        | "users" -> Users.handle HostEnvironment.system request
+        | "sudo" -> Sudo.handle HostEnvironment.system request
         | _ -> invalidArg "command" "Unsupported helper command."
 
     let private verifyGlobalization () =
@@ -54,6 +56,8 @@ module Program =
             | :? Swapfile.BackendError as backendError -> Some backendError.Message
             | :? Sshd.BackendError as backendError -> Some backendError.Message
             | :? Fail2Ban.BackendError as backendError -> Some backendError.Message
+            | :? Users.BackendError as backendError -> Some backendError.Message
+            | :? Sudo.BackendError as backendError -> Some backendError.Message
             | :? HostPrerequisiteError as prerequisiteError -> Some prerequisiteError.Message
             | _ -> None
 
@@ -83,7 +87,7 @@ module Program =
             usage ()
         else
             match arguments[0] with
-            | command when command = "apt" || command = "ufw" || command = "traefik" || command = "docker" || command = "swapfile" || command = "sshd" || command = "fail2ban" ->
+            | command when command = "apt" || command = "ufw" || command = "traefik" || command = "docker" || command = "swapfile" || command = "sshd" || command = "fail2ban" || command = "users" || command = "sudo" ->
                 try
                     verifyGlobalization ()
                     let requestText = Console.In.ReadToEnd()

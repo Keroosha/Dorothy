@@ -732,9 +732,6 @@ module TraefikBuilders =
     /// Sets a PKCS#12 bundle source.
     let bundle content = CertificatePart.Bundle content
 
-    /// Supplies an optional decryption password; it is used only by local validation.
-    let inline password (value: ^T) : CertificatePart =
-        ((^T or TraefikFields) : (static member Password : ^T -> CertificatePart) value)
 
     /// Sets the loopback-only API/admin listener port (defaults to 19080).
     let adminPort port = TraefikRootPart.AdminPort port

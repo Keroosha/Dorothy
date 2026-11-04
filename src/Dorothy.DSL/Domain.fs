@@ -20,6 +20,8 @@ type DebianSpec =
         Swapfile: SwapfileSpec option
         Sshd: SshdSpec option
         Fail2Ban: Fail2BanSpec option
+        Users: UsersSpec option
+        Sudo: SudoSpec option
     }
 
 [<RequireQualifiedAccess>]
@@ -31,6 +33,8 @@ type DebianDeclaration =
     | SwapfileConfiguration of SwapfileSpec
     | SshdConfiguration of SshdSpec
     | Fail2BanConfiguration of Fail2BanInputSpec
+    | UsersConfiguration of UsersSpec
+    | SudoConfiguration of SudoSpec
 
 /// A complete immutable description of one named SSH host.
 ///
@@ -50,7 +54,9 @@ type HostSpec
         docker: DockerSpec option,
         swapfile: SwapfileSpec option,
         sshd: SshdSpec option,
-        fail2ban: Fail2BanSpec option
+        fail2ban: Fail2BanSpec option,
+        users: UsersSpec option,
+        sudo: SudoSpec option
     ) =
     member _.Name = name
     member _.Address = address
@@ -64,6 +70,8 @@ type HostSpec
     member _.Swapfile = swapfile
     member _.Sshd = sshd
     member _.Fail2Ban = fail2ban
+    member _.Users = users
+    member _.Sudo = sudo
 
 type HostDeclaration =
     | Address of string
@@ -211,7 +219,7 @@ type AptBuilder() =
             Packages = DomainValidation.mergePackages packages
         }
 
-/// Merges APT packages, optional services, and SSH/Fail2Ban configuration into one Debian environment.
+/// Merges packages, host services, SSH/Fail2Ban, users, and sudo into one Debian environment.
 type DebianBuilder() =
     member _.Yield(aptBlock: AptSpec) =
         [ DebianDeclaration.AptPackages aptBlock ]
@@ -234,6 +242,12 @@ type DebianBuilder() =
     member _.Yield(fail2ban: Fail2BanInputSpec) =
         [ DebianDeclaration.Fail2BanConfiguration fail2ban ]
 
+    member _.Yield(users: UsersSpec) =
+        [ DebianDeclaration.UsersConfiguration users ]
+
+    member _.Yield(sudo: SudoSpec) =
+        [ DebianDeclaration.SudoConfiguration sudo ]
+
     member _.YieldFrom(aptBlocks: seq<AptSpec>) =
         aptBlocks |> Seq.map DebianDeclaration.AptPackages |> Seq.toList
 
@@ -248,6 +262,8 @@ type DebianBuilder() =
 
     member _.YieldFrom(swapfiles: seq<SwapfileSpec>) =
         swapfiles |> Seq.map DebianDeclaration.SwapfileConfiguration |> Seq.toList
+    member _.YieldFrom(users: seq<UsersSpec>) = users |> Seq.map DebianDeclaration.UsersConfiguration |> Seq.toList
+    member _.YieldFrom(sudos: seq<SudoSpec>) = sudos |> Seq.map DebianDeclaration.SudoConfiguration |> Seq.toList
 
     member _.YieldFrom(configurations: seq<SshdSpec>) =
         configurations |> Seq.map DebianDeclaration.SshdConfiguration |> Seq.toList
@@ -335,6 +351,25 @@ type DebianBuilder() =
             | [] -> None
             | values -> Some(Fail2BanConfigurationMerge.combine values)
 
+        let users =
+            declarations
+            |> List.choose (function
+                | DebianDeclaration.UsersConfiguration value -> Some value
+                | _ -> None)
+            |> function
+                | [] -> None
+                | [ value ] -> Some value
+                | _ -> invalidArg "debian" "A Debian environment may declare users only once."
+
+        let sudo =
+            declarations
+            |> List.choose (function
+                | DebianDeclaration.SudoConfiguration value -> Some value
+                | _ -> None)
+            |> function
+                | [] -> None
+                | [ value ] -> Some value
+                | _ -> invalidArg "debian" "A Debian environment may declare sudo only once."
 
         let packages =
             aptBlocks
@@ -352,8 +387,11 @@ type DebianBuilder() =
                 Swapfile = swapfile
                 Sshd = sshd
                 Fail2Ban = fail2ban
+                Users = users
+                Sudo = sudo
             }
 
+/// Collects the singleton SSH settings and the required Debian environment.
 type HostBuilder(name: string) =
     member _.Yield(declaration: HostDeclaration) = [ declaration ]
     member _.YieldFrom(declarations: seq<HostDeclaration>) = Seq.toList declarations
@@ -439,7 +477,9 @@ type HostBuilder(name: string) =
                 debian.Docker,
                 debian.Swapfile,
                 debian.Sshd,
-                debian.Fail2Ban
+                debian.Fail2Ban,
+                debian.Users,
+                debian.Sudo
             )
 
         result
