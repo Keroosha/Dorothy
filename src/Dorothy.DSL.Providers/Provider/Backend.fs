@@ -56,7 +56,7 @@ module SshTransport =
             invalidArg "connection" "SSH identityFile must be a non-empty local path."
         | _ -> ()
 
-    let private createStartInfo (connection: SshConnection) (remoteCommand: string) =
+    let private createStartInfo (connection: SshConnection) (remoteCommand: string) (freshConnection: bool) =
         let startInfo = ProcessStartInfo()
         startInfo.FileName <- "ssh"
         startInfo.UseShellExecute <- false
@@ -74,6 +74,11 @@ module SshTransport =
         addArgument "StrictHostKeyChecking=yes"
         addArgument "-o"
         addArgument "ConnectTimeout=15"
+        if freshConnection then
+            addArgument "-o"
+            addArgument "ControlMaster=no"
+            addArgument "-o"
+            addArgument "ControlPath=none"
         addArgument "-p"
         addArgument (string connection.Port)
 
@@ -81,6 +86,8 @@ module SshTransport =
         | Some path ->
             addArgument "-i"
             addArgument path
+            addArgument "-o"
+            addArgument "IdentitiesOnly=yes"
         | None -> ()
 
         addArgument (connection.User + "@" + connection.Address)
@@ -159,10 +166,11 @@ module SshTransport =
         (remoteCommand: string)
         (standardInput: Stream option)
         (cancellationToken: CancellationToken)
+        (freshConnection: bool)
         =
         task {
             validateConnection connection
-            let startInfo = createStartInfo connection remoteCommand
+            let startInfo = createStartInfo connection remoteCommand freshConnection
             use sshProcess = new Process()
             sshProcess.StartInfo <- startInfo
 
@@ -262,6 +270,7 @@ module SshTransport =
                     "uname -s && uname -m"
                     None
                     cancellationToken
+                    false
 
             let lines =
                 output.Trim().Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
@@ -402,6 +411,7 @@ module SshTransport =
                     checkCommand
                     None
                     cancellationToken
+                    false
 
             match cacheState.Trim() with
             | "present" -> ()
@@ -417,6 +427,7 @@ module SshTransport =
                         installCommand
                         (Some binary)
                         cancellationToken
+                        false
 
                 ()
             | _ ->
@@ -438,6 +449,7 @@ module SshTransport =
                     checkCommand
                     None
                     cancellationToken
+                    false
 
             match status.Trim() with
             | "present" -> ()
@@ -469,6 +481,7 @@ module SshTransport =
                         installCommand
                         None
                         cancellationToken
+                        false
 
                 match installStatus.Trim() with
                 | "present"
@@ -519,6 +532,7 @@ module SshTransport =
                         command
                         None
                         cancellationToken
+                        false
 
                 if reportedVersion.Trim() <> "keroosha-iac-helper protocol 1" then
                     raise (NativeHelperUnavailableException("The installed native helper does not report protocol version 1."))
@@ -537,15 +551,16 @@ module SshTransport =
             | error -> return raise error
         }
 
-    let runHelper
+    let private runHelperWithOptions
         (connection: SshConnection)
         (helperCommand: string)
         (operationName: string)
         (payload: string)
         (cancellationToken: CancellationToken)
+        (freshFinalConnection: bool)
         =
         task {
-            if helperCommand <> "apt" && helperCommand <> "ufw" && helperCommand <> "traefik" && helperCommand <> "docker" && helperCommand <> "swapfile" then
+            if helperCommand <> "apt" && helperCommand <> "ufw" && helperCommand <> "traefik" && helperCommand <> "docker" && helperCommand <> "swapfile" && helperCommand <> "sshd" && helperCommand <> "fail2ban" then
                 invalidArg "helperCommand" "Unsupported native helper operation."
 
             validateConnection connection
@@ -559,6 +574,8 @@ module SshTransport =
             let remoteCommand =
                 if connection.User = "root" then
                     sprintf "exec %s %s" remotePath helperCommand
+                elif helperCommand = "sshd" then
+                    sprintf "sudo -n -- env SSH_CONNECTION=\"${SSH_CONNECTION-}\" %s %s" remotePath helperCommand
                 else
                     sprintf "sudo -n -- %s %s" remotePath helperCommand
 
@@ -571,7 +588,15 @@ module SshTransport =
                     remoteCommand
                     (Some requestStream)
                     cancellationToken
+                    freshFinalConnection
         }
+
+    let runHelper connection helperCommand operationName payload cancellationToken =
+        runHelperWithOptions connection helperCommand operationName payload cancellationToken false
+
+    let runHelperFreshConnection connection helperCommand operationName payload cancellationToken =
+        runHelperWithOptions connection helperCommand operationName payload cancellationToken true
+
 module AptBackend =
     let private serializePayload (operation: string) (writeFields: Utf8JsonWriter -> unit) =
         use stream = new MemoryStream()

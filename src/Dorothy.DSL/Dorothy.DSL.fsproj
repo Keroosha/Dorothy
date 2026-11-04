@@ -12,6 +12,7 @@
         <Compile Include="Traefik.fs" />
         <Compile Include="Docker.fs" />
         <Compile Include="Swapfile.fs" />
+        <Compile Include="Sshd.fs" />
         <Compile Include="Domain.fs" />
         <Compile Include="DockerResources.fs" />
         <Compile Include="Resources.fs" />

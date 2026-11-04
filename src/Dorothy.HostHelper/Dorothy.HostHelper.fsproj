@@ -16,6 +16,8 @@
     <Compile Include="Traefik.fs" />
     <Compile Include="DockerEngine.fs" />
     <Compile Include="Swapfile.fs" />
+    <Compile Include="Sshd.fs" />
+    <Compile Include="Fail2Ban.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 </Project>

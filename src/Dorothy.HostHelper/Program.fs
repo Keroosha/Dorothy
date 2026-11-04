@@ -8,7 +8,7 @@ open System.Text.Json.Nodes
 
 module Program =
     let private usage () =
-        Console.Error.WriteLine("Usage: keroosha-iac-helper apt|ufw|traefik|docker|swapfile|--version")
+        Console.Error.WriteLine("Usage: keroosha-iac-helper apt|ufw|traefik|docker|swapfile|sshd|fail2ban|--version")
         64
 
     let private dispatch (command: string) (request: JsonElement) =
@@ -18,6 +18,8 @@ module Program =
         | "traefik" -> Traefik.handle HostEnvironment.system request
         | "docker" -> DockerEngine.handle HostEnvironment.system request
         | "swapfile" -> Swapfile.handle HostEnvironment.system request
+        | "sshd" -> Sshd.handle HostEnvironment.system request
+        | "fail2ban" -> Fail2Ban.handle HostEnvironment.system request
         | _ -> invalidArg "command" "Unsupported helper command."
 
     let private verifyGlobalization () =
@@ -50,6 +52,8 @@ module Program =
             | :? Traefik.BackendError as backendError -> Some backendError.Message
             | :? DockerEngine.BackendError as backendError -> Some backendError.Message
             | :? Swapfile.BackendError as backendError -> Some backendError.Message
+            | :? Sshd.BackendError as backendError -> Some backendError.Message
+            | :? Fail2Ban.BackendError as backendError -> Some backendError.Message
             | :? HostPrerequisiteError as prerequisiteError -> Some prerequisiteError.Message
             | _ -> None
 
@@ -79,7 +83,7 @@ module Program =
             usage ()
         else
             match arguments[0] with
-            | command when command = "apt" || command = "ufw" || command = "traefik" || command = "docker" || command = "swapfile" ->
+            | command when command = "apt" || command = "ufw" || command = "traefik" || command = "docker" || command = "swapfile" || command = "sshd" || command = "fail2ban" ->
                 try
                     verifyGlobalization ()
                     let requestText = Console.In.ReadToEnd()

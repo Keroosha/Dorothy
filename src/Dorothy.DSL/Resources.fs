@@ -76,6 +76,41 @@ type UfwArgs() =
 
     [<Input("defaultOut", true)>]
     member val DefaultOut: Input<string> = Unchecked.defaultof<_> with get, set
+/// Native Pulumi arguments for keroosha:debian:SshdConfig.
+type SshdConfigArgs() =
+    inherit ResourceArgs()
+
+    [<Input("connection", true)>]
+    member val Connection: Input<AptConnectionArgs> = Unchecked.defaultof<_> with get, set
+
+    [<Input("settings", true)>]
+    member val Settings: InputMap<string> = InputMap<string>() with get, set
+
+/// Native Pulumi arguments for keroosha:debian:Fail2BanSshd.
+type Fail2BanSshdArgs() =
+    inherit ResourceArgs()
+
+    [<Input("connection", true)>]
+    member val Connection: Input<AptConnectionArgs> = Unchecked.defaultof<_> with get, set
+
+    [<Input("enabled", true)>]
+    member val Enabled: Input<bool> = Unchecked.defaultof<_> with get, set
+
+    [<Input("maxRetry", true)>]
+    member val MaxRetry: Input<int> = Unchecked.defaultof<_> with get, set
+
+    [<Input("findTimeSeconds", true)>]
+    member val FindTimeSeconds: Input<int> = Unchecked.defaultof<_> with get, set
+
+    [<Input("banTimeSeconds", true)>]
+    member val BanTimeSeconds: Input<int> = Unchecked.defaultof<_> with get, set
+
+    [<Input("ignoreIps", true)>]
+    member val IgnoreIps: InputList<string> = InputList<string>() with get, set
+
+    [<Input("ports")>]
+    member val Ports: InputList<int> = InputList<int>() with get, set
+
 
 /// Resolver fields accepted by the native Traefik provider.
 type TraefikResolverArgs() =
@@ -225,6 +260,12 @@ module private ProviderContract =
     [<Literal>]
     let SwapfileResourceToken = "keroosha:debian:Swapfile"
 
+    [<Literal>]
+    let SshdConfigResourceToken = "keroosha:debian:SshdConfig"
+
+    [<Literal>]
+    let Fail2BanSshdResourceToken = "keroosha:debian:Fail2BanSshd"
+
 
     let resourceOptions () =
         let options = CustomResourceOptions()
@@ -361,6 +402,171 @@ type UfwFirewall(name: string, args: UfwArgs, options: CustomResourceOptions) =
     member this.ActualDefaultOut
         with get () = this.actualDefaultOut
         and private set value = this.actualDefaultOut <- value
+
+    [<Output("inSync")>]
+    member this.InSync
+        with get () = this.inSync
+        and private set value = this.inSync <- value
+
+/// Manages only the explicitly declared sshd overrides on one SSH host.
+type SshdConfigResource(name: string, args: SshdConfigArgs, options: CustomResourceOptions) =
+    inherit CustomResource(ProviderContract.SshdConfigResourceToken, name, args, options)
+
+    [<DefaultValue>]
+    val mutable private settings: Output<ImmutableDictionary<string, string>>
+
+    [<DefaultValue>]
+    val mutable private owned: Output<bool>
+
+    [<DefaultValue>]
+    val mutable private actualSettings: Output<ImmutableDictionary<string, string>>
+
+    [<DefaultValue>]
+    val mutable private ports: Output<ImmutableArray<int>>
+
+    [<DefaultValue>]
+    val mutable private inSync: Output<bool>
+
+    new(name: string, args: SshdConfigArgs) =
+        SshdConfigResource(name, args, ProviderContract.resourceOptions ())
+
+    [<Output("settings")>]
+    member this.Settings
+        with get () = this.settings
+        and private set value = this.settings <- value
+
+    [<Output("owned")>]
+    member this.Owned
+        with get () = this.owned
+        and private set value = this.owned <- value
+
+    [<Output("actualSettings")>]
+    member this.ActualSettings
+        with get () = this.actualSettings
+        and private set value = this.actualSettings <- value
+
+    [<Output("ports")>]
+    member this.Ports
+        with get () = this.ports
+        and private set value = this.ports <- value
+
+    [<Output("inSync")>]
+    member this.InSync
+        with get () = this.inSync
+        and private set value = this.inSync <- value
+
+/// Manages the Fail2Ban sshd jail independently from sshd's own configuration.
+type Fail2BanSshd(name: string, args: Fail2BanSshdArgs, options: CustomResourceOptions) =
+    inherit CustomResource(ProviderContract.Fail2BanSshdResourceToken, name, args, options)
+
+    [<DefaultValue>]
+    val mutable private enabled: Output<bool>
+
+    [<DefaultValue>]
+    val mutable private maxRetry: Output<int>
+
+    [<DefaultValue>]
+    val mutable private findTimeSeconds: Output<int>
+
+    [<DefaultValue>]
+    val mutable private banTimeSeconds: Output<int>
+
+    [<DefaultValue>]
+    val mutable private ignoreIps: Output<ImmutableArray<string>>
+
+    [<DefaultValue>]
+    val mutable private ports: Output<ImmutableArray<int>>
+
+    [<DefaultValue>]
+    val mutable private owned: Output<bool>
+
+    [<DefaultValue>]
+    val mutable private active: Output<bool>
+
+    [<DefaultValue>]
+    val mutable private actualPorts: Output<ImmutableArray<int>>
+
+    [<DefaultValue>]
+    val mutable private actualMaxRetry: Output<int>
+
+    [<DefaultValue>]
+    val mutable private actualFindTimeSeconds: Output<int>
+
+    [<DefaultValue>]
+    val mutable private actualBanTimeSeconds: Output<int>
+
+    [<DefaultValue>]
+    val mutable private actualIgnoreIps: Output<ImmutableArray<string>>
+
+    [<DefaultValue>]
+    val mutable private inSync: Output<bool>
+
+    new(name: string, args: Fail2BanSshdArgs) =
+        Fail2BanSshd(name, args, ProviderContract.resourceOptions ())
+
+    [<Output("enabled")>]
+    member this.Enabled
+        with get () = this.enabled
+        and private set value = this.enabled <- value
+
+    [<Output("maxRetry")>]
+    member this.MaxRetry
+        with get () = this.maxRetry
+        and private set value = this.maxRetry <- value
+
+    [<Output("findTimeSeconds")>]
+    member this.FindTimeSeconds
+        with get () = this.findTimeSeconds
+        and private set value = this.findTimeSeconds <- value
+
+    [<Output("banTimeSeconds")>]
+    member this.BanTimeSeconds
+        with get () = this.banTimeSeconds
+        and private set value = this.banTimeSeconds <- value
+
+    [<Output("ignoreIps")>]
+    member this.IgnoreIps
+        with get () = this.ignoreIps
+        and private set value = this.ignoreIps <- value
+
+    [<Output("ports")>]
+    member this.Ports
+        with get () = this.ports
+        and private set value = this.ports <- value
+    [<Output("owned")>]
+    member this.Owned
+        with get () = this.owned
+        and private set value = this.owned <- value
+
+    [<Output("active")>]
+    member this.Active
+        with get () = this.active
+        and private set value = this.active <- value
+
+    [<Output("actualPorts")>]
+    member this.ActualPorts
+        with get () = this.actualPorts
+        and private set value = this.actualPorts <- value
+
+    [<Output("actualMaxRetry")>]
+    member this.ActualMaxRetry
+        with get () = this.actualMaxRetry
+        and private set value = this.actualMaxRetry <- value
+
+    [<Output("actualFindTimeSeconds")>]
+    member this.ActualFindTimeSeconds
+        with get () = this.actualFindTimeSeconds
+        and private set value = this.actualFindTimeSeconds <- value
+
+    [<Output("actualBanTimeSeconds")>]
+    member this.ActualBanTimeSeconds
+        with get () = this.actualBanTimeSeconds
+        and private set value = this.actualBanTimeSeconds <- value
+
+    [<Output("actualIgnoreIps")>]
+    member this.ActualIgnoreIps
+        with get () = this.actualIgnoreIps
+        and private set value = this.actualIgnoreIps <- value
 
     [<Output("inSync")>]
     member this.InSync
@@ -524,6 +730,27 @@ module Host =
             | None -> declared
         let mainApt = createAptPackageSet host.Name mainPackages [] false
 
+        let fail2banPackages =
+            match host.Sshd with
+            | Some specification when specification.Fail2Ban.IsSome ->
+                [ "fail2ban"; "nftables" ]
+                |> List.choose (fun packageName ->
+                    // Explicit declarations remain owned by mainApt. Switching an existing package from
+                    // explicit to implicit ownership has no automatic zero-gap handoff.
+                    if Map.containsKey packageName host.Packages then
+                        None
+                    else
+                        // Retain each implicit package independently so removing one prerequisite never
+                        // shrinks another package owner's desired set.
+                        Some(
+                            createAptPackageSet
+                                (host.Name + "-" + packageName + "-package")
+                                (Map.ofList [ packageName, None ])
+                                [ mainApt :> Resource ]
+                                true
+                        ))
+            | _ -> []
+
         let swapfilePackage =
             if host.Swapfile.IsSome && not (Map.containsKey "util-linux" host.Packages) then
                 // Keep the helper's util-linux prerequisite installed after swapfile removal.
@@ -586,6 +813,45 @@ module Host =
                 Some(UfwFirewall(host.Name, args, ProviderContract.resourceOptionsWithDependencies [ mainApt :> Resource; packageSet :> Resource ]))
             | None, _ -> None
             | Some _, None -> invalidOp "A UFW declaration must have its APT prerequisite resource."
+
+        let sshdConfigResource =
+            match host.Sshd |> Option.bind (fun specification -> specification.Config) with
+            | Some specification ->
+                let settings = Dictionary<string, string>(StringComparer.Ordinal)
+                for KeyValue(keyword, value) in specification.Settings do
+                    settings.Add(keyword, value)
+
+                let args = SshdConfigArgs()
+                args.Connection <- Input<AptConnectionArgs>.op_Implicit connection
+                args.Settings <- InputMap<string>.op_Implicit settings
+
+                let options =
+                    ProviderContract.resourceOptionsWithDependencies [ mainApt :> Resource ]
+                Some(SshdConfigResource(host.Name + "-sshd-config", args, options))
+            | None -> None
+
+        match host.Sshd |> Option.bind (fun specification -> specification.Fail2Ban) with
+        | Some specification ->
+            let args = Fail2BanSshdArgs()
+            args.Connection <- Input<AptConnectionArgs>.op_Implicit connection
+            args.Enabled <- Input<bool>.op_Implicit specification.Enabled
+            args.MaxRetry <- Input<int>.op_Implicit specification.MaxRetry
+            args.FindTimeSeconds <- Input<int>.op_Implicit specification.FindTimeSeconds
+            args.BanTimeSeconds <- Input<int>.op_Implicit specification.BanTimeSeconds
+            args.IgnoreIps <- InputList<string>.op_Implicit (specification.IgnoreIps |> List.toArray)
+
+            args.Ports <-
+                match sshdConfigResource with
+                | Some resource -> InputList<int>.op_Implicit resource.Ports
+                | None -> InputList<int>.op_Implicit (Array.empty<int>)
+
+            let dependencies =
+                [ mainApt :> Resource ]
+                @ (fail2banPackages |> List.map (fun resource -> resource :> Resource))
+                @ (sshdConfigResource |> Option.map (fun resource -> resource :> Resource) |> Option.toList)
+            let options = ProviderContract.resourceOptionsWithDependencies dependencies
+            Fail2BanSshd(host.Name + "-fail2ban-sshd", args, options) |> ignore
+        | None -> ()
 
         match host.Traefik with
         | Some specification ->
