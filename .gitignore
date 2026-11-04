@@ -6,3 +6,4 @@ obj/
 .vs/
 TestResults/
 /src/Dorothy.DSL.Providers/Provider/helper/linux-*/
+/docs/.obsidian/workspace*.json
