@@ -2,7 +2,7 @@
 
 ## Structure
 
-- `docs/Agents/`: native SSHD/Fail2Ban guides and option catalogues for implementation and operation.
+- `docs/Agents/`: native host guides and option catalogues for implementation and operation.
 - `docs/Agents/Spec/`: implementation and migration plans.
 - `docs/Tech/features/`: operator-authored feature notes.
 - `docs/Tech/*.canvas`: Obsidian feature maps; file nodes are relative to the `docs` vault root.
