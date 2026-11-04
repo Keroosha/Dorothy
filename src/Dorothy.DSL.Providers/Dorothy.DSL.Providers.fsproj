@@ -8,6 +8,8 @@
   <ItemGroup>
     <ProjectReference Include="../Dorothy.DSL/Dorothy.DSL.fsproj" />
     <Compile Include="Provider/Backend.fs" />
+    <Compile Include="Provider/SshdBackend.fs" />
+    <Compile Include="Provider/Fail2BanBackend.fs" />
     <Compile Include="Provider/UfwBackend.fs" />
     <Compile Include="Provider/TraefikBackend.fs" />
     <Compile Include="Provider/DockerEngineBackend.fs" />
@@ -17,6 +19,8 @@
     <Compile Include="Provider/TraefikProvider.fs" />
     <Compile Include="Provider/DockerEngineProvider.fs" />
     <Compile Include="Provider/SwapfileProvider.fs" />
+    <Compile Include="Provider/SshdProvider.fs" />
+    <Compile Include="Provider/Fail2BanProvider.fs" />
     <Compile Include="Provider/Provider.fs" />
     <Compile Include="Provider/Program.fs" />
     <Content Include="Provider/helper/**/keroosha-iac-helper">

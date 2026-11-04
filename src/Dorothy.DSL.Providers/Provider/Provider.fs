@@ -15,10 +15,12 @@ module private ProviderSchema =
             use ufwDocument = JsonDocument.Parse(UfwProvider.Schema)
             use traefikDocument = JsonDocument.Parse(TraefikProvider.Schema)
             use dockerEngineDocument = JsonDocument.Parse(DockerEngineProvider.Schema)
+            use sshdDocument = JsonDocument.Parse(SshdProvider.Schema)
+            use fail2banDocument = JsonDocument.Parse(Fail2BanProvider.Schema)
             use swapfileDocument = JsonDocument.Parse(SwapfileProvider.Schema)
             use stream = new MemoryStream()
             use writer = new Utf8JsonWriter(stream)
-            let documents = [ aptDocument; ufwDocument; traefikDocument; dockerEngineDocument; swapfileDocument ]
+            let documents = [ aptDocument; ufwDocument; traefikDocument; dockerEngineDocument; swapfileDocument; sshdDocument; fail2banDocument ]
 
             let writeMergedObject (propertyName: string) =
                 writer.WritePropertyName(propertyName)
@@ -49,6 +51,8 @@ type DorothyProvider() =
     let traefik = TraefikProvider()
     let dockerEngine = DockerEngineProvider()
     let swapfile = SwapfileProvider()
+    let sshd = SshdProvider()
+    let fail2ban = Fail2BanProvider()
 
     static member Version = AptProvider.Version
 
@@ -69,6 +73,8 @@ type DorothyProvider() =
         elif request.Type = TraefikProvider.ResourceToken then traefik.Check(request, ct)
         elif request.Type = DockerEngineProvider.ResourceToken then dockerEngine.Check(request, ct)
         elif request.Type = SwapfileProvider.ResourceToken then swapfile.Check(request, ct)
+        elif request.Type = SshdProvider.ResourceToken then sshd.Check(request, ct)
+        elif request.Type = Fail2BanProvider.ResourceToken then fail2ban.Check(request, ct)
         else apt.Check(request, ct)
 
     override _.Diff(request: DiffRequest, ct: CancellationToken) =
@@ -76,6 +82,8 @@ type DorothyProvider() =
         elif request.Type = TraefikProvider.ResourceToken then traefik.Diff(request, ct)
         elif request.Type = DockerEngineProvider.ResourceToken then dockerEngine.Diff(request, ct)
         elif request.Type = SwapfileProvider.ResourceToken then swapfile.Diff(request, ct)
+        elif request.Type = SshdProvider.ResourceToken then sshd.Diff(request, ct)
+        elif request.Type = Fail2BanProvider.ResourceToken then fail2ban.Diff(request, ct)
         else apt.Diff(request, ct)
 
     override _.Create(request: CreateRequest, ct: CancellationToken) =
@@ -83,6 +91,8 @@ type DorothyProvider() =
         elif request.Type = TraefikProvider.ResourceToken then traefik.Create(request, ct)
         elif request.Type = DockerEngineProvider.ResourceToken then dockerEngine.Create(request, ct)
         elif request.Type = SwapfileProvider.ResourceToken then swapfile.Create(request, ct)
+        elif request.Type = SshdProvider.ResourceToken then sshd.Create(request, ct)
+        elif request.Type = Fail2BanProvider.ResourceToken then fail2ban.Create(request, ct)
         else apt.Create(request, ct)
 
     override _.Read(request: ReadRequest, ct: CancellationToken) =
@@ -90,6 +100,8 @@ type DorothyProvider() =
         elif request.Type = TraefikProvider.ResourceToken then traefik.Read(request, ct)
         elif request.Type = DockerEngineProvider.ResourceToken then dockerEngine.Read(request, ct)
         elif request.Type = SwapfileProvider.ResourceToken then swapfile.Read(request, ct)
+        elif request.Type = SshdProvider.ResourceToken then sshd.Read(request, ct)
+        elif request.Type = Fail2BanProvider.ResourceToken then fail2ban.Read(request, ct)
         else apt.Read(request, ct)
 
     override _.Update(request: UpdateRequest, ct: CancellationToken) =
@@ -97,6 +109,8 @@ type DorothyProvider() =
         elif request.Type = TraefikProvider.ResourceToken then traefik.Update(request, ct)
         elif request.Type = DockerEngineProvider.ResourceToken then dockerEngine.Update(request, ct)
         elif request.Type = SwapfileProvider.ResourceToken then swapfile.Update(request, ct)
+        elif request.Type = SshdProvider.ResourceToken then sshd.Update(request, ct)
+        elif request.Type = Fail2BanProvider.ResourceToken then fail2ban.Update(request, ct)
         else apt.Update(request, ct)
 
     override _.Delete(request: DeleteRequest, ct: CancellationToken) =
@@ -104,4 +118,6 @@ type DorothyProvider() =
         elif request.Type = TraefikProvider.ResourceToken then traefik.Delete(request, ct)
         elif request.Type = DockerEngineProvider.ResourceToken then dockerEngine.Delete(request, ct)
         elif request.Type = SwapfileProvider.ResourceToken then swapfile.Delete(request, ct)
+        elif request.Type = SshdProvider.ResourceToken then sshd.Delete(request, ct)
+        elif request.Type = Fail2BanProvider.ResourceToken then fail2ban.Delete(request, ct)
         else apt.Delete(request, ct)
