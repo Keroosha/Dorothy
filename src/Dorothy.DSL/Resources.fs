@@ -3,7 +3,9 @@ namespace Dorothy.DSL
 open System
 open System.Collections.Generic
 open System.Collections.Immutable
+open System.Globalization
 open Pulumi
+open System.Text.Json
 
 /// Typed arguments for the provider's SSH connection object.
 type AptConnectionArgs() =
@@ -38,6 +40,303 @@ type AptPackageSetArgs() =
     [<Input("packages", true)>]
     member val Packages: InputMap<AptPackageArgs> = InputMap<AptPackageArgs>() with get, set
 
+
+/// A user-group declaration passed to the native users provider.
+type UserGroupArgs() =
+    inherit ResourceArgs()
+
+    [<Input("gid")>]
+    member val Gid: Input<int> = Unchecked.defaultof<_> with get, set
+
+    [<Input("kind")>]
+    member val Kind: Input<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("existing")>]
+    member val Existing: Input<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("state")>]
+    member val State: Input<string> = Unchecked.defaultof<_> with get, set
+
+/// A primary group selection for one user.
+type UserPrimaryGroupArgs() =
+    inherit ResourceArgs()
+
+    [<Input("kind", true)>]
+    member val Kind: Input<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("name")>]
+    member val Name: Input<string> = Unchecked.defaultof<_> with get, set
+
+/// A managed or exclusive supplementary-group declaration.
+type UserSupplementaryGroupsArgs() =
+    inherit ResourceArgs()
+
+    [<Input("mode", true)>]
+    member val Mode: Input<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("names", true)>]
+    member val Names: InputList<string> = InputList<string>() with get, set
+
+/// One requested home-directory lifecycle.
+type UserHomeArgs() =
+    inherit ResourceArgs()
+
+    [<Input("kind", true)>]
+    member val Kind: Input<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("path")>]
+    member val Path: Input<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("mode")>]
+    member val Mode: Input<int> = Unchecked.defaultof<_> with get, set
+
+    [<Input("skeleton")>]
+    member val Skeleton: Input<string> = Unchecked.defaultof<_> with get, set
+
+/// Locked or hashed password input. Hash remains an Input to preserve secrecy/dependencies.
+type UserPasswordArgs() =
+    inherit ResourceArgs()
+
+    [<Input("kind", true)>]
+    member val Kind: Input<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("hash")>]
+    member val Hash: Input<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("update")>]
+    member val Update: Input<string> = Unchecked.defaultof<_> with get, set
+
+/// Calendar-date account expiry.
+type UserAccountExpiryArgs() =
+    inherit ResourceArgs()
+
+    [<Input("kind", true)>]
+    member val Kind: Input<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("date")>]
+    member val Date: Input<string> = Unchecked.defaultof<_> with get, set
+
+/// Optional shadow password-aging policy.
+type UserPasswordPolicyArgs() =
+    inherit ResourceArgs()
+
+    [<Input("minDays")>]
+    member val MinDays: Input<int> = Unchecked.defaultof<_> with get, set
+
+    [<Input("maxDays")>]
+    member val MaxDays: Input<int> = Unchecked.defaultof<_> with get, set
+
+    [<Input("warnDays")>]
+    member val WarnDays: Input<int> = Unchecked.defaultof<_> with get, set
+
+    [<Input("inactiveDays")>]
+    member val InactiveDays: Input<int> = Unchecked.defaultof<_> with get, set
+
+/// One subordinate UID or GID range.
+type UserSubordinateIdRangeArgs() =
+    inherit ResourceArgs()
+
+    [<Input("start", true)>]
+    member val Start: Input<int> = Unchecked.defaultof<_> with get, set
+
+    [<Input("count", true)>]
+    member val Count: Input<int> = Unchecked.defaultof<_> with get, set
+
+/// One structured OpenSSH authorized key.
+type UserAuthorizedKeyArgs() =
+    inherit ResourceArgs()
+
+    [<Input("id", true)>]
+    member val Id: Input<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("publicKey", true)>]
+    member val PublicKey: Input<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("comment")>]
+    member val Comment: Input<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("restrict")>]
+    member val Restrict: Input<bool> = Unchecked.defaultof<_> with get, set
+
+    [<Input("allowPty")>]
+    member val AllowPty: Input<bool> = Unchecked.defaultof<_> with get, set
+
+    [<Input("allowAgentForwarding")>]
+    member val AllowAgentForwarding: Input<bool> = Unchecked.defaultof<_> with get, set
+
+    [<Input("allowPortForwarding")>]
+    member val AllowPortForwarding: Input<bool> = Unchecked.defaultof<_> with get, set
+
+    [<Input("allowX11Forwarding")>]
+    member val AllowX11Forwarding: Input<bool> = Unchecked.defaultof<_> with get, set
+
+    [<Input("allowUserRc")>]
+    member val AllowUserRc: Input<bool> = Unchecked.defaultof<_> with get, set
+
+    [<Input("allowFrom")>]
+    member val AllowFrom: InputList<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("command")>]
+    member val Command: Input<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("expires")>]
+    member val Expires: Input<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("permitOpen")>]
+    member val PermitOpen: InputList<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("permitListen")>]
+    member val PermitListen: InputList<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("verifyRequired")>]
+    member val VerifyRequired: Input<bool> = Unchecked.defaultof<_> with get, set
+
+/// The complete managed or exclusive authorized-key collection.
+type UserAuthorizedKeysArgs() =
+    inherit ResourceArgs()
+
+    [<Input("mode", true)>]
+    member val Mode: Input<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("keys", true)>]
+    member val Keys: InputList<UserAuthorizedKeyArgs> = InputList<UserAuthorizedKeyArgs>() with get, set
+
+/// Native input for one user; the map key supplies its stable account name.
+type UserAccountArgs() =
+    inherit ResourceArgs()
+
+    [<Input("state")>]
+    member val State: Input<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("kind")>]
+    member val Kind: Input<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("existing")>]
+    member val Existing: Input<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("uid")>]
+    member val Uid: Input<int> = Unchecked.defaultof<_> with get, set
+
+    [<Input("description")>]
+    member val Description: Input<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("primaryGroup")>]
+    member val PrimaryGroup: Input<UserPrimaryGroupArgs> = Unchecked.defaultof<_> with get, set
+
+    [<Input("supplementaryGroups")>]
+    member val SupplementaryGroups: Input<UserSupplementaryGroupsArgs> = Unchecked.defaultof<_> with get, set
+
+    [<Input("home")>]
+    member val Home: Input<UserHomeArgs> = Unchecked.defaultof<_> with get, set
+
+    [<Input("shell")>]
+    member val Shell: Input<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("password")>]
+    member val Password: Input<UserPasswordArgs> = Unchecked.defaultof<_> with get, set
+
+    [<Input("accountExpiry")>]
+    member val AccountExpiry: Input<UserAccountExpiryArgs> = Unchecked.defaultof<_> with get, set
+
+    [<Input("passwordPolicy")>]
+    member val PasswordPolicy: Input<UserPasswordPolicyArgs> = Unchecked.defaultof<_> with get, set
+
+    [<Input("subordinateUids")>]
+    member val SubordinateUids: InputList<UserSubordinateIdRangeArgs> = Unchecked.defaultof<_> with get, set
+
+    [<Input("subordinateGids")>]
+    member val SubordinateGids: InputList<UserSubordinateIdRangeArgs> = Unchecked.defaultof<_> with get, set
+
+    [<Input("onDelete")>]
+    member val OnDelete: Input<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("authorizedKeys")>]
+    member val AuthorizedKeys: Input<UserAuthorizedKeysArgs> = Unchecked.defaultof<_> with get, set
+
+/// Native input for the owned users resource.
+type UsersArgs() =
+    inherit ResourceArgs()
+
+    [<Input("connection", true)>]
+    member val Connection: Input<AptConnectionArgs> = Unchecked.defaultof<_> with get, set
+
+    [<Input("groups", true)>]
+    member val Groups: InputMap<UserGroupArgs> = InputMap<UserGroupArgs>() with get, set
+
+    [<Input("users", true)>]
+    member val Users: InputMap<UserAccountArgs> = InputMap<UserAccountArgs>() with get, set
+
+/// One sudo policy subject.
+type SudoSubjectArgs() =
+    inherit ResourceArgs()
+
+    [<Input("kind", true)>]
+    member val Kind: Input<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("name", true)>]
+    member val Name: Input<string> = Unchecked.defaultof<_> with get, set
+
+/// Run-as identity for one sudo grant.
+type SudoRunAsArgs() =
+    inherit ResourceArgs()
+
+    [<Input("kind", true)>]
+    member val Kind: Input<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("user")>]
+    member val User: Input<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("group")>]
+    member val Group: Input<string> = Unchecked.defaultof<_> with get, set
+
+/// Explicit sudo command argument restriction.
+type SudoArgumentsArgs() =
+    inherit ResourceArgs()
+
+    [<Input("kind", true)>]
+    member val Kind: Input<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("value")>]
+    member val Value: Input<string> = Unchecked.defaultof<_> with get, set
+
+/// One sudo command path and argument restriction.
+type SudoCommandArgs() =
+    inherit ResourceArgs()
+
+    [<Input("path", true)>]
+    member val Path: Input<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("arguments", true)>]
+    member val Arguments: Input<SudoArgumentsArgs> = Unchecked.defaultof<_> with get, set
+
+/// One named sudo grant; its map key supplies the native grant name.
+type SudoGrantArgs() =
+    inherit ResourceArgs()
+
+    [<Input("subjects", true)>]
+    member val Subjects: InputList<SudoSubjectArgs> = InputList<SudoSubjectArgs>() with get, set
+
+    [<Input("runAs", true)>]
+    member val RunAs: Input<SudoRunAsArgs> = Unchecked.defaultof<_> with get, set
+
+    [<Input("authentication")>]
+    member val Authentication: Input<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("allCommands")>]
+    member val AllCommands: Input<bool> = Unchecked.defaultof<_> with get, set
+
+    [<Input("commands", true)>]
+    member val Commands: InputList<SudoCommandArgs> = InputList<SudoCommandArgs>() with get, set
+
+/// Native input for the owned sudo policy resource.
+type SudoArgs() =
+    inherit ResourceArgs()
+
+    [<Input("connection", true)>]
+    member val Connection: Input<AptConnectionArgs> = Unchecked.defaultof<_> with get, set
+
+    [<Input("grants", true)>]
+    member val Grants: InputMap<SudoGrantArgs> = InputMap<SudoGrantArgs>() with get, set
 /// Ensures the shared Docker daemon and SSH-user access after APT installs Docker.
 type DockerEngineArgs() =
     inherit ResourceArgs()
@@ -255,6 +554,11 @@ module private ProviderContract =
 
     [<Literal>]
     let SwapfileResourceToken = "keroosha:debian:Swapfile"
+    [<Literal>]
+    let UsersResourceToken = "keroosha:debian:Users"
+
+    [<Literal>]
+    let SudoResourceToken = "keroosha:debian:Sudo"
 
     [<Literal>]
     let SshdConfigResourceToken = "keroosha:debian:SshdConfig"
@@ -272,6 +576,68 @@ module private ProviderContract =
         let options = resourceOptions ()
         options.DependsOn <- InputList<Resource>.op_Implicit(dependencies |> List.toArray)
         options
+
+/// Manages the owned users and groups on one SSH host; deletion retains identities and revokes owned access.
+type UsersResource(name: string, args: UsersArgs, options: CustomResourceOptions) =
+    inherit CustomResource(ProviderContract.UsersResourceToken, name, args, options)
+
+    [<DefaultValue>]
+    val mutable private exists: Output<bool>
+
+    [<DefaultValue>]
+    val mutable private inSync: Output<bool>
+
+    [<DefaultValue>]
+    val mutable private actual: Output<JsonElement>
+
+    new(name: string, args: UsersArgs) =
+        UsersResource(name, args, ProviderContract.resourceOptions ())
+
+    [<Output("exists")>]
+    member this.Exists
+        with get () = this.exists
+        and private set value = this.exists <- value
+
+    [<Output("inSync")>]
+    member this.InSync
+        with get () = this.inSync
+        and private set value = this.inSync <- value
+
+    [<Output("actual")>]
+    member this.Actual
+        with get () = this.actual
+        and private set value = this.actual <- value
+
+/// Manages one owned sudo policy file; deletion removes only its grants.
+type SudoResource(name: string, args: SudoArgs, options: CustomResourceOptions) =
+    inherit CustomResource(ProviderContract.SudoResourceToken, name, args, options)
+
+    [<DefaultValue>]
+    val mutable private exists: Output<bool>
+
+    [<DefaultValue>]
+    val mutable private inSync: Output<bool>
+
+    [<DefaultValue>]
+    val mutable private actual: Output<JsonElement>
+
+    new(name: string, args: SudoArgs) =
+        SudoResource(name, args, ProviderContract.resourceOptions ())
+
+    [<Output("exists")>]
+    member this.Exists
+        with get () = this.exists
+        and private set value = this.exists <- value
+
+    [<Output("inSync")>]
+    member this.InSync
+        with get () = this.inSync
+        and private set value = this.inSync <- value
+
+    [<Output("actual")>]
+    member this.Actual
+        with get () = this.actual
+        and private set value = this.actual <- value
 
 /// A non-destructive shared host prerequisite; deletion retains the daemon and group membership.
 type DockerEngine(name: string, args: DockerEngineArgs, options: CustomResourceOptions) =
@@ -657,6 +1023,256 @@ module private TraefikResourceMappings =
     let routers values = mapImmutableOutput values router
     let certificates values = mapImmutableOutput values certificate
 
+module internal AccessResourceMappings =
+    let private input (value: 'T) : Input<'T> = Input<'T>.op_Implicit value
+    let private identityString = Func<string, string>(fun value -> value)
+
+    let private strings (values: string list) =
+        InputList<string>.op_Implicit (values |> List.toArray)
+
+    let private setOptional (setter: Input<'T> -> unit) (value: 'T option) =
+        value |> Option.iter (fun item -> setter (input item))
+    let formatUtcTimestamp (value: DateTimeOffset) =
+        value.UtcDateTime.ToString("O", CultureInfo.InvariantCulture)
+
+    let private identity = function
+        | ExistingIdentity.Reject -> "reject"
+        | ExistingIdentity.Adopt -> "adopt"
+
+    let private state = function
+        | UserState.Present -> "present"
+        | UserState.Absent -> "absent"
+
+    let private kind = function
+        | UserKind.Human -> "human"
+        | UserKind.System -> "system"
+
+    let private group (specification: UserGroupSpec) =
+        let args = UserGroupArgs()
+        setOptional (fun value -> args.Gid <- value) specification.Gid
+        specification.Kind |> Option.map kind |> setOptional (fun value -> args.Kind <- value)
+        specification.Existing |> Option.map identity |> setOptional (fun value -> args.Existing <- value)
+        specification.State |> Option.map state |> setOptional (fun value -> args.State <- value)
+        args
+
+    let private primaryGroup (value: PrimaryGroup) =
+        let args = UserPrimaryGroupArgs()
+        match value with
+        | PrimaryGroup.PrivateGroup -> args.Kind <- input "private"
+        | PrimaryGroup.ExistingGroup name ->
+            args.Kind <- input "existing"
+            args.Name <- input name
+        args
+
+    let private supplementaryGroups (value: SupplementaryGroups) =
+        let mode, names =
+            match value with
+            | SupplementaryGroups.Managed names -> "managed", names
+            | SupplementaryGroups.Exclusive names -> "exclusive", names
+        let args = UserSupplementaryGroupsArgs()
+        args.Mode <- input mode
+        args.Names <- strings names
+        args
+
+    let private home (value: Home) =
+        let args = UserHomeArgs()
+        match value with
+        | Home.Create(path, mode) ->
+            args.Kind <- input "create"
+            args.Path <- input path
+            args.Mode <- input mode
+        | Home.CreateWithSkeleton(path, mode, skeleton) ->
+            args.Kind <- input "create"
+            args.Path <- input path
+            args.Mode <- input mode
+            args.Skeleton <- input skeleton
+        | Home.Existing path ->
+            args.Kind <- input "existing"
+            args.Path <- input path
+        | Home.None -> args.Kind <- input "none"
+        args
+
+    let private password (specification: UserSpec) =
+        let args = UserPasswordArgs()
+        match specification.Password with
+        | Some Password.Locked -> args.Kind <- input "locked"
+        | Some (Password.Hash hash) ->
+            args.Kind <- input "hash"
+            let secretHash =
+                InputExtensions.Apply<string, string>(hash, identityString)
+                |> Output.CreateSecret<string>
+            args.Hash <- Input<string>.op_Implicit secretHash
+            let update =
+                specification.PasswordUpdate
+                |> Option.defaultValue PasswordUpdate.OnCreate
+                |> function
+                    | PasswordUpdate.Always -> "always"
+                    | PasswordUpdate.OnCreate -> "onCreate"
+            args.Update <- input update
+        | None -> ()
+        args
+
+    let private accountExpiry (value: AccountExpiry) =
+        let args = UserAccountExpiryArgs()
+        match value with
+        | AccountExpiry.Never -> args.Kind <- input "never"
+        | AccountExpiry.On date ->
+            args.Kind <- input "on"
+            args.Date <- input (date.ToString("yyyy-MM-dd", CultureInfo.InvariantCulture))
+        args
+
+    let private passwordPolicy (value: PasswordPolicySpec) =
+        let args = UserPasswordPolicyArgs()
+        setOptional (fun item -> args.MinDays <- item) value.MinDays
+        setOptional (fun item -> args.MaxDays <- item) value.MaxDays
+        setOptional (fun item -> args.WarnDays <- item) value.WarnDays
+        setOptional (fun item -> args.InactiveDays <- item) value.InactiveDays
+        args
+
+    let private subordinateRange (value: SubordinateIdRange) =
+        let args = UserSubordinateIdRangeArgs()
+        args.Start <- input value.Start
+        args.Count <- input value.Count
+        args
+
+    let authorizedKey (value: AuthorizedKeySpec) =
+        let args = UserAuthorizedKeyArgs()
+        args.Id <- input value.Id
+        args.PublicKey <- input value.PublicKey
+        setOptional (fun item -> args.Comment <- item) value.Comment
+        setOptional (fun item -> args.Restrict <- item) value.Restrict
+        setOptional (fun item -> args.AllowPty <- item) value.AllowPty
+        setOptional (fun item -> args.AllowAgentForwarding <- item) value.AllowAgentForwarding
+        setOptional (fun item -> args.AllowPortForwarding <- item) value.AllowPortForwarding
+        setOptional (fun item -> args.AllowX11Forwarding <- item) value.AllowX11Forwarding
+        setOptional (fun item -> args.AllowUserRc <- item) value.AllowUserRc
+        value.AllowFrom |> Option.iter (fun names -> args.AllowFrom <- strings names)
+        setOptional (fun item -> args.Command <- item) value.Command
+        value.Expires
+        |> Option.map formatUtcTimestamp
+        |> setOptional (fun item -> args.Expires <- item)
+        value.PermitOpen |> Option.iter (fun names -> args.PermitOpen <- strings names)
+        value.PermitListen |> Option.iter (fun names -> args.PermitListen <- strings names)
+        setOptional (fun item -> args.VerifyRequired <- item) value.VerifyRequired
+        args
+
+    let private authorizedKeys (value: AuthorizedKeysSpec) =
+        let args = UserAuthorizedKeysArgs()
+        args.Mode <-
+            input (
+                match value.Mode with
+                | AuthorizedKeysMode.Managed -> "managed"
+                | AuthorizedKeysMode.Exclusive -> "exclusive"
+            )
+        args.Keys <-
+            value.Keys
+            |> List.map authorizedKey
+            |> List.toArray
+            |> InputList<UserAuthorizedKeyArgs>.op_Implicit
+        args
+
+    let user (specification: UserSpec) =
+        let args = UserAccountArgs()
+        specification.State |> Option.map state |> setOptional (fun value -> args.State <- value)
+        specification.Kind |> Option.map kind |> setOptional (fun value -> args.Kind <- value)
+        specification.Existing |> Option.map identity |> setOptional (fun value -> args.Existing <- value)
+        setOptional (fun value -> args.Uid <- value) specification.Uid
+        setOptional (fun value -> args.Description <- value) specification.Description
+        specification.PrimaryGroup
+        |> Option.iter (primaryGroup >> input >> fun value -> args.PrimaryGroup <- value)
+        specification.SupplementaryGroups
+        |> Option.iter (supplementaryGroups >> input >> fun value -> args.SupplementaryGroups <- value)
+        specification.Home |> Option.iter (home >> input >> fun value -> args.Home <- value)
+        setOptional (fun value -> args.Shell <- value) specification.Shell
+        specification.Password
+        |> Option.iter (fun _ -> args.Password <- input (password specification))
+        specification.AccountExpiry
+        |> Option.iter (accountExpiry >> input >> fun value -> args.AccountExpiry <- value)
+        specification.PasswordPolicy
+        |> Option.iter (passwordPolicy >> input >> fun value -> args.PasswordPolicy <- value)
+        specification.SubordinateUids
+        |> Option.iter (fun ranges ->
+            args.SubordinateUids <- ranges |> List.map subordinateRange |> List.toArray |> InputList<UserSubordinateIdRangeArgs>.op_Implicit)
+        specification.SubordinateGids
+        |> Option.iter (fun ranges ->
+            args.SubordinateGids <- ranges |> List.map subordinateRange |> List.toArray |> InputList<UserSubordinateIdRangeArgs>.op_Implicit)
+        specification.OnDelete
+        |> Option.iter (function
+            | UserDeleteBehavior.RetainIdentity -> args.OnDelete <- input "retainIdentity")
+        specification.AuthorizedKeys
+        |> Option.iter (authorizedKeys >> input >> fun value -> args.AuthorizedKeys <- value)
+        args
+
+    let users (specification: UsersSpec) =
+        let groups = Dictionary<string, UserGroupArgs>(StringComparer.Ordinal)
+        for KeyValue(name, value) in specification.Groups do groups.Add(name, group value)
+        let users = Dictionary<string, UserAccountArgs>(StringComparer.Ordinal)
+        for KeyValue(name, value) in specification.Users do users.Add(name, user value)
+        groups, users
+
+    let private sudoSubject (value: SudoSubject) =
+        let args = SudoSubjectArgs()
+        match value with
+        | SudoSubject.User name ->
+            args.Kind <- input "user"
+            args.Name <- input name
+        | SudoSubject.Group name ->
+            args.Kind <- input "group"
+            args.Name <- input name
+        args
+
+    let private sudoRunAs (value: SudoRunAs) =
+        let args = SudoRunAsArgs()
+        match value with
+        | SudoRunAs.AllUsersAndGroups -> args.Kind <- input "all"
+        | SudoRunAs.SpecificRunAs(user, group) ->
+            args.Kind <- input "specific"
+            args.User <- input user
+            setOptional (fun item -> args.Group <- item) group
+        args
+
+    let private sudoArguments (value: SudoArguments) =
+        let args = SudoArgumentsArgs()
+        match value with
+        | SudoArguments.NoArguments -> args.Kind <- input "none"
+        | SudoArguments.Exact value ->
+            args.Kind <- input "exact"
+            args.Value <- input value
+        | SudoArguments.AnyArguments -> args.Kind <- input "any"
+        args
+
+    let private sudoCommand (value: SudoCommandSpec) =
+        let args = SudoCommandArgs()
+        args.Path <- input value.Path
+        args.Arguments <- sudoArguments value.Arguments |> input
+        args
+
+    let private sudoGrant (value: SudoGrantSpec) =
+        let args = SudoGrantArgs()
+        args.Subjects <-
+            value.Subjects
+            |> List.map sudoSubject
+            |> List.toArray
+            |> InputList<SudoSubjectArgs>.op_Implicit
+        args.RunAs <- sudoRunAs value.RunAs |> input
+        args.Authentication <-
+            input (
+                match value.Authentication with
+                | SudoAuthentication.Required -> "required"
+                | SudoAuthentication.Passwordless -> "passwordless"
+            )
+        args.AllCommands <- input value.AllCommands
+        args.Commands <-
+            value.Commands
+            |> List.map sudoCommand
+            |> List.toArray
+            |> InputList<SudoCommandArgs>.op_Implicit
+        args
+
+    let sudo (specification: SudoSpec) =
+        let grants = Dictionary<string, SudoGrantArgs>(StringComparer.Ordinal)
+        for KeyValue(name, value) in specification.Grants do grants.Add(name, sudoGrant value)
+        grants
 module Host =
     let deploy (host: HostSpec) =
         DomainValidation.validateHostSpec host
@@ -737,6 +1353,58 @@ module Host =
             else
                 []
 
+        let dockerPackage =
+            if host.Docker.IsSome && not (Map.containsKey "docker.io" host.Packages) then
+                // Install the shared Docker group before user access declarations are applied.
+                Some(createAptPackageSet (host.Name + "-docker-package") (Map.ofList [ "docker.io", None ]) [ mainApt :> Resource ] true)
+            else
+                None
+        let usersResource =
+            host.Users
+            |> Option.map (fun specification ->
+                let groups, users = AccessResourceMappings.users specification
+                let args = UsersArgs()
+                args.Connection <- Input<AptConnectionArgs>.op_Implicit connection
+                args.Groups <- InputMap<UserGroupArgs>.op_Implicit groups
+                args.Users <- InputMap<UserAccountArgs>.op_Implicit users
+                let dependencies =
+                    [ mainApt :> Resource ]
+                    @ (dockerPackage |> Option.map (fun resource -> resource :> Resource) |> Option.toList)
+                let options = ProviderContract.resourceOptionsWithDependencies dependencies
+                UsersResource(host.Name + "-users", args, options))
+
+        let sudoPackage =
+            match host.Sudo with
+            | None -> None
+            | Some _ ->
+                let prerequisiteResources =
+                    [ mainApt :> Resource ]
+                    @ (usersResource |> Option.map (fun resource -> resource :> Resource) |> Option.toList)
+                let packageSet =
+                    if Map.containsKey "sudo" host.Packages then
+                        mainApt
+                    else
+                        // Keep sudo installed after the owned grants are removed.
+                        createAptPackageSet
+                            (host.Name + "-sudo-package")
+                            (Map.ofList [ "sudo", None ])
+                            prerequisiteResources
+                            true
+                Some packageSet
+
+        match host.Sudo, sudoPackage with
+        | Some specification, Some packageSet ->
+            let args = SudoArgs()
+            args.Connection <- Input<AptConnectionArgs>.op_Implicit connection
+            args.Grants <- InputMap<SudoGrantArgs>.op_Implicit (AccessResourceMappings.sudo specification)
+            let dependencies =
+                [ packageSet :> Resource ]
+                @ (usersResource |> Option.map (fun resource -> resource :> Resource) |> Option.toList)
+            let options = ProviderContract.resourceOptionsWithDependencies dependencies
+            SudoResource(host.Name + "-sudo", args, options) |> ignore
+        | None, None -> ()
+        | _ -> invalidOp "A sudo declaration must have its APT prerequisite resource."
+
         let swapfilePackage =
             if host.Swapfile.IsSome && not (Map.containsKey "util-linux" host.Packages) then
                 // Keep the helper's util-linux prerequisite installed after swapfile removal.
@@ -766,19 +1434,7 @@ module Host =
             |> ignore
         | None -> ()
 
-        let dockerPackage =
-            if host.Docker.IsSome && not (Map.containsKey "docker.io" host.Packages) then
-                // Explicit APT declarations keep their original owner and removal semantics.
-                // An implicit Docker prerequisite is retained with the shared daemon.
-                Some(
-                    createAptPackageSet
-                        (host.Name + "-docker-package")
-                        (Map.ofList [ "docker.io", None ])
-                        [ mainApt :> Resource ]
-                        true
-                )
-            else
-                None
+
 
         let dockerContainers =
             match host.Docker with

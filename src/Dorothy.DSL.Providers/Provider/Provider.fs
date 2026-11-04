@@ -18,9 +18,11 @@ module private ProviderSchema =
             use sshdDocument = JsonDocument.Parse(SshdProvider.Schema)
             use fail2banDocument = JsonDocument.Parse(Fail2BanProvider.Schema)
             use swapfileDocument = JsonDocument.Parse(SwapfileProvider.Schema)
+            use usersDocument = JsonDocument.Parse(UsersProvider.Schema)
+            use sudoDocument = JsonDocument.Parse(SudoProvider.Schema)
             use stream = new MemoryStream()
             use writer = new Utf8JsonWriter(stream)
-            let documents = [ aptDocument; ufwDocument; traefikDocument; dockerEngineDocument; swapfileDocument; sshdDocument; fail2banDocument ]
+            let documents = [ aptDocument; ufwDocument; traefikDocument; dockerEngineDocument; swapfileDocument; sshdDocument; fail2banDocument; usersDocument; sudoDocument ]
 
             let writeMergedObject (propertyName: string) =
                 writer.WritePropertyName(propertyName)
@@ -53,6 +55,8 @@ type DorothyProvider() =
     let swapfile = SwapfileProvider()
     let sshd = SshdProvider()
     let fail2ban = Fail2BanProvider()
+    let users = UsersProvider()
+    let sudo = SudoProvider()
 
     static member Version = AptProvider.Version
 
@@ -75,6 +79,8 @@ type DorothyProvider() =
         elif request.Type = SwapfileProvider.ResourceToken then swapfile.Check(request, ct)
         elif request.Type = SshdProvider.ResourceToken then sshd.Check(request, ct)
         elif request.Type = Fail2BanProvider.ResourceToken then fail2ban.Check(request, ct)
+        elif request.Type = UsersProvider.ResourceToken then users.Check(request, ct)
+        elif request.Type = SudoProvider.ResourceToken then sudo.Check(request, ct)
         else apt.Check(request, ct)
 
     override _.Diff(request: DiffRequest, ct: CancellationToken) =
@@ -84,6 +90,8 @@ type DorothyProvider() =
         elif request.Type = SwapfileProvider.ResourceToken then swapfile.Diff(request, ct)
         elif request.Type = SshdProvider.ResourceToken then sshd.Diff(request, ct)
         elif request.Type = Fail2BanProvider.ResourceToken then fail2ban.Diff(request, ct)
+        elif request.Type = UsersProvider.ResourceToken then users.Diff(request, ct)
+        elif request.Type = SudoProvider.ResourceToken then sudo.Diff(request, ct)
         else apt.Diff(request, ct)
 
     override _.Create(request: CreateRequest, ct: CancellationToken) =
@@ -93,6 +101,8 @@ type DorothyProvider() =
         elif request.Type = SwapfileProvider.ResourceToken then swapfile.Create(request, ct)
         elif request.Type = SshdProvider.ResourceToken then sshd.Create(request, ct)
         elif request.Type = Fail2BanProvider.ResourceToken then fail2ban.Create(request, ct)
+        elif request.Type = UsersProvider.ResourceToken then users.Create(request, ct)
+        elif request.Type = SudoProvider.ResourceToken then sudo.Create(request, ct)
         else apt.Create(request, ct)
 
     override _.Read(request: ReadRequest, ct: CancellationToken) =
@@ -102,6 +112,8 @@ type DorothyProvider() =
         elif request.Type = SwapfileProvider.ResourceToken then swapfile.Read(request, ct)
         elif request.Type = SshdProvider.ResourceToken then sshd.Read(request, ct)
         elif request.Type = Fail2BanProvider.ResourceToken then fail2ban.Read(request, ct)
+        elif request.Type = UsersProvider.ResourceToken then users.Read(request, ct)
+        elif request.Type = SudoProvider.ResourceToken then sudo.Read(request, ct)
         else apt.Read(request, ct)
 
     override _.Update(request: UpdateRequest, ct: CancellationToken) =
@@ -111,6 +123,8 @@ type DorothyProvider() =
         elif request.Type = SwapfileProvider.ResourceToken then swapfile.Update(request, ct)
         elif request.Type = SshdProvider.ResourceToken then sshd.Update(request, ct)
         elif request.Type = Fail2BanProvider.ResourceToken then fail2ban.Update(request, ct)
+        elif request.Type = UsersProvider.ResourceToken then users.Update(request, ct)
+        elif request.Type = SudoProvider.ResourceToken then sudo.Update(request, ct)
         else apt.Update(request, ct)
 
     override _.Delete(request: DeleteRequest, ct: CancellationToken) =
@@ -120,4 +134,6 @@ type DorothyProvider() =
         elif request.Type = SwapfileProvider.ResourceToken then swapfile.Delete(request, ct)
         elif request.Type = SshdProvider.ResourceToken then sshd.Delete(request, ct)
         elif request.Type = Fail2BanProvider.ResourceToken then fail2ban.Delete(request, ct)
+        elif request.Type = UsersProvider.ResourceToken then users.Delete(request, ct)
+        elif request.Type = SudoProvider.ResourceToken then sudo.Delete(request, ct)
         else apt.Delete(request, ct)

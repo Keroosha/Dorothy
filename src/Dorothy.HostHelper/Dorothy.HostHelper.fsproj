@@ -19,6 +19,8 @@
     <Compile Include="Sshd.fs" />
     <Compile Include="Fail2BanNative.fs" />
     <Compile Include="Fail2Ban.fs" />
+    <Compile Include="Users.fs" />
+    <Compile Include="Sudo.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 </Project>

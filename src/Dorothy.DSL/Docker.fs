@@ -917,10 +917,8 @@ module DockerBuilders =
     let inline env key (value: ^T) : DockerContainerPart =
         ((^T or DockerFields) : (static member Env : string * ^T -> DockerContainerPart) (key, value))
 
-    let command argv = DockerContainerPart.Command argv
     let entrypoint argv = DockerContainerPart.Entrypoint argv
     let workingDir value = DockerContainerPart.WorkingDirectory value
-    let runAs value = DockerContainerPart.RunAs value
     let readOnlyRootFs value = DockerContainerPart.ReadOnlyRootFilesystem value
     let init value = DockerContainerPart.Init value
     let label key value = DockerContainerPart.Label(key, value)
