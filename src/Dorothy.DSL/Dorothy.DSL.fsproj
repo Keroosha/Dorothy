@@ -7,6 +7,7 @@
 
     <ItemGroup>
         <Compile Include="AssemblyInfo.fs" />
+        <Compile Include="Quantities.fs" />
         <Compile Include="Ufw.fs" />
         <Compile Include="Certificates.fs" />
         <Compile Include="Traefik.fs" />

@@ -1,12 +1,14 @@
 namespace Dorothy.Tests
 
 open System
+open System.Globalization
 open System.Collections.Generic
 open System.IO
 open System.Security.Cryptography
 open System.Text
 open System.Text.Json
 open System.Text.Json.Nodes
+open Dorothy.DSL
 open Dorothy.HostHelper
 open NUnit.Framework
 
@@ -979,3 +981,210 @@ type Fail2BanTests() =
         Assert.That(File.Exists(statePath host), Is.False)
         Assert.That(host.ServiceEvents, Is.Empty)
         Assert.That(host.ServiceActive, Is.False)
+
+[<TestFixture>]
+type Fail2BanDslTests() =
+    [<Test>]
+    member _.``Typed scalar helpers render exact invariant native values``() =
+        let originalCulture = CultureInfo.CurrentCulture
+
+        try
+            CultureInfo.CurrentCulture <- CultureInfo("fr-FR")
+
+            let input =
+                fail2ban {
+                    Fail2BanSections.daemon {
+                        Fail2BanDaemonOptions.loglevel (Fail2BanLogLevel.Numeric 20)
+                        Fail2BanDaemonOptions.logtarget (Fail2BanLogTarget.File "/var/log/fail2ban.log")
+                        Fail2BanDaemonOptions.syslogsocket Fail2BanSyslogSocket.Auto
+                        Fail2BanDaemonOptions.allowipv6 Fail2BanIpv6Mode.Disabled
+                        Fail2BanDaemonOptions.dbfile Fail2BanDatabase.InMemory
+                        Fail2BanDaemonOptions.dbmaxmatches 20
+                        Fail2BanDaemonOptions.dbpurgeage (TimeSpan.FromTicks 12_500_000L)
+                    }
+
+                    Fail2BanSections.thread {
+                        Fail2BanDaemonOptions.stacksize (Fail2BanStackSize.Size 64<KiB>)
+                    }
+
+                    Fail2BanSections.defaults {
+                        Fail2BanOptions.bantime (Fail2BanBanTime.Finite (TimeSpan.FromMinutes 1.))
+                        Fail2BanOptions.findtime (TimeSpan.FromTicks 12_500_000L)
+                        Fail2BanOptions.maxretry 5
+                        Fail2BanOptions.maxmatches 10
+                        Fail2BanOptions.bantimeFactor 1.5M
+                        Fail2BanOptions.bantimeMultipliers [ 1; 2; 4; 8 ]
+                        Fail2BanOptions.bantimeMaxtime (TimeSpan.FromTicks 25_000_000L)
+                        Fail2BanOptions.bantimeRndtime (TimeSpan.FromTicks 1L)
+                        Fail2BanOptions.ignorecache
+                            (Fail2BanIgnoreCache.Enabled
+                                {
+                                    Key = "<F-USER>@<ip-host>"
+                                    MaxCount = Some 100
+                                    MaxTime = Some (TimeSpan.FromTicks 12_500_000L)
+                                })
+                    }
+
+                    Fail2BanSections.jail "sshd" {
+                        Fail2BanOptions.backend Fail2BanBackend.Systemd
+                        Fail2BanOptions.usedns Fail2BanDnsMode.Raw
+                    }
+
+                    Fail2BanSections.actionInit "custom" {
+                        Fail2BanActionOptions.timeout (TimeSpan.FromTicks 12_500_000L)
+                        Fail2BanActionOptions.actionstartOnDemand true
+                        Fail2BanActionOptions.actionrepairOnUnban false
+
+                        Fail2BanActionOptions.families
+                            (Fail2BanFamilies.Only [ Fail2BanAddressFamily.Inet4; Fail2BanAddressFamily.Inet6 ])
+
+                        Fail2BanActionOptions.norestored true
+                    }
+                }
+
+            let files = (Fail2BanConfigurationMerge.combine [ input, false ]).Files
+
+            Assert.That(
+                files["fail2ban.d/90-dorothy.local"],
+                Does.Contain(
+                    "[Definition]\nloglevel = 20\nlogtarget = /var/log/fail2ban.log\nsyslogsocket = auto\nallowipv6 = no\ndbfile = :memory:\ndbmaxmatches = 20\ndbpurgeage = 1.25s\n"
+                )
+            )
+
+            Assert.That(
+                files["fail2ban.d/90-dorothy.local"],
+                Does.Contain("[Thread]\nstacksize = 64\n")
+            )
+
+            Assert.That(
+                files["jail.d/90-dorothy.local"],
+                Does.Contain(
+                    "[DEFAULT]\nbantime = 60\nfindtime = 1.25s\nmaxretry = 5\nmaxmatches = 10\nbantime.factor = 1.5\nbantime.multipliers = 1 2 4 8\nbantime.maxtime = 2.5s\nbantime.rndtime = 0.0000001s\nignorecache = key=\"<F-USER>@<ip-host>\", max-count=100, max-time=1.25s\n"
+                )
+            )
+
+            Assert.That(
+                files["jail.d/90-dorothy.local"],
+                Does.Contain("[sshd]\nbackend = systemd\nusedns = raw\n")
+            )
+
+            Assert.That(
+                files["action.d/custom.local"],
+                Does.Contain(
+                    "[Init]\ntimeout = 1.25s\nactionstart_on_demand = true\nactionrepair_on_unban = false\nfamilies = inet4 inet6\nnorestored = true\n"
+                )
+            )
+        finally
+            CultureInfo.CurrentCulture <- originalCulture
+
+    [<Test>]
+    member _.``Native month durations remain available through explicit custom text``() =
+        let input = fail2ban { Fail2BanOptions.custom "bantime" "1mo" }
+        let files = (Fail2BanConfigurationMerge.combine [ input, false ]).Files
+
+        Assert.That(
+            files["jail.d/90-dorothy.local"],
+            Is.EqualTo("[DEFAULT]\nbantime = 1mo\n")
+        )
+
+        Assert.That(
+            (Fail2BanOptions.bantime Fail2BanBanTime.Permanent).Value,
+            Is.EqualTo("-1")
+        )
+
+        let defaults: Fail2BanIgnoreCacheSettings =
+            {
+                Key = "ip"
+                MaxCount = None
+                MaxTime = None
+            }
+
+        Assert.That(
+            (Fail2BanOptions.ignorecache (Fail2BanIgnoreCache.Enabled defaults)).Value,
+            Is.EqualTo("key=\"ip\"")
+        )
+
+        Assert.That(
+            (Fail2BanOptions.ignorecache Fail2BanIgnoreCache.Disabled).Value,
+            Is.Empty
+        )
+
+        Assert.That(
+            (Fail2BanDaemonOptions.stacksize Fail2BanStackSize.PlatformDefault).Value,
+            Is.EqualTo("0")
+        )
+
+        Assert.That(
+            (Fail2BanDaemonOptions.allowipv6 Fail2BanIpv6Mode.Auto).Value,
+            Is.EqualTo("auto")
+        )
+
+        Assert.That(
+            (Fail2BanDaemonOptions.dbfile Fail2BanDatabase.Disabled).Value,
+            Is.EqualTo("None")
+        )
+
+        Assert.That(
+            (Fail2BanDaemonOptions.dbfile Fail2BanDatabase.InMemory).Value,
+            Is.EqualTo(":memory:")
+        )
+
+        Assert.That(
+            (Fail2BanDaemonOptions.syslogsocket
+                (Fail2BanSyslogSocket.Path "/run/fail2ban/log.sock"))
+                .Value,
+            Is.EqualTo("/run/fail2ban/log.sock")
+        )
+
+        Assert.That(
+            (Fail2BanActionOptions.families Fail2BanFamilies.Default).Value,
+            Is.Empty
+        )
+
+    [<Test>]
+    member _.``Typed native sentinels and limits reject ambiguous or truncated values``() =
+        let expectInvalid action =
+            Assert.Throws<ArgumentException>(TestDelegate action) |> ignore
+
+        expectInvalid (fun () ->
+            Fail2BanOptions.bantime
+                (Fail2BanBanTime.Finite (TimeSpan.FromMilliseconds 1500.))
+            |> ignore)
+
+        expectInvalid (fun () ->
+            Fail2BanOptions.bantime (Fail2BanBanTime.Finite (TimeSpan.FromSeconds(-1.)))
+            |> ignore)
+
+        expectInvalid (fun () ->
+            Fail2BanDaemonOptions.stacksize (Fail2BanStackSize.Size 31<KiB>)
+            |> ignore)
+
+        expectInvalid (fun () ->
+            Fail2BanOptions.ignorecache
+                (Fail2BanIgnoreCache.Enabled
+                    {
+                        Key = "ip"
+                        MaxCount = None
+                        MaxTime = Some (TimeSpan.FromSeconds(-1.))
+                    })
+            |> ignore)
+
+        expectInvalid (fun () ->
+            Fail2BanDaemonOptions.dbfile (Fail2BanDatabase.File "None")
+            |> ignore)
+
+        expectInvalid (fun () ->
+            Fail2BanDaemonOptions.syslogsocket (Fail2BanSyslogSocket.Path "auto")
+            |> ignore)
+
+        expectInvalid (fun () ->
+            Fail2BanDaemonOptions.logtarget (Fail2BanLogTarget.File "stdout")
+            |> ignore)
+
+        expectInvalid (fun () ->
+            Fail2BanActionOptions.families (Fail2BanFamilies.Only [])
+            |> ignore)
+
+        expectInvalid (fun () ->
+            Fail2BanDaemonOptions.loglevel (Fail2BanLogLevel.Numeric -1)
+            |> ignore)

@@ -401,10 +401,21 @@ type DockerDslTests() =
         ]
 
         let durationLimit = TimeSpan.FromTicks(Int64.MaxValue / 100L)
+        let withWaitHealthy name timeout =
+            container name {
+                image "registry.example.test/team/api:1.0"
+                restart unlessStopped
+                healthcheck { healthExec [ "/usr/bin/true" ] }
+                waitHealthy timeout
+            }
+        let maximumWait = TimeSpan.FromTicks(int64 Int32.MaxValue * int64 TimeSpan.TicksPerSecond)
+        let overMaximumWait = TimeSpan.FromTicks(maximumWait.Ticks + 1L)
 
         // Act / Assert
         DockerDslTestHelpers.expectArgumentException (fun () -> waitWithoutHealthcheck () |> ignore)
         for action in invalidDurations do DockerDslTestHelpers.expectArgumentException action
+        DockerDslTestHelpers.expectArgumentException (fun () ->
+            withWaitHealthy "over-maximum-wait" overMaximumWait |> ignore)
 
         let valid =
             container "healthy-api" {
@@ -429,29 +440,12 @@ type DockerDslTests() =
                     healthExec [ "/usr/bin/true" ]
                     interval durationLimit
                 }
-                waitHealthy durationLimit
             }
         Assert.That(durationBoundary.Healthcheck.Value.Interval, Is.EqualTo(Some durationLimit))
-        Assert.That(durationBoundary.WaitHealthy, Is.EqualTo(Some durationLimit))
-
-    [<Test>]
-    member _.``Docker duration formatting uses canonical Go spellings``() =
-        let cases: (TimeSpan * string) list = [
-            TimeSpan.Zero, "0s"
-            TimeSpan.FromTicks(1L), "100ns"
-            TimeSpan.FromTicks(10L), "1µs"
-            TimeSpan.FromTicks(15L), "1.5µs"
-            TimeSpan.FromMilliseconds(1.5), "1.5ms"
-            TimeSpan.FromSeconds(1.0), "1s"
-            TimeSpan.FromTicks(TimeSpan.TicksPerSecond + 1L), "1.0000001s"
-            TimeSpan.FromMinutes(1.0), "1m0s"
-            TimeSpan.FromMinutes(1.0).Add(TimeSpan.FromSeconds(30.0)), "1m30s"
-            TimeSpan.FromHours(1.0), "1h0m0s"
-            TimeSpan.FromHours(1.0).Add(TimeSpan.FromMinutes(1.0)).Add(TimeSpan.FromMilliseconds(1500.0)), "1h1m1.5s"
-        ]
-
-        for duration, expected in cases do
-            Assert.That(DockerDeployment.duration duration, Is.EqualTo(expected))
+        let maximumWaitContainer = withWaitHealthy "maximum-wait" maximumWait
+        Assert.That(maximumWaitContainer.WaitHealthy, Is.EqualTo(Some maximumWait))
+        let subsecondWaitContainer = withWaitHealthy "subsecond-wait" (TimeSpan.FromTicks(1L))
+        Assert.That(subsecondWaitContainer.WaitHealthy, Is.EqualTo(Some(TimeSpan.FromTicks(1L))))
 
     [<Test>]
     member _.``Docker service CE coexists with UFW and shares its transport helper``() =

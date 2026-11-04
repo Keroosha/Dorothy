@@ -11,12 +11,6 @@ open System.Threading
 open System.Threading.Tasks
 open Pulumi
 
-[<Measure>]
-type cpu
-
-[<Measure>]
-type MiB
-
 type DockerNetworkDriver =
     | Bridge
 
@@ -372,6 +366,18 @@ module internal DockerValidation =
         if value <= TimeSpan.Zero || value.Ticks > Int64.MaxValue / 100L then
             invalidArg parameterName (sprintf "Docker %s must be positive and fit in the Docker duration range." description)
         value
+
+    let waitHealthySeconds (value: TimeSpan) =
+        if value <= TimeSpan.Zero then
+            invalidArg "waitHealthy" "Docker health wait duration must be positive."
+        let ticks = value.Ticks
+        let wholeSeconds = ticks / int64 TimeSpan.TicksPerSecond
+        let roundedUpSeconds =
+            if ticks % int64 TimeSpan.TicksPerSecond = 0L then wholeSeconds
+            else wholeSeconds + 1L
+        if roundedUpSeconds > int64 Int32.MaxValue then
+            invalidArg "waitHealthy" "Docker health wait duration ceiling must fit in Int32 seconds."
+        int roundedUpSeconds
 
     let validatePositiveRetries parameterName description (value: int) =
         if value < 1 then invalidArg parameterName (sprintf "Docker %s must be positive." description)
@@ -759,7 +765,11 @@ type DockerContainerBuilder internal (name: string) =
                 port.HostAddress, port.HostPort, protocolOrder, port.ContainerPort)
         DockerValidation.validateNoOverlappingPorts publishedPorts
 
-        let waitHealthy = waitHealthy |> Option.map (DockerValidation.validateDuration "waitHealthy" "health wait duration")
+        let waitHealthy =
+            waitHealthy
+            |> Option.map (fun value ->
+                DockerValidation.waitHealthySeconds value |> ignore
+                value)
         if waitHealthy.IsSome && healthcheck.IsNone then
             invalidArg "waitHealthy" "waitHealthy requires an explicitly declared healthcheck."
 

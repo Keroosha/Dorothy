@@ -205,7 +205,7 @@ module internal DockerDeployment =
                 args.Healthcheck <- input value)
             container.WaitHealthy |> Option.iter (fun timeout ->
                 args.Wait <- input true
-                args.WaitTimeout <- input (int (Math.Ceiling timeout.TotalSeconds)))
+                args.WaitTimeout <- input (DockerValidation.waitHealthySeconds timeout))
             for file in container.Files do
                 let value = ContainerUploadArgs()
                 value.File <- input file.Path
