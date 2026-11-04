@@ -1,578 +1,981 @@
 namespace Dorothy.Tests
 
 open System
+open System.Collections.Generic
 open System.IO
 open System.Security.Cryptography
+open System.Text
 open System.Text.Json
 open System.Text.Json.Nodes
 open Dorothy.HostHelper
 open NUnit.Framework
 
 module private Fail2BanTestRequests =
-    let json (operation: string) (owner: string) (enabled: bool) (maxRetry: int) (findTimeSeconds: int) (banTimeSeconds: int) (ignoreIps: string list) (ports: int list) =
+    let json
+        (operation: string)
+        (owner: string)
+        (files: Map<string, string>)
+        (manageSshdPorts: bool)
+        (sshdPorts: int list)
+        =
         let request = JsonObject()
         request["operation"] <- JsonValue.Create operation
         request["ownerId"] <- JsonValue.Create owner
-        request["enabled"] <- JsonValue.Create enabled
-        request["maxRetry"] <- JsonValue.Create maxRetry
-        request["findTimeSeconds"] <- JsonValue.Create findTimeSeconds
-        request["banTimeSeconds"] <- JsonValue.Create banTimeSeconds
-        let ips = JsonArray()
-        for ip in ignoreIps do ips.Add(JsonValue.Create ip)
-        request["ignoreIps"] <- ips
-        let portArray = JsonArray()
-        for port in ports do portArray.Add(JsonValue.Create port)
-        request["ports"] <- portArray
+        let fileObject = JsonObject()
+
+        for KeyValue(path, contents) in files do
+            fileObject[path] <- JsonValue.Create contents
+
+        request["files"] <- fileObject
+        request["manageSshdPorts"] <- JsonValue.Create manageSshdPorts
+        let ports = JsonArray()
+
+        for port in sshdPorts do
+            ports.Add(JsonValue.Create port)
+
+        request["sshdPorts"] <- ports
         request.ToJsonString()
 
     let invoke (environment: HostEnvironment) (request: string) =
         use document = JsonDocument.Parse request
         Fail2Ban.handle environment document.RootElement
 
+    let emptyFiles = Map.empty<string, string>
+    let privateFileMode = UnixFileMode.UserRead ||| UnixFileMode.UserWrite
+
+    let actualFile (snapshot: JsonNode) (path: string) =
+        let files = snapshot["actualFiles"].AsObject()
+        files[path].GetValue<string>()
+
 [<Sealed>]
 type private FakeFail2BanHost() =
-    let temporary = new TemporaryDirectory("keroosha-fail2ban-")
+    let temporary = new TemporaryDirectory("dorothy-fail2ban-")
     let root = temporary.Path
     let calls = ResizeArray<string * string list>()
+    let serviceEvents = ResizeArray<string * Map<string, string>>()
     let mutable serviceEnabled = false
     let mutable serviceActive = false
-    let mutable failValidationWhenOwned = false
-    let mutable forceEffectiveSshdJail = false
-    let mutable runtimeBanTimeOverride: int option = None
-    let mutable runtimeActionBanOverride: string option = None
-    let mutable runtimeIgnoreRegexOverride: string option = None
-    let mutable runtimeActionsOverride: string array option = None
-    let mutable dumpAdditionalAction = false
-    let mutable dumpIgnoreRegex = false
-    let mutable sshdOutput = "port 22\nport 2222\nlistenaddress 0.0.0.0:22\nlistenaddress [::]:22\nlistenaddress 0.0.0.0:2222\nlistenaddress [::]:2222\n"
-    let mutable sshdExecReloadProperties =
-        [| "ExecReload={ path=/usr/sbin/sshd ; argv[]=/usr/sbin/sshd -t ; ignore_errors=no }"
-           "ExecReload={ path=/bin/kill ; argv[]=/bin/kill -HUP $MAINPID ; ignore_errors=no }" |]
-    let mutable packageConffiles = ""
-    let stockFilterPath = Path.Combine(root, "etc", "fail2ban", "filter.d", "sshd.conf")
-    let stockCommonFilterPath = Path.Combine(root, "etc", "fail2ban", "filter.d", "common.conf")
-    let stockActionPath = Path.Combine(root, "etc", "fail2ban", "action.d", "nftables.conf")
-    let digest path =
-        MD5.HashData(File.ReadAllBytes path) |> Convert.ToHexString |> fun value -> value.ToLowerInvariant()
-    let jailPath = Path.Combine(root, "etc", "fail2ban", "jail.d", "90-dorothy-sshd.local")
-    let journalPath = Path.Combine(root, "var", "lib", "keroosha-iac", "fail2ban", "sshd.json")
-    let path (logicalPath: string) = Path.Combine(root, logicalPath.TrimStart([| '/'; '\\' |]))
+    let mutable serviceFailed = false
+    let mutable failNextReload = false
+    let mutable failNextStart = false
+    let mutable failValidation = false
+    let mutable runtimeDrift = false
+    let mutable notReadyObservations = 0
+    let mutable nativeObserveCount = 0
+    let mutable runningFingerprint = ""
+    let sshdOutput = "listenaddress 127.0.0.1:22\nlistenaddress [::1]:2222\n"
 
-    let setting name =
-        if not (File.Exists jailPath) then ""
+    let path (logicalPath: string) =
+        Path.Combine(root, logicalPath.TrimStart([| '/'; '\\' |]))
+
+    let configPath = path "/etc/fail2ban"
+    let baseDaemonPath = path "/etc/fail2ban/fail2ban.conf"
+    let baseJailPath = path "/etc/fail2ban/jail.conf"
+
+
+    let captureFiles () =
+        if not (Directory.Exists configPath) then
+            Map.empty
         else
-            File.ReadAllLines jailPath
-            |> Array.tryPick (fun line ->
-                let trimmed = line.Trim()
-                let prefix = name + " ="
-                if trimmed.StartsWith(prefix, StringComparison.OrdinalIgnoreCase) then
-                    Some(trimmed.Substring(prefix.Length).Trim())
-                else None)
-            |> Option.defaultValue ""
+            Directory.EnumerateFiles(configPath, "*", SearchOption.AllDirectories)
+            |> Seq.choose (fun file ->
+                let relative =
+                    Path.GetRelativePath(configPath, file).Replace(Path.DirectorySeparatorChar, '/')
 
-    let ignoreIps () =
-        (setting "ignoreip").Split([| ' '; '\t' |], StringSplitOptions.RemoveEmptyEntries)
+                try
+                    Some(relative, File.ReadAllText file)
+                with
+                | :? FileNotFoundException -> None
+                | :? DirectoryNotFoundException -> None)
+            |> Map.ofSeq
 
-    let pythonString (value: string) =
-        "'" + value.Replace("\\", "\\\\", StringComparison.Ordinal).Replace("'", "\\'", StringComparison.Ordinal).Replace("\r", "\\r", StringComparison.Ordinal).Replace("\n", "\\n", StringComparison.Ordinal) + "'"
+    let configFingerprint (directory: string) =
+        let builder = StringBuilder()
 
-    let actionValues port =
-        let actionStart =
-            String.concat "\n" [
-                "nft add table inet f2b-table"
-                "nft -- add chain inet f2b-table f2b-chain \\{ type filter hook input priority -1 \\; \\}"
-                "nft add set inet f2b-table <addr_set> \\{ type <addr_type>\\; \\}"
-                "for proto in $(echo 'tcp' | sed 's/,/ /g'); do"
-                "nft add rule inet f2b-table f2b-chain $proto dport \\{ $(echo '" + port + "' | sed s/:/-/g) \\} <addr_family> saddr @<addr_set> reject"
-                "done"
+        if Directory.Exists directory then
+            Directory.EnumerateFiles(directory, "*", SearchOption.AllDirectories)
+            |> Seq.sortWith (fun left right ->
+                StringComparer.Ordinal.Compare(
+                    Path.GetRelativePath(directory, left),
+                    Path.GetRelativePath(directory, right)
+                ))
+            |> Seq.iter (fun file ->
+                builder
+                    .Append(Path.GetRelativePath(directory, file).Replace(Path.DirectorySeparatorChar, '/'))
+                    .Append('\u0000')
+                |> ignore
+
+                try
+                    builder.Append(File.ReadAllText file).Append('\u0000') |> ignore
+                with
+                | :? FileNotFoundException -> builder.Append("<unreadable>\u0000") |> ignore
+                | :? DirectoryNotFoundException -> builder.Append("<unreadable>\u0000") |> ignore)
+
+        SHA256.HashData(Encoding.UTF8.GetBytes(builder.ToString()))
+        |> Convert.ToHexString
+        |> fun value -> value.ToLowerInvariant()
+
+    let daemonValues (directory: string) =
+        let values = Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+        let orderedFiles = ResizeArray<string>()
+        let baseConfig = Path.Combine(directory, "fail2ban.conf")
+
+        if File.Exists baseConfig then
+            orderedFiles.Add baseConfig
+
+        let daemonDropins = Path.Combine(directory, "fail2ban.d")
+
+        if Directory.Exists daemonDropins then
+            Directory.EnumerateFiles(daemonDropins, "*.conf")
+            |> Seq.sortWith (fun left right -> StringComparer.Ordinal.Compare(left, right))
+            |> Seq.iter orderedFiles.Add
+
+        let localConfig = Path.Combine(directory, "fail2ban.local")
+
+        if File.Exists localConfig then
+            orderedFiles.Add localConfig
+
+        if Directory.Exists daemonDropins then
+            Directory.EnumerateFiles(daemonDropins, "*.local")
+            |> Seq.sortWith (fun left right -> StringComparer.Ordinal.Compare(left, right))
+            |> Seq.iter orderedFiles.Add
+
+        for file in orderedFiles do
+            let mutable section = ""
+
+            for rawLine in File.ReadAllLines file do
+                let line = rawLine.Trim()
+
+                if
+                    line.StartsWith("[", StringComparison.Ordinal)
+                    && line.EndsWith("]", StringComparison.Ordinal)
+                then
+                    section <- line.Substring(1, line.Length - 2).Trim()
+                elif
+                    line.Length > 0
+                    && not (
+                        line.StartsWith("#", StringComparison.Ordinal)
+                        || line.StartsWith(";", StringComparison.Ordinal)
+                    )
+                then
+                    let separator = line.IndexOf('=')
+
+                    if separator > 0 then
+                        let name = line.Substring(0, separator).Trim()
+                        let value = line.Substring(separator + 1).Trim()
+                        values[section + "/" + name] <- value
+
+        values
+
+    let enabledJails (directory: string) =
+        let states = Dictionary<string, bool>(StringComparer.Ordinal)
+        let paths = ResizeArray<string>()
+
+        for baseName in [ "jail.conf"; "jail.local" ] do
+            let candidate = Path.Combine(directory, baseName)
+
+            if File.Exists candidate then
+                paths.Add candidate
+
+        let jailDropins = Path.Combine(directory, "jail.d")
+
+        if Directory.Exists jailDropins then
+            Directory.EnumerateFiles(jailDropins)
+            |> Seq.filter (fun file ->
+                file.EndsWith(".conf", StringComparison.Ordinal)
+                || file.EndsWith(".local", StringComparison.Ordinal))
+            |> Seq.sortWith (fun left right -> StringComparer.Ordinal.Compare(left, right))
+            |> Seq.iter paths.Add
+
+        for file in paths do
+            let mutable section = ""
+
+            for rawLine in File.ReadAllLines file do
+                let line = rawLine.Trim()
+
+                if
+                    line.StartsWith("[", StringComparison.Ordinal)
+                    && line.EndsWith("]", StringComparison.Ordinal)
+                then
+                    section <- line.Substring(1, line.Length - 2).Trim()
+                elif
+                    section.Length > 0
+                    && not (section.Equals("DEFAULT", StringComparison.OrdinalIgnoreCase))
+                then
+                    let separator = line.IndexOf('=')
+
+                    if
+                        separator > 0
+                        && line.Substring(0, separator).Trim().Equals("enabled", StringComparison.OrdinalIgnoreCase)
+                    then
+                        let value = line.Substring(separator + 1).Trim()
+
+                        states[section] <-
+                            value.Equals("true", StringComparison.OrdinalIgnoreCase)
+                            || value.Equals("yes", StringComparison.OrdinalIgnoreCase)
+
+        states
+        |> Seq.choose (fun pair -> if pair.Value then Some pair.Key else None)
+        |> Seq.sortWith (fun left right -> StringComparer.Ordinal.Compare(left, right))
+        |> Seq.toList
+
+    let nativeResult (result: JsonObject) =
+        let envelope = JsonObject()
+        envelope["ok"] <- JsonValue.Create true
+        envelope["result"] <- result
+
+        {
+            ExitCode = 0
+            Stdout = envelope.ToJsonString()
+            Stderr = ""
+        }
+
+    let nativeFailure () =
+        {
+            ExitCode = 2
+            Stdout = ""
+            Stderr = "native configuration diagnostic must not escape"
+        }
+
+    let handleBridge (requestText: string) =
+        use request = JsonDocument.Parse requestText
+        let body = request.RootElement
+        let operation = body.GetProperty("operation").GetString()
+        let directory = body.GetProperty("configRoot").GetString()
+        let fingerprint = configFingerprint directory
+        let values = daemonValues directory
+
+        let get key fallback =
+            match values.TryGetValue key with
+            | true, value -> value
+            | _ -> fallback
+
+        let socket = get "Definition/socket" "/var/run/fail2ban/fail2ban.sock"
+        let pidFile = get "Definition/pidfile" "/var/run/fail2ban/fail2ban.pid"
+
+        let startupValues =
+            [
+                "Definition/socket", socket
+                "Definition/pidfile", pidFile
+                "Definition/dbfile", get "Definition/dbfile" "/var/lib/fail2ban/fail2ban.sqlite3"
+                "Definition/allowipv6", get "Definition/allowipv6" "auto"
+                "Definition/loglevel", get "Definition/loglevel" "INFO"
+                "Definition/logtarget", get "Definition/logtarget" "STDOUT"
+                "Definition/syslogsocket", get "Definition/syslogsocket" "auto"
+                "Thread/stacksize", get "Thread/stacksize" "0"
             ]
-        let actionStop =
-            String.concat "\n" [
-                "{ nft -a list chain inet f2b-table f2b-chain | grep -oP '@<addr_set>\\s+.*\\s+\\Khandle\\s+(\\d+)$'; } | while read -r hdl; do"
-                "nft delete rule inet f2b-table f2b-chain $hdl; done"
-                "nft delete set inet f2b-table <addr_set>"
-                "{ nft list table inet f2b-table | grep -qP '^\\s+set\\s+'; } || {"
-                "nft delete table inet f2b-table"
-                "}"
-            ]
-        let actionCheck = "nft list chain inet f2b-table f2b-chain | grep -q '@<addr_set>[ \\t]'"
-        [ "type", "multiport"
-          "actionstart", actionStart
-          "actionstop", actionStop
-          "actioncheck", actionCheck
-          "actionban", "nft add element inet f2b-table <addr_set> \\{ <ip> \\}"
-          "actionunban", "nft delete element inet f2b-table <addr_set> \\{ <ip> \\}"
-          "port", port
-          "protocol", "tcp" ]
 
-    let actionOutput property =
-        match property with
-        | "actionban" -> runtimeActionBanOverride |> Option.defaultValue (actionValues (setting "port") |> List.find (fun (name, _) -> name = property) |> snd)
-        | _ -> actionValues (setting "port") |> List.tryPick (fun (name, value) -> if name = property then Some value else None) |> Option.defaultValue ""
+        let startupText =
+            startupValues
+            |> List.map (fun (key, value) -> key + "=" + value)
+            |> String.concat "\n"
 
-    let policyDump () =
-        if not (File.Exists jailPath) || (setting "enabled" <> "true" && not forceEffectiveSshdJail) then "[]\n"
-        else
-            let port = setting "port"
-            let ignoreCommands = ignoreIps () |> Array.map (fun ip -> "['set', 'sshd', 'addignoreip', " + pythonString ip + "]")
-            let actionProperties =
-                actionValues port
-                |> List.map (fun (name, value) -> "[" + pythonString name + ", " + pythonString value + "]")
-                |> String.concat ", "
-            let actionLine = "['multi-set', 'sshd', 'action', 'nftables', [" + actionProperties + "]]"
-            let extraActions =
-                if dumpAdditionalAction then [| "['set', 'sshd', 'addaction', 'allports']" |]
-                else [||]
-            let ignoreRegexCommand =
-                if dumpIgnoreRegex then [| "['set', 'sshd', 'addignoreregex', '^Ignore this authentication failure$']" |]
-                else [||]
-            String.concat "\n" (Array.concat [
-                [| "['add', 'sshd', 'systemd']"
-                   "['set', 'sshd', 'usedns', 'no']"
-                   "['set', 'sshd', 'maxretry', " + setting "maxretry" + "]"
-                   "['set', 'sshd', 'findtime', " + pythonString (setting "findtime") + "]"
-                   "['set', 'sshd', 'bantime', " + pythonString (setting "bantime") + "]" |]
-                ignoreCommands
-                [| "['set', 'sshd', 'addaction', 'nftables']"
-                   actionLine |]
-                extraActions
-                ignoreRegexCommand
-                [| "['multi-set', 'sshd', 'addfailregex', ['^Failed password for invalid user.*$', '^Invalid user .*$', '^Too many authentication failures.*$']]"
-                   "['set', 'sshd', 'addjournalmatch', '_SYSTEMD_UNIT=ssh.service']"
-                   "['set', 'sshd', 'addjournalmatch', '+']"
-                   "['set', 'sshd', 'addjournalmatch', '_COMM=sshd']"
-                   "['start', 'sshd']" |]
-            ]) + "\n"
+        let startupFingerprint =
+            SHA256.HashData(Encoding.UTF8.GetBytes startupText)
+            |> Convert.ToHexString
+            |> fun value -> value.ToLowerInvariant()
 
-    let runtimeOutput field =
-        match field with
-        | "maxretry" -> setting "maxretry"
-        | "findtime" -> setting "findtime"
-        | "bantime" -> runtimeBanTimeOverride |> Option.map string |> Option.defaultValue (setting "bantime")
-        | "usedns" -> setting "usedns"
-        | "ignoreip" -> "The following IP addresses/networks are ignored:\n|- " + String.Join("\n|- ", ignoreIps ()) + "\n"
-        | "failregex" -> "1) ^Failed password for invalid user.*$\n2) ^Invalid user .*$\n3) ^Too many authentication failures.*$\n"
-        | "ignoreregex" -> runtimeIgnoreRegexOverride |> Option.defaultValue "No regular expression is defined\n"
-        | "journalmatch" -> "Current match filter:\n_SYSTEMD_UNIT=ssh.service + _COMM=sshd\n"
-        | _ -> ""
+        let jails = enabledJails directory
+        let result = JsonObject()
 
-    let run executable arguments _ =
+        match operation with
+        | "validate" ->
+            let containsInvalid =
+                Directory.EnumerateFiles(directory, "*", SearchOption.AllDirectories)
+                |> Seq.exists (fun file ->
+                    try
+                        File.ReadAllText(file).Contains("native-invalid", StringComparison.Ordinal)
+                    with
+                    | :? FileNotFoundException -> false
+                    | :? DirectoryNotFoundException -> false)
+
+            if containsInvalid then
+                nativeFailure ()
+            else
+                result["validated"] <- JsonValue.Create true
+                nativeResult result
+        | "inspect" ->
+            result["socket"] <- JsonValue.Create socket
+            result["pidfile"] <- JsonValue.Create pidFile
+            result["fingerprint"] <- JsonValue.Create fingerprint
+            result["startupFingerprint"] <- JsonValue.Create startupFingerprint
+            let jailArray = JsonArray()
+
+            for jail in jails do
+                jailArray.Add(JsonValue.Create jail)
+
+            result["enabledJails"] <- jailArray
+            nativeResult result
+        | "observe" ->
+            nativeObserveCount <- nativeObserveCount + 1
+            let configuration = body.GetProperty "configuration"
+            let expectedFingerprint = configuration.GetProperty("fingerprint").GetString()
+
+            let expectedStartupFingerprint =
+                configuration.GetProperty("startupFingerprint").GetString()
+
+            result["fingerprint"] <- JsonValue.Create fingerprint
+            result["startupFingerprint"] <- JsonValue.Create startupFingerprint
+            let active = if serviceActive then jails else []
+            let jailArray = JsonArray()
+
+            for jail in active do
+                jailArray.Add(JsonValue.Create jail)
+
+            result["activeJails"] <- jailArray
+            let stillStarting = notReadyObservations > 0
+
+            if stillStarting then
+                notReadyObservations <- notReadyObservations - 1
+
+            result["inSync"] <-
+                JsonValue.Create(
+                    serviceActive
+                    && not stillStarting
+                    && not runtimeDrift
+                    && runningFingerprint = fingerprint
+                    && expectedFingerprint = fingerprint
+                    && expectedStartupFingerprint = startupFingerprint
+                )
+
+            nativeResult result
+        | _ -> nativeFailure ()
+
+    let run executable arguments standardInput =
         calls.Add(executable, arguments)
-        match executable, arguments with
-        | "/usr/sbin/sshd", [ "-T" ] ->
-            { ExitCode = 0; Stdout = sshdOutput; Stderr = "" }
-        | "dpkg-query", [ "-W"; "-f=${Conffiles}"; "fail2ban" ] ->
-            { ExitCode = 0; Stdout = packageConffiles; Stderr = "" }
-        | "fail2ban-client", [ "--str2sec"; "10m" ] ->
-            { ExitCode = 0; Stdout = "600\n"; Stderr = "" }
-        | "fail2ban-client", [ "--str2sec"; "1h" ] ->
-            { ExitCode = 0; Stdout = "3600\n"; Stderr = "" }
-        | "fail2ban-client", [ "-t" ] when failValidationWhenOwned && File.Exists jailPath ->
-            { ExitCode = 1; Stdout = ""; Stderr = "invalid jail configuration" }
-        | "fail2ban-client", [ "-t" ] ->
-            { ExitCode = 0; Stdout = "OK\n"; Stderr = "" }
-        | "fail2ban-client", [ "-d" ] ->
-            { ExitCode = 0; Stdout = policyDump (); Stderr = "" }
-        | "systemctl", [ "show"; "--no-pager"; "--property=LoadState"; "--property=ActiveState"; "--property=ExecStart"; "--property=ExecReload"; "--property=Environment"; "--property=EnvironmentFiles"; "ssh.service" ] ->
-            { ExitCode = 0
-              Stdout =
-                "LoadState=loaded\nActiveState=active\n"
-                + "ExecStart={ path=/usr/sbin/sshd ; argv[]=/usr/sbin/sshd -D $SSHD_OPTS ; ignore_errors=no }\n"
-                + String.concat "\n" sshdExecReloadProperties
-                + "\nEnvironment=\nEnvironmentFiles=/etc/default/ssh (ignore_errors=yes)\n"
-              Stderr = "" }
-        | "systemctl", [ "show"; "--no-pager"; "--property=LoadState"; "--property=UnitFileState"; "--property=ActiveState"; "ssh.socket" ] ->
-            { ExitCode = 0; Stdout = "LoadState=not-found\nUnitFileState=disabled\nActiveState=inactive\n"; Stderr = "" }
-        | "systemctl", [ "show"; "--no-pager"; "--property=LoadState"; "--property=UnitFileState"; "--property=ActiveState"; "fail2ban.service" ] ->
-            { ExitCode = 0
-              Stdout =
-                "LoadState=loaded\nUnitFileState=" + (if serviceEnabled then "enabled" else "disabled")
-                + "\nActiveState=" + (if serviceActive then "active" else "inactive") + "\n"
-              Stderr = "" }
-        | "systemctl", [ "enable"; "fail2ban.service" ] ->
-            serviceEnabled <- true
-            { ExitCode = 0; Stdout = ""; Stderr = "" }
-        | "systemctl", [ "start"; "fail2ban.service" ] ->
-            serviceActive <- true
-            { ExitCode = 0; Stdout = ""; Stderr = "" }
-        | "fail2ban-client", [ "reload" ] ->
-            { ExitCode = 0; Stdout = "OK\n"; Stderr = "" }
-        | "fail2ban-client", [ "status" ] ->
-            let active = File.Exists jailPath && setting "enabled" = "true"
-            { ExitCode = 0
-              Stdout = "Status\n|- Number of jail: " + (if active then "1" else "0") + "\n`- Jail list: " + (if active then "sshd" else "") + "\n"
-              Stderr = "" }
-        | "fail2ban-client", [ "get"; "sshd"; "action"; "nftables"; property ] ->
-            { ExitCode = 0; Stdout = actionOutput property; Stderr = "" }
-        | "fail2ban-client", [ "get"; "sshd"; "actions" ] ->
-            let actions = runtimeActionsOverride |> Option.defaultValue [| "nftables" |]
-            { ExitCode = 0
-              Stdout = "The jail sshd has the following actions:\n" + String.concat "\n" actions + "\n"
-              Stderr = "" }
-        | "fail2ban-client", [ "get"; "sshd"; field ] ->
-            { ExitCode = 0; Stdout = runtimeOutput field; Stderr = "" }
-        | _ ->
-            { ExitCode = 99
-              Stdout = ""
-              Stderr = "unexpected command: " + executable + " " + String.concat " " arguments }
-    do
-        Directory.CreateDirectory(path "/run/lock") |> ignore
-        Directory.CreateDirectory(path "/etc/default") |> ignore
-        Directory.CreateDirectory(path "/etc/fail2ban/jail.d") |> ignore
-        Directory.CreateDirectory(path "/etc/fail2ban/filter.d") |> ignore
-        Directory.CreateDirectory(path "/etc/fail2ban/action.d") |> ignore
-        Directory.CreateDirectory(path "/var/lib") |> ignore
-        File.WriteAllText(path "/etc/services", "ssh 22/tcp\n")
-        File.WriteAllText(path "/etc/default/ssh", "SSHD_OPTS=\"\"\n")
-        File.WriteAllText(stockFilterPath, "packaged sshd filter\n")
-        File.WriteAllText(stockCommonFilterPath, "packaged common filter\n")
-        File.WriteAllText(stockActionPath, "packaged nftables action\n")
-        packageConffiles <-
-            "/etc/fail2ban/filter.d/sshd.conf " + digest stockFilterPath + "\n"
-            + "/etc/fail2ban/filter.d/common.conf " + digest stockCommonFilterPath + "\n"
-            + "/etc/fail2ban/action.d/nftables.conf " + digest stockActionPath + "\n"
 
-    member _.Environment =
+        match executable, arguments with
+        | "python3", [ "-c"; _ ] ->
+            match standardInput with
+            | Some request -> handleBridge request
+            | None ->
+                {
+                    ExitCode = 99
+                    Stdout = ""
+                    Stderr = "missing bridge request"
+                }
+        | "/usr/sbin/sshd", [ "-T" ] ->
+            {
+                ExitCode = 0
+                Stdout = sshdOutput
+                Stderr = ""
+            }
+        | "systemctl", args when
+            not (List.isEmpty args)
+            && List.head args = "show"
+            && List.last args = "fail2ban.service"
+            ->
+            let activeState =
+                if serviceFailed then "failed"
+                elif serviceActive then "active"
+                else "inactive"
+
+            let subState =
+                if serviceFailed then "failed"
+                elif serviceActive then "running"
+                else "dead"
+
+            let result = if serviceFailed then "exit-code" else "success"
+
+            {
+                ExitCode = 0
+                Stdout =
+                    "LoadState=loaded\nUnitFileState="
+                    + (if serviceEnabled then "enabled" else "disabled")
+                    + "\nActiveState="
+                    + activeState
+                    + "\nSubState="
+                    + subState
+                    + "\nResult="
+                    + result
+                    + "\n"
+                Stderr = ""
+            }
+        | "systemctl", [ "enable"; "fail2ban.service" ] ->
+            serviceEvents.Add("enable", captureFiles ())
+            serviceEnabled <- true
+
+            {
+                ExitCode = 0
+                Stdout = ""
+                Stderr = ""
+            }
+        | "systemctl", [ "disable"; "fail2ban.service" ] ->
+            serviceEvents.Add("disable", captureFiles ())
+            serviceEnabled <- false
+
+            {
+                ExitCode = 0
+                Stdout = ""
+                Stderr = ""
+            }
+        | "systemctl", [ "stop"; "fail2ban.service" ] ->
+            serviceEvents.Add("stop", captureFiles ())
+            serviceActive <- false
+            serviceFailed <- false
+
+            {
+                ExitCode = 0
+                Stdout = ""
+                Stderr = ""
+            }
+        | "systemctl", [ "start"; "fail2ban.service" ] ->
+            serviceEvents.Add("start", captureFiles ())
+
+            if failNextStart then
+                failNextStart <- false
+                serviceActive <- false
+                serviceFailed <- true
+
+                {
+                    ExitCode = 0
+                    Stdout = ""
+                    Stderr = ""
+                }
+            else
+                serviceActive <- true
+                serviceFailed <- false
+                runningFingerprint <- configFingerprint configPath
+
+                {
+                    ExitCode = 0
+                    Stdout = ""
+                    Stderr = ""
+                }
+        | "fail2ban-client", args when List.contains "reload" args ->
+            if failNextReload then
+                failNextReload <- false
+
+                {
+                    ExitCode = 1
+                    Stdout = ""
+                    Stderr = "reload failure"
+                }
+            else
+                runningFingerprint <- configFingerprint configPath
+
+                {
+                    ExitCode = 0
+                    Stdout = "OK\n"
+                    Stderr = ""
+                }
+        | _ ->
+            {
+                ExitCode = 99
+                Stdout = ""
+                Stderr = "unexpected fake host command"
+            }
+
+    let environment =
         TestSupport.fakeHostEnvironment root run (fun () -> DateTimeOffset.UnixEpoch)
 
-    member _.Calls = calls.ToArray()
-    member _.SshdOutput with get () = sshdOutput and set value = sshdOutput <- value
-    member _.SshdExecReloadProperties with get () = sshdExecReloadProperties and set value = sshdExecReloadProperties <- value
-    member _.RuntimeIgnoreRegexOverride with get () = runtimeIgnoreRegexOverride and set value = runtimeIgnoreRegexOverride <- value
-    member _.RuntimeActionsOverride with get () = runtimeActionsOverride and set value = runtimeActionsOverride <- value
-    member _.DumpAdditionalAction with get () = dumpAdditionalAction and set value = dumpAdditionalAction <- value
-    member _.DumpIgnoreRegex with get () = dumpIgnoreRegex and set value = dumpIgnoreRegex <- value
-    member _.ManagedPath = jailPath
-    member _.JournalPath = journalPath
-    member this.Path(logicalPath: string) = path logicalPath
-    member _.FailValidationWhenOwned with get () = failValidationWhenOwned and set value = failValidationWhenOwned <- value
-    member _.ForceEffectiveSshdJail with get () = forceEffectiveSshdJail and set value = forceEffectiveSshdJail <- value
-    member _.RuntimeBanTimeOverride with get () = runtimeBanTimeOverride and set value = runtimeBanTimeOverride <- value
-    member _.RuntimeActionBanOverride with get () = runtimeActionBanOverride and set value = runtimeActionBanOverride <- value
+    let makeRequest operation files manageSshdPorts sshdPorts =
+        let request =
+            Fail2BanTestRequests.json
+                operation
+                "urn:pulumi:test::test::keroosha:debian:Fail2Ban::full"
+                files
+                manageSshdPorts
+                sshdPorts
 
-    member this.Invoke(request: string) = Fail2BanTestRequests.invoke this.Environment request
+        Fail2BanTestRequests.invoke environment request
+
+    do
+        for directory in
+            [
+                "/run/lock"
+                "/etc/fail2ban/fail2ban.d"
+                "/etc/fail2ban/jail.d"
+                "/etc/fail2ban/action.d"
+                "/etc/fail2ban/filter.d"
+                "/var/lib/fail2ban"
+            ] do
+            Directory.CreateDirectory(path directory) |> ignore
+
+        Directory.CreateDirectory(path "/var/lib") |> ignore
+        Directory.CreateDirectory(path "/etc") |> ignore
+
+        File.WriteAllText(
+            baseDaemonPath,
+            "[Definition]\nsocket = /var/run/fail2ban/fail2ban.sock\npidfile = /var/run/fail2ban/fail2ban.pid\ndbfile = /var/lib/fail2ban/fail2ban.sqlite3\n[Thread]\nstacksize = 0\n"
+        )
+
+        File.WriteAllText(baseJailPath, "[DEFAULT]\nenabled = false\n")
+
+    member _.Environment = environment
+    member _.Calls = calls.ToArray()
+    member _.ServiceEvents = serviceEvents.ToArray()
+    member _.Path(logicalPath: string) = path logicalPath
+
+    member _.FailNextReload
+        with get () = failNextReload
+        and set value = failNextReload <- value
+
+    member _.FailNextStart
+        with get () = failNextStart
+        and set value = failNextStart <- value
+
+    member _.FailValidation
+        with get () = failValidation
+        and set value = failValidation <- value
+
+    member _.RuntimeDrift
+        with get () = runtimeDrift
+        and set value = runtimeDrift <- value
+
+    member _.NotReadyObservations
+        with get () = notReadyObservations
+        and set value = notReadyObservations <- value
+
+    member _.NativeObserveCount = nativeObserveCount
+    member _.ServiceActive = serviceActive
+    member _.ServiceEnabled = serviceEnabled
+    member _.Invoke(operation: string, files: Map<string, string>) = makeRequest operation files false []
+
+    member _.InvokeWithPorts
+        (operation: string, files: Map<string, string>, manageSshdPorts: bool, sshdPorts: int list)
+        =
+        makeRequest operation files manageSshdPorts sshdPorts
 
     interface IDisposable with
         member _.Dispose() = (temporary :> IDisposable).Dispose()
 
 [<TestFixture>]
 type Fail2BanTests() =
-    let owner = "urn:pulumi:unit::unit::keroosha:debian:Fail2BanSshd::sshd"
-    let desired enabled operation ports =
-        Fail2BanTestRequests.json operation owner enabled 5 600 3600 [ "127.0.0.0/8"; "::1" ] ports
+    let empty = Fail2BanTestRequests.emptyFiles
+
+    let readOnlyFiles =
+        Map.ofList [ "operator/untouched.local", "[operator]\nvalue = keep\n" ]
+
+    let jailFile = "jail.d/90-dorothy.local"
+    let actionFile = "action.d/custom.local"
+    let filterFile = "filter.d/custom.local"
+    let daemonFile = "fail2ban.d/90-dorothy.local"
+
+    let statePath (host: FakeFail2BanHost) =
+        host.Path "/var/lib/keroosha-iac/fail2ban/configuration.json"
 
     [<Test>]
-    member _.``Malformed ignore addresses fail before native commands``() =
+    member _.``Generic file maps preserve exact native text and isolate owned snapshot``() =
         use host = new FakeFail2BanHost()
-        let request = Fail2BanTestRequests.json "apply" owner true 5 600 3600 [ "example.test" ] [ 22; 2222 ]
-        let action = TestDelegate(fun () -> host.Invoke request |> ignore)
+        let operatorPath = host.Path "/etc/fail2ban/operator/untouched.local"
+        Directory.CreateDirectory(Path.GetDirectoryName operatorPath) |> ignore
+        File.WriteAllText(operatorPath, readOnlyFiles["operator/untouched.local"])
+        let databasePath = host.Path "/var/lib/fail2ban/existing.sqlite3"
+        File.WriteAllText(databasePath, "existing ban database")
 
-        Assert.Throws<Fail2Ban.BackendError>(action) |> ignore
-        Assert.That(host.Calls, Is.Empty)
-        Assert.That(File.Exists host.ManagedPath, Is.False)
+        let files =
+            Map.ofList
+                [
+                    jailFile, "[custom]\nenabled = true\nfilter = custom\naction = custom\nbantime = -1\n"
+                    filterFile,
+                    "[INCLUDES]\nbefore = common.conf\n[Definition]\nfailregex = ^custom 100%% <HOST>$\nignoreregex = ^ignore me$\n"
+                    actionFile,
+                    "[Definition]\nactionstart = printf '%s' '<ip>'\nactionstop = true\nactioncheck = true\nactionban = printf '%s' '<ip>'\nactionunban = true\n"
+                ]
 
-    [<Test>]
-    member _.``Retry windows ban times ports and CIDR values are strictly bounded``() =
-        use host = new FakeFail2BanHost()
-        let invalidRequests =
-            [ Fail2BanTestRequests.json "apply" owner true 0 600 3600 [ "127.0.0.0/8" ] [ 22 ]
-              Fail2BanTestRequests.json "apply" owner true 5 0 3600 [ "127.0.0.0/8" ] [ 22 ]
-              Fail2BanTestRequests.json "apply" owner true 5 600 0 [ "127.0.0.0/8" ] [ 22 ]
-              Fail2BanTestRequests.json "apply" owner true 5 600 3600 [ "192.0.2.1/33" ] [ 22 ]
-              Fail2BanTestRequests.json "apply" owner true 5 600 3600 [ "127.0.0.0/8" ] [ 0 ]
-              Fail2BanTestRequests.json "apply" owner true 5 600 3600 [ "127.0.0.0/8" ] [ 22; 22 ]
-              Fail2BanTestRequests.json "apply" owner true 5 600 3600 [ "0.0.0.0/0" ] [ 22 ]
-              Fail2BanTestRequests.json "apply" owner true 5 600 3600 [ "192.0.2.1/0" ] [ 22 ]
-              Fail2BanTestRequests.json "apply" owner true 5 600 3600 [ "0.0.0.0" ] [ 22 ]
-              Fail2BanTestRequests.json "apply" owner true 5 600 3600 [ "0.0.0.0/32" ] [ 22 ]
-              Fail2BanTestRequests.json "apply" owner true 5 600 3600 [ "::" ] [ 22 ]
-              Fail2BanTestRequests.json "apply" owner true 5 600 3600 [ "::/128" ] [ 22 ]
-              Fail2BanTestRequests.json "apply" owner true 5 600 3600 [ "::ffff:192.0.2.1/128" ] [ 22 ] ]
-        for request in invalidRequests do
-            let action = TestDelegate(fun () -> host.Invoke request |> ignore)
-            Assert.Throws<Fail2Ban.BackendError>(action) |> ignore
-        Assert.That(host.Calls, Is.Empty)
+        let snapshot = host.Invoke("apply", files)
 
-    [<Test>]
-    member _.``Bare mapped IPv6 hosts and noncanonical networks normalize to IPv4 CIDRs``() =
-        use host = new FakeFail2BanHost()
-        let request =
-            Fail2BanTestRequests.json "apply" owner true 5 600 3600
-                [ "::ffff:192.0.2.1"; "192.0.2.129/24" ] [ 22; 2222 ]
-        let snapshot = host.Invoke request
-        let config = File.ReadAllText host.ManagedPath
-
-        Assert.That(config, Does.Contain("ignoreip = 127.0.0.0/8 192.0.2.0/24 192.0.2.1 ::1"))
-        Assert.That(snapshot["actualIgnoreIps"].ToJsonString(), Is.EqualTo("[\"127.0.0.0/8\",\"192.0.2.0/24\",\"192.0.2.1\",\"::1\"]"))
-        Assert.That(snapshot["inSync"].GetValue<bool>(), Is.True)
-
-    [<Test>]
-    member _.``Observed mapped IPv6 CIDRs remain readable as runtime drift``() =
-        use host = new FakeFail2BanHost()
-        host.Invoke(desired true "apply" [ 22; 2222 ]) |> ignore
-        let config = File.ReadAllText host.ManagedPath
-        File.WriteAllText(host.ManagedPath, config.Replace("127.0.0.0/8 ::1", "::ffff:192.0.2.1/128", StringComparison.Ordinal))
-        let snapshot = host.Invoke(desired true "read" [])
-
-        Assert.That(snapshot["actualIgnoreIps"].ToJsonString(), Is.EqualTo("[\"::ffff:192.0.2.1/128\"]"))
-        Assert.That(snapshot["inSync"].GetValue<bool>(), Is.False)
-
-    [<Test>]
-    member _.``Native sshd ExecReload validation sequence and HUP-only variant are accepted``() =
-        use host = new FakeFail2BanHost()
-        let snapshot = host.Invoke(desired true "read" [])
-        Assert.That(snapshot["inSync"].GetValue<bool>(), Is.False)
-
-        host.SshdExecReloadProperties <-
-            [| "ExecReload={ path=/bin/kill ; argv[]=/bin/kill -HUP $MAINPID ; ignore_errors=no }" |]
-        let hupOnlySnapshot = host.Invoke(desired true "read" [])
-        Assert.That(hupOnlySnapshot["inSync"].GetValue<bool>(), Is.False)
-
-    [<Test>]
-    member _.``Unexpected sshd ExecReload commands are rejected``() =
-        use host = new FakeFail2BanHost()
-        host.SshdExecReloadProperties <-
-            [| "ExecReload={ path=/usr/sbin/sshd ; argv[]=/usr/sbin/sshd -t ; ignore_errors=no }"
-               "ExecReload={ path=/usr/local/bin/kill ; argv[]=/usr/local/bin/kill -HUP $MAINPID ; ignore_errors=no }" |]
-        let action = TestDelegate(fun () -> host.Invoke(desired true "read" []) |> ignore)
-
-        Assert.Throws<Fail2Ban.BackendError>(action) |> ignore
-
-    [<Test>]
-    member _.``Stock common filter checksum is verified from dpkg conffiles``() =
-        use host = new FakeFail2BanHost()
-        let commonFilterPath = host.Path "/etc/fail2ban/filter.d/common.conf"
-        File.WriteAllText(commonFilterPath, "locally modified common filter\n")
-        let action = TestDelegate(fun () -> host.Invoke(desired true "read" []) |> ignore)
-
-        Assert.Throws<Fail2Ban.BackendError>(action) |> ignore
-        Assert.That(host.Calls |> Array.exists (fun (exe, args) -> exe = "dpkg-query" && args = [ "-W"; "-f=${Conffiles}"; "fail2ban" ]), Is.True)
-
-    [<Test>]
-    member _.``Listener ports come from all IPv4 and IPv6 listenaddress entries``() =
-        use host = new FakeFail2BanHost()
-        host.SshdOutput <-
-            "port 22\nlistenaddress 192.0.2.10:22\nlistenaddress [2001:db8::1]:2222\nlistenaddress 0.0.0.0:2222\n"
-        let snapshot = host.Invoke(desired true "apply" [ 22; 2222 ])
-
-        Assert.That(snapshot["actualPorts"].ToJsonString(), Is.EqualTo("[22,2222]"))
-        Assert.That(snapshot["inSync"].GetValue<bool>(), Is.True)
-        Assert.That(host.Calls |> Array.exists (fun (exe, args) -> exe = "/usr/sbin/sshd" && args = [ "-T" ]), Is.True)
-
-    [<Test>]
-    member _.``Enabled false applies an owned disabled jail and starts the shared service``() =
-        use host = new FakeFail2BanHost()
-        let snapshot =
-            host.Invoke(Fail2BanTestRequests.json "apply" owner false 5 600 3600 [ "127.0.0.1/8"; "::1" ] [ 22; 2222 ])
-        let config = File.ReadAllText host.ManagedPath
-
-        Assert.That(config.Contains("enabled = false", StringComparison.Ordinal), Is.True)
-        Assert.That(config.Contains("ignoreip = 127.0.0.0/8 ::1", StringComparison.Ordinal), Is.True)
         Assert.That(snapshot["owned"].GetValue<bool>(), Is.True)
-        Assert.That(snapshot["active"].GetValue<bool>(), Is.False)
-        Assert.That(snapshot["inSync"].GetValue<bool>(), Is.True)
-        Assert.That(snapshot["actualPorts"].ToJsonString(), Is.EqualTo("[22,2222]"))
-        Assert.That(host.Calls |> Array.exists (fun (exe, args) -> exe = "systemctl" && args = [ "enable"; "fail2ban.service" ]), Is.True)
-        Assert.That(host.Calls |> Array.exists (fun (exe, args) -> exe = "systemctl" && args = [ "start"; "fail2ban.service" ]), Is.True)
-        Assert.That(host.Calls |> Array.exists (fun (exe, args) -> exe = "systemctl" && List.contains "stop" args), Is.False)
-        Assert.That(host.Calls |> Array.exists (fun (exe, _) -> exe = "ufw" || exe = "nft" || exe = "apt"), Is.False)
-
-    [<Test>]
-    member _.``Native dump runtime policy and repeat apply converge without a second reload``() =
-        use host = new FakeFail2BanHost()
-        let first = host.Invoke(desired true "apply" [ 22; 2222 ])
-        let reloadCount = host.Calls |> Array.filter (fun (exe, args) -> exe = "fail2ban-client" && args = [ "reload" ]) |> Array.length
-        let second = host.Invoke(desired true "apply" [ 22; 2222 ])
-        let reloadCountAfter = host.Calls |> Array.filter (fun (exe, args) -> exe = "fail2ban-client" && args = [ "reload" ]) |> Array.length
-
-        Assert.That(first["inSync"].GetValue<bool>(), Is.True)
-        Assert.That(second["inSync"].GetValue<bool>(), Is.True)
-        Assert.That(second["active"].GetValue<bool>(), Is.True)
-        Assert.That(second["actualMaxRetry"].GetValue<int>(), Is.EqualTo(5))
-        Assert.That(second["actualFindTimeSeconds"].GetValue<int>(), Is.EqualTo(600))
-        Assert.That(second["actualBanTimeSeconds"].GetValue<int>(), Is.EqualTo(3600))
-        Assert.That(second["actualIgnoreIps"].ToJsonString(), Is.EqualTo("[\"127.0.0.0/8\",\"::1\"]"))
-        Assert.That(reloadCountAfter, Is.EqualTo(reloadCount))
-        Assert.That(host.Calls |> Array.exists (fun (exe, args) -> exe = "/usr/sbin/sshd" && args = [ "-T" ]), Is.True)
-
-    [<Test>]
-    member _.``Runtime actionban changes are reported as policy drift``() =
-        use host = new FakeFail2BanHost()
-        host.Invoke(desired true "apply" [ 22; 2222 ]) |> ignore
-        host.RuntimeActionBanOverride <- Some "nft add element inet f2b-table unexpected-set \\{ <ip> \\}"
-        let snapshot = host.Invoke(desired true "read" [])
-
-        Assert.That(snapshot["inSync"].GetValue<bool>(), Is.False)
-        Assert.That(host.Calls |> Array.exists (fun (exe, args) -> exe = "fail2ban-client" && args = [ "get"; "sshd"; "action"; "nftables"; "actionban" ]), Is.True)
-
-    [<Test>]
-    member _.``Nonempty runtime ignoreregex is reported as policy drift``() =
-        use host = new FakeFail2BanHost()
-        host.Invoke(desired true "apply" [ 22; 2222 ]) |> ignore
-        host.RuntimeIgnoreRegexOverride <- Some "1) ^Ignore this authentication failure$"
-        let snapshot = host.Invoke(desired true "read" [])
-
-        Assert.That(snapshot["inSync"].GetValue<bool>(), Is.False)
-        Assert.That(host.Calls |> Array.exists (fun (exe, args) -> exe = "fail2ban-client" && args = [ "get"; "sshd"; "ignoreregex" ]), Is.True)
-
-    [<Test>]
-    member _.``Nonempty effective ignoreregex is reported as policy drift``() =
-        use host = new FakeFail2BanHost()
-        host.Invoke(desired true "apply" [ 22; 2222 ]) |> ignore
-        host.DumpIgnoreRegex <- true
-        let snapshot = host.Invoke(desired true "read" [])
-
-        Assert.That(snapshot["inSync"].GetValue<bool>(), Is.False)
-
-    [<Test>]
-    member _.``Multiple effective or runtime actions are reported as policy drift``() =
-        use host = new FakeFail2BanHost()
-        host.Invoke(desired true "apply" [ 22; 2222 ]) |> ignore
-        host.DumpAdditionalAction <- true
-        host.RuntimeActionsOverride <- Some [| "nftables"; "allports" |]
-        let snapshot = host.Invoke(desired true "read" [])
-
-        Assert.That(snapshot["inSync"].GetValue<bool>(), Is.False)
-        Assert.That(host.Calls |> Array.exists (fun (exe, args) -> exe = "fail2ban-client" && args = [ "get"; "sshd"; "actions" ]), Is.True)
-
-    [<Test>]
-    member _.``Observed ten-minute duration is converted from native Fail2Ban syntax``() =
-        use host = new FakeFail2BanHost()
-        host.Invoke(desired true "apply" [ 22; 2222 ]) |> ignore
-        let config = File.ReadAllText host.ManagedPath
-        File.WriteAllText(host.ManagedPath, config.Replace("findtime = 600", "findtime = 10m", StringComparison.Ordinal))
-        let snapshot = host.Invoke(desired true "read" [])
-
-        Assert.That(snapshot["actualFindTimeSeconds"].GetValue<int>(), Is.EqualTo(600))
-        Assert.That(snapshot["inSync"].GetValue<bool>(), Is.False)
-        Assert.That(host.Calls |> Array.exists (fun (exe, args) -> exe = "fail2ban-client" && args = [ "--str2sec"; "10m" ]), Is.True)
-
-    [<Test>]
-    member _.``Permanent runtime ban time is reported as drift instead of an invalid snapshot``() =
-        use host = new FakeFail2BanHost()
-        host.Invoke(desired true "apply" [ 22; 2222 ]) |> ignore
-        host.RuntimeBanTimeOverride <- Some -1
-        let snapshot = host.Invoke(desired true "read" [])
-
-        Assert.That(snapshot["actualBanTimeSeconds"].GetValue<int>(), Is.EqualTo(-1))
         Assert.That(snapshot["active"].GetValue<bool>(), Is.True)
-        Assert.That(snapshot["inSync"].GetValue<bool>(), Is.False)
+        Assert.That(snapshot["inSync"].GetValue<bool>(), Is.True)
+        Assert.That(Fail2BanTestRequests.actualFile snapshot jailFile, Is.EqualTo(files[jailFile]))
+        Assert.That(Fail2BanTestRequests.actualFile snapshot filterFile, Is.EqualTo(files[filterFile]))
+        Assert.That(Fail2BanTestRequests.actualFile snapshot actionFile, Is.EqualTo(files[actionFile]))
+        Assert.That(snapshot.AsObject().Count, Is.EqualTo(6))
+        Assert.That(snapshot["actualFiles"].AsObject().Count, Is.EqualTo(3))
+        Assert.That(snapshot["activeJails"].ToJsonString(), Is.EqualTo("[\"custom\"]"))
+        Assert.That(snapshot["socket"].GetValue<string>(), Is.EqualTo("/var/run/fail2ban/fail2ban.sock"))
+        Assert.That(File.ReadAllText(operatorPath), Is.EqualTo(readOnlyFiles["operator/untouched.local"]))
+        Assert.That(File.ReadAllText(databasePath), Is.EqualTo("existing ban database"))
+
+        Assert.That(
+            File.GetUnixFileMode(host.Path("/etc/fail2ban/" + actionFile)),
+            Is.EqualTo(Fail2BanTestRequests.privateFileMode)
+        )
+
+        Assert.That(File.GetUnixFileMode(statePath host), Is.EqualTo(Fail2BanTestRequests.privateFileMode))
+
+        let readBack = host.Invoke("read", files)
+        Assert.That(readBack["inSync"].GetValue<bool>(), Is.True)
+        Assert.That(Fail2BanTestRequests.actualFile readBack filterFile, Is.EqualTo(files[filterFile]))
+
+        Assert.That(
+            host.Calls
+            |> Array.exists (fun (executable, arguments) -> executable = "systemctl" && List.contains "stop" arguments),
+            Is.False
+        )
 
     [<Test>]
-    member _.``Invalid complete configuration rolls back the override and ownership journal``() =
+    member _.``Apply waits for native configuration convergence after service start``() =
         use host = new FakeFail2BanHost()
-        host.FailValidationWhenOwned <- true
-        let otherPath = host.Path "/etc/fail2ban/jail.d/10-operator.local"
-        let otherConfig = "[other]\nenabled = true\n"
-        File.WriteAllText(otherPath, otherConfig)
-        let action = TestDelegate(fun () -> host.Invoke(desired true "apply" [ 22; 2222 ]) |> ignore)
+        host.NotReadyObservations <- 2
+        let files = Map.ofList [ jailFile, "[sshd]\nenabled = true\n" ]
+        let snapshot = host.Invoke("apply", files)
+
+        Assert.That(snapshot["inSync"].GetValue<bool>(), Is.True)
+        Assert.That(host.NativeObserveCount, Is.EqualTo(3))
+        Assert.That(host.ServiceActive, Is.True)
+        let beforeReload = host.NativeObserveCount
+        host.NotReadyObservations <- 2
+        let updatedFiles = Map.add jailFile "[sshd]\nenabled = true\nmaxretry = 7\n" files
+        let updated = host.Invoke("apply", updatedFiles)
+        Assert.That(updated["inSync"].GetValue<bool>(), Is.True)
+        Assert.That(host.NativeObserveCount, Is.EqualTo(beforeReload + 3))
+
+    [<Test>]
+    member _.``Apply updates and removes only journaled paths while delete preserves unrelated files``() =
+        use host = new FakeFail2BanHost()
+        let foreignPath = host.Path "/etc/fail2ban/jail.d/10-operator.local"
+        let foreignText = "[operator]\nenabled = true\n"
+        File.WriteAllText(foreignPath, foreignText)
+
+        let first =
+            Map.ofList
+                [
+                    jailFile, "[sshd]\nenabled = false\n"
+                    filterFile, "[Definition]\nfailregex = ^old$\n"
+                ]
+
+        host.Invoke("apply", first) |> ignore
+
+        let second =
+            Map.ofList
+                [
+                    jailFile, "[sshd]\nenabled = true\n"
+                    actionFile, "[Definition]\nactionban = logger <ip>\n"
+                ]
+
+        let updated = host.Invoke("apply", second)
+
+        Assert.That(updated["inSync"].GetValue<bool>(), Is.True)
+        Assert.That(File.Exists(host.Path("/etc/fail2ban/" + filterFile)), Is.False)
+        Assert.That(File.ReadAllText(host.Path("/etc/fail2ban/" + jailFile)), Is.EqualTo(second[jailFile]))
+        Assert.That(File.ReadAllText foreignPath, Is.EqualTo(foreignText))
+        Assert.That(host.Invoke("delete", empty).AsObject().Count, Is.EqualTo(0))
+        Assert.That(File.Exists(host.Path("/etc/fail2ban/" + jailFile)), Is.False)
+        Assert.That(File.Exists(host.Path("/etc/fail2ban/" + actionFile)), Is.False)
+        Assert.That(File.ReadAllText foreignPath, Is.EqualTo(foreignText))
+        Assert.That(File.Exists(statePath host), Is.False)
+        Assert.That(host.ServiceActive, Is.True)
+
+    [<Test>]
+    member _.``Partial multi-file reload failure restores exact prior files and service state``() =
+        use host = new FakeFail2BanHost()
+
+        let first =
+            Map.ofList
+                [
+                    jailFile, "[sshd]\nenabled = false\n"
+                    filterFile, "[Definition]\nfailregex = ^old$\n"
+                ]
+
+        host.Invoke("apply", first) |> ignore
+        host.FailNextReload <- true
+
+        let changed =
+            Map.ofList
+                [
+                    jailFile, "[sshd]\nenabled = true\n"
+                    filterFile, "[Definition]\nfailregex = ^new$\n"
+                    actionFile, "[Definition]\nactionban = logger <ip>\n"
+                ]
+
+        let action = TestDelegate(fun () -> host.Invoke("apply", changed) |> ignore)
 
         Assert.Throws<Fail2Ban.BackendError>(action) |> ignore
-        Assert.That(File.Exists host.ManagedPath, Is.False)
-        Assert.That(File.Exists host.JournalPath, Is.False)
-        Assert.That(File.ReadAllText otherPath, Is.EqualTo(otherConfig))
-        Assert.That(host.Calls |> Array.exists (fun (exe, args) -> exe = "systemctl" && args = [ "start"; "fail2ban.service" ]), Is.False)
+        Assert.That(File.ReadAllText(host.Path("/etc/fail2ban/" + jailFile)), Is.EqualTo(first[jailFile]))
+        Assert.That(File.ReadAllText(host.Path("/etc/fail2ban/" + filterFile)), Is.EqualTo(first[filterFile]))
+        Assert.That(File.Exists(host.Path("/etc/fail2ban/" + actionFile)), Is.False)
+        Assert.That(host.ServiceActive, Is.True)
+        let readBack = host.Invoke("read", first)
+        Assert.That(readBack["inSync"].GetValue<bool>(), Is.True)
+
+        let reloads =
+            host.Calls
+            |> Array.filter (fun (executable, arguments) ->
+                executable = "fail2ban-client" && List.contains "reload" arguments)
+
+        Assert.That(reloads.Length, Is.EqualTo(2))
 
     [<Test>]
-    member _.``Later effective config cannot re-enable a disabled managed jail``() =
+    member _.``Startup socket pid database and thread changes stop old service before file switch and roll back``() =
         use host = new FakeFail2BanHost()
-        host.ForceEffectiveSshdJail <- true
-        let action = TestDelegate(fun () -> host.Invoke(desired false "apply" [ 22; 2222 ]) |> ignore)
+
+        let initial =
+            Map.ofList
+                [
+                    daemonFile,
+                    "[Definition]\nsocket = /run/fail2ban/old.sock\npidfile = /run/fail2ban/old.pid\ndbfile = /var/lib/fail2ban/old.sqlite3\n[Thread]\nstacksize = 64\n"
+                    jailFile, "[custom]\nenabled = true\n"
+                ]
+
+        host.Invoke("apply", initial) |> ignore
+        let databasePath = host.Path "/var/lib/fail2ban/old.sqlite3"
+        File.WriteAllText(databasePath, "do not migrate or delete")
+        host.FailNextStart <- true
+
+        let target =
+            Map.add
+                daemonFile
+                "[Definition]\nsocket = /run/fail2ban/new.sock\npidfile = /run/fail2ban/new.pid\ndbfile = /var/lib/fail2ban/new.sqlite3\n[Thread]\nstacksize = 128\n"
+                initial
+
+        let action = TestDelegate(fun () -> host.Invoke("apply", target) |> ignore)
 
         Assert.Throws<Fail2Ban.BackendError>(action) |> ignore
-        Assert.That(File.Exists host.ManagedPath, Is.False)
-        Assert.That(File.Exists host.JournalPath, Is.False)
-        Assert.That(host.Calls |> Array.exists (fun (exe, args) -> exe = "systemctl" && (args = [ "enable"; "fail2ban.service" ] || args = [ "start"; "fail2ban.service" ])), Is.False)
+
+        let serviceStops =
+            host.ServiceEvents |> Array.filter (fun (name, _) -> name = "stop")
+
+        Assert.That(serviceStops.Length, Is.EqualTo(1))
+        Assert.That(serviceStops.[0] |> snd |> Map.find daemonFile, Is.EqualTo(initial[daemonFile]))
+        let starts = host.ServiceEvents |> Array.filter (fun (name, _) -> name = "start")
+        Assert.That(starts.Length, Is.EqualTo(3))
+        Assert.That((snd starts.[1])[daemonFile], Is.EqualTo(target[daemonFile]))
+        Assert.That((snd starts.[2])[daemonFile], Is.EqualTo(initial[daemonFile]))
+        Assert.That(File.ReadAllText(host.Path("/etc/fail2ban/" + daemonFile)), Is.EqualTo(initial[daemonFile]))
+        Assert.That(File.ReadAllText(databasePath), Is.EqualTo("do not migrate or delete"))
+        let readBack = host.Invoke("read", initial)
+        Assert.That(readBack["socket"].GetValue<string>(), Is.EqualTo("/run/fail2ban/old.sock"))
+        Assert.That(host.ServiceActive, Is.True)
 
     [<Test>]
-    member _.``Delete removes only the managed override and reloads the retained baseline``() =
+    member _.``Staged validation follows configuration symlinks into the candidate tree``() =
         use host = new FakeFail2BanHost()
-        let baselinePath = host.Path "/etc/fail2ban/jail.d/10-operator.local"
-        let baseline = "[other]\nenabled = true\n"
-        File.WriteAllText(baselinePath, baseline)
-        host.Invoke(desired true "apply" [ 22; 2222 ]) |> ignore
-        let removed = host.Invoke(desired true "delete" [])
+        let targetPath = "operator/daemon.local"
+        let physicalTarget = host.Path("/etc/fail2ban/" + targetPath)
+        Directory.CreateDirectory(Path.GetDirectoryName physicalTarget) |> ignore
 
-        let reloadCount = host.Calls |> Array.filter (fun (exe, args) -> exe = "fail2ban-client" && args = [ "reload" ]) |> Array.length
-        let removedAgain = host.Invoke(desired true "delete" [])
-        let reloadCountAfter = host.Calls |> Array.filter (fun (exe, args) -> exe = "fail2ban-client" && args = [ "reload" ]) |> Array.length
-        Assert.That(removedAgain.AsObject().Count, Is.EqualTo(0))
+        let initial =
+            Map.ofList
+                [
+                    targetPath,
+                    "[Definition]\nsocket = /var/run/fail2ban/fail2ban.sock\npidfile = /var/run/fail2ban/fail2ban.pid\ndbfile = /var/lib/fail2ban/fail2ban.sqlite3\n[Thread]\nstacksize = 0\n"
+                ]
+
+        let firstSnapshot = host.Invoke("apply", initial)
+        Assert.That(firstSnapshot["socket"].GetValue<string>(), Is.EqualTo("/var/run/fail2ban/fail2ban.sock"))
+
+        File.CreateSymbolicLink(host.Path("/etc/fail2ban/fail2ban.local"), physicalTarget)
+        |> ignore
+
+        let linkedSnapshot = host.Invoke("apply", initial)
+        Assert.That(linkedSnapshot["inSync"].GetValue<bool>(), Is.True)
+
+        let updatedFiles =
+            Map.add
+                targetPath
+                "[Definition]\nsocket = /run/fail2ban/new.sock\npidfile = /run/fail2ban/new.pid\ndbfile = /var/lib/fail2ban/new.sqlite3\n[Thread]\nstacksize = 128\n"
+                initial
+
+        let updated = host.Invoke("apply", updatedFiles)
+
+        Assert.That(updated["socket"].GetValue<string>(), Is.EqualTo("/run/fail2ban/new.sock"))
+        Assert.That(updated["inSync"].GetValue<bool>(), Is.True)
+        Assert.That(File.Exists(host.Path("/etc/fail2ban/fail2ban.local")), Is.True)
+
+    [<Test>]
+    member _.``Custom Python action source changes cause a real service restart``() =
+        use host = new FakeFail2BanHost()
+        let pythonPath = "action.d/custom.py"
+
+        let first =
+            Map.ofList [ pythonPath, "class Action:\n    def start(self):\n        pass\n" ]
+
+        host.Invoke("apply", first) |> ignore
+
+        let reloadCount =
+            host.Calls
+            |> Array.filter (fun (executable, arguments) ->
+                executable = "fail2ban-client" && List.contains "reload" arguments)
+            |> Array.length
+
+        let second =
+            Map.add pythonPath "class Action:\n    def start(self):\n        self.changed = True\n" first
+
+        let updated = host.Invoke("apply", second)
+        Assert.That(updated["inSync"].GetValue<bool>(), Is.True)
+
+        let events = host.ServiceEvents |> Array.map fst
+        Assert.That(events |> Array.filter ((=) "stop") |> Array.length, Is.EqualTo(1))
+        Assert.That(events |> Array.filter ((=) "start") |> Array.length, Is.EqualTo(2))
+
+        let reloadCountAfter =
+            host.Calls
+            |> Array.filter (fun (executable, arguments) ->
+                executable = "fail2ban-client" && List.contains "reload" arguments)
+            |> Array.length
+
         Assert.That(reloadCountAfter, Is.EqualTo(reloadCount))
-        Assert.That(removed.AsObject().Count, Is.EqualTo(0))
-        Assert.That(File.Exists host.ManagedPath, Is.False)
-        Assert.That(File.Exists host.JournalPath, Is.False)
-        Assert.That(File.ReadAllText baselinePath, Is.EqualTo(baseline))
-        Assert.That(host.Calls |> Array.exists (fun (exe, args) -> exe = "fail2ban-client" && args = [ "reload" ]), Is.True)
-        Assert.That(host.Calls |> Array.exists (fun (exe, args) -> exe = "systemctl" && List.contains "stop" args), Is.False)
+        Assert.That(File.ReadAllText(host.Path("/etc/fail2ban/" + pythonPath)), Is.EqualTo(second[pythonPath]))
 
     [<Test>]
-    member _.``Read observes an interrupted apply and delete recovers without touching other jails``() =
+    member _.``Read leaves interrupted multi-file ownership journal untouched and delete recovers it``() =
         use host = new FakeFail2BanHost()
-        let baselinePath = host.Path "/etc/fail2ban/jail.d/10-operator.local"
-        let baseline = "[other]\nenabled = true\n"
-        File.WriteAllText(baselinePath, baseline)
-        host.Invoke(desired true "apply" [ 22; 2222 ]) |> ignore
-        let journal = JsonNode.Parse(File.ReadAllText host.JournalPath).AsObject()
-        let managedContent = journal["managedContent"].GetValue<string>()
-        journal["managedContent"] <- null
+        let firstPath = "jail.d/10-first.local"
+        let secondPath = "jail.d/20-second.local"
+
+        let firstFiles =
+            Map.ofList
+                [
+                    firstPath, "[first]\nenabled = false\n"
+                    secondPath, "[second]\nenabled = false\n"
+                ]
+
+        host.Invoke("apply", firstFiles) |> ignore
+
+        let targetFiles =
+            Map.ofList
+                [
+                    firstPath, "[first]\nenabled = true\nnative-invalid\n"
+                    secondPath, "[second]\nenabled = true\n"
+                ]
+
+        File.WriteAllText(host.Path("/etc/fail2ban/" + firstPath), targetFiles[firstPath])
+        let journal = JsonObject()
+        journal["version"] <- JsonValue.Create 2
+        journal["ownerId"] <- JsonValue.Create "urn:pulumi:test::test::keroosha:debian:Fail2Ban::full"
+        let priorNode = JsonObject()
+
+        for KeyValue(path, text) in firstFiles do
+            priorNode[path] <- JsonValue.Create text
+
+        journal["files"] <- priorNode
         let pending = JsonObject()
         pending["operation"] <- JsonValue.Create "apply"
-        pending["priorContent"] <- null
-        pending["targetContent"] <- JsonValue.Create managedContent
+        pending["priorOwned"] <- JsonValue.Create true
+        pending["priorActive"] <- JsonValue.Create true
+        pending["priorEnabled"] <- JsonValue.Create true
+        pending["startupChanged"] <- JsonValue.Create false
+        pending["pythonChanged"] <- JsonValue.Create false
+        let targetNode = JsonObject()
+
+        for KeyValue(path, text) in targetFiles do
+            targetNode[path] <- JsonValue.Create text
+
+        pending["targetFiles"] <- targetNode
+        let mutations = JsonArray()
+
+        for path in [ firstPath; secondPath ] do
+            let mutation = JsonObject()
+            mutation["path"] <- JsonValue.Create path
+            mutation["prior"] <- JsonValue.Create firstFiles[path]
+            mutation["target"] <- JsonValue.Create targetFiles[path]
+            mutations.Add mutation
+
+        pending["mutations"] <- mutations
         journal["pending"] <- pending
-        File.WriteAllText(host.JournalPath, journal.ToJsonString())
-        File.SetUnixFileMode(host.JournalPath, UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
-        let pendingJournal = File.ReadAllText host.JournalPath
+        let rawJournal = journal.ToJsonString() + "\n"
+        Directory.CreateDirectory(Path.GetDirectoryName(statePath host)) |> ignore
+        File.WriteAllText(statePath host, rawJournal)
+        File.SetUnixFileMode(statePath host, Fail2BanTestRequests.privateFileMode)
 
-        let snapshot = host.Invoke(desired true "read" [])
-        Assert.That(snapshot["owned"].GetValue<bool>(), Is.True)
-        Assert.That(snapshot["inSync"].GetValue<bool>(), Is.False)
-        Assert.That(File.ReadAllText host.ManagedPath, Is.EqualTo(managedContent))
-        Assert.That(File.ReadAllText host.JournalPath, Is.EqualTo(pendingJournal))
+        host.FailValidation <- true
+        let read = host.Invoke("read", firstFiles)
+        Assert.That(read["owned"].GetValue<bool>(), Is.True)
+        Assert.That(read["inSync"].GetValue<bool>(), Is.False)
+        Assert.That(Fail2BanTestRequests.actualFile read firstPath, Is.EqualTo(targetFiles[firstPath]))
+        Assert.That(Fail2BanTestRequests.actualFile read secondPath, Is.EqualTo(firstFiles[secondPath]))
+        Assert.That(File.ReadAllText(statePath host), Is.EqualTo(rawJournal))
+        Assert.That(host.ServiceEvents |> Array.exists (fun (name, _) -> name = "stop"), Is.False)
+        host.FailValidation <- false
 
-        host.Invoke(desired true "delete" []) |> ignore
-
-        let afterDelete = host.Invoke(desired true "read" [])
-        Assert.That(afterDelete["owned"].GetValue<bool>(), Is.False)
-        Assert.That(File.Exists host.ManagedPath, Is.False)
-        Assert.That(File.Exists host.JournalPath, Is.False)
-        Assert.That(File.ReadAllText baselinePath, Is.EqualTo(baseline))
-        Assert.That(host.Calls |> Array.exists (fun (exe, args) -> exe = "fail2ban-client" && args = [ "reload" ]), Is.True)
+        host.Invoke("delete", empty) |> ignore
+        Assert.That(File.Exists(host.Path("/etc/fail2ban/" + firstPath)), Is.False)
+        Assert.That(File.Exists(host.Path("/etc/fail2ban/" + secondPath)), Is.False)
+        Assert.That(File.Exists(statePath host), Is.False)
+        Assert.That(host.ServiceActive, Is.True)
 
     [<Test>]
-    member _.``Foreign override and journal drift are never overwritten or deleted``() =
+    member _.``Foreign files and drifted owned files are never taken over or deleted``() =
         use foreignHost = new FakeFail2BanHost()
-        let foreign = "[sshd]\nenabled = false\n# operator-owned\n"
-        File.WriteAllText(foreignHost.ManagedPath, foreign)
-        let applyForeign = TestDelegate(fun () -> foreignHost.Invoke(desired true "apply" [ 22; 2222 ]) |> ignore)
-        let deleteForeign = TestDelegate(fun () -> foreignHost.Invoke(desired true "delete" []) |> ignore)
-        Assert.Throws<Fail2Ban.BackendError>(applyForeign) |> ignore
-        Assert.Throws<Fail2Ban.BackendError>(deleteForeign) |> ignore
-        Assert.That(File.ReadAllText foreignHost.ManagedPath, Is.EqualTo(foreign))
+        let foreignPath = foreignHost.Path("/etc/fail2ban/" + jailFile)
+        let foreign = "[operator]\nenabled = true\n"
+        File.WriteAllText(foreignPath, foreign)
+        let request = Map.ofList [ jailFile, "[sshd]\nenabled = true\n" ]
+
+        Assert.Throws<Fail2Ban.BackendError>(TestDelegate(fun () -> foreignHost.Invoke("apply", request) |> ignore))
+        |> ignore
+
+        foreignHost.Invoke("delete", empty) |> ignore
+        Assert.That(File.ReadAllText foreignPath, Is.EqualTo(foreign))
 
         use driftedHost = new FakeFail2BanHost()
-        driftedHost.Invoke(desired true "apply" [ 22; 2222 ]) |> ignore
-        let content = File.ReadAllText driftedHost.ManagedPath
-        let driftedContent = content.Replace("maxretry = 5", "maxretry = 7", StringComparison.Ordinal).Replace("port = 22,2222", "port = 22", StringComparison.Ordinal)
-        File.WriteAllText(driftedHost.ManagedPath, driftedContent)
-        let snapshot = driftedHost.Invoke(desired true "read" [])
-        let applyDrift = TestDelegate(fun () -> driftedHost.Invoke(desired true "apply" [ 22; 2222 ]) |> ignore)
-        let deleteDrift = TestDelegate(fun () -> driftedHost.Invoke(desired true "delete" []) |> ignore)
-
+        let managed = Map.ofList [ jailFile, "[sshd]\nenabled = true\n" ]
+        driftedHost.Invoke("apply", managed) |> ignore
+        File.WriteAllText(driftedHost.Path("/etc/fail2ban/" + jailFile), "[sshd]\nenabled = false\n")
+        let snapshot = driftedHost.Invoke("read", managed)
         Assert.That(snapshot["owned"].GetValue<bool>(), Is.True)
         Assert.That(snapshot["inSync"].GetValue<bool>(), Is.False)
-        Assert.That(snapshot["actualMaxRetry"].GetValue<int>(), Is.EqualTo(7))
-        Assert.That(snapshot["actualPorts"].ToJsonString(), Is.EqualTo("[22]"))
-        Assert.Throws<Fail2Ban.BackendError>(applyDrift) |> ignore
-        Assert.Throws<Fail2Ban.BackendError>(deleteDrift) |> ignore
-        Assert.That(File.ReadAllText driftedHost.ManagedPath, Does.Contain("maxretry = 7"))
+        Assert.That(Fail2BanTestRequests.actualFile snapshot jailFile, Is.EqualTo("[sshd]\nenabled = false\n"))
+
+        Assert.Throws<Fail2Ban.BackendError>(TestDelegate(fun () -> driftedHost.Invoke("apply", managed) |> ignore))
+        |> ignore
+
+        Assert.Throws<Fail2Ban.BackendError>(TestDelegate(fun () -> driftedHost.Invoke("delete", empty) |> ignore))
+        |> ignore
+
+        Assert.That(
+            File.ReadAllText(driftedHost.Path("/etc/fail2ban/" + jailFile)),
+            Is.EqualTo("[sshd]\nenabled = false\n")
+        )
 
     [<Test>]
-    member _.``Stale declared sshd ports fail before a jail mutation``() =
+    member _.``Readable permissions on owned secrets are reported and refused as drift``() =
         use host = new FakeFail2BanHost()
-        let action = TestDelegate(fun () -> host.Invoke(desired true "apply" [ 2222 ]) |> ignore)
+        let path = "action.d/custom.py"
+        let files = Map.ofList [ path, "class Action:\n    pass\n" ]
+        host.Invoke("apply", files) |> ignore
+        let physicalPath = host.Path("/etc/fail2ban/" + path)
+
+        let readableByOthers =
+            UnixFileMode.UserRead
+            ||| UnixFileMode.UserWrite
+            ||| UnixFileMode.GroupRead
+            ||| UnixFileMode.OtherRead
+
+        File.SetUnixFileMode(physicalPath, readableByOthers)
+
+        let snapshot = host.Invoke("read", files)
+        Assert.That(snapshot["owned"].GetValue<bool>(), Is.True)
+        Assert.That(snapshot["inSync"].GetValue<bool>(), Is.False)
+
+        Assert.Throws<Fail2Ban.BackendError>(TestDelegate(fun () -> host.Invoke("apply", files) |> ignore))
+        |> ignore
+
+        Assert.Throws<Fail2Ban.BackendError>(TestDelegate(fun () -> host.Invoke("delete", empty) |> ignore))
+        |> ignore
+
+        Assert.That(File.GetUnixFileMode(physicalPath), Is.EqualTo(readableByOthers))
+
+    [<Test>]
+    member _.``Automatic sshd port linking owns and removes only the reserved native drop-in``() =
+        use host = new FakeFail2BanHost()
+        let auto = host.InvokeWithPorts("apply", empty, true, [])
+
+        Assert.That(
+            Fail2BanTestRequests.actualFile auto "jail.d/99-dorothy-sshd-ports.local",
+            Is.EqualTo("# Managed by Dorothy for the linked sshd configuration.\n[sshd]\nport = 22,2222\n")
+        )
+
+        Assert.That(
+            host.Calls
+            |> Array.exists (fun (executable, arguments) -> executable = "/usr/sbin/sshd" && arguments = [ "-T" ]),
+            Is.True
+        )
+
+        host.Invoke("delete", empty) |> ignore
+        Assert.That(File.Exists(host.Path("/etc/fail2ban/jail.d/99-dorothy-sshd-ports.local")), Is.False)
+
+    [<Test>]
+    member _.``Invalid staged tree fails before journal files or service changes``() =
+        use host = new FakeFail2BanHost()
+        let files = Map.ofList [ jailFile, "native-invalid\n" ]
+        let action = TestDelegate(fun () -> host.Invoke("apply", files) |> ignore)
 
         Assert.Throws<Fail2Ban.BackendError>(action) |> ignore
-        Assert.That(File.Exists host.ManagedPath, Is.False)
-        Assert.That(host.Calls |> Array.exists (fun (exe, args) -> exe = "/usr/sbin/sshd" && args = [ "-T" ]), Is.True)
-        Assert.That(host.Calls |> Array.exists (fun (exe, _) -> exe = "fail2ban-client"), Is.False)
+        Assert.That(File.Exists(host.Path("/etc/fail2ban/" + jailFile)), Is.False)
+        Assert.That(File.Exists(statePath host), Is.False)
+        Assert.That(host.ServiceEvents, Is.Empty)
+        Assert.That(host.ServiceActive, Is.False)

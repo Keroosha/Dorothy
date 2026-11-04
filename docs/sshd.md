@@ -1,9 +1,16 @@
-# SSHD overrides and Fail2Ban
+# Native SSHD and Fail2Ban configuration
 
-Dorothy supports an existing Debian 13 OpenSSH server through two independent resources:
+Dorothy configures existing Debian hosts through native drop-ins. It does not replace `/etc/ssh/sshd_config`, rewrite vendor configuration, or run sshd against a separate generated main file.
+
+The public SSH catalogue covers all **106 canonical directives** documented for Debian 13/OpenSSH 10, including `Match` and `Include`. Fail2Ban supports daemon settings, defaults, arbitrary named jails, filters, command actions, Python actions and native include/interpolation variables. There is no fixed sshd-option or packaged-filter/action allowlist in the provider/helper protocol.
+
+- [SSH directive catalogue](sshd-options.md)
+- [Fail2Ban option and file catalogue](fail2ban-options.md)
+- Native authorities: [Debian sshd_config(5)](https://manpages.debian.org/trixie/openssh-server/sshd_config.5.en.html), [Debian jail.conf(5)](https://manpages.debian.org/trixie/fail2ban/jail.conf.5.en.html).
+
+## SSH configuration and its jail
 
 ```fsharp
-open System
 open Dorothy.DSL
 
 let server =
@@ -14,16 +21,27 @@ let server =
         debian {
             sshd {
                 config {
-                    passwordAuthentication false
-                    kbdInteractiveAuthentication false
-                    pubkeyAuthentication true
-                    permitRootLogin No
-                    maxAuthTries 6
+                    SshdOptions.passwordAuthentication false
+                    SshdOptions.kbdInteractiveAuthentication false
+                    SshdOptions.pubkeyAuthentication true
+                    SshdOptions.permitRootLogin "no"
+                    SshdOptions.clientAliveInterval "45s"
+                    SshdOptions.maxSessions 4
+                    SshdOptions.allowTcpForwarding "local"
+                    SshdOptions.acceptEnv "APP_ENV"
+                    SshdOptions.acceptEnv "DEPLOYMENT_ID"
+                    matchBlock "User transfer" {
+                        SshdOptions.forceCommand "internal-sftp"
+                        SshdOptions.allowTcpForwarding "no"
+                        SshdOptions.permitTTY false
+                    }
                 }
                 fail2ban {
-                    maxRetry 5
-                    findTime (TimeSpan.FromMinutes 10.)
-                    banTime (TimeSpan.FromHours 1.)
+                    Fail2BanOptions.enabled true
+                    Fail2BanOptions.filter "sshd[mode=extra]"
+                    Fail2BanOptions.banaction "nftables[type=multiport]"
+                    Fail2BanOptions.maxretry 5
+                    Fail2BanOptions.bantime "1h"
                 }
             }
         }
@@ -32,84 +50,121 @@ let server =
 Host.deploy server |> ignore
 ```
 
-Replace the example address and identity path. Declare administrator IPs/networks explicitly with repeated `ignoreIp` entries inside `fail2ban`; the current deployment address is not automatically trusted. Maintain tested out-of-band console access before changing authentication or ban policy.
+Replace example addresses, account names and paths with existing host prerequisites. Both nested blocks are optional. Unspecified native settings remain inherited: Dorothy does not copy defaults or impose a hardening preset.
 
-Both nested blocks are optional. Omission means unmanaged; a Fail2Ban-only declaration does not configure sshd. Each block may occur only once. The resource tokens retain the existing provider namespace: `keroosha:debian:SshdConfig` and `keroosha:debian:Fail2BanSshd`.
+### Native semantics, not a custom merge language
 
-## `config`: explicit overrides, not a replacement configuration
+SSH declarations form an **ordered native configuration body**. Repeated directives and argument expressions remain ordered; native time units, algorithm modifiers, patterns and command arguments are not replaced by guessed enum policies. Use `SshdOptions.extension keyword argumentTail` for vendor/new options or `nativeText` for a complete native fragment.
 
-Only declared settings are written to `/etc/ssh/sshd_config.d/00-dorothy.conf`. Removing a setting restores inheritance from the remaining system configuration. Dorothy does not copy built-in defaults, edit `/etc/ssh/sshd_config`, rewrite cloud-init files, manage authorized keys, or change UFW rules.
+The drop-in is `/etc/ssh/sshd_config.d/00-dorothy.conf`. It must participate in the host's native Include topology; the helper verifies participation using sshd's own loader trace. Its basename does not outrank a directive already read before it.
 
-| Declaration | Accepted values |
-| --- | --- |
-| `passwordAuthentication` | `bool` |
-| `kbdInteractiveAuthentication` | `bool` |
-| `pubkeyAuthentication` | `bool` |
-| `permitRootLogin` | `Yes`, `No`, `ProhibitPassword`, `ForcedCommandsOnly` |
-| `port` | Integer 1–65535 |
-| `maxAuthTries` | Positive integer |
+OpenSSH generally uses the **first obtained value**. Some settings accumulate, including ports, listener addresses and allow/deny lists; a duplicate subsystem name can be an error. Dorothy deliberately preserves those rules. Declaring every setting is supported, but a drop-in is not a universal way to replace an inherited list or conflicting subsystem. Native conflicts must be resolved in the configuration's ownership/source, not by silently rewriting vendor files.
 
-The root-login cases are also available as `SshdRootLogin.*`. Duplicate settings are rejected. Raw configuration text, `Match` declarations and accumulating lists such as `AllowUsers` are not exposed.
+Put global directives before native `Match` sections. A `matchBlock` represents a native section, not a language-level reset to global scope: subsequent rows follow OpenSSH's scope rules until the next `Match` or end of that file. Included files and conditional includes retain their native scope behavior. Installed sshd is authoritative for build-dependent directives, algorithm availability and valid values.
 
-OpenSSH normally uses the **first obtained value**, not the last. An early filename is insufficient if another directive occurs before the include. The helper checks syntax with `sshd -t`, global effective values with `sshd -T`, and effective values for the deployment connection with `sshd -T -C`. Conflicting precedence is an error; foreign files are not rewritten. This does not prove policy for every possible existing `Match` context.
+## Complete Fail2Ban configuration
 
-`Port` can accumulate in OpenSSH, and an explicitly port-qualified `ListenAddress` can override listener selection. A requested port is accepted only when the effective configuration and resolved listener ports agree with that single port. Outputs derive local ports from resolved `listenaddress` entries, not from the provider's connection port.
+A standalone `fail2ban` block configures the shared daemon and any number of jails. It can coexist with the nested SSH block; both lower to **one host configuration resource**. Unscoped nested options target `[sshd]`; unscoped standalone options target `[DEFAULT]`.
 
-### SSH change confirmation and recovery
+```fsharp
+fail2ban {
+    Fail2BanSections.daemon {
+        Fail2BanDaemonOptions.logtarget "STDOUT"
+        Fail2BanDaemonOptions.socket "/run/fail2ban/site.sock"
+        Fail2BanDaemonOptions.dbpurgeage "7d"
+    }
+    Fail2BanSections.thread {
+        Fail2BanDaemonOptions.stacksize "256"
+    }
+    Fail2BanSections.defaults {
+        Fail2BanOptions.ignoreself true
+        Fail2BanOptions.ignoreip "127.0.0.0/8 ::1"
+        Fail2BanOptions.findtime "10m"
+    }
+    Fail2BanSections.jail "app-auth" {
+        Fail2BanOptions.enabled true
+        Fail2BanOptions.backend "polling"
+        Fail2BanOptions.filter "app-auth"
+        Fail2BanOptions.logpath "/var/log/app/auth.log"
+        Fail2BanOptions.maxretry 3
+        Fail2BanOptions.bantime "-1"
+        Fail2BanOptions.action "nftables[name=app-auth,port=443]"
+        Fail2BanOptions.action "app-notify"
+    }
+    Fail2BanSections.filter "app-auth" {
+        Fail2BanFilterOptions.failregex "^Failed login from <HOST>$"
+    }
+    Fail2BanSections.action "app-notify" {
+        Fail2BanActionOptions.actionban "logger -t fail2ban -- 'ban <ip> in <name>'"
+        Fail2BanActionOptions.actionunban "logger -t fail2ban -- 'unban <ip> in <name>'"
+    }
+    Fail2BanSections.actionInit "app-notify" {
+        Fail2BanActionOptions.timeout "30s"
+    }
+}
+```
 
-Before changing its file, the helper records the previous file/ownership state and arms an independent systemd rollback timer. It validates the candidate before reloading `ssh.service`. The provider then establishes a **new** SSH connection with multiplexing disabled, executes the privileged confirmation operation, and reads back finalized state. Explicit identity files use `IdentitiesOnly=yes`.
+This block belongs inside `debian { ... }`. The application log must exist and contain events matching the declared filter. The notification action supplements the nftables action; it does not itself block traffic.
 
-If confirmation fails or the client disconnects, the host-owned timer restores the prior configuration after approximately two minutes. Recovery reloads an active daemon or starts the restored daemon if it failed or stopped; a healthy daemon is not restarted. The timer is enabled so a pending transaction can recover after reboot. This is recoverable reconciliation, not an atomic network transaction or a substitute for a recovery console. Independent file changes during recovery are refused rather than overwritten.
+### Sections, definitions and extension values
 
-The connection endpoint is unchanged during confirmation. There is no automatic NAT inference, SSH port migration or firewall adjustment: a change that makes the configured endpoint inaccessible is not confirmed and is rolled back. Manage firewall and endpoint migrations deliberately.
+- `Fail2BanSections.daemon` / `thread`: daemon `[Definition]` / `[Thread]` in `fail2ban.d/90-dorothy.local`.
+- `defaults` / `jail name`: `[DEFAULT]` / named jails in `jail.d/90-dorothy.local`.
+- `filter`, `filterDefaults`, `filterIncludes`, `filterInit`: native sections in `filter.d/<name>.local`.
+- `action`, `actionIncludes`, `actionInit`: native sections in `action.d/<name>.local`.
+- `nativeSection relativePath sectionName`: arbitrary native INI sections, including `Init?family=inet6`.
+- `Fail2BanFiles.file relativePath contents`: complete native files/include assets beneath `/etc/fail2ban`.
+- `Fail2BanFiles.pythonAction name source`: an `action.d/<name>.py` module exporting the native `Action` implementation.
+- `Fail2BanOptions.custom` and the qualified modules' `custom` functions: installation-specific parameters and arbitrary interpolation variables.
 
-The resource owns one file and one host-wide SSH ownership record. Delete removes only its override, validates/reloads the inherited configuration, and requires fresh SSH confirmation too. It does not uninstall OpenSSH or disable the SSH service.
+Compatible structured contributions to the same file/section merge into one native section. Section names remain case-sensitive; option names follow native case-insensitive matching. Identical scalar declarations deduplicate and conflicting scalars are rejected. Repeated typed `Fail2BanOptions.action` declarations append to a single multiline native action option. Raw file contents are never rewritten by this composition layer; their duplicate/precedence behavior remains the native parser's responsibility.
 
-Recovery state lives under `/var/lib/keroosha-iac/sshd`; the temporary units are `keroosha-iac-sshd-rollback.service` and `.timer`. Do not delete these files or the immutable helper cache while recovery is pending. Retry with the same resource identity after resolving an error.
+Values preserve regex escapes, `<tags>` and multiline continuations. Interpolation forms `%(name)s`, `%(section/parameter)s`, `%(known/parameter)s`, and `<known/parameter>` retain their native meanings. Literal percent characters must be escaped as `%%` where native INI interpolation requires it. Native `before`/`after` includes and conditional family sections are supported. New `.local`-only filter/action definitions work without fabricating `.conf` companions.
 
-## `fail2ban`: the existing sshd jail
+There are no Dorothy-only positive-duration, IP-only, stock-filter or nftables-only policies. Native-valid permanent bans (`-1`), incremental policies, DNS allowlists, custom backends and action parameters are passed to the installed implementation. Dependencies and side effects of custom commands/Python code remain the author's responsibility; native version/build support still applies.
 
-This resource manages `/etc/fail2ban/jail.d/90-dorothy-sshd.local`, using the existing `sshd` jail rather than adding a parallel jail.
+### Automatic SSH port linking
 
-| Declaration | Default / constraint |
-| --- | --- |
-| `enabled` | `true` |
-| `maxRetry` | `5`; positive integer |
-| `findTime` | 10 minutes |
-| `banTime` | 1 hour |
-| `ignoreIp` | Repeatable IP/CIDR; loopback `127.0.0.0/8` and `::1` are included |
+A nested SSH jail without an explicit port uses resolved local `listenaddress` ports from sshd, not `sshHost.Port` (which may be a forwarded endpoint). When `config` is present, its observed port output is an actual Pulumi input dependency, so port changes update the jail.
 
-Durations must be positive whole seconds fitting Int32. DNS allowlist entries are not supported. Bare IPv4-mapped IPv6 hosts normalize to IPv4; mapped IPv6 CIDRs are rejected because their native interpretation is ambiguous. `/0` networks and unspecified hosts (`0.0.0.0`, `::`, including full-width host masks) are rejected: native Fail2Ban observations cannot distinguish these representations reliably. Use `enabled false` to disable the managed jail rather than ignoring all addresses.
+The helper owns `jail.d/99-dorothy-sshd-ports.local` for this automatic link. Explicit `[sshd]` or `[DEFAULT]` port declarations disable it, including native `:`-delimited options. `Fail2BanFiles.manageSshdPorts false` opts out for include-driven policies. Standalone full configuration has no implicit SSH-server dependency. The generated port file is reserved and cannot also be declared as a user file.
 
-The fixed policy uses:
+## Applying changes, recovery and deletion
 
-- `backend = systemd`, without a file log path;
-- the packaged `sshd[mode=normal]` filter and `usedns = no`;
-- the native nftables multiport action, separate from UFW user chains;
-- local listener ports discovered from `sshd -T`.
+### SSHD
 
-When both blocks are present, the jail depends on the SSH resource and consumes its observed ports as a Pulumi input. A port-output change therefore updates the jail; `DependsOn` alone would not do this. Without `config`, the helper discovers local ports itself.
+Only the owned drop-in and private recovery state are written. `sshd -t` validates the candidate; plain `sshd -T` and `sshd -T -C` report global and deployment-context configuration. A separate private debug trace checks Include participation without changing the reported effective LogLevel.
 
-The helper validates the complete configuration before applying it and compares managed policy with native runtime observations, including action commands and ignored-regex behavior. It requires the packaged `sshd.conf`, `common.conf` and `nftables.conf` definitions to match Debian's conffile checksums; local overrides of those filters/actions are unsupported. This is not a complete firewall audit or protection against arbitrary out-of-band changes to the daemon or its environment. Dynamic ban addresses and counters are not stored as desired state and do not cause Pulumi diffs.
+Before mutation, the helper durably records prior file/state and arms an independent systemd rollback timer. It validates before reload, then requires privileged confirmation through a **fresh, non-multiplexed SSH connection**. The configured connection endpoint remains unchanged. A change that loses access is not confirmed; the host watchdog restores the previous configuration after approximately two minutes, including after reboot. Recovery reloads an active daemon or starts a restored daemon that failed/stopped; it does not restart a healthy daemon unnecessarily.
 
-`enabled false` disables only the sshd jail. **Deleting the resource removes its override and reloads the remaining configuration. That may re-enable a distro or pre-existing sshd jail.** Delete preserves other jail files, the shared daemon and the ban database. Ownership/recovery state is `/var/lib/keroosha-iac/fail2ban/sshd.json`. An edited or foreign managed-path file is refused rather than overwritten or deleted blindly.
+Delete removes the owned drop-in, restores native inheritance and requires the same fresh confirmation. It does not disable/uninstall SSH or modify firewall rules. Recovery state is under `/var/lib/keroosha-iac/sshd`; temporary units are `keroosha-iac-sshd-rollback.service` and `.timer`. Keep the immutable helper cache and pending state until recovery completes.
 
-## Prerequisites and package ownership
+### Fail2Ban
 
-An already reachable OpenSSH server, active Debian `ssh.service`, working systemd, trusted SSH host keys, and root or noninteractive sudo are required. SSH socket activation and custom SSH command-line/configuration paths are unsupported. Fail2Ban requires the stock Debian service invocation with empty `SSHD_OPTS`. The native helper needs compatible ICU libraries; existing provider bootstrap behavior applies.
+The helper stages the resulting configuration tree—including removals—and validates it with the installed Fail2Ban parser. Multi-file writes use a durable ownership/mutation journal. Another owner's file, out-of-band file edits, unsafe paths and insecure owned-file permission drift are refused rather than silently overwritten.
 
-Dorothy does **not** implicitly install or take ownership of `openssh-server`: removing/reinstalling the active transport is unsafe. Explicit user APT declarations remain unchanged.
+Ordinary jail/filter/command-action changes use native `reload --restart --all`. Startup changes (including socket, PID file, database and thread settings) and Python-source changes restart the daemon. The old service/endpoint is stopped before installing startup changes; the new endpoint and native state must become ready within a bounded deadline. Failed changes restore attributable previous files and daemon availability; interrupted mutation retries recover from the journal.
 
-Missing implicit `fail2ban` and `nftables` declarations get separate, stable, retained package resources. Removing the jail does not uninstall these packages. Explicit APT declarations retain their existing ownership and deletion semantics. Moving a package between explicit and implicit ownership is not an automatic zero-gap handoff: retain the existing declaration or perform a deliberate state/ownership migration. In particular, an explicit-to-implicit transition can remove the old owner's package before its new owner installs it.
+This is shared-daemon configuration: reload/restart can affect all configured jails, including those in preserved foreign files. No `--unban` is requested, but ban persistence follows native DB/restart behavior. Changing `dbfile` does not migrate or delete a database. Setting `dbfile=None` is supported.
 
-Check, Diff and preview do not connect to the host. External changes require refresh, for example `pulumi preview --refresh --diff`. Read observes policy without applying or rolling back pending SSH/jail changes; mutation retries handle recovery. SSH/command failures are errors, not absent resources. The existing helper ICU bootstrap remains an exception to read-only host inspection.
+Delete removes only journaled files and reloads/restarts the inherited configuration. **An inherited distro/operator jail can become enabled again.** Other configuration files, database files and retained prerequisite packages remain. The shared service is not uninstalled or globally disabled merely because the resource disappears. State is `/var/lib/keroosha-iac/fail2ban/configuration.json`.
 
-## Adopting an existing machine
+Config rollback cannot undo arbitrary external effects of command/Python actions. Such actions execute with the daemon's privileges; test them on an isolated host and maintain independent recovery access.
 
-1. Record effective SSH policy, service invocation, current jail policy and an out-of-band recovery path.
-2. Declare only the intended SSH overrides. Confirm administrator access before disabling authentication methods.
-3. Preserve existing ban thresholds during adoption unless a policy change is intentional. An existing `jail.local` remains a source of inherited settings and can become effective again after resource deletion.
-4. Resolve ownership collisions at Dorothy's reserved file paths explicitly. Do not erase unrelated configuration or the ban database.
-5. Apply in a maintenance window, verify a fresh login and the effective jail, then exercise ban/unban from a separate disposable source address.
+## Observation and security boundaries
 
-Publish/install the native helper and provider using the repository's existing workflow before deploying these new resource types. No existing host is migrated merely by adding these declarations to the library.
+Check, Diff and preview do not connect or mutate the host. External changes require refresh, for example `pulumi preview --refresh --diff`. Read never repairs or rolls back a pending configuration. An interrupted/invalid tree is reported as owned/out-of-sync with available file observations; endpoint/jail observations can be unavailable while that tree is incomplete. Do not infer a healthy empty daemon from such a pending snapshot.
+
+Native effective configuration, service/jail presence and observable runtime settings are checked. Dynamic bans/counters do not cause diffs. A getter that cannot expose the original declaration is not guessed: for example `logencoding=auto` is selected in the daemon's environment, not the SSH client's forced locale. This is not an audit of arbitrary Python behavior, every possible `Match` context, external executables or the whole kernel firewall.
+
+Owned configuration/Python files and journals are root-private (`0600`); staging/state directories are private. Full SSH effective configuration, Fail2Ban file observations and control-socket outputs are Pulumi secrets because inherited settings can contain sensitive arguments. Native validation errors do not echo configuration bodies. Native daemon logs and custom actions still obey their own logging behavior.
+
+For secret/dynamic input contents, use the Input-typed `SshdConfigArgs.Configuration` and `Fail2BanConfigurationArgs.Files` rather than unwrapping a Pulumi secret into a plain string. Public native resource tokens are `keroosha:debian:SshdConfig` and `keroosha:debian:Fail2Ban`.
+
+## Prerequisites and adoption
+
+- Existing Debian 13/systemd, trusted SSH host keys, root or noninteractive sudo, and a compatible native helper/ICU runtime. Existing provider ICU bootstrap remains an exception to otherwise observational Read.
+- SSH configuration requires an existing active OpenSSH service and native Include topology. It does not implicitly install/take ownership of `openssh-server`. SSH socket activation and transparent endpoint/firewall migration are not managed by this resource.
+- Implicit `fail2ban`/`nftables` prerequisites use separate retained package resources. Other action executables/packages belong in the caller's APT declarations. Explicit package ownership is preserved; switching explicit/implicit ownership requires deliberate migration, not an assumed zero-gap handoff.
+- Keep vendor `.conf` files as the baseline and inspect existing `.local` precedence before adoption. Reserved managed-path collisions require an explicit ownership transition. Do not erase foreign config or ban DBs to make an apply pass.
+- Declare administrator allowlists explicitly; the deployment address is not silently trusted. Verify out-of-band console access before changing authentication, listeners or ban policy. Native-drop-in semantics intentionally preserve upstream conflicts and inheritance.

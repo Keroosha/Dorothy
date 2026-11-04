@@ -30,6 +30,7 @@
     <Compile Include="Fail2BanTests.fs" />
     <Compile Include="SshProviderTests.fs" />
     <Compile Include="SshdDslTests.fs" />
+    <Compile Include="FullConfigDslTests.fs" />
     <Compile Include="PulumiCliTests.fs" />
   </ItemGroup>
 </Project>
