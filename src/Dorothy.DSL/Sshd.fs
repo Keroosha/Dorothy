@@ -11,6 +11,251 @@ type SshdRootLogin =
     | ProhibitPassword
     | ForcedCommandsOnly
 
+[<RequireQualifiedAccess>]
+type SshdAddressFamily =
+    | Any
+    | IPv4
+    | IPv6
+
+[<RequireQualifiedAccess>]
+type SshdForwardingMode =
+    | Yes
+    | All
+    | No
+    | Local
+    | Remote
+
+[<RequireQualifiedAccess>]
+type SshdCompression =
+    | Yes
+    | Delayed
+    | No
+
+[<RequireQualifiedAccess>]
+type SshdFingerprintHash =
+    | Md5
+    | Sha256
+
+[<RequireQualifiedAccess>]
+type SshdGatewayPorts =
+    | No
+    | Yes
+    | ClientSpecified
+
+[<RequireQualifiedAccess>]
+type SshdIgnoreRhosts =
+    | Yes
+    | No
+    | ShostsOnly
+
+[<RequireQualifiedAccess>]
+type SshdLogLevel =
+    | Quiet
+    | Fatal
+    | Error
+    | Info
+    | Verbose
+    | Debug
+    | Debug1
+    | Debug2
+    | Debug3
+
+[<RequireQualifiedAccess>]
+type SshdPermitTunnel =
+    | Yes
+    | PointToPoint
+    | Ethernet
+    | No
+
+[<RequireQualifiedAccess>]
+type SshdSyslogFacility =
+    | Daemon
+    | User
+    | Auth
+    | AuthPriv
+    | Local0
+    | Local1
+    | Local2
+    | Local3
+    | Local4
+    | Local5
+    | Local6
+    | Local7
+
+[<RequireQualifiedAccess>]
+type SshdPermitUserEnvironment =
+    | Yes
+    | No
+    | Patterns of string
+
+[<RequireQualifiedAccess>]
+type SshdLoginGraceTime =
+    | NoLimit
+    | LimitedTo of TimeSpan
+
+[<RequireQualifiedAccess>]
+type SshdClientAliveInterval =
+    | Disabled
+    | Every of TimeSpan
+
+[<RequireQualifiedAccess>]
+type SshdUnusedConnectionTimeout =
+    | Never
+    | After of TimeSpan
+
+[<RequireQualifiedAccess>]
+type SshdChannel =
+    | Global
+    | AgentConnection
+    | DirectTcpip
+    | DirectStreamLocal
+    | ForwardedTcpip
+    | ForwardedStreamLocal
+    | Session
+    | Shell
+    | Command
+    | TunConnection
+    | X11Connection
+    | Subsystem
+    | Pattern of string
+
+type SshdChannelTimeoutEntry =
+    { Channel: SshdChannel
+      InactiveFor: TimeSpan }
+
+[<RequireQualifiedAccess>]
+type SshdChannelTimeout =
+    | Disabled
+    | Timeouts of SshdChannelTimeoutEntry list
+
+[<RequireQualifiedAccess>]
+type SshdRekeyDataLimit =
+    | Default
+    | Bytes of int64<B>
+
+type SshdRekeyLimit =
+    { DataLimit: SshdRekeyDataLimit
+      TimeLimit: TimeSpan option }
+
+type SshdRandomEarlyDrop =
+    { Start: int
+      Rate: int
+      Full: int }
+
+[<RequireQualifiedAccess>]
+type SshdMaxStartups =
+    | Limit of int
+    | RandomEarlyDrop of SshdRandomEarlyDrop
+
+[<RequireQualifiedAccess>]
+type SshdPerSourceMaxStartups =
+    | Unlimited
+    | Limit of int
+
+type SshdPerSourceNetBlockSize =
+    { IPv4Prefix: int
+      IPv6Prefix: int option }
+
+[<RequireQualifiedAccess>]
+type SshdPerSourceOverflowMode =
+    | DenyAll
+    | Permissive
+
+[<RequireQualifiedAccess>]
+type SshdPerSourcePenalty =
+    | Crash of TimeSpan
+    | AuthFail of TimeSpan
+    | NoAuth of TimeSpan
+    | GraceExceeded of TimeSpan
+    | RefuseConnection of TimeSpan
+    | Max of TimeSpan
+    | Min of TimeSpan
+    | MaxSources4 of int
+    | MaxSources6 of int
+    | Overflow of SshdPerSourceOverflowMode
+    | Overflow6 of SshdPerSourceOverflowMode
+
+[<RequireQualifiedAccess>]
+type SshdPerSourcePenalties =
+    | Disabled
+    | Enabled
+    | Configured of SshdPerSourcePenalty list
+
+[<RequireQualifiedAccess>]
+type SshdForwardPort =
+    | Any
+    | Number of int
+    | ServiceName of string
+
+type SshdPermitOpenDestination =
+    { Host: string
+      Port: SshdForwardPort }
+
+[<RequireQualifiedAccess>]
+type SshdPermitOpen =
+    | Any
+    | None
+    | Destinations of SshdPermitOpenDestination list
+
+type SshdPermitListenAddress =
+    { Host: string option
+      Port: SshdForwardPort }
+
+[<RequireQualifiedAccess>]
+type SshdPermitListen =
+    | Any
+    | None
+    | Addresses of SshdPermitListenAddress list
+
+type SshdListenAddress =
+    { Address: string
+      Port: SshdForwardPort option
+      RoutingDomain: string option }
+
+[<RequireQualifiedAccess>]
+type SshdIpQosValue =
+    | OsDefault
+    | Af11
+    | Af12
+    | Af13
+    | Af21
+    | Af22
+    | Af23
+    | Af31
+    | Af32
+    | Af33
+    | Af41
+    | Af42
+    | Af43
+    | Cs0
+    | Cs1
+    | Cs2
+    | Cs3
+    | Cs4
+    | Cs5
+    | Cs6
+    | Cs7
+    | Ef
+    | Le
+    | LowDelay
+    | Throughput
+    | Reliability
+    | Numeric of int
+
+type SshdIpQos =
+    { Interactive: SshdIpQosValue
+      Bulk: SshdIpQosValue option }
+
+[<RequireQualifiedAccess>]
+type SshdPubkeyAuthOption =
+    | TouchRequired
+    | VerifyRequired
+
+[<RequireQualifiedAccess>]
+type SshdPubkeyAuthOptions =
+    | None
+    | Options of SshdPubkeyAuthOption list
+
 type SshdConfigPart =
     | Directive of keyword: string * arguments: string
     | NativeText of string
@@ -92,17 +337,197 @@ module SshdOptions =
     let private integer = SshdNative.integer
     let private list = SshdNative.list
 
+    let private validateSingleToken (parameterName: string) (value: string) =
+        if
+            String.IsNullOrWhiteSpace value
+            || (value
+                |> Seq.exists (fun character ->
+                    Char.IsWhiteSpace character
+                    || character = '\u0000'
+                    || character = '#'
+                    || character = '"'
+                    || character = '\u0027'))
+        then
+            invalidArg parameterName "The value cannot contain whitespace, comments, quotes, or NUL."
+
+        value
+    let private validateInteger (parameterName: string) (minimum: int) (maximum: int) (value: int) =
+        if value < minimum || value > maximum then
+            invalidArg parameterName $"The value must be in the range {minimum} through {maximum}."
+
+        value.ToString(CultureInfo.InvariantCulture)
+
+    let private integerInRange keyword minimum maximum value =
+        validateInteger keyword minimum maximum value |> ignore
+        integer keyword value
+
+    let private renderSeconds parameterName allowZero (duration: TimeSpan) =
+        let ticksPerSecond = TimeSpan.TicksPerSecond
+
+        if duration.Ticks % ticksPerSecond <> 0L then
+            invalidArg parameterName "OpenSSH time values must be an exact whole number of seconds."
+
+        let seconds = duration.Ticks / ticksPerSecond
+
+        if
+            seconds < 0L
+            || (seconds = 0L && not allowZero)
+            || seconds > int64 Int32.MaxValue
+        then
+            invalidArg parameterName $"OpenSSH time values must be between {(if allowZero then 0 else 1)} and {Int32.MaxValue} whole seconds."
+
+        seconds.ToString(CultureInfo.InvariantCulture)
+
+    let private renderForwardPort (port: SshdForwardPort) =
+        match port with
+        | SshdForwardPort.Any -> "*"
+        | SshdForwardPort.Number value -> validateInteger "Port" 1 65535 value
+        | SshdForwardPort.ServiceName name -> validateSingleToken "Port" name
+
+    let private renderEndpointHost parameterName (host: string) =
+        let host = validateSingleToken parameterName host
+
+        if host.Contains(':')
+           && not (host.StartsWith("[", StringComparison.Ordinal) && host.EndsWith("]", StringComparison.Ordinal)) then
+            "[" + host + "]"
+        else
+            host
+
+    let private renderChannel (channel: SshdChannel) =
+        match channel with
+        | SshdChannel.Global -> "global"
+        | SshdChannel.AgentConnection -> "agent-connection"
+        | SshdChannel.DirectTcpip -> "direct-tcpip"
+        | SshdChannel.DirectStreamLocal -> "direct-streamlocal@openssh.com"
+        | SshdChannel.ForwardedTcpip -> "forwarded-tcpip"
+        | SshdChannel.ForwardedStreamLocal -> "forwarded-streamlocal@openssh.com"
+        | SshdChannel.Session -> "session*"
+        | SshdChannel.Shell -> "session:shell"
+        | SshdChannel.Command -> "session:command"
+        | SshdChannel.TunConnection -> "tun"
+        | SshdChannel.X11Connection -> "x11-connection"
+        | SshdChannel.Subsystem -> "session:subsystem:*"
+        | SshdChannel.Pattern pattern ->
+            let pattern = validateSingleToken "Channel" pattern
+
+            if pattern.Contains('=') then
+                invalidArg "Channel" "A channel pattern cannot contain '='."
+
+            pattern
+
+    let private renderIpQosValue (value: SshdIpQosValue) =
+        match value with
+        | SshdIpQosValue.OsDefault -> "none"
+        | SshdIpQosValue.Af11 -> "af11"
+        | SshdIpQosValue.Af12 -> "af12"
+        | SshdIpQosValue.Af13 -> "af13"
+        | SshdIpQosValue.Af21 -> "af21"
+        | SshdIpQosValue.Af22 -> "af22"
+        | SshdIpQosValue.Af23 -> "af23"
+        | SshdIpQosValue.Af31 -> "af31"
+        | SshdIpQosValue.Af32 -> "af32"
+        | SshdIpQosValue.Af33 -> "af33"
+        | SshdIpQosValue.Af41 -> "af41"
+        | SshdIpQosValue.Af42 -> "af42"
+        | SshdIpQosValue.Af43 -> "af43"
+        | SshdIpQosValue.Cs0 -> "cs0"
+        | SshdIpQosValue.Cs1 -> "cs1"
+        | SshdIpQosValue.Cs2 -> "cs2"
+        | SshdIpQosValue.Cs3 -> "cs3"
+        | SshdIpQosValue.Cs4 -> "cs4"
+        | SshdIpQosValue.Cs5 -> "cs5"
+        | SshdIpQosValue.Cs6 -> "cs6"
+        | SshdIpQosValue.Cs7 -> "cs7"
+        | SshdIpQosValue.Ef -> "ef"
+        | SshdIpQosValue.Le -> "le"
+        | SshdIpQosValue.LowDelay -> "lowdelay"
+        | SshdIpQosValue.Throughput -> "throughput"
+        | SshdIpQosValue.Reliability -> "reliability"
+        | SshdIpQosValue.Numeric value -> validateInteger "IPQoS" 0 255 value
+
+    let private renderPerSourcePenalty (penalty: SshdPerSourcePenalty) =
+        let duration name value = name + ":" + renderSeconds name true value
+        let count name value = name + ":" + validateInteger name 0 Int32.MaxValue value
+
+        match penalty with
+        | SshdPerSourcePenalty.Crash value -> duration "crash" value
+        | SshdPerSourcePenalty.AuthFail value -> duration "authfail" value
+        | SshdPerSourcePenalty.NoAuth value -> duration "noauth" value
+        | SshdPerSourcePenalty.GraceExceeded value -> duration "grace-exceeded" value
+        | SshdPerSourcePenalty.RefuseConnection value -> duration "refuseconnection" value
+        | SshdPerSourcePenalty.Max value -> duration "max" value
+        | SshdPerSourcePenalty.Min value -> duration "min" value
+        | SshdPerSourcePenalty.MaxSources4 value -> count "max-sources4" value
+        | SshdPerSourcePenalty.MaxSources6 value -> count "max-sources6" value
+        | SshdPerSourcePenalty.Overflow SshdPerSourceOverflowMode.DenyAll -> "overflow:deny-all"
+        | SshdPerSourcePenalty.Overflow SshdPerSourceOverflowMode.Permissive -> "overflow:permissive"
+        | SshdPerSourcePenalty.Overflow6 SshdPerSourceOverflowMode.DenyAll -> "overflow6:deny-all"
+        | SshdPerSourcePenalty.Overflow6 SshdPerSourceOverflowMode.Permissive -> "overflow6:permissive"
+
+    let private renderForwardingAddress host port =
+        let renderedPort = renderForwardPort port
+
+        match host with
+        | None -> renderedPort
+        | Some value -> renderEndpointHost "Host" value + ":" + renderedPort
+
+    let private renderListenAddress (address: SshdListenAddress) =
+        let host = validateSingleToken "Address" address.Address
+
+        let endpoint =
+            match address.Port with
+            | None -> host
+            | Some SshdForwardPort.Any ->
+                invalidArg "Port" "ListenAddress requires a numeric port or service name."
+            | Some port -> renderEndpointHost "Address" host + ":" + renderForwardPort port
+
+        match address.RoutingDomain with
+        | None -> endpoint
+        | Some routingDomain -> endpoint + " rdomain " + validateSingleToken "RoutingDomain" routingDomain
+
+    let private renderPermitOpenDestination (destination: SshdPermitOpenDestination) =
+        renderEndpointHost "Host" destination.Host
+        + ":"
+        + renderForwardPort destination.Port
+
     let acceptEnv value = directive "AcceptEnv" value
     let acceptEnvList values = list "AcceptEnv" values
-    let addressFamily value = directive "AddressFamily" value
+
+    let addressFamily (value: SshdAddressFamily) =
+        let token =
+            match value with
+            | SshdAddressFamily.Any -> "any"
+            | SshdAddressFamily.IPv4 -> "inet"
+            | SshdAddressFamily.IPv6 -> "inet6"
+
+        directive "AddressFamily" token
+
     let allowAgentForwarding value = boolean "AllowAgentForwarding" value
     let allowGroups value = directive "AllowGroups" value
     let allowGroupsList values = list "AllowGroups" values
 
-    let allowStreamLocalForwarding value =
-        directive "AllowStreamLocalForwarding" value
+    let allowStreamLocalForwarding (value: SshdForwardingMode) =
+        let token =
+            match value with
+            | SshdForwardingMode.Yes -> "yes"
+            | SshdForwardingMode.All -> "all"
+            | SshdForwardingMode.No -> "no"
+            | SshdForwardingMode.Local -> "local"
+            | SshdForwardingMode.Remote -> "remote"
 
-    let allowTcpForwarding value = directive "AllowTcpForwarding" value
+        directive "AllowStreamLocalForwarding" token
+
+    let allowTcpForwarding (value: SshdForwardingMode) =
+        let token =
+            match value with
+            | SshdForwardingMode.Yes -> "yes"
+            | SshdForwardingMode.All -> "all"
+            | SshdForwardingMode.No -> "no"
+            | SshdForwardingMode.Local -> "local"
+            | SshdForwardingMode.Remote -> "remote"
+
+        directive "AllowTcpForwarding" token
+
     let allowUsers value = directive "AllowUsers" value
     let allowUsersList values = list "AllowUsers" values
     let authenticationMethods value = directive "AuthenticationMethods" value
@@ -124,12 +549,45 @@ module SshdOptions =
 
     let banner value = directive "Banner" value
     let caSignatureAlgorithms value = directive "CASignatureAlgorithms" value
-    let channelTimeout value = directive "ChannelTimeout" value
+
+    let channelTimeout (value: SshdChannelTimeout) =
+        match value with
+        | SshdChannelTimeout.Disabled -> directive "ChannelTimeout" "none"
+        | SshdChannelTimeout.Timeouts [] ->
+            invalidArg "value" "ChannelTimeout requires at least one timeout entry."
+        | SshdChannelTimeout.Timeouts entries ->
+            entries
+            |> List.map (fun entry ->
+                renderChannel entry.Channel
+                + "="
+                + renderSeconds "InactiveFor" true entry.InactiveFor)
+            |> String.concat " "
+            |> directive "ChannelTimeout"
+
     let chrootDirectory value = directive "ChrootDirectory" value
     let ciphers value = directive "Ciphers" value
-    let clientAliveCountMax value = integer "ClientAliveCountMax" value
-    let clientAliveInterval value = directive "ClientAliveInterval" value
-    let compression value = directive "Compression" value
+
+    let clientAliveCountMax value =
+        integerInRange "ClientAliveCountMax" 0 Int32.MaxValue value
+
+    let clientAliveInterval (value: SshdClientAliveInterval) =
+        let seconds =
+            match value with
+            | SshdClientAliveInterval.Disabled -> "0"
+            | SshdClientAliveInterval.Every interval ->
+                renderSeconds "ClientAliveInterval" false interval
+
+        directive "ClientAliveInterval" seconds
+
+    let compression (value: SshdCompression) =
+        let token =
+            match value with
+            | SshdCompression.Yes -> "yes"
+            | SshdCompression.Delayed -> "delayed"
+            | SshdCompression.No -> "no"
+
+        directive "Compression" token
+
     let debianBanner value = boolean "DebianBanner" value
     let denyGroups value = directive "DenyGroups" value
     let denyGroupsList values = list "DenyGroups" values
@@ -137,9 +595,26 @@ module SshdOptions =
     let denyUsersList values = list "DenyUsers" values
     let disableForwarding value = boolean "DisableForwarding" value
     let exposeAuthInfo value = boolean "ExposeAuthInfo" value
-    let fingerprintHash value = directive "FingerprintHash" value
+
+    let fingerprintHash (value: SshdFingerprintHash) =
+        let token =
+            match value with
+            | SshdFingerprintHash.Md5 -> "md5"
+            | SshdFingerprintHash.Sha256 -> "sha256"
+
+        directive "FingerprintHash" token
+
     let forceCommand value = directive "ForceCommand" value
-    let gatewayPorts value = directive "GatewayPorts" value
+
+    let gatewayPorts (value: SshdGatewayPorts) =
+        let token =
+            match value with
+            | SshdGatewayPorts.No -> "no"
+            | SshdGatewayPorts.Yes -> "yes"
+            | SshdGatewayPorts.ClientSpecified -> "clientspecified"
+
+        directive "GatewayPorts" token
+
     let gssapiAuthentication value = boolean "GSSAPIAuthentication" value
 
     let gssapiCleanupCredentials value =
@@ -175,11 +650,29 @@ module SshdOptions =
 
     let hostKeyAgent value = directive "HostKeyAgent" value
     let hostKeyAlgorithms value = directive "HostKeyAlgorithms" value
-    let ignoreRhosts value = directive "IgnoreRhosts" value
+
+    let ignoreRhosts (value: SshdIgnoreRhosts) =
+        let token =
+            match value with
+            | SshdIgnoreRhosts.Yes -> "yes"
+            | SshdIgnoreRhosts.No -> "no"
+            | SshdIgnoreRhosts.ShostsOnly -> "shosts-only"
+
+        directive "IgnoreRhosts" token
+
     let ignoreUserKnownHosts value = boolean "IgnoreUserKnownHosts" value
     let includePath value = directive "Include" value
     let includePaths values = list "Include" values
-    let ipQos value = directive "IPQoS" value
+
+    let ipQos (value: SshdIpQos) =
+        let interactive = renderIpQosValue value.Interactive
+
+        let arguments =
+            match value.Bulk with
+            | None -> interactive
+            | Some bulk -> interactive + " " + renderIpQosValue bulk
+
+        directive "IPQoS" arguments
 
     let kbdInteractiveAuthentication value =
         boolean "KbdInteractiveAuthentication" value
@@ -189,42 +682,176 @@ module SshdOptions =
     let kerberosOrLocalPasswd value = boolean "KerberosOrLocalPasswd" value
     let kerberosTicketCleanup value = boolean "KerberosTicketCleanup" value
     let kexAlgorithms value = directive "KexAlgorithms" value
-    let listenAddress value = directive "ListenAddress" value
 
-    let listenAddresses values =
-        values |> Seq.map (directive "ListenAddress") |> Seq.toList
+    let listenAddress (address: SshdListenAddress) =
+        renderListenAddress address |> directive "ListenAddress"
 
-    let loginGraceTime value = directive "LoginGraceTime" value
-    let logLevel value = directive "LogLevel" value
+    let listenAddresses (addresses: seq<SshdListenAddress>) =
+        addresses
+        |> Seq.map (fun address -> renderListenAddress address |> directive "ListenAddress")
+        |> Seq.toList
+
+    let loginGraceTime (value: SshdLoginGraceTime) =
+        let seconds =
+            match value with
+            | SshdLoginGraceTime.NoLimit -> "0"
+            | SshdLoginGraceTime.LimitedTo duration ->
+                renderSeconds "LoginGraceTime" false duration
+
+        directive "LoginGraceTime" seconds
+
+    let logLevel (value: SshdLogLevel) =
+        let token =
+            match value with
+            | SshdLogLevel.Quiet -> "QUIET"
+            | SshdLogLevel.Fatal -> "FATAL"
+            | SshdLogLevel.Error -> "ERROR"
+            | SshdLogLevel.Info -> "INFO"
+            | SshdLogLevel.Verbose -> "VERBOSE"
+            | SshdLogLevel.Debug -> "DEBUG"
+            | SshdLogLevel.Debug1 -> "DEBUG1"
+            | SshdLogLevel.Debug2 -> "DEBUG2"
+            | SshdLogLevel.Debug3 -> "DEBUG3"
+
+        directive "LogLevel" token
+
     let logVerbose value = directive "LogVerbose" value
     let macs value = directive "MACs" value
-    let maxAuthTries value = integer "MaxAuthTries" value
-    let maxSessions value = integer "MaxSessions" value
-    let maxStartups value = directive "MaxStartups" value
+
+    let maxAuthTries value =
+        integerInRange "MaxAuthTries" 0 Int32.MaxValue value
+
+    let maxSessions value =
+        integerInRange "MaxSessions" 0 Int32.MaxValue value
+
+    let maxStartups (value: SshdMaxStartups) =
+        let arguments =
+            match value with
+            | SshdMaxStartups.Limit count ->
+                validateInteger "MaxStartups" 1 Int32.MaxValue count
+            | SshdMaxStartups.RandomEarlyDrop limits ->
+                let start = validateInteger "Start" 1 Int32.MaxValue limits.Start
+                let rate = validateInteger "Rate" 1 100 limits.Rate
+                let full = validateInteger "Full" 1 Int32.MaxValue limits.Full
+
+                if limits.Start > limits.Full then
+                    invalidArg "Full" "MaxStartups start must not exceed full."
+
+                start + ":" + rate + ":" + full
+
+        directive "MaxStartups" arguments
+
     let moduliFile value = directive "ModuliFile" value
     let pamServiceName value = directive "PAMServiceName" value
     let passwordAuthentication value = boolean "PasswordAuthentication" value
     let permitEmptyPasswords value = boolean "PermitEmptyPasswords" value
-    let permitListen value = directive "PermitListen" value
-    let permitOpen value = directive "PermitOpen" value
-    let permitRootLogin value = directive "PermitRootLogin" value
+
+    let permitListen (value: SshdPermitListen) =
+        let arguments =
+            match value with
+            | SshdPermitListen.Any -> "any"
+            | SshdPermitListen.None -> "none"
+            | SshdPermitListen.Addresses [] ->
+                invalidArg "value" "PermitListen requires at least one address."
+            | SshdPermitListen.Addresses addresses ->
+                addresses
+                |> List.map (fun address -> renderForwardingAddress address.Host address.Port)
+                |> String.concat " "
+
+        directive "PermitListen" arguments
+
+    let permitOpen (value: SshdPermitOpen) =
+        let arguments =
+            match value with
+            | SshdPermitOpen.Any -> "any"
+            | SshdPermitOpen.None -> "none"
+            | SshdPermitOpen.Destinations [] ->
+                invalidArg "value" "PermitOpen requires at least one destination."
+            | SshdPermitOpen.Destinations destinations ->
+                destinations
+                |> List.map renderPermitOpenDestination
+                |> String.concat " "
+
+        directive "PermitOpen" arguments
+
+    let permitRootLogin (value: SshdRootLogin) =
+        let token =
+            match value with
+            | SshdRootLogin.Yes -> "yes"
+            | SshdRootLogin.No -> "no"
+            | SshdRootLogin.ProhibitPassword -> "prohibit-password"
+            | SshdRootLogin.ForcedCommandsOnly -> "forced-commands-only"
+
+        directive "PermitRootLogin" token
+
     let permitTTY value = boolean "PermitTTY" value
-    let permitTunnel value = directive "PermitTunnel" value
-    let permitUserEnvironment value = directive "PermitUserEnvironment" value
-    let permitUserEnvironmentEnabled value = boolean "PermitUserEnvironment" value
+
+    let permitTunnel (value: SshdPermitTunnel) =
+        let token =
+            match value with
+            | SshdPermitTunnel.Yes -> "yes"
+            | SshdPermitTunnel.PointToPoint -> "point-to-point"
+            | SshdPermitTunnel.Ethernet -> "ethernet"
+            | SshdPermitTunnel.No -> "no"
+
+        directive "PermitTunnel" token
+
+    let permitUserEnvironment (value: SshdPermitUserEnvironment) =
+        let arguments =
+            match value with
+            | SshdPermitUserEnvironment.Yes -> "yes"
+            | SshdPermitUserEnvironment.No -> "no"
+            | SshdPermitUserEnvironment.Patterns patterns ->
+                let patterns = validateSingleToken "Patterns" patterns
+
+                if
+                    String.Equals(patterns, "yes", StringComparison.Ordinal)
+                    || String.Equals(patterns, "no", StringComparison.Ordinal)
+                then
+                    invalidArg "Patterns" "Use the explicit Yes or No case for these native sentinel values."
+
+                patterns
+
+        directive "PermitUserEnvironment" arguments
+
     let permitUserRC value = boolean "PermitUserRC" value
-    let perSourceMaxStartups value = directive "PerSourceMaxStartups" value
-    let perSourceNetBlockSize value = directive "PerSourceNetBlockSize" value
-    let perSourcePenalties value = directive "PerSourcePenalties" value
+
+    let perSourceMaxStartups (value: SshdPerSourceMaxStartups) =
+        let arguments =
+            match value with
+            | SshdPerSourceMaxStartups.Unlimited -> "none"
+            | SshdPerSourceMaxStartups.Limit count ->
+                validateInteger "PerSourceMaxStartups" 0 Int32.MaxValue count
+
+        directive "PerSourceMaxStartups" arguments
+
+    let perSourceNetBlockSize (value: SshdPerSourceNetBlockSize) =
+        let ipv4 = validateInteger "IPv4Prefix" 0 32 value.IPv4Prefix
+        let ipv6 = validateInteger "IPv6Prefix" 0 128 (defaultArg value.IPv6Prefix 128)
+        directive "PerSourceNetBlockSize" (ipv4 + ":" + ipv6)
+
+    let perSourcePenalties (value: SshdPerSourcePenalties) =
+        let arguments =
+            match value with
+            | SshdPerSourcePenalties.Disabled -> "no"
+            | SshdPerSourcePenalties.Enabled -> "yes"
+            | SshdPerSourcePenalties.Configured [] ->
+                invalidArg "value" "PerSourcePenalties requires at least one setting."
+            | SshdPerSourcePenalties.Configured settings ->
+                settings |> List.map renderPerSourcePenalty |> String.concat " "
+
+        directive "PerSourcePenalties" arguments
 
     let perSourcePenaltyExemptList value =
         directive "PerSourcePenaltyExemptList" value
 
     let pidFile value = directive "PidFile" value
-    let port value = integer "Port" value
+
+    let port value =
+        integerInRange "Port" 1 65535 value
 
     let ports values =
-        values |> Seq.map (integer "Port") |> Seq.toList
+        values |> Seq.map port |> Seq.toList
 
     let printLastLog value = boolean "PrintLastLog" value
     let printMotd value = boolean "PrintMotd" value
@@ -232,32 +859,97 @@ module SshdOptions =
     let pubkeyAcceptedAlgorithms value =
         directive "PubkeyAcceptedAlgorithms" value
 
-    let pubkeyAuthOptions value = directive "PubkeyAuthOptions" value
+    let pubkeyAuthOptions (value: SshdPubkeyAuthOptions) =
+        let arguments =
+            match value with
+            | SshdPubkeyAuthOptions.None -> "none"
+            | SshdPubkeyAuthOptions.Options [] ->
+                invalidArg "value" "PubkeyAuthOptions requires at least one option."
+            | SshdPubkeyAuthOptions.Options options ->
+                options
+                |> List.map (function
+                    | SshdPubkeyAuthOption.TouchRequired -> "touch-required"
+                    | SshdPubkeyAuthOption.VerifyRequired -> "verify-required")
+                |> String.concat " "
+
+        directive "PubkeyAuthOptions" arguments
+
     let pubkeyAuthentication value = boolean "PubkeyAuthentication" value
     let refuseConnection value = boolean "RefuseConnection" value
-    let rekeyLimit value = directive "RekeyLimit" value
-    let requiredRsaSize value = integer "RequiredRSASize" value
+
+    let rekeyLimit (value: SshdRekeyLimit) =
+        let data =
+            match value.DataLimit with
+            | SshdRekeyDataLimit.Default -> "default"
+            | SshdRekeyDataLimit.Bytes bytes ->
+                if bytes < 16L<B> then
+                    invalidArg "DataLimit" "RekeyLimit bytes must be at least 16."
+
+                (int64 bytes).ToString(CultureInfo.InvariantCulture)
+
+        let interval =
+            match value.TimeLimit with
+            | None -> "none"
+            | Some duration -> renderSeconds "TimeLimit" false duration
+
+        directive "RekeyLimit" (data + " " + interval)
+
+    let requiredRsaSize value =
+        integerInRange "RequiredRSASize" 1024 Int32.MaxValue value
+
     let revokedKeys value = directive "RevokedKeys" value
     let securityKeyProvider value = directive "SecurityKeyProvider" value
     let setEnv value = directive "SetEnv" value
     let setEnvList values = list "SetEnv" values
     let sshdAuthPath value = directive "SshdAuthPath" value
     let sshdSessionPath value = directive "SshdSessionPath" value
-    let streamLocalBindMask value = directive "StreamLocalBindMask" value
+
+    let streamLocalBindMask value =
+        validateInteger "StreamLocalBindMask" 0 0o777 value |> ignore
+        let octal = Convert.ToString(value, 8).PadLeft(3, '0')
+        directive "StreamLocalBindMask" ("0" + octal)
+
     let streamLocalBindUnlink value = boolean "StreamLocalBindUnlink" value
     let strictModes value = boolean "StrictModes" value
     let subsystem value = directive "Subsystem" value
-    let syslogFacility value = directive "SyslogFacility" value
+
+    let syslogFacility (value: SshdSyslogFacility) =
+        let token =
+            match value with
+            | SshdSyslogFacility.Daemon -> "DAEMON"
+            | SshdSyslogFacility.User -> "USER"
+            | SshdSyslogFacility.Auth -> "AUTH"
+            | SshdSyslogFacility.AuthPriv -> "AUTHPRIV"
+            | SshdSyslogFacility.Local0 -> "LOCAL0"
+            | SshdSyslogFacility.Local1 -> "LOCAL1"
+            | SshdSyslogFacility.Local2 -> "LOCAL2"
+            | SshdSyslogFacility.Local3 -> "LOCAL3"
+            | SshdSyslogFacility.Local4 -> "LOCAL4"
+            | SshdSyslogFacility.Local5 -> "LOCAL5"
+            | SshdSyslogFacility.Local6 -> "LOCAL6"
+            | SshdSyslogFacility.Local7 -> "LOCAL7"
+
+        directive "SyslogFacility" token
+
     let tcpKeepAlive value = boolean "TCPKeepAlive" value
     let trustedUserCAKeys value = directive "TrustedUserCAKeys" value
 
-    let unusedConnectionTimeout value =
-        directive "UnusedConnectionTimeout" value
+    let unusedConnectionTimeout (value: SshdUnusedConnectionTimeout) =
+        let seconds =
+            match value with
+            | SshdUnusedConnectionTimeout.Never -> "none"
+            | SshdUnusedConnectionTimeout.After duration ->
+                renderSeconds "UnusedConnectionTimeout" false duration
+
+        directive "UnusedConnectionTimeout" seconds
 
     let useDns value = boolean "UseDNS" value
     let usePam value = boolean "UsePAM" value
     let versionAddendum value = directive "VersionAddendum" value
-    let x11DisplayOffset value = integer "X11DisplayOffset" value
+
+    let x11DisplayOffset value =
+        integerInRange "X11DisplayOffset" 0 Int32.MaxValue value
+
     let x11Forwarding value = boolean "X11Forwarding" value
     let x11UseLocalhost value = boolean "X11UseLocalhost" value
     let xAuthLocation value = directive "XAuthLocation" value
@@ -354,14 +1046,7 @@ module SshdBuilders =
     let pubkeyAuthentication value = SshdOptions.pubkeyAuthentication value
 
     let permitRootLogin value =
-        let token =
-            match value with
-            | SshdRootLogin.Yes -> "yes"
-            | SshdRootLogin.No -> "no"
-            | SshdRootLogin.ProhibitPassword -> "prohibit-password"
-            | SshdRootLogin.ForcedCommandsOnly -> "forced-commands-only"
-
-        SshdOptions.permitRootLogin token
+        SshdOptions.permitRootLogin value
 
     let port value = SshdOptions.port value
     let maxAuthTries value = SshdOptions.maxAuthTries value

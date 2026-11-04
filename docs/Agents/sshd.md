@@ -11,6 +11,7 @@ The public SSH catalogue covers all **106 canonical directives** documented for 
 ## SSH configuration and its jail
 
 ```fsharp
+open System
 open Dorothy.DSL
 
 let server =
@@ -24,15 +25,15 @@ let server =
                     SshdOptions.passwordAuthentication false
                     SshdOptions.kbdInteractiveAuthentication false
                     SshdOptions.pubkeyAuthentication true
-                    SshdOptions.permitRootLogin "no"
-                    SshdOptions.clientAliveInterval "45s"
+                    SshdOptions.permitRootLogin SshdRootLogin.No
+                    SshdOptions.clientAliveInterval (SshdClientAliveInterval.Every(TimeSpan.FromSeconds 45.))
                     SshdOptions.maxSessions 4
-                    SshdOptions.allowTcpForwarding "local"
+                    SshdOptions.allowTcpForwarding SshdForwardingMode.Local
                     SshdOptions.acceptEnv "APP_ENV"
                     SshdOptions.acceptEnv "DEPLOYMENT_ID"
                     matchBlock "User transfer" {
                         SshdOptions.forceCommand "internal-sftp"
-                        SshdOptions.allowTcpForwarding "no"
+                        SshdOptions.allowTcpForwarding SshdForwardingMode.No
                         SshdOptions.permitTTY false
                     }
                 }
@@ -41,7 +42,7 @@ let server =
                     Fail2BanOptions.filter "sshd[mode=extra]"
                     Fail2BanOptions.banaction "nftables[type=multiport]"
                     Fail2BanOptions.maxretry 5
-                    Fail2BanOptions.bantime "1h"
+                    Fail2BanOptions.bantime (Fail2BanBanTime.Finite(TimeSpan.FromHours 1.))
                 }
             }
         }
@@ -54,7 +55,7 @@ Replace example addresses, account names and paths with existing host prerequisi
 
 ### Native semantics, not a custom merge language
 
-SSH declarations form an **ordered native configuration body**. Repeated directives and argument expressions remain ordered; native time units, algorithm modifiers, patterns and command arguments are not replaced by guessed enum policies. Use `SshdOptions.extension keyword argumentTail` for vendor/new options or `nativeText` for a complete native fragment.
+SSH declarations form an **ordered native configuration body**. Named helpers use typed durations, sizes, modes and compound settings; text remains appropriate for commands, patterns and other open grammars. Use `SshdOptions.extension keyword argumentTail` for an explicitly native value (including vendor/new options), or `nativeText` for a complete native fragment. Typed helpers do not change directive ordering, inheritance or native precedence.
 
 The drop-in is `/etc/ssh/sshd_config.d/00-dorothy.conf`. It must participate in the host's native Include topology; the helper verifies participation using sshd's own loader trace. Its basename does not outrank a directive already read before it.
 
@@ -69,25 +70,25 @@ A standalone `fail2ban` block configures the shared daemon and any number of jai
 ```fsharp
 fail2ban {
     Fail2BanSections.daemon {
-        Fail2BanDaemonOptions.logtarget "STDOUT"
+        Fail2BanDaemonOptions.logtarget Fail2BanLogTarget.Stdout
         Fail2BanDaemonOptions.socket "/run/fail2ban/site.sock"
-        Fail2BanDaemonOptions.dbpurgeage "7d"
+        Fail2BanDaemonOptions.dbpurgeage (TimeSpan.FromDays 7.)
     }
     Fail2BanSections.thread {
-        Fail2BanDaemonOptions.stacksize "256"
+        Fail2BanDaemonOptions.stacksize (Fail2BanStackSize.Size 256<KiB>)
     }
     Fail2BanSections.defaults {
         Fail2BanOptions.ignoreself true
         Fail2BanOptions.ignoreip "127.0.0.0/8 ::1"
-        Fail2BanOptions.findtime "10m"
+        Fail2BanOptions.findtime (TimeSpan.FromMinutes 10.)
     }
     Fail2BanSections.jail "app-auth" {
         Fail2BanOptions.enabled true
-        Fail2BanOptions.backend "polling"
+        Fail2BanOptions.backend Fail2BanBackend.Polling
         Fail2BanOptions.filter "app-auth"
         Fail2BanOptions.logpath "/var/log/app/auth.log"
         Fail2BanOptions.maxretry 3
-        Fail2BanOptions.bantime "-1"
+        Fail2BanOptions.bantime Fail2BanBanTime.Permanent
         Fail2BanOptions.action "nftables[name=app-auth,port=443]"
         Fail2BanOptions.action "app-notify"
     }
@@ -99,7 +100,7 @@ fail2ban {
         Fail2BanActionOptions.actionunban "logger -t fail2ban -- 'unban <ip> in <name>'"
     }
     Fail2BanSections.actionInit "app-notify" {
-        Fail2BanActionOptions.timeout "30s"
+        Fail2BanActionOptions.timeout (TimeSpan.FromSeconds 30.)
     }
 }
 ```
@@ -115,13 +116,13 @@ This block belongs inside `debian { ... }`. The application log must exist and c
 - `nativeSection relativePath sectionName`: arbitrary native INI sections, including `Init?family=inet6`.
 - `Fail2BanFiles.file relativePath contents`: complete native files/include assets beneath `/etc/fail2ban`.
 - `Fail2BanFiles.pythonAction name source`: an `action.d/<name>.py` module exporting the native `Action` implementation.
-- `Fail2BanOptions.custom` and the qualified modules' `custom` functions: installation-specific parameters and arbitrary interpolation variables.
+- `Fail2BanOptions.custom` and the qualified modules' `custom` functions: explicitly native values, installation-specific parameters and arbitrary interpolation variables, including native expressions for otherwise typed options.
 
 Compatible structured contributions to the same file/section merge into one native section. Section names remain case-sensitive; option names follow native case-insensitive matching. Identical scalar declarations deduplicate and conflicting scalars are rejected. Repeated typed `Fail2BanOptions.action` declarations append to a single multiline native action option. Raw file contents are never rewritten by this composition layer; their duplicate/precedence behavior remains the native parser's responsibility.
 
 Values preserve regex escapes, `<tags>` and multiline continuations. Interpolation forms `%(name)s`, `%(section/parameter)s`, `%(known/parameter)s`, and `<known/parameter>` retain their native meanings. Literal percent characters must be escaped as `%%` where native INI interpolation requires it. Native `before`/`after` includes and conditional family sections are supported. New `.local`-only filter/action definitions work without fabricating `.conf` companions.
 
-There are no Dorothy-only positive-duration, IP-only, stock-filter or nftables-only policies. Native-valid permanent bans (`-1`), incremental policies, DNS allowlists, custom backends and action parameters are passed to the installed implementation. Dependencies and side effects of custom commands/Python code remain the author's responsibility; native version/build support still applies.
+Named helpers validate the supported domain before deployment. Explicit native/custom values remain available for native time expressions, interpolation, future enum values and installation-specific backends/actions; they are not constrained by the typed helper model. Native permanent bans, incremental policies, DNS allowlists and action parameters remain supported. Dependencies and side effects of custom commands/Python code remain the author's responsibility; installed version/build support and native validation still apply.
 
 ### Automatic SSH port linking
 
@@ -160,6 +161,19 @@ Native effective configuration, service/jail presence and observable runtime set
 Owned configuration/Python files and journals are root-private (`0600`); staging/state directories are private. Full SSH effective configuration, Fail2Ban file observations and control-socket outputs are Pulumi secrets because inherited settings can contain sensitive arguments. Native validation errors do not echo configuration bodies. Native daemon logs and custom actions still obey their own logging behavior.
 
 For secret/dynamic input contents, use the Input-typed `SshdConfigArgs.Configuration` and `Fail2BanConfigurationArgs.Files` rather than unwrapping a Pulumi secret into a plain string. Public native resource tokens are `keroosha:debian:SshdConfig` and `keroosha:debian:Fail2Ban`.
+
+## Typed API migration
+
+This is a source-breaking DSL migration. Update callers before changing their Dorothy dependency; there are no compatibility string overloads for typed options.
+
+- Use `TimeSpan` for finite elapsed time, not `TimeSpan.ToString()`. Each native consumer has its own formatting, precision and range rules.
+- SSH time values and finite Fail2Ban `bantime` require whole seconds; fractional values are rejected rather than truncated. Other Fail2Ban duration helpers preserve fractional seconds in native text.
+- Use explicit domain cases for permanent bans, disabled/default limits and closed modes. Do not simulate them with `TimeSpan.MaxValue` or negative durations.
+- Use measured sizes: SSH data limits are `int64<B>`, Fail2Ban thread stack sizes are `int<KiB>`, and Docker/swapfile sizes remain `int<MiB>`. `cpu`, `B`, `KiB` and `MiB` belong to the shared `Dorothy.DSL` namespace.
+- Preserve expressions such as Fail2Ban `1mo`, formulas and `%(default/findtime)s` through the explicit native/custom surface. A native month is not a fixed 30-day `TimeSpan`.
+- Provider resource tokens and string/file-map schemas are unchanged. Canonical typed serialization can still produce a textual Pulumi diff (`1w` versus `604800`) without changing effective policy; inspect preview before applying.
+
+Docker `waitHealthy` remains `TimeSpan`: positive fractional seconds round up to the next whole second, and values exceeding `Int32.MaxValue` seconds are rejected before deployment. Healthcheck durations retain their separate Docker/Go duration range. Docker container memory inputs remain provider-native MB values; only byte-valued fields such as tmpfs perform a bytes conversion.
 
 ## Prerequisites and adoption
 

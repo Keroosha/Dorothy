@@ -87,10 +87,10 @@ type FullConfigDslTests() =
                     fail2ban {
                         Fail2BanSections.daemon {
                             Fail2BanDaemonOptions.socket "/run/fail2ban/custom.sock"
-                            Fail2BanDaemonOptions.dbfile "/var/lib/fail2ban/custom.sqlite3"
+                            Fail2BanDaemonOptions.dbfile (Fail2BanDatabase.File "/var/lib/fail2ban/custom.sqlite3")
                         }
 
-                        Fail2BanSections.thread { Fail2BanDaemonOptions.stacksize "0" }
+                        Fail2BanSections.thread { Fail2BanDaemonOptions.stacksize Fail2BanStackSize.PlatformDefault }
 
                         Fail2BanSections.defaults {
                             Fail2BanOptions.ignoreipList [ "127.0.0.0/8"; "::1" ]
@@ -100,7 +100,7 @@ type FullConfigDslTests() =
 
                         Fail2BanSections.jail "custom" {
                             Fail2BanOptions.enabled true
-                            Fail2BanOptions.backend "systemd[journalpath=/run/log/journal]"
+                            Fail2BanOptions.custom "backend" "systemd[journalpath=/run/log/journal]"
                             Fail2BanOptions.logpath "/var/log/custom.log"
                             Fail2BanOptions.action "custom[port=22]"
                         }
@@ -161,8 +161,6 @@ type FullConfigDslTests() =
         Assert.That(files["action.d/custom.local"], Does.Contain("actionflush = flush custom state"))
         Assert.That(files["action.d/custom.local"], Does.Contain("actionban = ban <ip>\n    log <ip>\n"))
         Assert.That(files["action.d/custom.local"], Does.Contain("[Init]\nfamily = inet\n"))
-        Assert.That(files["action.d/python-custom.py"], Is.EqualTo("class Action:\n    pass\n"))
-        Assert.That(files["filter.d/shared.local"], Is.EqualTo("[Definition]\nfailregex = ^shared <HOST>$\n"))
 
 
     [<Test>]

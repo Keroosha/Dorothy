@@ -6,6 +6,93 @@ open System.Globalization
 open System.Text
 
 [<RequireQualifiedAccess>]
+type Fail2BanBanTime =
+    | Finite of TimeSpan
+    | Permanent
+
+[<RequireQualifiedAccess>]
+type Fail2BanStackSize =
+    | PlatformDefault
+    | Size of int<KiB>
+
+[<RequireQualifiedAccess>]
+type Fail2BanBackend =
+    | Auto
+    | Pyinotify
+    | Polling
+    | Systemd
+
+[<RequireQualifiedAccess>]
+type Fail2BanDnsMode =
+    | Yes
+    | Warn
+    | No
+    | Raw
+
+[<RequireQualifiedAccess>]
+type Fail2BanLogLevel =
+    | Critical
+    | Error
+    | Warning
+    | Notice
+    | Info
+    | Debug
+    | TraceDebug
+    | HeavyDebug
+    | Numeric of int
+
+[<RequireQualifiedAccess>]
+type Fail2BanLogTarget =
+    | File of string
+    | Syslog
+    | Stdout
+    | Sysout
+    | Stderr
+    | SystemdJournal
+    | Inherited
+
+[<RequireQualifiedAccess>]
+type Fail2BanSyslogSocket =
+    | Auto
+    | Path of string
+
+[<RequireQualifiedAccess>]
+type Fail2BanIpv6Mode =
+    | Auto
+    | Enabled
+    | Disabled
+
+[<RequireQualifiedAccess>]
+type Fail2BanDatabase =
+    | Disabled
+    | InMemory
+    | File of string
+
+[<RequireQualifiedAccess>]
+type Fail2BanAddressFamily =
+    | Inet4
+    | Inet6
+
+[<RequireQualifiedAccess>]
+type Fail2BanFamilies =
+    | Default
+    | Only of Fail2BanAddressFamily list
+
+/// Overrides for Fail2Ban 1.1's ignore cache; omitted limits retain its native defaults.
+type Fail2BanIgnoreCacheSettings =
+    {
+        Key: string
+        MaxCount: int option
+        MaxTime: TimeSpan option
+    }
+
+[<RequireQualifiedAccess>]
+type Fail2BanIgnoreCache =
+    | Disabled
+    | Enabled of Fail2BanIgnoreCacheSettings
+
+
+[<RequireQualifiedAccess>]
 type internal Fail2BanOptionMergeBehavior =
     | Scalar
     | Append
@@ -97,6 +184,39 @@ module private Fail2BanValidation =
             invalidArg parameterName "A native Fail2Ban configuration value cannot be null."
 
         value
+
+    let nativePath parameterName (value: string) =
+        if String.IsNullOrWhiteSpace value then
+            invalidArg parameterName "A Fail2Ban file or socket path cannot be empty."
+
+        value
+
+    let durationSeconds parameterName requireWholeSeconds (duration: TimeSpan) =
+        let ticks = duration.Ticks
+
+        if ticks < 0L then
+            invalidArg parameterName "A typed Fail2Ban duration cannot be negative."
+
+        let wholeSeconds = ticks / TimeSpan.TicksPerSecond
+        let fractionalTicks = ticks % TimeSpan.TicksPerSecond
+
+        if requireWholeSeconds && fractionalTicks <> 0L then
+            invalidArg
+                parameterName
+                "Fail2Ban truncates bantime to whole seconds; use an integral-second TimeSpan."
+
+        let seconds = wholeSeconds.ToString(CultureInfo.InvariantCulture)
+
+        if fractionalTicks = 0L then
+            seconds
+        else
+            let fraction =
+                fractionalTicks
+                    .ToString(CultureInfo.InvariantCulture)
+                    .PadLeft(7, '0')
+                    .TrimEnd([| '0' |])
+
+            seconds + "." + fraction + "s"
 
     let reservedPortPath = "jail.d/99-dorothy-sshd-ports.local"
     let jailPath = "jail.d/90-dorothy.local"
@@ -422,7 +542,7 @@ module private Fail2BanValidation =
 
 [<RequireQualifiedAccess>]
 module Fail2BanOptions =
-    let option (name: string) (value: string) =
+    let internal option (name: string) (value: string) =
         Fail2BanOption(
             Fail2BanValidation.optionName name,
             Fail2BanValidation.nonNull "value" value,
@@ -445,9 +565,18 @@ module Fail2BanOptions =
 
     let private valuesOption name (values: seq<string>) = option name (String.concat " " values)
 
+    let private durationOption name requireWholeSeconds duration =
+        Fail2BanValidation.durationSeconds "value" requireWholeSeconds duration
+        |> option name
+
     let enabled value = boolOption "enabled" value
-    let bantime value = option "bantime" value
-    let findtime value = option "findtime" value
+
+    let bantime value =
+        match value with
+        | Fail2BanBanTime.Finite duration -> durationOption "bantime" true duration
+        | Fail2BanBanTime.Permanent -> option "bantime" "-1"
+
+    let findtime value = durationOption "findtime" false value
 
     let maxretry (value: int) =
         option "maxretry" (value.ToString(CultureInfo.InvariantCulture))
@@ -456,20 +585,91 @@ module Fail2BanOptions =
         option "maxmatches" (value.ToString(CultureInfo.InvariantCulture))
 
     let bantimeIncrement value = boolOption "bantime.increment" value
-    let bantimeFactor value = option "bantime.factor" value
+    let bantimeFactor (value: decimal) =
+        option "bantime.factor" (value.ToString("G29", CultureInfo.InvariantCulture))
     let bantimeFormula value = option "bantime.formula" value
-    let bantimeMultipliers value = option "bantime.multipliers" value
-    let bantimeMaxtime value = option "bantime.maxtime" value
-    let bantimeRndtime value = option "bantime.rndtime" value
+
+    let bantimeMultipliers (values: seq<int>) =
+        values
+        |> Seq.map (fun value -> value.ToString(CultureInfo.InvariantCulture))
+        |> String.concat " "
+        |> option "bantime.multipliers"
+
+    let bantimeMaxtime value = durationOption "bantime.maxtime" false value
+    let bantimeRndtime value = durationOption "bantime.rndtime" false value
     let bantimeOveralljails value = boolOption "bantime.overalljails" value
     let ignoreself value = boolOption "ignoreself" value
     let ignoreip value = option "ignoreip" value
     let ignoreipList values = valuesOption "ignoreip" values
     let ignorecommand value = option "ignorecommand" value
-    let ignorecache value = option "ignorecache" value
-    let usedns value = option "usedns" value
+    let private quoteIgnoreCacheKey (key: string) =
+        let key = Fail2BanValidation.nonNull "value" key
+
+        if
+            key.IndexOfAny([| '\r'; '\n'; '\u0000' |]) >= 0
+            || (key.Length > 0
+                && (Char.IsWhiteSpace key[0]
+                    || Char.IsWhiteSpace key[key.Length - 1]))
+        then
+            invalidArg "value" "An ignore-cache key cannot have outer whitespace or line breaks."
+
+        if not (key.Contains('"')) then
+            "\"" + key + "\""
+        elif not (key.Contains('\'')) then
+            "'" + key + "'"
+        elif
+            key.Contains(',')
+            || key.Contains(']')
+            || key.StartsWith("\"", StringComparison.Ordinal)
+            || key.StartsWith("'", StringComparison.Ordinal)
+        then
+            invalidArg
+                "value"
+                "Fail2Ban 1.1 cannot quote an ignore-cache key containing both quote types and option delimiters."
+        else
+            key
+
+    let ignorecache value =
+        let nativeValue =
+            match value with
+            | Fail2BanIgnoreCache.Disabled -> ""
+            | Fail2BanIgnoreCache.Enabled settings ->
+                [
+                    Some("key=" + quoteIgnoreCacheKey settings.Key)
+                    settings.MaxCount
+                    |> Option.map (fun count ->
+                        "max-count=" + count.ToString(CultureInfo.InvariantCulture))
+                    settings.MaxTime
+                    |> Option.map (fun maxTime ->
+                        "max-time=" + Fail2BanValidation.durationSeconds "value" false maxTime)
+                ]
+                |> List.choose id
+                |> String.concat ", "
+
+        option "ignorecache" nativeValue
+
+    let usedns value =
+        let nativeValue =
+            match value with
+            | Fail2BanDnsMode.Yes -> "yes"
+            | Fail2BanDnsMode.Warn -> "warn"
+            | Fail2BanDnsMode.No -> "no"
+            | Fail2BanDnsMode.Raw -> "raw"
+
+        option "usedns" nativeValue
+
     let filter value = option "filter" value
-    let backend value = option "backend" value
+
+    let backend value =
+        let nativeValue =
+            match value with
+            | Fail2BanBackend.Auto -> "auto"
+            | Fail2BanBackend.Pyinotify -> "pyinotify"
+            | Fail2BanBackend.Polling -> "polling"
+            | Fail2BanBackend.Systemd -> "systemd"
+
+        option "backend" nativeValue
+
     let logpath value = option "logpath" value
 
     let logpathList values =
@@ -502,16 +702,117 @@ module Fail2BanOptions =
 [<RequireQualifiedAccess>]
 module Fail2BanDaemonOptions =
     let private option = Fail2BanOptions.option
-    let loglevel value = option "loglevel" value
-    let logtarget value = option "logtarget" value
-    let syslogsocket value = option "syslogsocket" value
+
+    let loglevel value =
+        let nativeValue =
+            match value with
+            | Fail2BanLogLevel.Critical -> "CRITICAL"
+            | Fail2BanLogLevel.Error -> "ERROR"
+            | Fail2BanLogLevel.Warning -> "WARNING"
+            | Fail2BanLogLevel.Notice -> "NOTICE"
+            | Fail2BanLogLevel.Info -> "INFO"
+            | Fail2BanLogLevel.Debug -> "DEBUG"
+            | Fail2BanLogLevel.TraceDebug -> "TRACEDEBUG"
+            | Fail2BanLogLevel.HeavyDebug -> "HEAVYDEBUG"
+            | Fail2BanLogLevel.Numeric level ->
+                if level < 0 then
+                    invalidArg "value" "Fail2Ban numeric log levels must be non-negative."
+
+                level.ToString(CultureInfo.InvariantCulture)
+
+        option "loglevel" nativeValue
+
+    let private isReservedLogTarget (target: string) =
+        target.Equals("SYSLOG", StringComparison.OrdinalIgnoreCase)
+        || target.Equals("STDOUT", StringComparison.OrdinalIgnoreCase)
+        || target.Equals("SYSOUT", StringComparison.OrdinalIgnoreCase)
+        || target.Equals("STDERR", StringComparison.OrdinalIgnoreCase)
+        || target.Equals("SYSTEMD-JOURNAL", StringComparison.OrdinalIgnoreCase)
+        || target.Equals("INHERITED", StringComparison.OrdinalIgnoreCase)
+
+    let logtarget value =
+        let nativeValue =
+            match value with
+            | Fail2BanLogTarget.File path ->
+                let path = Fail2BanValidation.nativePath "value" path
+
+                if isReservedLogTarget path then
+                    invalidArg
+                        "value"
+                        "A Fail2Ban log file path cannot equal a reserved log target; use its typed target case."
+
+                path
+            | Fail2BanLogTarget.Syslog -> "SYSLOG"
+            | Fail2BanLogTarget.Stdout -> "STDOUT"
+            | Fail2BanLogTarget.Sysout -> "SYSOUT"
+            | Fail2BanLogTarget.Stderr -> "STDERR"
+            | Fail2BanLogTarget.SystemdJournal -> "SYSTEMD-JOURNAL"
+            | Fail2BanLogTarget.Inherited -> "INHERITED"
+
+        option "logtarget" nativeValue
+
+    let syslogsocket value =
+        let nativeValue =
+            match value with
+            | Fail2BanSyslogSocket.Auto -> "auto"
+            | Fail2BanSyslogSocket.Path path ->
+                let path = Fail2BanValidation.nativePath "value" path
+
+                if path = "auto" then
+                    invalidArg "value" "The native syslog socket path 'auto' is a sentinel; use Auto."
+
+                path
+
+        option "syslogsocket" nativeValue
+
     let socket value = option "socket" value
     let pidfile value = option "pidfile" value
-    let allowipv6 value = option "allowipv6" value
-    let dbfile value = option "dbfile" value
-    let dbmaxmatches value = option "dbmaxmatches" value
-    let dbpurgeage value = option "dbpurgeage" value
-    let stacksize value = option "stacksize" value
+
+    let allowipv6 value =
+        let nativeValue =
+            match value with
+            | Fail2BanIpv6Mode.Auto -> "auto"
+            | Fail2BanIpv6Mode.Enabled -> "yes"
+            | Fail2BanIpv6Mode.Disabled -> "no"
+
+        option "allowipv6" nativeValue
+
+    let dbfile value =
+        let nativeValue =
+            match value with
+            | Fail2BanDatabase.Disabled -> "None"
+            | Fail2BanDatabase.InMemory -> ":memory:"
+            | Fail2BanDatabase.File path ->
+                let path = Fail2BanValidation.nativePath "value" path
+
+                if
+                    path.Equals("None", StringComparison.OrdinalIgnoreCase)
+                    || path = ":memory:"
+                then
+                    invalidArg "value" "A Fail2Ban database path cannot equal a native sentinel."
+
+                path
+
+        option "dbfile" nativeValue
+
+    let dbmaxmatches (value: int) =
+        option "dbmaxmatches" (value.ToString(CultureInfo.InvariantCulture))
+
+    let dbpurgeage value =
+        Fail2BanValidation.durationSeconds "value" false value |> option "dbpurgeage"
+
+    let stacksize value =
+        let nativeValue =
+            match value with
+            | Fail2BanStackSize.PlatformDefault -> "0"
+            | Fail2BanStackSize.Size size ->
+                if size < 32<KiB> then
+                    invalidArg "value" "Fail2Ban thread stack size must be at least 32 KiB."
+
+                (int size).ToString(CultureInfo.InvariantCulture)
+
+        option "stacksize" nativeValue
+
     let custom name value = option name value
 
 [<RequireQualifiedAccess>]
@@ -538,6 +839,10 @@ module Fail2BanFilterOptions =
 [<RequireQualifiedAccess>]
 module Fail2BanActionOptions =
     let private option = Fail2BanOptions.option
+
+    let private boolOption name value =
+        option name (if value then "true" else "false")
+
     let actionstart value = option "actionstart" value
     let actionstop value = option "actionstop" value
     let actioncheck value = option "actioncheck" value
@@ -548,11 +853,29 @@ module Fail2BanActionOptions =
     let actionreload value = option "actionreload" value
     let actionreban value = option "actionreban" value
     let actionprolong value = option "actionprolong" value
-    let timeout value = option "timeout" value
-    let actionstartOnDemand value = option "actionstart_on_demand" value
-    let actionrepairOnUnban value = option "actionrepair_on_unban" value
-    let families value = option "families" value
-    let norestored value = option "norestored" value
+
+    let timeout value =
+        Fail2BanValidation.durationSeconds "value" false value |> option "timeout"
+
+    let actionstartOnDemand value = boolOption "actionstart_on_demand" value
+    let actionrepairOnUnban value = boolOption "actionrepair_on_unban" value
+
+    let families value =
+        let nativeValue =
+            match value with
+            | Fail2BanFamilies.Default -> ""
+            | Fail2BanFamilies.Only [] ->
+                invalidArg "value" "An explicit Fail2Ban family selection must contain at least one family."
+            | Fail2BanFamilies.Only families ->
+                families
+                |> List.map (function
+                    | Fail2BanAddressFamily.Inet4 -> "inet4"
+                    | Fail2BanAddressFamily.Inet6 -> "inet6")
+                |> String.concat " "
+
+        option "families" nativeValue
+
+    let norestored value = boolOption "norestored" value
     let init name value = option name value
     let definition name value = option name value
     let custom name value = option name value
