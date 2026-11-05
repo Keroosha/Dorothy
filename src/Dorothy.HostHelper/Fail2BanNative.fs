@@ -1,14 +1,56 @@
 namespace Dorothy.HostHelper
 
 open System
+open System.Collections.Generic
+open System.Globalization
 open System.IO
+open System.Numerics
+open System.Security.Cryptography
+open System.Text
 open System.Text.Json
+open Fail2BanCliData
 
 module Fail2BanNative =
     type BackendError(message: string) =
         inherit InvalidOperationException(message)
 
-    type Configuration =
+    type internal DirectCheck =
+        | DnsMode of string
+        | Text of string
+        | Boolean of bool
+        | Integer of BigInteger
+        | Duration of PythonLiteral
+        | ActionNames of Set<string>
+        | ActionProperties of Set<string>
+
+    type internal GetterExpectation =
+        {
+            Arguments: string list
+            DirectCheck: DirectCheck option
+        }
+
+    type internal RuntimePlan =
+        {
+            Getters: GetterExpectation list
+        }
+
+    type Configuration internal
+        (
+            socket: string,
+            pidFile: string,
+            fingerprint: string,
+            startupFingerprint: string,
+            enabledJails: string list,
+            runtimePlan: RuntimePlan
+        ) =
+        member _.Socket = socket
+        member _.PidFile = pidFile
+        member _.Fingerprint = fingerprint
+        member _.StartupFingerprint = startupFingerprint
+        member _.EnabledJails = enabledJails
+        member internal _.RuntimePlan = runtimePlan
+
+    type private ConfigurationSeed =
         {
             Socket: string
             PidFile: string
@@ -17,481 +59,44 @@ module Fail2BanNative =
             EnabledJails: string list
         }
 
+    type internal RuntimeBaseline =
+        {
+            Fingerprint: string
+            StartupFingerprint: string
+            ObservationFingerprint: string
+        }
+
     type Runtime =
         {
             ActiveJails: string list
             InSync: bool
         }
-
-    let private pythonBridge =
-        """
-import contextlib
-import hashlib
-import io
-import json
-import os
-import sys
-def _normalize_root(value, root):
-    source = os.path.normpath(root)
-    if source == os.path.sep:
-        return value
-
-    def _replace(text):
-        result = []
-        cursor = 0
-        while True:
-            start = text.find(source, cursor)
-            if start < 0:
-                result.append(text[cursor:])
-                break
-            end = start + len(source)
-            before_is_boundary = start == 0 or not (
-                text[start - 1].isalnum() or text[start - 1] in "_.-"
-            )
-            after_is_boundary = end == len(text) or text[end] in (
-                "/", "\\", " ", "\t", "\r", "\n", "'", '"', "=", ":", ",", ";", ")", "]", "}", ">"
-            )
-            if before_is_boundary and after_is_boundary:
-                result.append(text[cursor:start])
-                result.append("/etc/fail2ban")
-                cursor = end
-            else:
-                result.append(text[cursor:end])
-                cursor = end
-        return "".join(result)
-
-    if isinstance(value, str):
-        return _replace(value)
-    if isinstance(value, dict):
-        return {_normalize_root(key, root): _normalize_root(item, root) for key, item in value.items()}
-    if isinstance(value, (list, tuple)):
-        return [_normalize_root(item, root) for item in value]
-    return value
-
-_output = sys.stdout
-_request = json.load(sys.stdin)
+    type private PythonLiteral = Fail2BanCliData.PythonLiteral
 
 
-def _emit(value, status=0):
-    _output.write(json.dumps(value, ensure_ascii=False, separators=(",", ":")))
-    _output.flush()
-    raise SystemExit(status)
+    let private fail (message: string) = raise (BackendError(message))
 
+    let private runClient
+        (environment: HostEnvironment)
+        (arguments: string list)
+        (standardInput: string option)
+        =
+        try
+            Some(environment.Run "fail2ban-client" arguments standardInput)
+        with _ ->
+            None
 
-def _canonical(value):
-    return json.dumps(value, ensure_ascii=False, sort_keys=True, separators=(",", ":"), default=str).encode("utf-8")
+    let private runRuntimeClient (environment: HostEnvironment) (arguments: string list) =
+        try
+            let boundedArguments =
+                [ "--kill-after=1s"; "5s"; "fail2ban-client" ] @ arguments
 
+            Some(environment.Run "timeout" boundedArguments None)
+        with _ ->
+            None
 
-def _hash(value):
-    return hashlib.sha256(_canonical(value)).hexdigest()
-
-def _python_action_sources(root):
-    directory = os.path.join(root, "action.d")
-    sources = []
-    try:
-        for entry in os.scandir(directory):
-            if entry.name.endswith(".py") and entry.is_file():
-                with open(entry.path, "rb") as source:
-                    sources.append([entry.name, hashlib.sha256(source.read()).hexdigest()])
-    except FileNotFoundError:
-        pass
-    return sorted(sources)
-
-
-def _read_config(root):
-    from fail2ban.client.configurator import Configurator
-
-    configurator = Configurator()
-    configurator.Reload()
-    configurator.setBaseDir(root)
-    configurator.readAll()
-    if not configurator.getOptions():
-        raise ValueError()
-    configurator.convertToProtocol(allow_no_files=False)
-    early = configurator.getEarlyOptions()
-    stream = configurator.getConfigStream()
-    normalized_early = _normalize_root(early, root)
-    normalized_stream = _normalize_root(stream, root)
-
-    startup_keys = {"thread", "syslogsocket", "loglevel", "logtarget", "allowipv6", "dbfile"}
-    startup_commands = [
-        command for command in normalized_stream
-        if isinstance(command, (list, tuple))
-        and command[0] == "set"
-        and (
-            (len(command) == 3 and command[1] in startup_keys)
-            or (len(command) >= 4 and command[1] == "thread" and command[2] == "stacksize")
-        )
-    ]
-    python_action_sources = _python_action_sources(root)
-    startup = {
-        "socket": normalized_early.get("socket"),
-        "pidfile": normalized_early.get("pidfile"),
-        "loglevel": normalized_early.get("loglevel"),
-        "logtarget": normalized_early.get("logtarget"),
-        "syslogsocket": normalized_early.get("syslogsocket"),
-        "commands": startup_commands,
-    }
-    enabled_jails = sorted({
-        command[1] for command in stream
-        if isinstance(command, (list, tuple))
-        and len(command) >= 2
-        and command[0] == "start"
-        and isinstance(command[1], str)
-    })
-    return early, stream, _hash({"early": normalized_early, "stream": normalized_stream, "pythonActionSources": python_action_sources}), _hash(startup), enabled_jails
-
-
-def _as_list(value):
-    if isinstance(value, (list, tuple)):
-        return list(value)
-    if value is None:
-        return []
-    return [value]
-
-
-def _collect_expected(stream):
-    global_values = {}
-    jail_values = {}
-    jail_lists = {}
-    action_names = {}
-    action_values = {}
-
-    def _append(target, key, value):
-        target.setdefault(key, []).extend(_as_list(value))
-
-    for command in stream:
-        if not isinstance(command, (list, tuple)) or not command:
-            continue
-        name = command[0]
-        if name == "set" and len(command) == 3 and command[1] in {
-            "loglevel", "logtarget", "syslogsocket", "dbfile", "dbmaxmatches", "dbpurgeage"
-        }:
-            global_values[command[1]] = command[2]
-            continue
-        if name == "set" and len(command) >= 4 and isinstance(command[1], str):
-            jail = command[1]
-            option = command[2]
-            if option == "addaction" and len(command) >= 4:
-                action_names.setdefault(jail, set()).add(command[3])
-            elif option == "action" and len(command) >= 6:
-                action_values.setdefault((jail, command[3]), {})[command[4]] = command[5]
-            elif option in ("addignoreip", "addfailregex", "addignoreregex"):
-                list_name = {
-                    "addignoreip": "ignoreip",
-                    "addfailregex": "failregex",
-                    "addignoreregex": "ignoreregex",
-                }[option]
-                _append(jail_lists, (jail, list_name), command[3:])
-            elif option == "addlogpath" and len(command) >= 5:
-                _append(jail_lists, (jail, "logpath"), command[3])
-            elif option not in ("addjournalmatch", "addlogpath"):
-                jail_values[(jail, option)] = command[3]
-            continue
-        if name == "multi-set" and len(command) >= 4 and isinstance(command[1], str):
-            jail = command[1]
-            option = command[2]
-            if option in ("addfailregex", "addignoreregex"):
-                list_name = "failregex" if option == "addfailregex" else "ignoreregex"
-                _append(jail_lists, (jail, list_name), command[3])
-            elif option == "action" and len(command) >= 5:
-                action = command[3]
-                properties = command[4]
-                values = action_values.setdefault((jail, action), {})
-                if isinstance(properties, (list, tuple)):
-                    for pair in properties:
-                        if isinstance(pair, (list, tuple)) and len(pair) >= 2:
-                            values[pair[0]] = pair[1]
-
-    return global_values, jail_values, jail_lists, action_names, action_values
-
-
-def _native_usedns(value):
-    if isinstance(value, bool):
-        value = "yes" if value else "no"
-    value = str(value).lower()
-    return value if value in ("yes", "warn", "no", "raw") else "no"
-
-
-def _same(expected, actual, key, scope):
-    try:
-        is_duration = (
-            (scope == "global" and key == "dbpurgeage")
-            or (scope == "jail" and key in ("findtime", "bantime", "bantime.maxtime", "bantime.rndtime"))
-            or (scope == "action" and key == "timeout")
-        )
-        if is_duration:
-            from fail2ban.helpers import MyTime
-            if expected is not None and isinstance(expected, str):
-                expected = MyTime.str2seconds(expected)
-            if actual is not None and isinstance(actual, str):
-                actual = MyTime.str2seconds(actual)
-            return expected == actual
-        if (scope == "global" and key == "dbmaxmatches") or (
-            scope == "jail" and key in ("maxretry", "maxmatches", "maxlines")
-        ):
-            if isinstance(expected, str):
-                expected = int(expected)
-            if isinstance(actual, str):
-                actual = int(actual)
-            return expected == actual
-        if scope == "global" and key == "dbfile":
-            if isinstance(expected, str) and expected.lower() == "none":
-                expected = None
-            if isinstance(actual, str) and actual.lower() == "none":
-                actual = None
-            return expected == actual
-        if scope == "jail" and key == "usedns":
-            return _native_usedns(expected) == _native_usedns(actual)
-        if scope == "jail" and key == "logencoding":
-            if not isinstance(expected, str) or expected.lower() == "auto":
-                return None
-            if not isinstance(actual, str):
-                return None
-            import codecs
-            try:
-                return codecs.lookup(expected).name == codecs.lookup(actual).name
-            except LookupError:
-                return None
-        if scope == "jail" and key == "ignoreip":
-            from fail2ban.server.ipdns import IPAddr
-
-            def as_ip(value):
-                return value if isinstance(value, IPAddr) else IPAddr(value)
-
-            return {as_ip(item) for item in _as_list(expected)} == {
-                as_ip(item) for item in _as_list(actual)
-            }
-        if scope == "jail" and key == "logpath":
-            return sorted(str(item) for item in _as_list(expected)) == sorted(str(item) for item in _as_list(actual))
-        if isinstance(expected, bool) or isinstance(actual, bool):
-            def as_bool(value):
-                if isinstance(value, bool):
-                    return value
-                if isinstance(value, int) and value in (0, 1):
-                    return bool(value)
-                if isinstance(value, str):
-                    normalized = value.strip().lower()
-                    if normalized in ("true", "yes", "on", "1"):
-                        return True
-                    if normalized in ("false", "no", "off", "0"):
-                        return False
-                return None
-
-            expected_bool = as_bool(expected)
-            actual_bool = as_bool(actual)
-            if expected_bool is None or actual_bool is None:
-                return None
-            return expected_bool == actual_bool
-        return _canonical(expected) == _canonical(actual)
-    except Exception:
-        return None
-
-
-def _native_regexes(values, key, jail_values, jail):
-    from fail2ban.server.failregex import FailRegex, Regex
-
-    use_dns = _native_usedns(jail_values.get((jail, "usedns"), "yes"))
-    prefregex_value = jail_values.get((jail, "prefregex"))
-    prefregex = Regex(prefregex_value, useDns=use_dns) if prefregex_value else None
-    try:
-        maxlines = int(jail_values.get((jail, "maxlines"), 1))
-    except (TypeError, ValueError):
-        maxlines = 1
-    multiline = maxlines > 1
-
-    if key == "failregex":
-        return [
-            FailRegex(value, prefRegex=prefregex, multiline=multiline, useDns=use_dns).getRegex()
-            for value in values
-        ]
-    return [Regex(value, useDns=use_dns).getRegex() for value in values]
-
-
-def _native_prefregex(value, jail_values, jail):
-    from fail2ban.server.failregex import Regex
-
-    use_dns = _native_usedns(jail_values.get((jail, "usedns"), "yes"))
-    return Regex(value, useDns=use_dns).getRegex()
-
-
-def _native_datepattern(value, timezone):
-    from fail2ban.server.filter import DateDetector
-
-    if value is None:
-        return None
-    detector = DateDetector()
-    detector.default_tz = timezone
-    if not isinstance(value, (list, tuple)):
-        import re
-        value = [pattern.strip() for pattern in re.split("\\n+", str(value)) if pattern.strip()]
-    for pattern in value:
-        detector.appendTemplate(pattern)
-    templates = detector.templates
-    if not templates or len(templates) > 2:
-        return None, "Default Detectors"
-    template = templates[0]
-    return getattr(template, "pattern", None), template.name
-
-
-def _observe(root, configuration):
-    socket_path = configuration.get("socket")
-    expected_fingerprint = configuration.get("fingerprint")
-    expected_startup_fingerprint = configuration.get("startupFingerprint")
-    early, stream, fingerprint, startup_fingerprint, expected_jails = _read_config(root)
-    in_sync = fingerprint == expected_fingerprint and startup_fingerprint == expected_startup_fingerprint
-    active_jails = []
-
-    if not socket_path:
-        return {"fingerprint": fingerprint, "startupFingerprint": startup_fingerprint,
-                "activeJails": active_jails, "inSync": False}
-
-    client = None
-    try:
-        from fail2ban.client.csocket import CSocket
-        client = CSocket(socket_path, timeout=5)
-        status = client.send(["status"])
-        if not isinstance(status, (list, tuple)) or len(status) < 2 or status[0] != 0:
-            return {"fingerprint": fingerprint, "startupFingerprint": startup_fingerprint,
-                    "activeJails": active_jails, "inSync": False}
-        for item in status[1] if isinstance(status[1], (list, tuple)) else []:
-            if isinstance(item, (list, tuple)) and len(item) >= 2 and item[0] == "Jail list":
-                names = item[1]
-                if isinstance(names, str) and names.strip():
-                    active_jails = sorted(name.strip() for name in names.split(",") if name.strip())
-                break
-    except Exception:
-        return {"fingerprint": fingerprint, "startupFingerprint": startup_fingerprint,
-                "activeJails": active_jails, "inSync": False}
-
-    expected_jails = sorted(expected_jails)
-    if active_jails != expected_jails:
-        in_sync = False
-
-    global_values, jail_values, jail_lists, action_names, action_values = _collect_expected(stream)
-
-    query_failed = False
-
-    def _query(command):
-        nonlocal in_sync, query_failed
-        if query_failed:
-            return False, None
-        try:
-            response = client.send(command)
-        except Exception:
-            in_sync = False
-            query_failed = True
-            return False, None
-        if not isinstance(response, (list, tuple)) or len(response) < 2 or type(response[0]) is not int:
-            in_sync = False
-            query_failed = True
-            return False, None
-        if response[0] == 0:
-            return True, response[1]
-        return False, None
-
-    def _compare(command, expected, key, scope):
-        nonlocal in_sync
-        ok, actual = _query(command)
-        if not ok:
-            return
-        matches = _same(expected, actual, key, scope)
-        if matches is not None and not matches:
-            in_sync = False
-
-    db_file = global_values.get("dbfile", object())
-    database_disabled = db_file is None or (
-        isinstance(db_file, str) and db_file.lower() == "none"
-    )
-    for key, value in global_values.items():
-        if database_disabled and key in ("dbmaxmatches", "dbpurgeage"):
-            continue
-        _compare(["get", key], value, key, "global")
-
-    supported_jail_getters = {
-        "maxretry", "maxmatches", "maxlines", "findtime", "bantime", "usedns",
-        "ignoreself", "ignorecommand", "logencoding",
-    }
-    for (jail, key), value in jail_values.items():
-        if key in supported_jail_getters:
-            _compare(["get", jail, key], value, key, "jail")
-        elif key == "prefregex":
-            normalized = _native_prefregex(value, jail_values, jail)
-            _compare(["get", jail, key], normalized, key, "jail")
-        elif key.startswith("bantime."):
-            _compare(["get", jail, key], value, key, "jail")
-
-    for (jail, key), values in jail_lists.items():
-        if key in ("ignoreip", "logpath"):
-            _compare(["get", jail, key], values, key, "jail")
-        elif key in ("failregex", "ignoreregex"):
-            normalized = _native_regexes(values, key, jail_values, jail)
-            _compare(["get", jail, key], normalized, key, "jail")
-
-    for jail in expected_jails:
-        expected_actions = action_names.get(jail, set())
-        ok, actual_actions = _query(["get", jail, "actions"])
-        if ok and isinstance(actual_actions, (list, tuple)):
-            if set(actual_actions) != expected_actions:
-                in_sync = False
-
-        for action in expected_actions:
-            for property_name, value in action_values.get((jail, action), {}).items():
-                _compare(["get", jail, "action", action, property_name], value, property_name, "action")
-
-    if client is not None:
-        try:
-            client.close()
-        except Exception:
-            pass
-
-    return {"fingerprint": fingerprint, "startupFingerprint": startup_fingerprint,
-            "activeJails": active_jails, "inSync": bool(in_sync)}
-
-
-try:
-    with contextlib.redirect_stdout(io.StringIO()), contextlib.redirect_stderr(io.StringIO()):
-        operation = _request.get("operation")
-        root = _request.get("configRoot")
-        configuration = _request.get("configuration") or {}
-        if not isinstance(root, str) or not root:
-            raise ValueError()
-        if operation == "observe":
-            result = _observe(root, configuration)
-        else:
-            early, stream, fingerprint, startup_fingerprint, enabled_jails = _read_config(root)
-            if operation == "inspect":
-                result = {
-                    "socket": str(early.get("socket", "")),
-                    "pidfile": str(early.get("pidfile", "")),
-                    "fingerprint": fingerprint,
-                    "startupFingerprint": startup_fingerprint,
-                    "enabledJails": enabled_jails,
-                }
-            elif operation == "validate":
-                result = {"validated": True}
-            else:
-                raise ValueError()
-    _emit({"ok": True, "result": result})
-except SystemExit:
-    raise
-except BaseException:
-    _emit({"ok": False}, 2)
-"""
-
-    let private fail message = raise (BackendError(message))
-
-    let private jsonString (value: string) =
-        System.Text.Json.Nodes.JsonValue.Create(value).ToJsonString()
-
-    let private createRequest (operation: string) (configRoot: string) (configurationJson: string) =
-        "{\"operation\":"
-        + jsonString operation
-        + ",\"configRoot\":"
-        + jsonString configRoot
-        + ",\"configuration\":"
-        + configurationJson
-        + "}"
+    let private runGetterClient (environment: HostEnvironment) (arguments: string list) =
+        runRuntimeClient environment ([ "-v"; "-v"; "-v" ] @ arguments)
 
     let private mappedPath (environment: HostEnvironment) (logicalPath: string) =
         try
@@ -499,143 +104,688 @@ except BaseException:
         with _ ->
             fail "The native Fail2Ban path is invalid."
 
-    let private runBridge (environment: HostEnvironment) (request: string) =
-        let result =
+
+    let private hashJson (write: Utf8JsonWriter -> unit) =
+        use stream = new MemoryStream()
+        use writer = new Utf8JsonWriter(stream)
+        write writer
+        writer.Flush()
+        SHA256.HashData(stream.GetBuffer().AsSpan(0, int stream.Length))
+        |> Convert.ToHexString
+        |> fun value -> value.ToLowerInvariant()
+
+    let private pythonActionSources (root: string) =
+        let directory = Path.Combine(root, "action.d")
+
+        if not (Directory.Exists directory) then
+            []
+        else
             try
-                environment.Run "python3" [ "-c"; pythonBridge ] (Some request)
+                Directory.EnumerateFiles directory
+                |> Seq.choose (fun path ->
+                    let name = Path.GetFileName path
+
+                    if name.EndsWith(".py", StringComparison.Ordinal) && File.Exists path then
+                        use source = File.OpenRead path
+                        let digest =
+                            SHA256.HashData source
+                            |> Convert.ToHexString
+                            |> fun value -> value.ToLowerInvariant()
+
+                        Some(name, digest)
+                    else
+                        None)
+                |> Seq.sortWith (fun (left, _) (right, _) -> StringComparer.Ordinal.Compare(left, right))
+                |> Seq.toList
             with _ ->
-                fail "The native Fail2Ban configuration bridge could not run."
+                fail "The native Fail2Ban Python action sources could not be read."
 
-        if result.ExitCode <> 0 then
-            fail "The native Fail2Ban configuration could not be read."
+    let private startupKeys =
+        set [ "thread"; "syslogsocket"; "loglevel"; "logtarget"; "allowipv6"; "dbfile" ]
 
-        let document =
-            try
-                JsonDocument.Parse result.Stdout
-            with _ ->
-                fail "The native Fail2Ban configuration bridge returned an invalid response."
+    let private isStartupCommand command =
+        match commandFields command with
+        | Some fields when indexedString fields 0 = Some "set" ->
+            match indexedString fields 1, indexedString fields 2 with
+            | Some key, _ when fields.Length = 3 && Set.contains key startupKeys -> true
+            | Some "thread", Some "stacksize" when fields.Length >= 4 -> true
+            | _ -> false
+        | _ -> false
 
-        let ok =
-            try
-                document.RootElement.GetProperty("ok").GetBoolean()
-            with _ ->
-                document.Dispose()
-                fail "The native Fail2Ban configuration bridge returned an invalid response."
+    let private createConfiguration root socket pidFile commands =
+        let normalizedCommands = commands |> List.map (normalizeLiteral root)
+        let sources = pythonActionSources root
 
-        if not ok then
-            document.Dispose()
-            fail "The native Fail2Ban configuration could not be read."
+        let fingerprint =
+            hashJson (fun writer ->
+                writer.WriteStartObject()
+                writer.WriteString("socket", normalizeRoot root socket)
+                writer.WriteString("pidFile", normalizeRoot root pidFile)
+                writer.WritePropertyName("commands")
+                writer.WriteStartArray()
 
-        document
+                for command in normalizedCommands do
+                    writeLiteral writer command
 
-    let private resultElement (document: JsonDocument) =
-        try
-            document.RootElement.GetProperty("result")
-        with _ ->
-            fail "The native Fail2Ban configuration bridge returned an invalid response."
+                writer.WriteEndArray()
+                writer.WritePropertyName("pythonActionSources")
+                writer.WriteStartArray()
 
-    let private readString (element: JsonElement) (name: string) =
-        try
-            let value = element.GetProperty(name).GetString()
+                for name, digest in sources do
+                    writer.WriteStartArray()
+                    writer.WriteStringValue name
+                    writer.WriteStringValue digest
+                    writer.WriteEndArray()
 
-            if isNull value then
-                fail "The native Fail2Ban configuration bridge returned an invalid response."
+                writer.WriteEndArray()
+                writer.WriteEndObject())
 
-            value
-        with
-        | :? BackendError -> reraise ()
-        | _ -> fail "The native Fail2Ban configuration bridge returned an invalid response."
+        let startupCommands =
+            commands
+            |> List.filter isStartupCommand
+            |> List.map (normalizeLiteral root)
 
-    let private readStrings (element: JsonElement) (name: string) =
-        try
-            element.GetProperty(name).EnumerateArray()
-            |> Seq.map (fun item ->
-                let value = item.GetString()
+        let startupFingerprint =
+            hashJson (fun writer ->
+                writer.WriteStartObject()
+                writer.WriteString("socket", normalizeRoot root socket)
+                writer.WriteString("pidFile", normalizeRoot root pidFile)
+                writer.WritePropertyName("commands")
+                writer.WriteStartArray()
 
-                if isNull value then
-                    fail "The native Fail2Ban configuration bridge returned an invalid response."
+                for command in startupCommands do
+                    writeLiteral writer command
 
-                value)
-            |> Seq.toList
-        with
-        | :? BackendError -> reraise ()
-        | _ -> fail "The native Fail2Ban configuration bridge returned an invalid response."
+                writer.WriteEndArray()
+                writer.WriteEndObject())
+
+        let enabledJails =
+            commands
+            |> List.choose (fun command ->
+                match commandFields command with
+                | Some fields when indexedString fields 0 = Some "start" -> indexedString fields 1
+                | _ -> None)
+            |> List.distinct
+            |> List.sortWith (fun left right -> StringComparer.Ordinal.Compare(left, right))
+
+        {
+            Socket = socket
+            PidFile = pidFile
+            Fingerprint = fingerprint
+            StartupFingerprint = startupFingerprint
+            EnabledJails = enabledJails
+        }
+
+    let private numericValue literal =
+        let asNumber = function
+            | (PyInteger _ | PyFloat _ | PyNone) as number -> Some number
+            | PyBoolean value -> Some(PyInteger(if value then BigInteger.One else BigInteger.Zero))
+            | _ -> None
+
+        match literal with
+        | PyString text -> tryParseResponse text |> Option.bind asNumber
+        | value -> asNumber value
+
+    let private numericEqual left right =
+        let integerEqualsFloat integer number =
+            Double.IsFinite number
+            && Math.Truncate number = number
+            && BigInteger(number) = integer
+
+        match left, right with
+        | PyInteger left, PyInteger right -> left = right
+        | PyFloat left, PyFloat right -> not (Double.IsNaN left || Double.IsNaN right) && left = right
+        | PyInteger integer, PyFloat number
+        | PyFloat number, PyInteger integer -> integerEqualsFloat integer number
+        | PyNone, PyNone -> true
+        | _ -> false
+
+    let private numericMarker = function
+        | PyInteger value -> value.ToString(CultureInfo.InvariantCulture)
+        | PyFloat value when Double.IsFinite value && Math.Truncate value = value ->
+            BigInteger(value).ToString(CultureInfo.InvariantCulture)
+        | PyFloat value -> value.ToString("R", CultureInfo.InvariantCulture)
+        | PyNone -> "none"
+        | _ -> fail "The native Fail2Ban numeric response is malformed."
+
+    let rec private readNativeConfiguration (environment: HostEnvironment) (root: string) =
+        match runClient environment [ "-v"; "-c"; root; "-d" ] None with
+        | None -> fail "The native Fail2Ban configuration could not be read."
+        | Some result when result.ExitCode <> 0 -> fail "The native Fail2Ban configuration could not be read."
+        | Some result ->
+            let socket, pidFile =
+                match tryEndpointFromDiagnostics result.Stderr with
+                | Some paths -> paths
+                | None -> fail "The native Fail2Ban client did not report its configured socket and PID paths."
+            let commands = parseDump result.Stdout
+            let seed = createConfiguration root socket pidFile commands
+            let plan = runtimePlan environment seed.EnabledJails commands
+
+            let configuration =
+                Configuration(
+                    seed.Socket,
+                    seed.PidFile,
+                    seed.Fingerprint,
+                    seed.StartupFingerprint,
+                    seed.EnabledJails,
+                    plan
+                )
+
+            configuration, commands
+
+    and private runtimePlan (environment: HostEnvironment) (enabledJails: string list) (commands: PythonLiteral list) =
+        let getters = Dictionary<string, GetterExpectation>(StringComparer.Ordinal)
+        let actionNames = Dictionary<string, HashSet<string>>(StringComparer.Ordinal)
+        let actionProperties = Dictionary<string * string, HashSet<string>>()
+        let durationCache = Dictionary<string, PythonLiteral>(StringComparer.Ordinal)
+
+        let keyForArguments (arguments: string list) =
+            let builder = StringBuilder()
+
+            for argument in arguments do
+                builder.Append(argument.Length.ToString(CultureInfo.InvariantCulture)).Append(':').Append(argument)
+                |> ignore
+
+            builder.ToString()
+
+        let addGetter arguments directCheck =
+            let key = keyForArguments arguments
+            getters[key] <- { Arguments = arguments; DirectCheck = directCheck }
+        let directString value = value |> valueText |> Option.map Text
+
+        let directInteger value =
+            let parsed =
+                match value with
+                | PyInteger number -> Some number
+                | PyString text ->
+                    match BigInteger.TryParse(text, NumberStyles.Integer, CultureInfo.InvariantCulture) with
+                    | true, number -> Some number
+                    | _ -> None
+                | _ -> None
+
+            parsed |> Option.map Integer
+
+        let directBoolean value =
+            let parsed =
+                match value with
+                | PyBoolean boolean -> Some boolean
+                | PyInteger number when number.IsZero -> Some false
+                | PyInteger number when number.IsOne -> Some true
+                | PyString text ->
+                    match text.Trim().ToLowerInvariant() with
+                    | "true"
+                    | "yes"
+                    | "on"
+                    | "1" -> Some true
+                    | "false"
+                    | "no"
+                    | "off"
+                    | "0" -> Some false
+                    | _ -> None
+                | _ -> None
+
+            parsed |> Option.map Boolean
+        let nativeUsedns = function
+            | PyBoolean true -> "yes"
+            | PyBoolean false -> "no"
+            | value ->
+                match valueText value with
+                | Some text ->
+                    match text.ToLowerInvariant() with
+                    | "yes" -> "yes"
+                    | "warn" -> "warn"
+                    | "no" -> "no"
+                    | "raw" -> "raw"
+                    | _ -> "no"
+                | None -> "no"
+
+        let nativeDurationSeconds (text: string) =
+            match durationCache.TryGetValue text with
+            | true, seconds -> seconds
+            | _ ->
+                let seconds =
+                    match runClient environment [ "--str2sec"; text ] None with
+                    | Some result when result.ExitCode = 0 ->
+                        tryParseResponse (result.Stdout.Trim()) |> Option.bind numericValue
+                    | _ -> None
+
+                match seconds with
+                | Some value ->
+                    durationCache.Add(text, value)
+                    value
+                | None -> fail "The native Fail2Ban client could not normalize a configured duration."
+
+        let directDuration value =
+            match value with
+            | (PyInteger _ | PyFloat _ | PyNone) as seconds -> Some(Duration seconds)
+            | PyString text -> Some(Duration(nativeDurationSeconds text))
+            | _ -> None
+
+        let globalCheck key value =
+            match key with
+            | "loglevel" -> directString value
+            | "logtarget"
+            | "syslogsocket"
+            | "dbfile" -> directString value
+            | "dbmaxmatches" -> directInteger value
+            | "dbpurgeage" -> directDuration value
+            | _ -> None
+
+        let jailCheck key value =
+            match key with
+            | "maxretry"
+            | "maxmatches"
+            | "maxlines" -> directInteger value
+            | "findtime"
+            | "bantime"
+            | "bantime.maxtime"
+            | "bantime.rndtime" -> directDuration value
+            | "usedns" -> Some(DnsMode(nativeUsedns value))
+            | "ignoreself" -> directBoolean value
+            | "ignorecommand" -> directString value
+            | _ -> None
+
+        let addActionName jail action =
+            match actionNames.TryGetValue jail with
+            | true, names -> names.Add action |> ignore
+            | _ ->
+                let names = HashSet<string>(StringComparer.Ordinal)
+                names.Add action |> ignore
+                actionNames.Add(jail, names)
+
+        let addActionProperty jail action property value =
+            let key = jail, action
+
+            let properties =
+                match actionProperties.TryGetValue key with
+                | true, existing -> existing
+                | _ ->
+                    let created = HashSet<string>(StringComparer.Ordinal)
+                    actionProperties.Add(key, created)
+                    created
+
+            properties.Add property |> ignore
+
+            let direct = if property = "timeout" then directDuration value else None
+            addGetter [ "get"; jail; "action"; action; property ] direct
+
+        let enabled = Set.ofList enabledJails
+        let mutable jailValues = Map.empty<string, Map<string, PythonLiteral>>
+        let mutable globalValues = Map.empty<string, PythonLiteral>
+
+        let recordJailValue jail key value =
+            let current = jailValues |> Map.tryFind jail |> Option.defaultValue Map.empty
+            jailValues <- Map.add jail (Map.add key value current) jailValues
+
+        let handleSet fields =
+            match fields with
+            | [ PyString "set"; PyString key; value ] ->
+                globalValues <- Map.add key value globalValues
+                match key with
+                | "loglevel" | "logtarget" | "syslogsocket" | "dbfile" | "dbmaxmatches" | "dbpurgeage" ->
+                    addGetter [ "get"; key ] (globalCheck key value)
+                | _ -> ()
+            | PyString "set" :: PyString jail :: PyString "action" :: PyString action :: PyString property :: value :: _ ->
+                if enabled.Contains jail then
+                    addActionName jail action
+                    addActionProperty jail action property value
+            | PyString "set" :: PyString jail :: PyString option :: rest when rest.Length > 0 ->
+                if option = "addaction" then
+                    match rest |> List.tryHead |> Option.bind stringValue with
+                    | Some action -> addActionName jail action
+                    | None -> ()
+                elif option = "addignoreip" then
+                    if enabled.Contains jail then addGetter [ "get"; jail; "ignoreip" ] None
+                elif option = "addlogpath" then
+                    if enabled.Contains jail then addGetter [ "get"; jail; "logpath" ] None
+                elif option = "addjournalmatch" then
+                    if enabled.Contains jail then addGetter [ "get"; jail; "journalmatch" ] None
+                elif option = "addfailregex" then
+                    if enabled.Contains jail then addGetter [ "get"; jail; "failregex" ] None
+                elif option = "addignoreregex" then
+                    if enabled.Contains jail then addGetter [ "get"; jail; "ignoreregex" ] None
+                else
+                    match rest |> List.tryHead with
+                    | Some value -> recordJailValue jail option value
+                    | None -> ()
+            | _ -> ()
+
+        let handleMultiSet fields =
+            match fields with
+            | PyString "multi-set" :: PyString jail :: PyString option :: rest ->
+                if option = "action" && rest.Length >= 2 then
+                    match rest.[0] |> stringValue, sequenceValues rest.[1] with
+                    | Some action, Some pairs when enabled.Contains jail ->
+                        addActionName jail action
+
+                        for pair in pairs do
+                            match sequenceValues pair with
+                            | Some [ PyString property; value ] -> addActionProperty jail action property value
+                            | _ -> ()
+                    | _ -> ()
+                elif enabled.Contains jail && option = "addfailregex" then
+                    addGetter [ "get"; jail; "failregex" ] None
+                elif enabled.Contains jail && option = "addignoreregex" then
+                    addGetter [ "get"; jail; "ignoreregex" ] None
+                elif enabled.Contains jail && option = "addignoreip" then
+                    addGetter [ "get"; jail; "ignoreip" ] None
+                else
+                    ()
+            | _ -> ()
+
+        for command in commands do
+            match commandFields command with
+            | Some fields ->
+                handleSet fields
+                handleMultiSet fields
+            | None -> ()
+
+        let databaseDisabled =
+            globalValues
+            |> Map.tryFind "dbfile"
+            |> Option.exists (fun value ->
+                match valueText value with
+                | Some text -> text.Equals("None", StringComparison.OrdinalIgnoreCase)
+                | None -> false)
+
+        if databaseDisabled then
+            getters.Remove(keyForArguments [ "get"; "dbmaxmatches" ]) |> ignore
+            getters.Remove(keyForArguments [ "get"; "dbpurgeage" ]) |> ignore
+
+        for jail in enabledJails do
+            let names =
+                match actionNames.TryGetValue jail with
+                | true, values -> values |> Seq.toList |> Set.ofList
+                | _ -> Set.empty
+
+            addGetter [ "get"; jail; "actions" ] (Some(ActionNames names))
+
+            for action in names do
+                let key = jail, action
+
+                let properties =
+                    match actionProperties.TryGetValue key with
+                    | true, values -> values |> Seq.toList |> Set.ofList
+                    | _ -> Set.empty
+
+                addGetter
+                    [ "get"; jail; "actionproperties"; action ]
+                    (Some(ActionProperties properties))
+
+        for KeyValue(jail, values) in jailValues do
+            if enabled.Contains jail then
+                for KeyValue(key, value) in values do
+                    addGetter [ "get"; jail; key ] (jailCheck key value)
+
+        getters.Values
+        |> Seq.sortWith (fun left right ->
+            StringComparer.Ordinal.Compare(keyForArguments left.Arguments, keyForArguments right.Arguments))
+        |> Seq.toList
+        |> fun values -> { Getters = values }
+
 
     let validate (environment: HostEnvironment) (configRoot: string) =
         let root = mappedPath environment configRoot
-        let request = createRequest "validate" root "null"
-        use document = runBridge environment request
-        resultElement document |> ignore
+
+        match runClient environment [ "-c"; root; "-t" ] None with
+        | Some result when result.ExitCode = 0 -> ()
+        | _ -> fail "The native Fail2Ban configuration could not be validated."
 
     let inspect (environment: HostEnvironment) (configRoot: string) =
         let root = mappedPath environment configRoot
-        let request = createRequest "inspect" root "null"
-        use document = runBridge environment request
-        let result = resultElement document
+        readNativeConfiguration environment root |> fst
 
-        {
-            Socket = readString result "socket"
-            PidFile = readString result "pidfile"
-            Fingerprint = readString result "fingerprint"
-            StartupFingerprint = readString result "startupFingerprint"
-            EnabledJails = readStrings result "enabledJails"
-        }
+    let private getterKey (arguments: string list) =
+        let builder = StringBuilder()
 
-    let observe (environment: HostEnvironment) (configRoot: string) (configuration: Configuration) =
+        for argument in arguments do
+            builder.Append(argument.Length.ToString(CultureInfo.InvariantCulture)).Append(':').Append(argument)
+            |> ignore
+
+        builder.ToString()
+
+    let private parseActiveJails (output: string) =
+        let matches = ResizeArray<string>()
+
+        for rawLine in output.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries) do
+            let line = rawLine.Trim()
+            let marker = "Jail list:"
+            let position = line.IndexOf(marker, StringComparison.Ordinal)
+
+            if position >= 0 then
+                let rawNames = line.Substring(position + marker.Length).Trim()
+
+                if rawNames.Length > 0 then
+                    for name in rawNames.Split(',', StringSplitOptions.RemoveEmptyEntries) do
+                        let normalized = name.Trim()
+
+                        if normalized.Length = 0 then
+                            fail "The native Fail2Ban status response is malformed."
+
+                        matches.Add normalized
+
+        if matches.Count = 0
+           && not (output.Contains("Jail list:", StringComparison.Ordinal)) then
+            None
+        elif matches.Count <> (matches |> Seq.distinct |> Seq.length) then
+            None
+        else
+            matches
+            |> Seq.sortWith (fun left right -> StringComparer.Ordinal.Compare(left, right))
+            |> Seq.toList
+            |> Some
+
+    let private booleanValue = function
+        | PyBoolean value -> Some value
+        | PyInteger value when value.IsOne -> Some true
+        | PyInteger value when value.IsZero -> Some false
+        | PyString value ->
+            match value.Trim().ToLowerInvariant() with
+            | "true" | "yes" | "on" | "1" -> Some true
+            | "false" | "no" | "off" | "0" -> Some false
+            | _ -> None
+        | _ -> None
+
+    let private namesValue literal =
+        match sequenceValues literal with
+        | Some values ->
+            let names = values |> List.choose stringValue
+            if names.Length = values.Length then Some(Set.ofList names) else None
+        | None -> None
+
+    let private directMarker (kind: string) (values: string list) =
+        hashJson (fun writer ->
+            writer.WriteStartArray()
+            writer.WriteStringValue kind
+
+            for value in values do
+                writer.WriteStringValue value
+
+            writer.WriteEndArray())
+
+    let private canonicalText (arguments: string list) (value: string) =
+        match arguments, value.ToLowerInvariant() with
+        | [ "get"; "loglevel" ], _ -> value.ToUpperInvariant()
+        | [ "get"; "dbfile" ], "none" -> "none"
+        | [ "get"; "logtarget" ], ("stdout" | "stderr" | "syslog" | "sysout" | "systemd-journal") ->
+            value.ToLowerInvariant()
+        | [ "get"; "syslogsocket" ], "auto" -> "auto"
+        | [ "get"; _; "usedns" ], dns -> dns
+        | _ -> value
+
+    let private nativeUsednsText (value: string) =
+        match value.Trim().ToLowerInvariant() with
+        | "yes" -> "yes"
+        | "warn" -> "warn"
+        | "no" -> "no"
+        | "raw" -> "raw"
+        | _ -> "no"
+
+    let private directCheckObservation
+        (arguments: string list)
+        (expected: DirectCheck)
+        (actual: PythonLiteral)
+        =
+        match expected with
+        | Text value ->
+            let wanted = canonicalText arguments value
+            let matches = valueText actual |> Option.exists (fun text -> canonicalText arguments text = wanted)
+            matches, directMarker "text" [ wanted ]
+        | DnsMode expectedMode ->
+            let actualMode =
+                match actual with
+                | PyBoolean value -> Some(if value then "yes" else "no")
+                | value -> valueText value |> Option.map nativeUsednsText
+
+            actualMode = Some expectedMode, directMarker "usedns" [ expectedMode ]
+        | Boolean value ->
+            booleanValue actual = Some value, directMarker "boolean" [ if value then "true" else "false" ]
+        | Integer value ->
+            let matches = numericValue actual |> Option.exists (numericEqual (PyInteger value))
+            matches, directMarker "integer" [ value.ToString(CultureInfo.InvariantCulture) ]
+        | Duration seconds ->
+            let matches = numericValue actual |> Option.exists (numericEqual seconds)
+            matches, directMarker "duration" [ numericMarker seconds ]
+        | ActionNames expectedNames ->
+            let actualNames = namesValue actual
+            actualNames = Some expectedNames, directMarker "actions" (Set.toList expectedNames)
+        | ActionProperties expectedNames ->
+            let actualNames = namesValue actual
+            let matches = actualNames |> Option.exists (Set.isSubset expectedNames)
+            let values = actualNames |> Option.defaultValue Set.empty |> Set.toList
+            matches, directMarker "action-properties" values
+
+    let private isUnsupportedGetter (result: CommandResult) =
+        result.ExitCode <> 0
+        && result.ExitCode <> 124
+        && result.ExitCode <> 137
+        && result.Stdout.Trim().Equals("Invalid command (no get action or not yet implemented)", StringComparison.Ordinal)
+        && result.Stderr.Contains("NOK:", StringComparison.Ordinal)
+
+    let private rawGetterResponse (diagnostics: string) =
+        if isNull diagnostics then
+            None
+        else
+            let responses =
+                diagnostics.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
+                |> Array.choose (tryDiagnosticMessage "fail2ban" "HEAVY")
+                |> Array.filter (fun message -> message.StartsWith("OK :", StringComparison.Ordinal))
+
+            match responses with
+            | [| response |] -> tryParseResponse (response.Substring(4).Trim())
+            | _ -> None
+
+    let private createObservationFingerprint (activeJails: string list) (observations: (string * string) list) =
+        hashJson (fun writer ->
+            writer.WriteStartObject()
+            writer.WritePropertyName("activeJails")
+            writer.WriteStartArray()
+
+            for jail in activeJails do
+                writer.WriteStringValue jail
+
+            writer.WriteEndArray()
+            writer.WritePropertyName("getters")
+            writer.WriteStartArray()
+
+            for key, observation in observations |> List.sortWith (fun (left, _) (right, _) -> StringComparer.Ordinal.Compare(left, right)) do
+                writer.WriteStartArray()
+                writer.WriteStringValue key
+                writer.WriteStringValue observation
+                writer.WriteEndArray()
+
+            writer.WriteEndArray()
+            writer.WriteEndObject())
+
+    let internal observeWithBaseline
+        (environment: HostEnvironment)
+        (configRoot: string)
+        (configuration: Configuration)
+        (baseline: RuntimeBaseline option)
+        =
         let root = mappedPath environment configRoot
+        let statusResult = runRuntimeClient environment [ "-c"; root; "status" ]
 
-        let socket =
-            if String.IsNullOrWhiteSpace configuration.Socket then
-                ""
-            elif Path.IsPathRooted configuration.Socket then
-                mappedPath environment configuration.Socket
-            else
-                configuration.Socket
+        match statusResult with
+        | None ->
+            { ActiveJails = []; InSync = false }, None
+        | Some status when status.ExitCode <> 0 ->
+            { ActiveJails = []; InSync = false }, None
+        | Some status ->
+            match parseActiveJails status.Stdout with
+            | None -> { ActiveJails = []; InSync = false }, None
+            | Some activeJails ->
+                let jailSetMatches = activeJails = configuration.EnabledJails
+                let observations = ResizeArray<string * string>()
+                let mutable directChecksMatch = true
+                let mutable allGettersAnswered = jailSetMatches
 
-        let configurationJson =
-            "{\"socket\":"
-            + jsonString socket
-            + ",\"fingerprint\":"
-            + jsonString configuration.Fingerprint
-            + ",\"startupFingerprint\":"
-            + jsonString configuration.StartupFingerprint
-            + "}"
+                for getter in configuration.RuntimePlan.Getters do
+                    if allGettersAnswered then
+                        let key = getterKey getter.Arguments
+                        let arguments = "-c" :: root :: getter.Arguments
 
-        let request = createRequest "observe" root configurationJson
+                        match runGetterClient environment arguments with
+                        | None -> allGettersAnswered <- false
+                        | Some result when result.ExitCode = 0 ->
+                            match rawGetterResponse result.Stderr with
+                            | None -> allGettersAnswered <- false
+                            | Some raw ->
+                                match getter.DirectCheck with
+                                | Some check ->
+                                    let matches, marker =
+                                        directCheckObservation getter.Arguments check raw
 
-        use document = runBridge environment request
-        let result = resultElement document
+                                    if not matches then
+                                        directChecksMatch <- false
 
-        let inSync =
-            try
-                result.GetProperty("inSync").GetBoolean()
-            with _ ->
-                fail "The native Fail2Ban runtime bridge returned an invalid response."
+                                    observations.Add(key, "direct:" + marker)
+                                | None ->
+                                    let fingerprint = hashJson (fun writer -> writeLiteral writer raw)
+                                    observations.Add(key, "native:" + fingerprint)
+                        | Some result when isUnsupportedGetter result ->
+                            if getter.DirectCheck.IsSome then
+                                directChecksMatch <- false
 
-        {
-            ActiveJails = readStrings result "activeJails"
-            InSync = inSync
-        }
+                            observations.Add(key, "unsupported")
+                        | Some _ -> allGettersAnswered <- false
+
+                let observationFingerprint =
+                    createObservationFingerprint activeJails (List.ofSeq observations)
+
+                let configurationMatches =
+                    baseline
+                    |> Option.forall (fun expected ->
+                        expected.Fingerprint = configuration.Fingerprint
+                        && expected.StartupFingerprint = configuration.StartupFingerprint
+                        && expected.ObservationFingerprint = observationFingerprint)
+
+                let ready =
+                    jailSetMatches
+                    && directChecksMatch
+                    && allGettersAnswered
+
+                let capturedBaseline =
+                    if ready then
+                        Some
+                            {
+                                Fingerprint = configuration.Fingerprint
+                                StartupFingerprint = configuration.StartupFingerprint
+                                ObservationFingerprint = observationFingerprint
+                            }
+                    else
+                        None
+
+                {
+                    ActiveJails = activeJails
+                    InSync = ready && configurationMatches
+                }, capturedBaseline
+
 
     let reload (environment: HostEnvironment) (configuration: Configuration) =
         let configRoot = mappedPath environment "/etc/fail2ban"
+        let result = runClient environment [ "-c"; configRoot; "reload"; "--restart"; "--all" ] None
 
-        let socket =
-            if String.IsNullOrWhiteSpace configuration.Socket then
-                fail "The native Fail2Ban socket path is unavailable."
-            elif Path.IsPathRooted configuration.Socket then
-                mappedPath environment configuration.Socket
-            else
-                configuration.Socket
-
-        let result =
-            try
-                environment.Run
-                    "fail2ban-client"
-                    [ "-c"; configRoot; "-s"; socket; "reload"; "--restart"; "--all" ]
-                    None
-            with _ ->
-                fail "The native Fail2Ban reload could not run."
-
-        if result.ExitCode <> 0 then
-            fail "The native Fail2Ban reload failed."
+        match result with
+        | Some command when command.ExitCode = 0 -> ()
+        | _ -> fail "The native Fail2Ban reload failed."
