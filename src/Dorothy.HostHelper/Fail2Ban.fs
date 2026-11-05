@@ -38,6 +38,7 @@ module Fail2Ban =
         {
             OwnerId: string
             Files: Map<string, string>
+            RuntimeBaseline: Fail2BanNative.RuntimeBaseline option
             Pending: PendingMutation option
         }
 
@@ -648,9 +649,10 @@ module Fail2Ban =
         (environment: HostEnvironment)
         (root: string)
         (configuration: Fail2BanNative.Configuration)
+        (baseline: Fail2BanNative.RuntimeBaseline option)
         =
         try
-            Fail2BanNative.observe environment root configuration
+            Fail2BanNative.observeWithBaseline environment root configuration baseline
         with
         | :? BackendError -> reraise ()
         | :? Fail2BanNative.BackendError -> fail "Fail2Ban runtime observation failed"
@@ -853,11 +855,22 @@ module Fail2Ban =
         | Some text -> JsonValue.Create text :> JsonNode
         | None -> null
 
+    let private serializeRuntimeBaseline (baseline: Fail2BanNative.RuntimeBaseline option) : JsonNode =
+        match baseline with
+        | None -> null
+        | Some value ->
+            let node = JsonObject()
+            node["fingerprint"] <- JsonValue.Create value.Fingerprint
+            node["startupFingerprint"] <- JsonValue.Create value.StartupFingerprint
+            node["observationFingerprint"] <- JsonValue.Create value.ObservationFingerprint
+            node :> JsonNode
+
     let private journalNode (journal: Journal) =
         let root = JsonObject()
-        root["version"] <- JsonValue.Create 2
+        root["version"] <- JsonValue.Create 3
         root["ownerId"] <- JsonValue.Create journal.OwnerId
         root["files"] <- serializeMap journal.Files
+        root["runtimeBaseline"] <- serializeRuntimeBaseline journal.RuntimeBaseline
 
         root["pending"] <-
             match journal.Pending with
@@ -959,6 +972,41 @@ module Fail2Ban =
             | text -> Some text
         | _ -> fail ("Fail2Ban ownership journal has an invalid " + field)
 
+
+    let private isSha256Digest (value: string) =
+        value.Length = 64
+        && (value
+            |> Seq.forall (fun character ->
+                (character >= '0' && character <= '9')
+                || (character >= 'a' && character <= 'f')))
+
+    let private readRuntimeBaseline (element: JsonElement) : Fail2BanNative.RuntimeBaseline option =
+        match element.ValueKind with
+        | JsonValueKind.Null -> None
+        | JsonValueKind.Object ->
+            ensureExactProperties
+                element
+                (set [ "fingerprint"; "startupFingerprint"; "observationFingerprint" ])
+                "Fail2Ban runtime baseline"
+
+            let fingerprint = requiredString element "fingerprint"
+            let startupFingerprint = requiredString element "startupFingerprint"
+            let observationFingerprint = requiredString element "observationFingerprint"
+
+            if
+                not (isSha256Digest fingerprint)
+                || not (isSha256Digest startupFingerprint)
+                || not (isSha256Digest observationFingerprint)
+            then
+                fail "Fail2Ban runtime baseline has an invalid digest"
+
+            Some
+                {
+                    Fingerprint = fingerprint
+                    StartupFingerprint = startupFingerprint
+                    ObservationFingerprint = observationFingerprint
+                }
+        | _ -> fail "Fail2Ban ownership journal has an invalid runtime baseline"
     let private readJournal (environment: HostEnvironment) (ownerId: string) =
         let directory = mappedPath environment stateDirectory
 
@@ -995,15 +1043,24 @@ module Fail2Ban =
                     if checkDuplicateProperties root then
                         fail "Fail2Ban ownership journal contains duplicate JSON properties"
 
-                    ensureExactProperties
-                        root
-                        (set [ "version"; "ownerId"; "files"; "pending" ])
-                        "Fail2Ban ownership journal"
+                    let versionElement = root.GetProperty "version"
 
-                    let version = root.GetProperty "version"
+                    let version =
+                        if versionElement.ValueKind = JsonValueKind.Number then
+                            versionElement.GetInt32()
+                        else
+                            -1
 
-                    if version.ValueKind <> JsonValueKind.Number || version.GetInt32() <> 2 then
+                    if version <> 2 && version <> 3 then
                         fail "Fail2Ban ownership journal has an unsupported version"
+
+                    let journalProperties =
+                        if version = 2 then
+                            set [ "version"; "ownerId"; "files"; "pending" ]
+                        else
+                            set [ "version"; "ownerId"; "files"; "runtimeBaseline"; "pending" ]
+
+                    ensureExactProperties root journalProperties "Fail2Ban ownership journal"
 
                     let storedOwner = requiredString root "ownerId"
                     validateOwnerId storedOwner
@@ -1013,6 +1070,12 @@ module Fail2Ban =
 
                     let files =
                         expectObjectStringMap (root.GetProperty "files") "Fail2Ban journal files"
+
+                    let runtimeBaseline =
+                        if version = 2 then
+                            None
+                        else
+                            readRuntimeBaseline (root.GetProperty "runtimeBaseline")
 
                     let pendingElement = root.GetProperty "pending"
 
@@ -1109,6 +1172,7 @@ module Fail2Ban =
                         {
                             OwnerId = storedOwner
                             Files = files
+                            RuntimeBaseline = runtimeBaseline
                             Pending = pending
                         }
                 with
@@ -1211,10 +1275,13 @@ module Fail2Ban =
         (environment: HostEnvironment)
         (expectedEnabled: bool)
         (configuration: Fail2BanNative.Configuration)
+        (baseline: Fail2BanNative.RuntimeBaseline option)
         =
         let timer = Stopwatch.StartNew()
         let mutable delayMilliseconds = 100
-        let mutable observation: (ServiceState * Fail2BanNative.Runtime) option = None
+        let mutable observation:
+            (ServiceState * Fail2BanNative.Runtime * Fail2BanNative.RuntimeBaseline) option =
+            None
 
         while observation.IsNone && timer.Elapsed < readinessTimeout do
             let state = readServiceState environment
@@ -1223,10 +1290,12 @@ module Fail2Ban =
                 fail "Fail2Ban service failed before native configuration became ready"
 
             if state.Enabled = expectedEnabled && state.Active then
-                let runtime = nativeObserve environment configRoot configuration
+                let runtime, capturedBaseline =
+                    nativeObserve environment configRoot configuration baseline
 
-                if runtime.InSync then
-                    observation <- Some(state, runtime)
+                match capturedBaseline with
+                | Some value when runtime.InSync -> observation <- Some(state, runtime, value)
+                | _ -> ()
 
             if observation.IsNone && timer.Elapsed < readinessTimeout then
                 let remaining = (readinessTimeout - timer.Elapsed).TotalMilliseconds
@@ -1287,7 +1356,7 @@ module Fail2Ban =
                 setServiceEnabled environment pending.PriorEnabled
 
             if pending.PriorActive then
-                waitForReadiness environment pending.PriorEnabled restoredConfiguration
+                waitForReadiness environment pending.PriorEnabled restoredConfiguration journal.RuntimeBaseline
                 |> ignore
             else
                 ensureServiceState environment false pending.PriorEnabled |> ignore
@@ -1325,9 +1394,10 @@ module Fail2Ban =
         (environment: HostEnvironment)
         (service: ServiceState)
         (configuration: Fail2BanNative.Configuration)
+        (baseline: Fail2BanNative.RuntimeBaseline option)
         =
         if service.Active then
-            Some(nativeObserve environment configRoot configuration)
+            Some(nativeObserve environment configRoot configuration baseline)
         else
             None
 
@@ -1349,15 +1419,19 @@ module Fail2Ban =
                 Some(nativeInspect environment configRoot)
 
         let service = readServiceState environment
+        let baseline = journal |> Option.bind (fun state -> state.RuntimeBaseline)
 
         let runtime =
             match configuration, service.Active with
             | Some config, true when pending ->
                 try
-                    Some(nativeObserve environment configRoot config)
+                    let value, _ = nativeObserve environment configRoot config baseline
+                    Some value
                 with :? BackendError ->
                     None
-            | Some config, true -> Some(nativeObserve environment configRoot config)
+            | Some config, true ->
+                let value, _ = nativeObserve environment configRoot config baseline
+                Some value
             | _ -> None
 
         let filesMatch =
@@ -1371,7 +1445,9 @@ module Fail2Ban =
 
         let owned = ownedInJournal journal
         let noPending = not pending
-        let runtimeMatches = runtime |> Option.exists (fun value -> value.InSync)
+        let runtimeMatches =
+            baseline.IsSome
+            && (runtime |> Option.exists (fun value -> value.InSync))
 
         let inSync =
             owned
@@ -1419,7 +1495,8 @@ module Fail2Ban =
         let serviceBefore = readServiceState environment
         nativeValidate environment configRoot
         let priorConfiguration = nativeInspect environment configRoot
-        let runtimeBefore = observeCurrent environment serviceBefore priorConfiguration
+        let priorBaseline = loaded |> Option.bind (fun state -> state.RuntimeBaseline)
+        let runtimeBefore = observeCurrent environment serviceBefore priorConfiguration priorBaseline
 
         withStagedConfiguration environment targetFiles removals (fun _ targetConfiguration ->
             let startupChanged =
@@ -1444,10 +1521,13 @@ module Fail2Ban =
                 {
                     OwnerId = desired.OwnerId
                     Files = priorFiles
+                    RuntimeBaseline = priorBaseline
                     Pending = Some pending
                 }
 
             saveJournal environment initial
+
+            let mutable nativeAcknowledged = false
 
             try
                 if (startupChanged || pythonChanged) && serviceBefore.Active then
@@ -1471,18 +1551,32 @@ module Fail2Ban =
 
                 if startupChanged || pythonChanged then
                     changeServiceState environment "start"
+                    nativeAcknowledged <- true
                 elif serviceBefore.Active then
                     let needsReload =
                         mutations.Length > 0
-                        || (runtimeBefore |> Option.exists (fun runtime -> not runtime.InSync))
+                        || priorBaseline.IsNone
+                        || (runtimeBefore |> Option.exists (fun (runtime, _) -> not runtime.InSync))
 
                     if needsReload then
                         nativeReload environment installedConfiguration
+                        nativeAcknowledged <- true
                 else
                     changeServiceState environment "start"
+                    nativeAcknowledged <- true
 
-                let finalService, finalRuntime =
-                    waitForReadiness environment true installedConfiguration
+                let readinessBaseline = if nativeAcknowledged then None else priorBaseline
+
+                let finalService, finalRuntime, capturedBaseline =
+                    waitForReadiness environment true installedConfiguration readinessBaseline
+
+                let finalBaseline =
+                    if nativeAcknowledged then
+                        capturedBaseline
+                    else
+                        match priorBaseline with
+                        | Some value -> value
+                        | None -> fail "Fail2Ban runtime baseline is unavailable after no-op apply"
 
                 let currentOwnedFiles =
                     currentFilesForJournal
@@ -1509,6 +1603,7 @@ module Fail2Ban =
                     environment
                     { initial with
                         Files = targetFiles
+                        RuntimeBaseline = Some finalBaseline
                         Pending = None
                     }
 
@@ -1546,7 +1641,8 @@ module Fail2Ban =
             let serviceBefore = readServiceState environment
             nativeValidate environment configRoot
             let priorConfiguration = nativeInspect environment configRoot
-            let runtimeBefore = observeCurrent environment serviceBefore priorConfiguration
+            let priorBaseline = state.RuntimeBaseline
+            let runtimeBefore = observeCurrent environment serviceBefore priorConfiguration priorBaseline
 
             withStagedConfiguration environment targetFiles removals (fun _ targetConfiguration ->
                 let startupChanged =
@@ -1592,12 +1688,12 @@ module Fail2Ban =
                     elif
                         serviceBefore.Active
                         && (mutations.Length > 0
-                            || (runtimeBefore |> Option.exists (fun runtime -> not runtime.InSync)))
+                            || (runtimeBefore |> Option.exists (fun (runtime, _) -> not runtime.InSync)))
                     then
                         nativeReload environment installedConfiguration
 
                     if serviceBefore.Active then
-                        waitForReadiness environment serviceBefore.Enabled installedConfiguration
+                        waitForReadiness environment serviceBefore.Enabled installedConfiguration None
                         |> ignore
                     else
                         ensureServiceState environment false serviceBefore.Enabled |> ignore

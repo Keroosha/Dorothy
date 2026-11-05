@@ -144,7 +144,13 @@ Delete removes the owned drop-in, restores native inheritance and requires the s
 
 The helper stages the resulting configuration tree—including removals—and validates it with the installed Fail2Ban parser. Multi-file writes use a durable ownership/mutation journal. Another owner's file, out-of-band file edits, unsafe paths and insecure owned-file permission drift are refused rather than silently overwritten.
 
+The adapter is F# and calls the installed `fail2ban-client`: native `-t` validation and `-v -d` configuration dumps retain Fail2Ban's includes, interpolation and regex grammar. It parses emitted literal data without evaluating it. Runtime getters use the lossless `-vvv` server-response diagnostics rather than the human-facing Beautifier output, which can truncate values such as fractional `dbpurgeage`. Status/get processes have a five-second deadline and one-second termination grace through Debian's `timeout`; transport failure stops the remaining getters.
+
+Our helper implementation must remain F#; introducing a Python bridge requires explicit prior agreement. This does not prohibit caller-supplied native Python actions or Python inside installed Fail2Ban/UFW packages.
+
 Ordinary jail/filter/command-action changes use native `reload --restart --all`. Startup changes (including socket, PID file, database and thread settings) and Python-source changes restart the daemon. The old service/endpoint is stopped before installing startup changes; the new endpoint and native state must become ready within a bounded deadline. Failed changes restore attributable previous files and daemon availability; interrupted mutation retries recover from the journal.
+
+Version-3 ownership journals bind a stable runtime-observation fingerprint to the applied configuration and startup fingerprints. Version-2 journals retain their ownership and pending-recovery semantics, but have no trusted runtime baseline: Read reports out-of-sync without rewriting them. An explicit Apply performs an acknowledged native reload/start and records the baseline; a refresh followed by `pulumi up` can therefore require one update with unchanged declarative inputs. Helpers that only understand v2 cannot read upgraded journals: retain a v3-capable helper for recovery rather than deleting ownership state.
 
 This is shared-daemon configuration: reload/restart can affect all configured jails, including those in preserved foreign files. No `--unban` is requested, but ban persistence follows native DB/restart behavior. Changing `dbfile` does not migrate or delete a database. Setting `dbfile=None` is supported.
 
@@ -156,7 +162,9 @@ Config rollback cannot undo arbitrary external effects of command/Python actions
 
 Check, Diff and preview do not connect or mutate the host. External changes require refresh, for example `pulumi preview --refresh --diff`. Read never repairs or rolls back a pending configuration. An interrupted/invalid tree is reported as owned/out-of-sync with available file observations; endpoint/jail observations can be unavailable while that tree is incomplete. Do not infer a healthy empty daemon from such a pending snapshot.
 
-Native effective configuration, service/jail presence and observable runtime settings are checked. Dynamic bans/counters do not cause diffs. A getter that cannot expose the original declaration is not guessed: for example `logencoding=auto` is selected in the daemon's environment, not the SSH client's forced locale. This is not an audit of arbitrary Python behavior, every possible `Match` context, external executables or the whole kernel firewall.
+Native effective configuration, service/jail presence and observable runtime settings are checked. Directly comparable settings are checked against their declarations; durations are normalized by native `--str2sec`, preserving binary64 precision and exact integer values. For normalization-dependent settings such as expanded regexes and canonical IP lists, observation compares the stable native responses with the baseline captured after an acknowledged reload/start and readiness checks. That initial baseline relies on native application acknowledgement, not an independent reimplementation of Fail2Ban's normalization. Read never creates or refreshes it.
+
+Dynamic bans/counters do not enter the baseline. A getter that cannot expose the original declaration is not guessed: for example `logencoding=auto` is selected in the daemon's environment, not the SSH client's forced locale. Malformed/missing/duplicate response diagnostics and transport failures cannot establish readiness. The data parsers follow the observed Fail2Ban 1.1.0 CLI formats on Debian 13; incompatible output fails closed instead of falling back to lossy text. This is not an audit of arbitrary Python behavior, every possible `Match` context, external executables or the whole kernel firewall.
 
 Owned configuration/Python files and journals are root-private (`0600`); staging/state directories are private. Full SSH effective configuration, Fail2Ban file observations and control-socket outputs are Pulumi secrets because inherited settings can contain sensitive arguments. Native validation errors do not echo configuration bodies. Native daemon logs and custom actions still obey their own logging behavior.
 
@@ -182,3 +190,13 @@ Docker `waitHealthy` remains `TimeSpan`: positive fractional seconds round up to
 - Implicit `fail2ban`/`nftables` prerequisites use separate retained package resources. Other action executables/packages belong in the caller's APT declarations. Explicit package ownership is preserved; switching explicit/implicit ownership requires deliberate migration, not an assumed zero-gap handoff.
 - Keep vendor `.conf` files as the baseline and inspect existing `.local` precedence before adoption. Reserved managed-path collisions require an explicit ownership transition. Do not erase foreign config or ban DBs to make an apply pass.
 - Declare administrator allowlists explicitly; the deployment address is not silently trusted. Verify out-of-band console access before changing authentication, listeners or ban policy. Native-drop-in semantics intentionally preserve upstream conflicts and inheritance.
+
+## Native adapter verification — 2026-11-05
+
+- The targeted Fail2Ban NUnit suite passed 34 tests. The full non-Sandbox Dorothy suite passed 255 tests, with three ownership-related tests skipped.
+- A `linux-x64` NativeAOT helper published with .NET 10 was exercised on a disposable Debian 13.7 VM with Fail2Ban 1.1.0-8. Native includes/interpolation, multiline regexes, custom socket/PID/database/thread settings, multiple/no actions, v2-to-v3 journal migration, drift refusal/repair, source-only Python restart and deletion were exercised.
+- Real native clients connected to deliberately stalled Unix sockets. Status and getter reads completed in 5.290 and 5.298 seconds respectively, returned out-of-sync, and left the journal unchanged.
+- A separate F# Pulumi consumer exercised create, refresh/no-op (`--expect-no-changes`), update, runtime-drift repair, disable and delete over pinned loopback SSH. The automatic SSH jail port remained the guest's local port 22, not the forwarded connection port.
+- Declared native `.py` actions recorded ban/unban effects before and after a source-only update. A syntax-valid action whose constructor failed passed native preflight, then failed service startup; the helper restored the previous action bytes, journal and healthy service. Subsequent refresh/no-op and the restored action succeeded.
+- Deletion preserved vendor/foreign configuration and probe rows in both the inherited and custom SQLite databases; both integrity checks returned `ok`. No production host was contacted.
+

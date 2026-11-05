@@ -4,8 +4,6 @@ open System
 open System.Globalization
 open System.Collections.Generic
 open System.IO
-open System.Security.Cryptography
-open System.Text
 open System.Text.Json
 open System.Text.Json.Nodes
 open Dorothy.DSL
@@ -49,11 +47,20 @@ module private Fail2BanTestRequests =
         let files = snapshot["actualFiles"].AsObject()
         files[path].GetValue<string>()
 
+    let nativeGetterTrace (payload: string) =
+        " +   14 7F56DB271780 fail2ban                  HEAVY OK : " + payload
+
+    let nativeInfoLog (message: string) =
+        "2026-11-05 14:01:28,969 fail2ban                [2726]: INFO    " + message
+
 [<Sealed>]
 type private FakeFail2BanHost() =
     let temporary = new TemporaryDirectory("dorothy-fail2ban-")
     let root = temporary.Path
     let calls = ResizeArray<string * string list>()
+    let rawGetterDiagnostics = ResizeArray<string>()
+    let getterHumanOutputs = ResizeArray<string>()
+
     let serviceEvents = ResizeArray<string * Map<string, string>>()
     let mutable serviceEnabled = false
     let mutable serviceActive = false
@@ -62,9 +69,18 @@ type private FakeFail2BanHost() =
     let mutable failNextStart = false
     let mutable failValidation = false
     let mutable runtimeDrift = false
+    let mutable timeoutNextGetter = false
+    let mutable transportFailureNextGetter = false
+    let mutable nextGetterResponse: (string list * string) option = None
+    let mutable injectedDiagnosticSeen = false
+    let mutable getterCallsAfterInjectedDiagnostic = 0
+    let mutable runtimeDbpurgeage: string option = None
+    let mutable staleMaxretryAfterReload = false
+    let mutable staleMaxretryValue: string option = None
     let mutable notReadyObservations = 0
     let mutable nativeObserveCount = 0
-    let mutable runningFingerprint = ""
+    let mutable runtimeSettings = Map.empty<string, string>
+    let mutable runtimeJails: string list = []
     let sshdOutput = "listenaddress 127.0.0.1:22\nlistenaddress [::1]:2222\n"
 
     let path (logicalPath: string) =
@@ -73,7 +89,6 @@ type private FakeFail2BanHost() =
     let configPath = path "/etc/fail2ban"
     let baseDaemonPath = path "/etc/fail2ban/fail2ban.conf"
     let baseJailPath = path "/etc/fail2ban/jail.conf"
-
 
     let captureFiles () =
         if not (Directory.Exists configPath) then
@@ -90,32 +105,6 @@ type private FakeFail2BanHost() =
                 | :? FileNotFoundException -> None
                 | :? DirectoryNotFoundException -> None)
             |> Map.ofSeq
-
-    let configFingerprint (directory: string) =
-        let builder = StringBuilder()
-
-        if Directory.Exists directory then
-            Directory.EnumerateFiles(directory, "*", SearchOption.AllDirectories)
-            |> Seq.sortWith (fun left right ->
-                StringComparer.Ordinal.Compare(
-                    Path.GetRelativePath(directory, left),
-                    Path.GetRelativePath(directory, right)
-                ))
-            |> Seq.iter (fun file ->
-                builder
-                    .Append(Path.GetRelativePath(directory, file).Replace(Path.DirectorySeparatorChar, '/'))
-                    .Append('\u0000')
-                |> ignore
-
-                try
-                    builder.Append(File.ReadAllText file).Append('\u0000') |> ignore
-                with
-                | :? FileNotFoundException -> builder.Append("<unreadable>\u0000") |> ignore
-                | :? DirectoryNotFoundException -> builder.Append("<unreadable>\u0000") |> ignore)
-
-        SHA256.HashData(Encoding.UTF8.GetBytes(builder.ToString()))
-        |> Convert.ToHexString
-        |> fun value -> value.ToLowerInvariant()
 
     let daemonValues (directory: string) =
         let values = Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
@@ -148,10 +137,7 @@ type private FakeFail2BanHost() =
             for rawLine in File.ReadAllLines file do
                 let line = rawLine.Trim()
 
-                if
-                    line.StartsWith("[", StringComparison.Ordinal)
-                    && line.EndsWith("]", StringComparison.Ordinal)
-                then
+                if line.StartsWith("[", StringComparison.Ordinal) && line.EndsWith("]", StringComparison.Ordinal) then
                     section <- line.Substring(1, line.Length - 2).Trim()
                 elif
                     line.Length > 0
@@ -169,199 +155,664 @@ type private FakeFail2BanHost() =
 
         values
 
-    let enabledJails (directory: string) =
-        let states = Dictionary<string, bool>(StringComparer.Ordinal)
+    let parseSectionFiles (files: string list) =
+        let sections = Dictionary<string, Dictionary<string, string>>(StringComparer.Ordinal)
+
+        for file in files do
+            if File.Exists file then
+                let mutable section = ""
+
+                for rawLine in File.ReadAllLines file do
+                    let line = rawLine.Trim()
+
+                    if line.StartsWith("[", StringComparison.Ordinal) && line.EndsWith("]", StringComparison.Ordinal) then
+                        section <- line.Substring(1, line.Length - 2).Trim()
+                    elif
+                        line.Length > 0
+                        && not (
+                            line.StartsWith("#", StringComparison.Ordinal)
+                            || line.StartsWith(";", StringComparison.Ordinal)
+                        )
+                    then
+                        let separator = line.IndexOf('=')
+
+                        if separator > 0 && section.Length > 0 then
+                            let name = line.Substring(0, separator).Trim()
+                            let value = line.Substring(separator + 1).Trim()
+
+                            let values =
+                                match sections.TryGetValue section with
+                                | true, existing -> existing
+                                | _ ->
+                                    let created = Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+                                    sections[section] <- created
+                                    created
+
+                            values[name] <- value
+
+        sections
+
+    let jailFiles (directory: string) =
         let paths = ResizeArray<string>()
 
-        for baseName in [ "jail.conf"; "jail.local" ] do
-            let candidate = Path.Combine(directory, baseName)
+        for name in [ "jail.conf"; "jail.local" ] do
+            let file = Path.Combine(directory, name)
 
-            if File.Exists candidate then
-                paths.Add candidate
+            if File.Exists file then
+                paths.Add file
 
-        let jailDropins = Path.Combine(directory, "jail.d")
+        let dropins = Path.Combine(directory, "jail.d")
 
-        if Directory.Exists jailDropins then
-            Directory.EnumerateFiles(jailDropins)
+        if Directory.Exists dropins then
+            Directory.EnumerateFiles(dropins)
             |> Seq.filter (fun file ->
                 file.EndsWith(".conf", StringComparison.Ordinal)
                 || file.EndsWith(".local", StringComparison.Ordinal))
             |> Seq.sortWith (fun left right -> StringComparer.Ordinal.Compare(left, right))
             |> Seq.iter paths.Add
 
-        for file in paths do
-            let mutable section = ""
+        List.ofSeq paths
 
-            for rawLine in File.ReadAllLines file do
-                let line = rawLine.Trim()
+    let jailValues (directory: string) =
+        let sections = parseSectionFiles (jailFiles directory)
+        let defaults = Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
 
-                if
-                    line.StartsWith("[", StringComparison.Ordinal)
-                    && line.EndsWith("]", StringComparison.Ordinal)
-                then
-                    section <- line.Substring(1, line.Length - 2).Trim()
-                elif
-                    section.Length > 0
-                    && not (section.Equals("DEFAULT", StringComparison.OrdinalIgnoreCase))
-                then
-                    let separator = line.IndexOf('=')
+        match sections.TryGetValue "DEFAULT" with
+        | true, values ->
+            for KeyValue(name, value) in values do
+                defaults[name] <- value
+        | _ -> ()
 
-                    if
-                        separator > 0
-                        && line.Substring(0, separator).Trim().Equals("enabled", StringComparison.OrdinalIgnoreCase)
-                    then
-                        let value = line.Substring(separator + 1).Trim()
+        sections
+        |> Seq.choose (fun pair ->
+            if pair.Key.Equals("DEFAULT", StringComparison.OrdinalIgnoreCase) then
+                None
+            else
+                let values = Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
 
-                        states[section] <-
-                            value.Equals("true", StringComparison.OrdinalIgnoreCase)
-                            || value.Equals("yes", StringComparison.OrdinalIgnoreCase)
+                for KeyValue(name, value) in defaults do
+                    values[name] <- value
 
-        states
-        |> Seq.choose (fun pair -> if pair.Value then Some pair.Key else None)
+                for KeyValue(name, value) in pair.Value do
+                    values[name] <- value
+
+                Some(pair.Key, values))
+        |> Map.ofSeq
+
+    let enabledJails (directory: string) =
+        jailValues directory
+        |> Seq.choose (fun pair ->
+            if pair.Key.Equals("DEFAULT", StringComparison.OrdinalIgnoreCase) then
+                None
+            else
+                let mutable enabled = ""
+
+                if pair.Value.TryGetValue("enabled", &enabled)
+                   && (enabled.Equals("true", StringComparison.OrdinalIgnoreCase)
+                       || enabled.Equals("yes", StringComparison.OrdinalIgnoreCase)) then
+                    Some pair.Key
+                else
+                    None)
         |> Seq.sortWith (fun left right -> StringComparer.Ordinal.Compare(left, right))
         |> Seq.toList
 
-    let nativeResult (result: JsonObject) =
-        let envelope = JsonObject()
-        envelope["ok"] <- JsonValue.Create true
-        envelope["result"] <- result
+    let filterValues (directory: string) (jail: string) =
+        let settings = jailValues directory |> Map.tryFind jail
 
-        {
-            ExitCode = 0
-            Stdout = envelope.ToJsonString()
-            Stderr = ""
-        }
+        let filterName =
+            match settings with
+            | Some values ->
+                match values.TryGetValue "filter" with
+                | true, value -> value
+                | _ -> jail
+            | None -> jail
 
-    let nativeFailure () =
-        {
-            ExitCode = 2
-            Stdout = ""
-            Stderr = "native configuration diagnostic must not escape"
-        }
+        let basePath = Path.Combine(directory, "filter.d", filterName)
+        let sections = parseSectionFiles [ basePath + ".conf"; basePath + ".local" ]
 
-    let handleBridge (requestText: string) =
-        use request = JsonDocument.Parse requestText
-        let body = request.RootElement
-        let operation = body.GetProperty("operation").GetString()
-        let directory = body.GetProperty("configRoot").GetString()
-        let fingerprint = configFingerprint directory
-        let values = daemonValues directory
+        match sections.TryGetValue "Definition" with
+        | true, values -> values
+        | _ -> Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
 
-        let get key fallback =
-            match values.TryGetValue key with
+    let filterLists (directory: string) (jail: string) =
+        let values = filterValues directory jail
+        [ "failregex"; "ignoreregex" ]
+        |> List.choose (fun name ->
+            match values.TryGetValue name with
+            | true, value -> Some(name, [ value ])
+            | _ -> None)
+        |> Map.ofList
+
+    let jailLists (directory: string) (jail: string) =
+        let settings = jailValues directory |> Map.tryFind jail
+        let lists = Dictionary<string, string list>(StringComparer.OrdinalIgnoreCase)
+
+        match settings with
+        | Some values ->
+            for name in [ "ignoreip"; "logpath" ] do
+                match values.TryGetValue name with
+                | true, value ->
+                    let items =
+                        value.Split([| ','; ' '; '\t' |], StringSplitOptions.RemoveEmptyEntries)
+                        |> Array.toList
+
+                    lists[name] <- items
+                | _ -> ()
+        | None -> ()
+
+        for KeyValue(name, values) in filterLists directory jail do
+            lists[name] <- values
+
+        lists
+
+    let actionNames (directory: string) (jail: string) =
+        match jailValues directory |> Map.tryFind jail with
+        | None -> []
+        | Some values ->
+            match values.TryGetValue "action" with
+            | true, value ->
+                value.Split([| ','; ' '; '\t' |], StringSplitOptions.RemoveEmptyEntries)
+                |> Array.toList
+            | _ -> []
+
+    let actionProperties (directory: string) (action: string) =
+        let basePath = Path.Combine(directory, "action.d", action)
+        let sections = parseSectionFiles [ basePath + ".conf"; basePath + ".local" ]
+
+        match sections.TryGetValue "Definition" with
+        | true, values -> values
+        | _ -> Dictionary<string, string>(StringComparer.OrdinalIgnoreCase)
+
+    let pythonString (value: string) =
+        "'"
+        + value
+            .Replace("\\", "\\\\", StringComparison.Ordinal)
+            .Replace("'", "\\'", StringComparison.Ordinal)
+            .Replace("\r", "\\r", StringComparison.Ordinal)
+            .Replace("\n", "\\n", StringComparison.Ordinal)
+            .Replace("\t", "\\t", StringComparison.Ordinal)
+        + "'"
+
+    let pythonValue (value: string) =
+        let mutable number = 0
+
+        if Int32.TryParse(value, NumberStyles.Integer, CultureInfo.InvariantCulture, &number) then
+            string number
+        elif value.Equals("true", StringComparison.OrdinalIgnoreCase) then
+            "True"
+        elif value.Equals("false", StringComparison.OrdinalIgnoreCase) then
+            "False"
+        else
+            pythonString value
+
+    let pythonCommand (values: string list) =
+        values |> List.map pythonValue |> String.concat ", " |> fun body -> "[" + body + "]"
+
+    let pythonStringList (values: string list) =
+        values |> List.map pythonString |> String.concat ", " |> fun body -> "[" + body + "]"
+
+    let nativeSettings (directory: string) =
+        let daemon = daemonValues directory
+
+        let getDaemon name fallback =
+            match daemon.TryGetValue("Definition/" + name) with
             | true, value -> value
             | _ -> fallback
 
-        let socket = get "Definition/socket" "/var/run/fail2ban/fail2ban.sock"
-        let pidFile = get "Definition/pidfile" "/var/run/fail2ban/fail2ban.pid"
-
-        let startupValues =
+        let globalValues =
             [
-                "Definition/socket", socket
-                "Definition/pidfile", pidFile
-                "Definition/dbfile", get "Definition/dbfile" "/var/lib/fail2ban/fail2ban.sqlite3"
-                "Definition/allowipv6", get "Definition/allowipv6" "auto"
-                "Definition/loglevel", get "Definition/loglevel" "INFO"
-                "Definition/logtarget", get "Definition/logtarget" "STDOUT"
-                "Definition/syslogsocket", get "Definition/syslogsocket" "auto"
-                "Thread/stacksize", get "Thread/stacksize" "0"
+                "syslogsocket", getDaemon "syslogsocket" "auto"
+                "loglevel", getDaemon "loglevel" "INFO"
+                "logtarget", getDaemon "logtarget" "STDOUT"
+                "allowipv6", getDaemon "allowipv6" "auto"
+                "dbfile", getDaemon "dbfile" "/var/lib/fail2ban/fail2ban.sqlite3"
+                "dbmaxmatches", getDaemon "dbmaxmatches" "10"
+                "dbpurgeage", getDaemon "dbpurgeage" "1d"
             ]
 
-        let startupText =
-            startupValues
-            |> List.map (fun (key, value) -> key + "=" + value)
-            |> String.concat "\n"
+        let globals = globalValues |> List.map (fun (name, value) -> "global/" + name, value) |> Map.ofList
 
-        let startupFingerprint =
-            SHA256.HashData(Encoding.UTF8.GetBytes startupText)
-            |> Convert.ToHexString
-            |> fun value -> value.ToLowerInvariant()
+        let globals =
+            match daemon.TryGetValue "Thread/stacksize" with
+            | true, value -> Map.add "global/thread.stacksize" value globals
+            | _ -> globals
 
-        let jails = enabledJails directory
-        let result = JsonObject()
+        let defaults =
+            [
+                "backend", "auto"
+                "maxretry", "5"
+                "maxmatches", "5"
+                "maxlines", "1"
+                "findtime", "10m"
+                "bantime", "10m"
+                "usedns", "warn"
+                "ignoreself", "true"
+                "ignorecommand", ""
+                "logencoding", "auto"
+            ]
 
-        match operation with
-        | "validate" ->
-            let containsInvalid =
-                Directory.EnumerateFiles(directory, "*", SearchOption.AllDirectories)
-                |> Seq.exists (fun file ->
-                    try
-                        File.ReadAllText(file).Contains("native-invalid", StringComparison.Ordinal)
-                    with
-                    | :? FileNotFoundException -> false
-                    | :? DirectoryNotFoundException -> false)
+        enabledJails directory
+        |> List.fold (fun settings jail ->
+            let explicit = jailValues directory |> Map.find jail
 
-            if containsInvalid then
-                nativeFailure ()
+            defaults
+            |> List.fold (fun state (name, fallback) ->
+                let mutable value = ""
+                let actual = if explicit.TryGetValue(name, &value) then value else fallback
+                Map.add (jail + "/" + name) actual state) settings) globals
+
+    let nativeDump (directory: string) =
+        let settings = nativeSettings directory
+        let lines = ResizeArray<string>()
+
+        for name in [ "syslogsocket"; "loglevel"; "logtarget"; "allowipv6"; "dbfile"; "dbmaxmatches"; "dbpurgeage" ] do
+            if name = "loglevel" then
+                lines.Add("['set', 'loglevel', " + pythonString settings["global/loglevel"] + "]")
             else
-                result["validated"] <- JsonValue.Create true
-                nativeResult result
-        | "inspect" ->
-            result["socket"] <- JsonValue.Create socket
-            result["pidfile"] <- JsonValue.Create pidFile
-            result["fingerprint"] <- JsonValue.Create fingerprint
-            result["startupFingerprint"] <- JsonValue.Create startupFingerprint
-            let jailArray = JsonArray()
+                lines.Add(pythonCommand [ "set"; name; settings["global/" + name] ])
 
-            for jail in jails do
-                jailArray.Add(JsonValue.Create jail)
+        match settings.TryFind "global/thread.stacksize" with
+        | Some value -> lines.Add(pythonCommand [ "set"; "thread"; "stacksize"; value ])
+        | None -> ()
 
-            result["enabledJails"] <- jailArray
-            nativeResult result
-        | "observe" ->
-            nativeObserveCount <- nativeObserveCount + 1
-            let configuration = body.GetProperty "configuration"
-            let expectedFingerprint = configuration.GetProperty("fingerprint").GetString()
+        for jail in enabledJails directory do
+            lines.Add(pythonCommand [ "add"; jail; settings[jail + "/backend"] ])
 
-            let expectedStartupFingerprint =
-                configuration.GetProperty("startupFingerprint").GetString()
+            for option in
+                [
+                    "maxretry"; "maxmatches"; "maxlines"; "findtime"; "bantime"; "usedns"
+                    "ignoreself"; "ignorecommand"; "logencoding"
+                ] do
+                lines.Add(pythonCommand [ "set"; jail; option; settings[jail + "/" + option] ])
 
-            result["fingerprint"] <- JsonValue.Create fingerprint
-            result["startupFingerprint"] <- JsonValue.Create startupFingerprint
-            let active = if serviceActive then jails else []
-            let jailArray = JsonArray()
+            for KeyValue(option, values) in jailLists directory jail do
+                match option with
+                | "failregex" ->
+                    lines.Add(
+                        "['multi-set', "
+                        + pythonString jail
+                        + ", 'addfailregex', "
+                        + pythonStringList values
+                        + "]"
+                    )
+                | "ignoreregex" ->
+                    lines.Add(
+                        "['multi-set', "
+                        + pythonString jail
+                        + ", 'addignoreregex', "
+                        + pythonStringList values
+                        + "]"
+                    )
+                | "ignoreip" ->
+                    for value in values do
+                        lines.Add(pythonCommand [ "set"; jail; "addignoreip"; value ])
+                | "logpath" ->
+                    for value in values do
+                        lines.Add(pythonCommand [ "set"; jail; "addlogpath"; value ])
+                | _ -> ()
 
-            for jail in active do
-                jailArray.Add(JsonValue.Create jail)
+            for action in actionNames directory jail do
+                lines.Add(pythonCommand [ "set"; jail; "addaction"; action ])
 
-            result["activeJails"] <- jailArray
-            let stillStarting = notReadyObservations > 0
+                let properties = actionProperties directory action
 
-            if stillStarting then
-                notReadyObservations <- notReadyObservations - 1
+                if properties.Count > 0 then
+                    let pairs =
+                        properties
+                        |> Seq.map (fun pair -> "[" + pythonString pair.Key + ", " + pythonString pair.Value + "]")
+                        |> String.concat ", "
 
-            result["inSync"] <-
-                JsonValue.Create(
-                    serviceActive
-                    && not stillStarting
-                    && not runtimeDrift
-                    && runningFingerprint = fingerprint
-                    && expectedFingerprint = fingerprint
-                    && expectedStartupFingerprint = startupFingerprint
-                )
+                    lines.Add(
+                        "['multi-set', "
+                        + pythonString jail
+                        + ", 'action', "
+                        + pythonString action
+                        + ", ["
+                        + pairs
+                        + "]]"
+                    )
 
-            nativeResult result
-        | _ -> nativeFailure ()
+            lines.Add(pythonCommand [ "start"; jail ])
 
-    let run executable arguments standardInput =
+        String.concat "\n" lines + "\n"
+
+
+
+    let durationSeconds =
+        Map.ofList
+            [
+                "-1", "-1"
+                "0", "0"
+                "1d", "86400"
+                "10m", "600"
+                "1.5s", "1.5"
+                "1.75s", "1.75"
+                "0.00000000000000000000000000001s", "1e-29"
+            ]
+
+    let seconds (value: string) = Map.tryFind value durationSeconds
+
+    let pythonFloat (value: string) =
+        let number = Double.Parse(value, NumberStyles.Float, CultureInfo.InvariantCulture)
+        let representation = number.ToString("R", CultureInfo.InvariantCulture).ToLowerInvariant()
+
+        if representation.Contains(".", StringComparison.Ordinal)
+           || representation.Contains("e", StringComparison.Ordinal) then
+            representation
+        else
+            representation + ".0"
+
+    let nativeSuccess stdout stderr =
+        {
+            ExitCode = 0
+            Stdout = stdout
+            Stderr = stderr
+        }
+
+    let nativeFailure exitCode stdout stderr =
+        {
+            ExitCode = exitCode
+            Stdout = stdout
+            Stderr = stderr
+        }
+
+    let nativeGetterResult payload stdout =
+        let trace = Fail2BanTestRequests.nativeGetterTrace payload
+        rawGetterDiagnostics.Add trace
+        getterHumanOutputs.Add stdout
+
+        let beautifier =
+            " +   14 7F56DB271780 fail2ban.beautifier HEAVY Beautify 'fail2ban HEAVY OK : "
+            + payload
+            + "' ..."
+
+        let command =
+            Fail2BanTestRequests.nativeInfoLog ("CMD: get response contains fail2ban HEAVY OK : " + payload)
+
+        nativeSuccess stdout (String.concat "\n" [ beautifier; command; trace ] + "\n")
+
+    let scalarOutput jail option =
+        let key =
+            if String.IsNullOrEmpty jail then
+                "global/" + option
+            else
+                jail + "/" + option
+
+        let value =
+            if option = "dbpurgeage" && runtimeDbpurgeage.IsSome then
+                runtimeDbpurgeage
+            elif option = "maxretry" && runtimeDrift then
+                Some "99"
+            elif option = "maxretry" && not (String.IsNullOrEmpty jail) && staleMaxretryValue.IsSome then
+                let stale = staleMaxretryValue.Value
+                staleMaxretryValue <- None
+                Some stale
+            else
+                runtimeSettings.TryFind key
+
+        match value with
+        | Some actual when option = "findtime" || option = "bantime" || option = "dbpurgeage" ->
+            match seconds actual with
+            | Some reported ->
+                let raw = pythonFloat reported
+
+                if option = "dbpurgeage" then
+                    let humanSeconds =
+                        Double.Parse(reported, NumberStyles.Float, CultureInfo.InvariantCulture)
+                        |> Math.Truncate
+                        |> fun value -> value.ToString("0", CultureInfo.InvariantCulture)
+
+                    nativeGetterResult
+                        raw
+                        ("Current database purge age is:\n`- " + humanSeconds + "seconds\n")
+                else
+                    nativeGetterResult raw (raw + "\n")
+            | None -> nativeFailure 255 "" ("ERROR unsupported duration fixture: " + actual + "\n")
+        | Some actual when option = "ignoreself" ->
+            let normalized = if actual.Equals("true", StringComparison.OrdinalIgnoreCase) then "True" else "False"
+            nativeGetterResult normalized (normalized + "\n")
+        | Some actual when
+            option = "maxretry"
+            || option = "maxmatches"
+            || option = "maxlines"
+            || option = "dbmaxmatches"
+            || option = "stacksize"
+            ->
+            let mutable number = 0
+
+            if Int32.TryParse(actual, NumberStyles.Integer, CultureInfo.InvariantCulture, &number) then
+                nativeGetterResult (string number) (string number + "\n")
+            else
+                nativeGetterResult (pythonString actual) (actual + "\n")
+        | Some actual ->
+            let stdout =
+                match option, actual with
+                | "loglevel", value -> "Current logging level is '" + value + "'\n"
+                | "logtarget", value -> "Current logging target is:\n`- " + value + "\n"
+                | "syslogsocket", value -> "Current syslog socket is:\n`- " + value + "\n"
+                | "dbfile", "None" -> "Database currently disabled\n"
+                | "dbfile", ":memory:" -> "Current database file is:\n`- :memory\n"
+                | "dbfile", value -> "Current database file is:\n`- " + value + "\n"
+                | _ -> actual + "\n"
+
+            nativeGetterResult (pythonString actual) stdout
+        | None ->
+            nativeFailure
+                255
+                "Invalid command (no get action or not yet implemented)\n"
+                "ERROR NOK: (no get action or not yet implemented)\n"
+
+    let listOutput jail option values =
+        let stdout =
+            if List.isEmpty values then
+                match option with
+                | "failregex"
+                | "ignoreregex" -> "No regular expression is defined\n"
+                | "logpath" -> "No file is currently monitored\n"
+                | "ignoreip" -> "No IP address is currently ignored\n"
+                | _ -> ""
+            else
+                let header =
+                    match option with
+                    | "failregex" -> "The jail " + jail + " has the following failregexes:"
+                    | "ignoreregex" -> "The jail " + jail + " has the following ignoreregexes:"
+                    | "logpath" -> "Currently monitored log files:"
+                    | "ignoreip" -> "Currently ignored IP addresses:"
+                    | _ -> ""
+
+                let body =
+                    values
+                    |> List.mapi (fun index value -> string (index + 1) + ". " + value)
+                    |> String.concat "\n"
+
+                header + "\n" + body + "\n"
+
+        nativeGetterResult (pythonStringList values) stdout
+
+    let handleGet (directory: string) (arguments: string list) =
+        let getIndex = arguments |> List.findIndex ((=) "get")
+        let query = arguments |> List.skip (getIndex + 1)
+
+        match query with
+        | [ jail; "actions" ] ->
+            let names = actionNames directory jail
+
+            let stdout =
+                if List.isEmpty names then
+                    "No actions for jail " + jail + "\n"
+                else
+                    "The jail "
+                    + jail
+                    + " has the following actions:\n"
+                    + String.concat ", " names
+                    + "\n"
+
+            nativeGetterResult (pythonStringList names) stdout
+        | [ jail; "actionproperties"; action ] ->
+            let properties = actionProperties directory action
+
+            let names =
+                properties
+                |> Seq.map (fun pair -> pair.Key)
+                |> Seq.sortWith (fun left right -> StringComparer.Ordinal.Compare(left, right))
+                |> Seq.toList
+
+            let stdout =
+                if List.isEmpty names then
+                    "No properties for jail " + jail + " action " + action + "\n"
+                else
+                    "The jail " + jail + " action " + action + " has the following properties:\n"
+                    + String.concat ", " names
+                    + "\n"
+
+            nativeGetterResult (pythonStringList names) stdout
+        | [ _jail; "action"; action; property ] ->
+            let properties = actionProperties directory action
+
+            match properties.TryGetValue property with
+            | true, value -> nativeGetterResult (pythonString value) (value + "\n")
+            | _ ->
+                nativeFailure
+                    255
+                    "Invalid command (no get action or not yet implemented)\n"
+                    "ERROR NOK: (no get action or not yet implemented)\n"
+        | [ jail; option ] when
+            option = "failregex"
+            || option = "ignoreregex"
+            || option = "ignoreip"
+            || option = "logpath"
+            ->
+            let lists = jailLists directory jail
+            let values = match lists.TryGetValue option with | true, values -> values | _ -> []
+            listOutput jail option values
+        | [ jail; option ] -> scalarOutput jail option
+        | [ "loglevel" ] -> scalarOutput "" "loglevel"
+        | [ "logtarget" ] -> scalarOutput "" "logtarget"
+        | [ "syslogsocket" ] -> scalarOutput "" "syslogsocket"
+        | [ "dbfile" ] -> scalarOutput "" "dbfile"
+        | [ "dbpurgeage" ] -> scalarOutput "" "dbpurgeage"
+        | [ "allowipv6" ] ->
+            nativeFailure 255 "Sorry but the command is invalid\n" "ERROR NOK ('list index out of range',)\n"
+
+        | [ option ] -> scalarOutput "" option
+        | _ ->
+            nativeFailure
+                255
+                "Invalid command (no get action or not yet implemented)\n"
+                "ERROR NOK: (no get action or not yet implemented)\n"
+
+    let refreshRuntime directory =
+        runtimeSettings <- nativeSettings directory
+        runtimeJails <- enabledJails directory
+
+    let run executable arguments _standardInput =
+        let executable, arguments, timed =
+            match executable, arguments with
+            | "timeout", "--kill-after=1s" :: "5s" :: "fail2ban-client" :: wrappedArguments
+                when List.contains "status" wrappedArguments || List.contains "get" wrappedArguments ->
+                "fail2ban-client", wrappedArguments, true
+            | _ -> executable, arguments, false
+
         calls.Add(executable, arguments)
 
         match executable, arguments with
-        | "python3", [ "-c"; _ ] ->
-            match standardInput with
-            | Some request -> handleBridge request
-            | None ->
-                {
-                    ExitCode = 99
-                    Stdout = ""
-                    Stderr = "missing bridge request"
-                }
         | "/usr/sbin/sshd", [ "-T" ] ->
-            {
-                ExitCode = 0
-                Stdout = sshdOutput
-                Stderr = ""
-            }
+            nativeSuccess sshdOutput ""
+        | "fail2ban-client", [ "-c"; directory; "-t" ] ->
+            if failValidation && directory <> configPath then
+                nativeFailure
+                    255
+                    ""
+                    "2026-11-05 14:03:08,094 fail2ban                [3010]: ERROR   Failed during configuration: Bad value substitution: option 'maxretry' in section 'dorothy-bad' contains an interpolation key 'missing_retry' which is not a valid option name. Raw value: '%(missing_retry)s'\n2026-11-05 14:03:08,094 fail2ban                [3010]: ERROR   ERROR: test configuration failed\n"
+            else
+                nativeSuccess "OK: configuration test is successful\n" ""
+        | "fail2ban-client", [ "-v"; "-c"; directory; "-d" ] ->
+            let daemon = daemonValues directory
+
+            let get name fallback =
+                match daemon.TryGetValue("Definition/" + name) with
+                | true, value -> value
+                | _ -> fallback
+
+            let stderr =
+                [
+                    Fail2BanTestRequests.nativeInfoLog
+                        ("Using socket file " + get "socket" "/var/run/fail2ban/fail2ban.sock")
+                    Fail2BanTestRequests.nativeInfoLog
+                        ("Using pid file "
+                         + get "pidfile" "/var/run/fail2ban/fail2ban.pid"
+                         + ", [DEBUG] logging to "
+                         + get "logtarget" "STDOUT")
+                ]
+                |> String.concat "\n"
+                |> fun lines -> lines + "\n"
+
+            nativeSuccess (nativeDump directory) stderr
+        | "fail2ban-client", [ "--str2sec"; value ] ->
+            match seconds value with
+            | Some converted -> nativeSuccess (pythonFloat converted + "\n") ""
+            | None -> nativeFailure 255 "" ("ERROR unsupported duration fixture: " + value + "\n")
+        | "fail2ban-client", [ "-c"; directory; "status" ] when timed ->
+            nativeObserveCount <- nativeObserveCount + 1
+
+            if not serviceActive then
+                let daemon = daemonValues directory
+
+                let socket =
+                    match daemon.TryGetValue "Definition/socket" with
+                    | true, value -> value
+                    | _ -> "/var/run/fail2ban/fail2ban.sock"
+
+                nativeFailure 255 "" ("ERROR Failed to access socket path: " + socket + ". Is fail2ban running?\n")
+            else
+                let ready = notReadyObservations = 0
+
+                if not ready then
+                    notReadyObservations <- notReadyObservations - 1
+
+                let active = if ready then runtimeJails else []
+
+                nativeSuccess
+                    ("Status\n|- Number of jail:\t"
+                     + string active.Length
+                     + "\n|- Jail list:\t"
+                     + String.concat "," active
+                     + "\n")
+                    ""
+        | "fail2ban-client",
+          "-v" :: "-v" :: "-v" :: "-c" :: directory :: "get" :: query when timed && not (List.isEmpty query) ->
+            if injectedDiagnosticSeen then
+                getterCallsAfterInjectedDiagnostic <- getterCallsAfterInjectedDiagnostic + 1
+
+            if timeoutNextGetter then
+                timeoutNextGetter <- false
+                nativeFailure 124 "" ""
+            elif transportFailureNextGetter then
+                transportFailureNextGetter <- false
+                nativeFailure 1 "" "connect: Connection refused\n"
+            else
+                match nextGetterResponse with
+                | Some(targetQuery, stderr) when query = targetQuery ->
+                    nextGetterResponse <- None
+                    injectedDiagnosticSeen <- true
+                    let rawDiagnosticsBefore = rawGetterDiagnostics.Count
+                    let response = handleGet directory arguments
+                    rawGetterDiagnostics.RemoveRange(rawDiagnosticsBefore, rawGetterDiagnostics.Count - rawDiagnosticsBefore)
+                    { response with Stderr = stderr }
+                | _ -> handleGet directory arguments
+        | "fail2ban-client", [ "-c"; _directory; "reload"; "--restart"; "--all" ] ->
+            if failNextReload then
+                failNextReload <- false
+                nativeFailure 1 "" "reload failure\n"
+            else
+                let previousMaxretry = runtimeSettings.TryFind "sshd/maxretry" |> Option.defaultValue "5"
+                refreshRuntime configPath
+
+                if staleMaxretryAfterReload then
+                    staleMaxretryValue <- Some previousMaxretry
+                    staleMaxretryAfterReload <- false
+
+                nativeSuccess "OK\n" ""
         | "systemctl", args when
             not (List.isEmpty args)
             && List.head args = "show"
@@ -379,48 +830,30 @@ type private FakeFail2BanHost() =
 
             let result = if serviceFailed then "exit-code" else "success"
 
-            {
-                ExitCode = 0
-                Stdout =
-                    "LoadState=loaded\nUnitFileState="
-                    + (if serviceEnabled then "enabled" else "disabled")
-                    + "\nActiveState="
-                    + activeState
-                    + "\nSubState="
-                    + subState
-                    + "\nResult="
-                    + result
-                    + "\n"
-                Stderr = ""
-            }
+            nativeSuccess
+                ("LoadState=loaded\nUnitFileState="
+                 + (if serviceEnabled then "enabled" else "disabled")
+                 + "\nActiveState="
+                 + activeState
+                 + "\nSubState="
+                 + subState
+                 + "\nResult="
+                 + result
+                 + "\n")
+                ""
         | "systemctl", [ "enable"; "fail2ban.service" ] ->
             serviceEvents.Add("enable", captureFiles ())
             serviceEnabled <- true
-
-            {
-                ExitCode = 0
-                Stdout = ""
-                Stderr = ""
-            }
+            nativeSuccess "" ""
         | "systemctl", [ "disable"; "fail2ban.service" ] ->
             serviceEvents.Add("disable", captureFiles ())
             serviceEnabled <- false
-
-            {
-                ExitCode = 0
-                Stdout = ""
-                Stderr = ""
-            }
+            nativeSuccess "" ""
         | "systemctl", [ "stop"; "fail2ban.service" ] ->
             serviceEvents.Add("stop", captureFiles ())
             serviceActive <- false
             serviceFailed <- false
-
-            {
-                ExitCode = 0
-                Stdout = ""
-                Stderr = ""
-            }
+            nativeSuccess "" ""
         | "systemctl", [ "start"; "fail2ban.service" ] ->
             serviceEvents.Add("start", captureFiles ())
 
@@ -428,45 +861,14 @@ type private FakeFail2BanHost() =
                 failNextStart <- false
                 serviceActive <- false
                 serviceFailed <- true
-
-                {
-                    ExitCode = 0
-                    Stdout = ""
-                    Stderr = ""
-                }
+                nativeSuccess "" ""
             else
                 serviceActive <- true
                 serviceFailed <- false
-                runningFingerprint <- configFingerprint configPath
-
-                {
-                    ExitCode = 0
-                    Stdout = ""
-                    Stderr = ""
-                }
-        | "fail2ban-client", args when List.contains "reload" args ->
-            if failNextReload then
-                failNextReload <- false
-
-                {
-                    ExitCode = 1
-                    Stdout = ""
-                    Stderr = "reload failure"
-                }
-            else
-                runningFingerprint <- configFingerprint configPath
-
-                {
-                    ExitCode = 0
-                    Stdout = "OK\n"
-                    Stderr = ""
-                }
+                refreshRuntime configPath
+                nativeSuccess "" ""
         | _ ->
-            {
-                ExitCode = 99
-                Stdout = ""
-                Stderr = "unexpected fake host command"
-            }
+            nativeFailure 99 "" "unexpected fake host command\n"
 
     let environment =
         TestSupport.fakeHostEnvironment root run (fun () -> DateTimeOffset.UnixEpoch)
@@ -506,6 +908,12 @@ type private FakeFail2BanHost() =
 
     member _.Environment = environment
     member _.Calls = calls.ToArray()
+    member _.RawGetterDiagnostics = rawGetterDiagnostics.ToArray()
+    member _.GetterHumanOutputs = getterHumanOutputs.ToArray()
+    member _.GetterCallsAfterInjectedDiagnostic = getterCallsAfterInjectedDiagnostic
+
+
+
     member _.ServiceEvents = serviceEvents.ToArray()
     member _.Path(logicalPath: string) = path logicalPath
 
@@ -525,6 +933,27 @@ type private FakeFail2BanHost() =
         with get () = runtimeDrift
         and set value = runtimeDrift <- value
 
+    member _.TimeoutNextGetter
+        with get () = timeoutNextGetter
+        and set value = timeoutNextGetter <- value
+
+    member _.TransportFailureNextGetter
+        with get () = transportFailureNextGetter
+        and set value = transportFailureNextGetter <- value
+
+    member _.NextGetterResponse
+        with get () = nextGetterResponse
+        and set value = nextGetterResponse <- value
+
+    member _.RuntimeDbpurgeage
+        with get () = runtimeDbpurgeage
+        and set value = runtimeDbpurgeage <- value
+
+
+    member _.StaleMaxretryAfterReload
+        with get () = staleMaxretryAfterReload
+        and set value = staleMaxretryAfterReload <- value
+
     member _.NotReadyObservations
         with get () = notReadyObservations
         and set value = notReadyObservations <- value
@@ -541,7 +970,6 @@ type private FakeFail2BanHost() =
 
     interface IDisposable with
         member _.Dispose() = (temporary :> IDisposable).Dispose()
-
 [<TestFixture>]
 type Fail2BanTests() =
     let empty = Fail2BanTestRequests.emptyFiles
@@ -608,6 +1036,28 @@ type Fail2BanTests() =
             Is.False
         )
 
+
+
+    [<Test>]
+    member _.``Native action getters preserve multiple actions and empty action lists``() =
+        use host = new FakeFail2BanHost()
+        let files =
+            Map.ofList
+                [
+                    jailFile,
+                    "[sshd]\nenabled = true\naction = custom, empty\n[noaction]\nenabled = true\naction =\n"
+                    actionFile, "[Definition]\nactionban = logger <ip>\n"
+                ]
+
+        let snapshot = host.Invoke("apply", files)
+        Assert.That(snapshot["inSync"].GetValue<bool>(), Is.True)
+        Assert.That(
+            host.RawGetterDiagnostics,
+            Does.Contain(Fail2BanTestRequests.nativeGetterTrace "['custom', 'empty']")
+        )
+        Assert.That(host.RawGetterDiagnostics, Does.Contain(Fail2BanTestRequests.nativeGetterTrace "['actionban']"))
+        Assert.That(host.RawGetterDiagnostics, Does.Contain(Fail2BanTestRequests.nativeGetterTrace "[]"))
+
     [<Test>]
     member _.``Apply waits for native configuration convergence after service start``() =
         use host = new FakeFail2BanHost()
@@ -625,6 +1075,177 @@ type Fail2BanTests() =
         Assert.That(updated["inSync"].GetValue<bool>(), Is.True)
         Assert.That(host.NativeObserveCount, Is.EqualTo(beforeReload + 3))
 
+    [<Test>]
+    member _.``Fractional dbpurgeage uses exact raw seconds despite identical human output``() =
+        use host = new FakeFail2BanHost()
+        let files = Map.ofList [ daemonFile, "[Definition]\ndbpurgeage = 1.5s\n" ]
+        let applied = host.Invoke("apply", files)
+        let humanOutput = "Current database purge age is:\n`- 1seconds\n"
+        let conversionCount () =
+            host.Calls
+            |> Array.filter (fun (executable, arguments) ->
+                executable = "fail2ban-client" && arguments = [ "--str2sec"; "1.5s" ])
+            |> Array.length
+
+        Assert.That(applied["inSync"].GetValue<bool>(), Is.True)
+        Assert.That(host.RawGetterDiagnostics, Does.Contain(Fail2BanTestRequests.nativeGetterTrace "1.5"))
+        Assert.That(host.GetterHumanOutputs, Does.Contain(humanOutput))
+
+        let journalBefore = File.ReadAllText(statePath host)
+        host.RuntimeDbpurgeage <- Some "1.75s"
+        let conversionsBeforeRead = conversionCount ()
+
+        let drift = host.Invoke("read", files)
+
+        Assert.That(drift["inSync"].GetValue<bool>(), Is.False)
+        Assert.That(host.RawGetterDiagnostics, Does.Contain(Fail2BanTestRequests.nativeGetterTrace "1.75"))
+        let sameHumanOutputCount = host.GetterHumanOutputs |> Array.filter ((=) humanOutput) |> Array.length
+        Assert.That(conversionCount (), Is.EqualTo(conversionsBeforeRead + 1))
+        Assert.That(sameHumanOutputCount, Is.GreaterThanOrEqualTo(2))
+        Assert.That(File.ReadAllText(statePath host), Is.EqualTo(journalBefore))
+
+    [<Test>]
+    member _.``Binary64 subnormal-scale durations remain distinct from zero``() =
+        use host = new FakeFail2BanHost()
+        let files =
+            Map.ofList
+                [ daemonFile, "[Definition]\ndbpurgeage = 0.00000000000000000000000000001s\n" ]
+
+        let applied = host.Invoke("apply", files)
+        Assert.That(applied["inSync"].GetValue<bool>(), Is.True)
+        Assert.That(host.RawGetterDiagnostics, Does.Contain(Fail2BanTestRequests.nativeGetterTrace "1e-29"))
+
+        host.RuntimeDbpurgeage <- Some "0"
+        let drift = host.Invoke("read", files)
+
+        Assert.That(drift["inSync"].GetValue<bool>(), Is.False)
+        Assert.That(host.RawGetterDiagnostics, Does.Contain(Fail2BanTestRequests.nativeGetterTrace "0.0"))
+
+    [<Test>]
+    member _.``Numeric loglevel remains a Python string in raw diagnostics``() =
+        use host = new FakeFail2BanHost()
+        let files = Map.ofList [ daemonFile, "[Definition]\nloglevel = 5\n" ]
+        let snapshot = host.Invoke("apply", files)
+
+        Assert.That(snapshot["inSync"].GetValue<bool>(), Is.True)
+        Assert.That(host.RawGetterDiagnostics, Does.Contain(Fail2BanTestRequests.nativeGetterTrace "'5'"))
+
+    [<Test>]
+    member _.``Marker-like response data in Beautifier and CMD logs is not parsed as the response``() =
+        use host = new FakeFail2BanHost()
+        let logtarget = "/var/log/fail2ban HEAVY OK : embedded.log"
+        let files = Map.ofList [ daemonFile, "[Definition]\nlogtarget = " + logtarget + "\n" ]
+        let snapshot = host.Invoke("apply", files)
+
+        Assert.That(snapshot["inSync"].GetValue<bool>(), Is.True)
+        Assert.That(
+            host.RawGetterDiagnostics,
+            Does.Contain(Fail2BanTestRequests.nativeGetterTrace ("'" + logtarget + "'"))
+        )
+
+    [<Test>]
+    member _.``Missing empty duplicate and malformed raw success diagnostics fail closed``() =
+        let rawInfo = Fail2BanTestRequests.nativeGetterTrace "'INFO'"
+
+        let cases =
+            [
+                "missing", ""
+                "empty", Fail2BanTestRequests.nativeGetterTrace "" + "\n"
+                "duplicate", String.concat "\n" [ rawInfo; rawInfo ] + "\n"
+                "malformed", Fail2BanTestRequests.nativeGetterTrace "not-a-python-literal" + "\n"
+            ]
+
+        for _caseName, diagnostics in cases do
+            use host = new FakeFail2BanHost()
+            let files = Map.ofList [ jailFile, "[sshd]\nenabled = true\nmaxretry = 5\n" ]
+            host.Invoke("apply", files) |> ignore
+            let journalBefore = File.ReadAllText(statePath host)
+            host.NextGetterResponse <- Some([ "loglevel" ], diagnostics)
+            let snapshot = host.Invoke("read", files)
+
+            Assert.That(snapshot["inSync"].GetValue<bool>(), Is.False)
+            Assert.That(host.GetterCallsAfterInjectedDiagnostic, Is.Zero)
+            Assert.That(
+                host.GetterHumanOutputs,
+                Does.Contain("Current logging level is 'INFO'\n")
+            )
+            Assert.That(File.ReadAllText(statePath host), Is.EqualTo(journalBefore))
+
+
+    [<Test>]
+    member _.``Runtime drift is reported by read without rebaselining or reloading``() =
+        use host = new FakeFail2BanHost()
+        let files = Map.ofList [ jailFile, "[sshd]\nenabled = true\nmaxretry = 7\n" ]
+        host.Invoke("apply", files) |> ignore
+        let journalBefore = File.ReadAllText(statePath host)
+
+        let reloadCount () =
+            host.Calls
+            |> Array.filter (fun (executable, arguments) ->
+                executable = "fail2ban-client" && List.contains "reload" arguments)
+            |> Array.length
+
+        let reloadsBefore = reloadCount ()
+        let serviceEventsBefore = host.ServiceEvents.Length
+        host.RuntimeDrift <- true
+
+        let first = host.Invoke("read", files)
+        let second = host.Invoke("read", files)
+
+        Assert.That(first["inSync"].GetValue<bool>(), Is.False)
+        Assert.That(second["inSync"].GetValue<bool>(), Is.False)
+        Assert.That(File.ReadAllText(statePath host), Is.EqualTo(journalBefore))
+        Assert.That(host.ServiceEvents.Length, Is.EqualTo(serviceEventsBefore))
+        Assert.That(reloadCount (), Is.EqualTo(reloadsBefore))
+
+    [<Test>]
+    member _.``Stale scalar after successful reload delays readiness until direct getters converge``() =
+        use host = new FakeFail2BanHost()
+        let firstFiles = Map.ofList [ jailFile, "[sshd]\nenabled = true\nmaxretry = 5\n" ]
+        host.Invoke("apply", firstFiles) |> ignore
+        let observationsBefore = host.NativeObserveCount
+
+        let reloadCount () =
+            host.Calls
+            |> Array.filter (fun (executable, arguments) ->
+                executable = "fail2ban-client" && List.contains "reload" arguments)
+            |> Array.length
+
+        let reloadsBefore = reloadCount ()
+        host.StaleMaxretryAfterReload <- true
+        let targetFiles = Map.add jailFile "[sshd]\nenabled = true\nmaxretry = 7\n" firstFiles
+        let updated = host.Invoke("apply", targetFiles)
+
+        Assert.That(updated["inSync"].GetValue<bool>(), Is.True)
+        Assert.That(host.NativeObserveCount, Is.GreaterThanOrEqualTo(observationsBefore + 3))
+        Assert.That(reloadCount (), Is.EqualTo(reloadsBefore + 1))
+
+    [<Test>]
+    member _.``Getter timeout and transport failures stop later native probes``() =
+        for failure in [ "timeout"; "transport" ] do
+            use host = new FakeFail2BanHost()
+            let files = Map.ofList [ jailFile, "[sshd]\nenabled = true\nmaxretry = 7\n" ]
+            host.Invoke("apply", files) |> ignore
+            let journalBefore = File.ReadAllText(statePath host)
+
+            let getterCount () =
+                host.Calls
+                |> Array.filter (fun (executable, arguments) ->
+                    executable = "fail2ban-client" && List.contains "get" arguments)
+                |> Array.length
+
+            let gettersBefore = getterCount ()
+
+            if failure = "timeout" then
+                host.TimeoutNextGetter <- true
+            else
+                host.TransportFailureNextGetter <- true
+
+            let snapshot = host.Invoke("read", files)
+
+            Assert.That(snapshot["inSync"].GetValue<bool>(), Is.False)
+            Assert.That(getterCount (), Is.EqualTo(gettersBefore + 1))
+            Assert.That(File.ReadAllText(statePath host), Is.EqualTo(journalBefore))
     [<Test>]
     member _.``Apply updates and removes only journaled paths while delete preserves unrelated files``() =
         use host = new FakeFail2BanHost()
@@ -830,7 +1451,7 @@ type Fail2BanTests() =
         let targetFiles =
             Map.ofList
                 [
-                    firstPath, "[first]\nenabled = true\nnative-invalid\n"
+                    firstPath, "[first]\nenabled = true\n"
                     secondPath, "[second]\nenabled = true\n"
                 ]
 
@@ -888,6 +1509,111 @@ type Fail2BanTests() =
         Assert.That(File.Exists(host.Path("/etc/fail2ban/" + secondPath)), Is.False)
         Assert.That(File.Exists(statePath host), Is.False)
         Assert.That(host.ServiceActive, Is.True)
+
+    [<Test>]
+    member _.``Legacy v2 journal reads without a baseline and migrates only after explicit apply``() =
+        use host = new FakeFail2BanHost()
+        let files = Map.ofList [ jailFile, "[sshd]\nenabled = true\nmaxretry = 5\n" ]
+        host.Invoke("apply", files) |> ignore
+        let owned = JsonObject()
+
+        for KeyValue(path, text) in files do
+            owned[path] <- JsonValue.Create text
+
+        let rawV2 =
+            "{\"version\":2,\"ownerId\":"
+            + JsonValue.Create("urn:pulumi:test::test::keroosha:debian:Fail2Ban::full").ToJsonString()
+            + ",\"files\":"
+            + owned.ToJsonString()
+            + ",\"pending\":null}\n"
+
+        File.WriteAllText(statePath host, rawV2)
+        File.SetUnixFileMode(statePath host, Fail2BanTestRequests.privateFileMode)
+
+        let reloadCount () =
+            host.Calls
+            |> Array.filter (fun (executable, arguments) ->
+                executable = "fail2ban-client" && List.contains "reload" arguments)
+            |> Array.length
+
+        let reloadsBeforeRead = reloadCount ()
+        let legacyRead = host.Invoke("read", files)
+        Assert.That(legacyRead["owned"].GetValue<bool>(), Is.True)
+        Assert.That(legacyRead["inSync"].GetValue<bool>(), Is.False)
+        Assert.That(File.ReadAllText(statePath host), Is.EqualTo(rawV2))
+        Assert.That(reloadCount (), Is.EqualTo(reloadsBeforeRead))
+        Assert.That(host.ServiceActive, Is.True)
+
+        let applied = host.Invoke("apply", files)
+        Assert.That(applied["inSync"].GetValue<bool>(), Is.True)
+        Assert.That(reloadCount (), Is.GreaterThan reloadsBeforeRead)
+
+        let migrated = JsonNode.Parse(File.ReadAllText(statePath host))
+        Assert.That(migrated["version"].GetValue<int>(), Is.EqualTo(3))
+        Assert.That(migrated["runtimeBaseline"], Is.Not.Null)
+
+        for name in [ "fingerprint"; "startupFingerprint"; "observationFingerprint" ] do
+            Assert.That((migrated["runtimeBaseline"][name]).GetValue<string>(), Is.Not.Empty)
+
+        let migratedJournal = File.ReadAllText(statePath host)
+        let readBack = host.Invoke("read", files)
+        Assert.That(readBack["inSync"].GetValue<bool>(), Is.True)
+        Assert.That(File.ReadAllText(statePath host), Is.EqualTo(migratedJournal))
+
+    [<Test>]
+    member _.``Legacy pending v2 read stays unbaselined until apply rolls back and migrates``() =
+        use host = new FakeFail2BanHost()
+        let path = "jail.d/40-legacy.local"
+        let priorFiles = Map.ofList [ path, "[sshd]\nenabled = true\nmaxretry = 5\n" ]
+        let targetFiles = Map.add path "[sshd]\nenabled = true\nmaxretry = 7\n" priorFiles
+        host.Invoke("apply", priorFiles) |> ignore
+        File.WriteAllText(host.Path("/etc/fail2ban/" + path), targetFiles[path])
+
+        let journal = JsonObject()
+        journal["version"] <- JsonValue.Create 2
+        journal["ownerId"] <- JsonValue.Create "urn:pulumi:test::test::keroosha:debian:Fail2Ban::full"
+        let priorNode = JsonObject()
+        let targetNode = JsonObject()
+
+        for KeyValue(filePath, text) in priorFiles do
+            priorNode[filePath] <- JsonValue.Create text
+
+        for KeyValue(filePath, text) in targetFiles do
+            targetNode[filePath] <- JsonValue.Create text
+
+        journal["files"] <- priorNode
+        let pending = JsonObject()
+        pending["operation"] <- JsonValue.Create "apply"
+        pending["priorOwned"] <- JsonValue.Create true
+        pending["priorActive"] <- JsonValue.Create true
+        pending["priorEnabled"] <- JsonValue.Create true
+        pending["startupChanged"] <- JsonValue.Create false
+        pending["pythonChanged"] <- JsonValue.Create false
+        pending["targetFiles"] <- targetNode
+        let mutations = JsonArray()
+        let mutation = JsonObject()
+        mutation["path"] <- JsonValue.Create path
+        mutation["prior"] <- JsonValue.Create priorFiles[path]
+        mutation["target"] <- JsonValue.Create targetFiles[path]
+        mutations.Add mutation
+        pending["mutations"] <- mutations
+        journal["pending"] <- pending
+        let rawPendingJournal = journal.ToJsonString() + "\n"
+        File.WriteAllText(statePath host, rawPendingJournal)
+        File.SetUnixFileMode(statePath host, Fail2BanTestRequests.privateFileMode)
+
+        let pendingRead = host.Invoke("read", priorFiles)
+        Assert.That(pendingRead["inSync"].GetValue<bool>(), Is.False)
+        Assert.That(File.ReadAllText(statePath host), Is.EqualTo(rawPendingJournal))
+        Assert.That(File.ReadAllText(host.Path("/etc/fail2ban/" + path)), Is.EqualTo(targetFiles[path]))
+
+        let recovered = host.Invoke("apply", priorFiles)
+        Assert.That(recovered["inSync"].GetValue<bool>(), Is.True)
+        Assert.That(File.ReadAllText(host.Path("/etc/fail2ban/" + path)), Is.EqualTo(priorFiles[path]))
+
+        let migrated = JsonNode.Parse(File.ReadAllText(statePath host))
+        Assert.That(migrated["version"].GetValue<int>(), Is.EqualTo(3))
+        Assert.That(migrated["runtimeBaseline"], Is.Not.Null)
 
     [<Test>]
     member _.``Foreign files and drifted owned files are never taken over or deleted``() =
@@ -961,11 +1687,6 @@ type Fail2BanTests() =
             Is.EqualTo("# Managed by Dorothy for the linked sshd configuration.\n[sshd]\nport = 22,2222\n")
         )
 
-        Assert.That(
-            host.Calls
-            |> Array.exists (fun (executable, arguments) -> executable = "/usr/sbin/sshd" && arguments = [ "-T" ]),
-            Is.True
-        )
 
         host.Invoke("delete", empty) |> ignore
         Assert.That(File.Exists(host.Path("/etc/fail2ban/jail.d/99-dorothy-sshd-ports.local")), Is.False)
@@ -973,10 +1694,13 @@ type Fail2BanTests() =
     [<Test>]
     member _.``Invalid staged tree fails before journal files or service changes``() =
         use host = new FakeFail2BanHost()
-        let files = Map.ofList [ jailFile, "native-invalid\n" ]
+        let files = Map.ofList [ jailFile, "[sshd]\nenabled = true\nmaxretry = %(missing_retry)s\n" ]
+        host.FailValidation <- true
         let action = TestDelegate(fun () -> host.Invoke("apply", files) |> ignore)
-
-        Assert.Throws<Fail2Ban.BackendError>(action) |> ignore
+        let error = Assert.Throws<Fail2Ban.BackendError>(action)
+        Assert.That(error.Message, Does.Not.Contain("Bad value substitution"))
+        Assert.That(error.Message, Does.Not.Contain("missing_retry"))
+        Assert.That(error.Message, Does.Not.Contain("ERROR: test configuration failed"))
         Assert.That(File.Exists(host.Path("/etc/fail2ban/" + jailFile)), Is.False)
         Assert.That(File.Exists(statePath host), Is.False)
         Assert.That(host.ServiceEvents, Is.Empty)
