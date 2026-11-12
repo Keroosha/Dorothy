@@ -75,7 +75,7 @@ module private SudoProviderLogic =
                       "type": "object",
                       "additionalProperties": false,
                       "properties": {
-                        "kind": { "type": "string", "enum": ["none", "exact", "any"] },
+                        "kind": { "type": "string", "enum": ["none", "exact", "glob", "any"] },
                         "value": { "type": "string" }
                       },
                       "required": ["kind"]
@@ -102,7 +102,7 @@ module private SudoProviderLogic =
               "runAs": { "type": "object", "additionalProperties": false, "properties": { "kind": { "type": "string", "enum": ["all", "specific"] }, "user": { "type": "string" }, "group": { "type": "string" } }, "required": ["kind"] },
               "authentication": { "type": "string", "enum": ["required", "passwordless"] },
               "allCommands": { "type": "boolean" },
-              "commands": { "type": "array", "items": { "type": "object", "additionalProperties": false, "properties": { "path": { "type": "string" }, "arguments": { "type": "object", "additionalProperties": false, "properties": { "kind": { "type": "string", "enum": ["none", "exact", "any"] }, "value": { "type": "string" } }, "required": ["kind"] } }, "required": ["path", "arguments"] } }
+              "commands": { "type": "array", "items": { "type": "object", "additionalProperties": false, "properties": { "path": { "type": "string" }, "arguments": { "type": "object", "additionalProperties": false, "properties": { "kind": { "type": "string", "enum": ["none", "exact", "glob", "any"] }, "value": { "type": "string" } }, "required": ["kind"] } }, "required": ["path", "arguments"] } }
             },
             "required": ["subjects", "runAs"]
           }
@@ -520,7 +520,7 @@ module private SudoProviderLogic =
             | Some values ->
                 let normalized = dictionaryFromImmutable values
                 checkFields (Set.ofList [ "kind"; "value" ]) (path + ".") values failures
-                normalizeEnum values normalized "kind" (path + ".") (Set.ofList [ "none"; "exact"; "any" ]) None failures
+                normalizeEnum values normalized "kind" (path + ".") (Set.ofList [ "none"; "exact"; "glob"; "any" ]) None failures
                 normalizeOptionalText
                     values normalized "value" (path + ".") isSafeExactArguments
                     "Exact sudo arguments must use supported printable ASCII and cannot contain controls, '#', quotes, or leading/trailing spaces."
@@ -533,6 +533,14 @@ module private SudoProviderLogic =
                         | true, value when value.IsComputed -> ()
                         | true, _ -> ()
                         | false, _ -> addFailure failures (path + ".value") "Arguments kind 'exact' requires a literal value."
+                    | Some "glob" ->
+                        match valueField with
+                        | true, value when value.IsComputed -> ()
+                        | true, value ->
+                            match tryGetString value with
+                            | Some pattern when (pattern.Contains('*') || pattern.Contains('?')) && pattern.IndexOfAny([| '['; ']'; '\\' |]) < 0 -> ()
+                            | _ -> addFailure failures (path + ".value") "Arguments kind 'glob' requires a pattern with * or ? and without [ ] or \\."
+                        | false, _ -> addFailure failures (path + ".value") "Arguments kind 'glob' requires a pattern."
                     | Some "none"
                     | Some "any" ->
                         match valueField with
@@ -593,8 +601,8 @@ module private SudoProviderLogic =
                                     | _ -> ()
                                 | (true, kindValue), (true, argValue) ->
                                     match tryGetString kindValue, tryGetString argValue with
-                                    | Some "exact", Some value ->
-                                        let key = commandPath + "\u0000exact\u0000" + value
+                                    | Some ("exact" | "glob" as kind), Some value ->
+                                        let key = commandPath + "\u0000" + kind + "\u0000" + value
                                         if not (seen.Add(key)) then
                                             addFailure failures (sprintf "%s[%d]" path index) "Duplicate sudo commands are not allowed."
                                     | _ -> ()

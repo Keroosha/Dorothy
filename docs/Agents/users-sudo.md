@@ -178,7 +178,10 @@ Every command requires an argument restriction:
 
 - `NoArguments`: only a call with no arguments. This renders sudoers' special empty-argument restriction.
 - `Exact "..."`: a literal sudo argument-string match, not an `argv`-array comparison. Metacharacters are escaped, not interpreted as user-supplied glob/regex syntax.
+- `Glob "..."`: native sudoers wildcard match on the whole argument string. `*` matches any run of characters **including spaces** (so it can span several arguments), `?` matches one character; everything else is literal and escaped as in `Exact`. The pattern must contain `*` or `?`; `[`, `]` and `\\` are rejected. Example: `Glob "set wg0 peer * remove"`.
 - `AnyArguments`: arbitrary arguments, explicitly requested.
+
+Commands of one grant may overlap (they share every setting); only an exact repeat is rejected. Across grants for the same subject and run-as, overlapping commands are rejected, with globs compared by actual pattern intersection.
 
 Omitting arguments in native sudoers means **any arguments**, so the DSL never silently chooses that behavior. Exact values accept ASCII letters/digits and spaces plus `_ - . / : = + @ % , * ? [ ] \\ ^ $`; empty values, leading/trailing spaces, controls, quotes, `#`, and other unsupported characters are rejected. Paths must be absolute supported executable paths; raw sudoers directives, aliases, negative command lists, and regex policies are not exposed.
 

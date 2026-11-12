@@ -19,6 +19,9 @@ type SudoRunAs =
 type SudoArguments =
     | NoArguments
     | Exact of argumentString: string
+    /// Native sudoers wildcard match on the whole argument string: `*` matches any run of characters
+    /// (spaces included), `?` one character. Other characters match literally; `[`/`]`/`\` are not accepted.
+    | Glob of pattern: string
     | AnyArguments
 
 type SudoCommandSpec =
@@ -58,6 +61,11 @@ type SudoCommandBuilder internal (path: string) =
             | _ -> invalidArg "command" "Sudo command arguments may only be declared once."
         match arguments with
         | Exact value when String.IsNullOrEmpty value -> invalidArg "arguments" "Use NoArguments rather than an empty Exact argument string."
+        | Glob pattern when String.IsNullOrEmpty pattern -> invalidArg "arguments" "A Glob argument pattern cannot be empty."
+        | Glob pattern when not (pattern.Contains('*') || pattern.Contains('?')) ->
+            invalidArg "arguments" "A Glob argument pattern must contain * or ?; use Exact for a literal argument string."
+        | Glob pattern when pattern.IndexOfAny([| '['; ']'; '\\' |]) >= 0 ->
+            invalidArg "arguments" "Glob argument patterns support only * and ? wildcards; [ ] and \\ are not accepted."
         | _ -> ()
         { Path = path; Arguments = arguments }
 

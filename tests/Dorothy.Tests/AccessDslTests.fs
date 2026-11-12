@@ -392,6 +392,8 @@ type AccessDslTests() =
         let missingRunAs = fun () -> sudo { grant "invalid" { subjects [ SudoSubject.User "alice" ]; allCommands } }
         let missingArguments = fun () -> sudo { grant "invalid" { subjects [ SudoSubject.User "alice" ]; runAsUser "root"; (command "/usr/bin/id") {} } }
         let emptyExact = fun () -> sudo { grant "invalid" { subjects [ SudoSubject.User "alice" ]; runAsUser "root"; (command "/usr/bin/id") { arguments (Exact "") } } }
+        let globWithoutWildcard = fun () -> sudo { grant "invalid" { subjects [ SudoSubject.User "alice" ]; runAsUser "root"; (command "/usr/bin/wg") { arguments (Glob "show") } } }
+        let globWithClass = fun () -> sudo { grant "invalid" { subjects [ SudoSubject.User "alice" ]; runAsUser "root"; (command "/usr/bin/wg") { arguments (Glob "set wg[01] *") } } }
         let mixedAllAndCommands = fun () -> sudo { grant "invalid" { subjects [ SudoSubject.User "alice" ]; runAsUser "root"; allCommands; (command "/usr/bin/id") { arguments NoArguments } } }
 
         let expectArgumentException action =
@@ -404,4 +406,6 @@ type AccessDslTests() =
         expectArgumentException missingRunAs
         expectArgumentException missingArguments
         expectArgumentException emptyExact
+        expectArgumentException globWithoutWildcard
+        expectArgumentException globWithClass
         expectArgumentException mixedAllAndCommands

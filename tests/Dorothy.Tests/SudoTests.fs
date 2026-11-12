@@ -427,3 +427,47 @@ type SudoTests() =
         let deleted = SudoTestHelpers.runAsJson "delete" host (SudoTestHelpers.grants [ rule ])
         Assert.That(SudoTestHelpers.getBool deleted "exists", Is.False)
         Assert.That(File.Exists(SudoTestHelpers.sudoersPath host), Is.False)
+
+    [<Test>]
+    member _.``Glob arguments keep native wildcards while exact arguments stay literal``() =
+        let temporary, host = makeHost ()
+        use _temporary = temporary
+        let rule =
+            SudoTestHelpers.grant
+                "lainvpn-wg"
+                // The fake policy view only confirms ALL rules; an empty group keeps the check structural.
+                [ SudoTestHelpers.subject "group" "dorothy-empty-test" ]
+                (SudoTestHelpers.runAsAll ())
+                (Some "passwordless")
+                false
+                [ SudoTestHelpers.command "/usr/bin/wg" "glob" (Some "set wg-lain-public peer * allowed-ips *")
+                  SudoTestHelpers.command "/usr/bin/wg" "glob" (Some "set wg-lain-public peer * remove")
+                  SudoTestHelpers.command "/usr/bin/wg" "exact" (Some "show wg-lain-public *") ]
+
+        let applied = SudoTestHelpers.runAsJson "apply" host (SudoTestHelpers.grants [ rule ])
+        Assert.That(SudoTestHelpers.getBool applied "inSync", Is.True)
+        let sudoers = File.ReadAllText(SudoTestHelpers.sudoersPath host)
+        Assert.That(sudoers, Does.Contain("/usr/bin/wg set wg-lain-public peer * allowed-ips *"))
+        Assert.That(sudoers, Does.Contain("/usr/bin/wg set wg-lain-public peer * remove"))
+        Assert.That(sudoers, Does.Contain("/usr/bin/wg show wg-lain-public \\*"))
+        let read = SudoTestHelpers.runAsJson "read" host (SudoTestHelpers.grants [ rule ])
+        Assert.That(SudoTestHelpers.getBool read "inSync", Is.True)
+
+    [<Test>]
+    member _.``Rejects glob arguments without wildcards or with character classes``() =
+        let temporary, host = makeHost ()
+        use _temporary = temporary
+        for pattern in [ "show"; "set wg[01] *"; "set \\* *" ] do
+            let rule =
+                SudoTestHelpers.grant
+                    "bad-glob"
+                    [ SudoTestHelpers.subject "user" Environment.UserName ]
+                    (SudoTestHelpers.runAsAll ())
+                    (Some "passwordless")
+                    false
+                    [ SudoTestHelpers.command "/usr/bin/wg" "glob" (Some pattern) ]
+            Assert.That(
+                (fun () -> SudoTestHelpers.runAsJson "apply" host (SudoTestHelpers.grants [ rule ]) |> ignore),
+                Throws.Exception,
+                pattern)
+            Assert.That(File.Exists(SudoTestHelpers.sudoersPath host), Is.False, pattern)
