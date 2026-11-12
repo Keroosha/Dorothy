@@ -15,6 +15,7 @@ type DebianSpec =
     {
         Packages: Map<string, string option>
         Ufw: UfwSpec option
+        Firewalld: FirewalldSpec option
         Traefik: TraefikSpec option
         Docker: DockerSpec option
         Swapfile: SwapfileSpec option
@@ -28,6 +29,7 @@ type DebianSpec =
 type DebianDeclaration =
     | AptPackages of AptSpec
     | UfwConfiguration of UfwSpec
+    | FirewalldConfiguration of FirewalldSpec
     | TraefikConfiguration of TraefikSpec
     | DockerConfiguration of DockerSpec
     | SwapfileConfiguration of SwapfileSpec
@@ -50,6 +52,7 @@ type HostSpec
         identityFile: string option,
         packages: Map<string, string option>,
         ufw: UfwSpec option,
+        firewalld: FirewalldSpec option,
         traefik: TraefikSpec option,
         docker: DockerSpec option,
         swapfile: SwapfileSpec option,
@@ -65,6 +68,7 @@ type HostSpec
     member _.IdentityFile = identityFile
     member _.Packages = packages
     member _.Ufw = ufw
+    member _.Firewalld = firewalld
     member _.Traefik = traefik
     member _.Docker = docker
     member _.Swapfile = swapfile
@@ -227,6 +231,9 @@ type DebianBuilder() =
     member _.Yield(firewall: UfwSpec) =
         [ DebianDeclaration.UfwConfiguration firewall ]
 
+    member _.Yield(firewall: FirewalldSpec) =
+        [ DebianDeclaration.FirewalldConfiguration firewall ]
+
     member _.Yield(proxy: TraefikSpec) =
         [ DebianDeclaration.TraefikConfiguration proxy ]
 
@@ -253,6 +260,9 @@ type DebianBuilder() =
 
     member _.YieldFrom(firewalls: seq<UfwSpec>) =
         firewalls |> Seq.map DebianDeclaration.UfwConfiguration |> Seq.toList
+
+    member _.YieldFrom(firewalls: seq<FirewalldSpec>) =
+        firewalls |> Seq.map DebianDeclaration.FirewalldConfiguration |> Seq.toList
 
     member _.YieldFrom(proxies: seq<TraefikSpec>) =
         proxies |> Seq.map DebianDeclaration.TraefikConfiguration |> Seq.toList
@@ -295,6 +305,16 @@ type DebianBuilder() =
                 | [] -> None
                 | [ value ] -> Some value
                 | _ -> invalidArg "debian" "A Debian environment may declare UFW only once."
+
+        let firewalld =
+            declarations
+            |> List.choose (function DebianDeclaration.FirewalldConfiguration value -> Some value | _ -> None)
+            |> function
+                | [] -> None
+                | [ value ] -> Some value
+                | _ -> invalidArg "debian" "A Debian environment may declare firewalld only once."
+        if firewall.IsSome && firewalld.IsSome then
+            invalidArg "debian" "UFW and firewalld cannot be declared in the same Debian environment."
 
         let traefik =
             declarations
@@ -382,6 +402,7 @@ type DebianBuilder() =
             {
                 Packages = DomainValidation.mergePackages packages
                 Ufw = firewall
+                Firewalld = firewalld
                 Traefik = traefik
                 Docker = docker
                 Swapfile = swapfile
@@ -473,6 +494,7 @@ type HostBuilder(name: string) =
                 identityFile,
                 debian.Packages,
                 debian.Ufw,
+                debian.Firewalld,
                 debian.Traefik,
                 debian.Docker,
                 debian.Swapfile,

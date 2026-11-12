@@ -20,6 +20,7 @@
     <Compile Include="NativeCoreTests.fs" />
     <Compile Include="AptTests.fs" />
     <Compile Include="UfwBackendTests.fs" />
+    <Compile Include="FirewalldTests.fs" />
     <Compile Include="TraefikBackendTests.fs" />
     <Compile Include="DslTests.fs" />
     <Compile Include="CertificateTests.fs" />

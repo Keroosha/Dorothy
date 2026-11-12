@@ -560,7 +560,7 @@ module SshTransport =
         (freshFinalConnection: bool)
         =
         task {
-            if helperCommand <> "apt" && helperCommand <> "ufw" && helperCommand <> "traefik" && helperCommand <> "docker" && helperCommand <> "swapfile" && helperCommand <> "sshd" && helperCommand <> "fail2ban" && helperCommand <> "users" && helperCommand <> "sudo" then
+            if helperCommand <> "apt" && helperCommand <> "ufw" && helperCommand <> "firewalld" && helperCommand <> "traefik" && helperCommand <> "docker" && helperCommand <> "swapfile" && helperCommand <> "sshd" && helperCommand <> "fail2ban" && helperCommand <> "users" && helperCommand <> "sudo" then
                 invalidArg "helperCommand" "Unsupported native helper operation."
 
             validateConnection connection
@@ -574,7 +574,7 @@ module SshTransport =
             let remoteCommand =
                 if connection.User = "root" then
                     sprintf "exec %s %s" remotePath helperCommand
-                elif helperCommand = "sshd" then
+                elif helperCommand = "sshd" || helperCommand = "firewalld" then
                     sprintf "sudo -n -- env SSH_CONNECTION=\"${SSH_CONNECTION-}\" %s %s" remotePath helperCommand
                 else
                     sprintf "sudo -n -- %s %s" remotePath helperCommand

@@ -11,6 +11,7 @@
     <Compile Include="Provider/SshdBackend.fs" />
     <Compile Include="Provider/Fail2BanBackend.fs" />
     <Compile Include="Provider/UfwBackend.fs" />
+    <Compile Include="Provider/FirewalldBackend.fs" />
     <Compile Include="Provider/TraefikBackend.fs" />
     <Compile Include="Provider/DockerEngineBackend.fs" />
     <Compile Include="Provider/SwapfileBackend.fs" />
@@ -18,6 +19,7 @@
     <Compile Include="Provider/SudoBackend.fs" />
     <Compile Include="Provider/AptProvider.fs" />
     <Compile Include="Provider/UfwProvider.fs" />
+    <Compile Include="Provider/FirewalldProvider.fs" />
     <Compile Include="Provider/TraefikProvider.fs" />
     <Compile Include="Provider/DockerEngineProvider.fs" />
     <Compile Include="Provider/SwapfileProvider.fs" />
