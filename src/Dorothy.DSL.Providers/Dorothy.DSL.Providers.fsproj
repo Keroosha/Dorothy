@@ -16,6 +16,7 @@
     <Compile Include="Provider/SwapfileBackend.fs" />
     <Compile Include="Provider/UsersBackend.fs" />
     <Compile Include="Provider/SudoBackend.fs" />
+    <Compile Include="Provider/ContentBackend.fs" />
     <Compile Include="Provider/AptProvider.fs" />
     <Compile Include="Provider/UfwProvider.fs" />
     <Compile Include="Provider/TraefikProvider.fs" />
@@ -25,6 +26,7 @@
     <Compile Include="Provider/Fail2BanProvider.fs" />
     <Compile Include="Provider/UsersProvider.fs" />
     <Compile Include="Provider/SudoProvider.fs" />
+    <Compile Include="Provider/ContentServicesProvider.fs" />
     <Compile Include="Provider/Provider.fs" />
     <Compile Include="Provider/Program.fs" />
     <Content Include="Provider/helper/**/keroosha-iac-helper">

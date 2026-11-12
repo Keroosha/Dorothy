@@ -17,6 +17,8 @@
         <Compile Include="Sshd.fs" />
         <Compile Include="Users.fs" />
         <Compile Include="Sudo.fs" />
+        <Compile Include="HostContent.fs" />
+        <Compile Include="HostContentInputs.fs" />
         <Compile Include="Domain.fs" />
         <Compile Include="DockerResources.fs" />
         <Compile Include="Resources.fs" />

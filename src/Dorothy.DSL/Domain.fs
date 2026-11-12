@@ -22,6 +22,8 @@ type DebianSpec =
         Fail2Ban: Fail2BanSpec option
         Users: UsersSpec option
         Sudo: SudoSpec option
+        Content: HostContentSpec option
+        Services: HostServiceSpec list
     }
 
 [<RequireQualifiedAccess>]
@@ -35,6 +37,8 @@ type DebianDeclaration =
     | Fail2BanConfiguration of Fail2BanInputSpec
     | UsersConfiguration of UsersSpec
     | SudoConfiguration of SudoSpec
+    | ContentConfiguration of HostContentSpec
+    | ServiceConfiguration of HostServiceSpec
 
 /// A complete immutable description of one named SSH host.
 ///
@@ -56,7 +60,9 @@ type HostSpec
         sshd: SshdSpec option,
         fail2ban: Fail2BanSpec option,
         users: UsersSpec option,
-        sudo: SudoSpec option
+        sudo: SudoSpec option,
+        content: HostContentSpec option,
+        services: HostServiceSpec list
     ) =
     member _.Name = name
     member _.Address = address
@@ -72,6 +78,8 @@ type HostSpec
     member _.Fail2Ban = fail2ban
     member _.Users = users
     member _.Sudo = sudo
+    member _.Content = content
+    member _.Services = services
 
 type HostDeclaration =
     | Address of string
@@ -248,6 +256,10 @@ type DebianBuilder() =
     member _.Yield(sudo: SudoSpec) =
         [ DebianDeclaration.SudoConfiguration sudo ]
 
+    member _.Yield(content: HostContentSpec) = [ DebianDeclaration.ContentConfiguration content ]
+    member _.Yield(service: HostServiceSpec) = [ DebianDeclaration.ServiceConfiguration service ]
+    member _.YieldFrom(services: seq<HostServiceSpec>) = services |> Seq.map DebianDeclaration.ServiceConfiguration |> Seq.toList
+
     member _.YieldFrom(aptBlocks: seq<AptSpec>) =
         aptBlocks |> Seq.map DebianDeclaration.AptPackages |> Seq.toList
 
@@ -371,6 +383,25 @@ type DebianBuilder() =
                 | [ value ] -> Some value
                 | _ -> invalidArg "debian" "A Debian environment may declare sudo only once."
 
+        let content =
+            declarations
+            |> List.choose (function DebianDeclaration.ContentConfiguration value -> Some value | _ -> None)
+            |> function
+                | [] -> None
+                | [ value ] -> Some value
+                | _ -> invalidArg "content" "A Debian environment may declare content only once."
+        let services =
+            declarations |> List.choose (function DebianDeclaration.ServiceConfiguration value -> Some value | _ -> None)
+        HostContentValidation.unique "services" (services |> List.map _.Name)
+        let contentItems = content |> Option.map _.Items |> Option.defaultValue []
+        let targetPaths = contentItems |> List.collect (fun item -> item.Targets |> List.map _.Path)
+        for service in services do
+            for item in service.Uses do
+                if not (contentItems |> List.exists (fun declared -> Object.ReferenceEquals(declared, item))) then
+                    invalidArg "uses" "Every referenced content item must be declared in this environment's content block."
+            if service.Managed && List.contains ("/etc/systemd/system/" + service.Name) targetPaths then
+                invalidArg "content" "Content and service cannot own the same unit file."
+
         let packages =
             aptBlocks
             |> Seq.collect (fun block ->
@@ -389,6 +420,8 @@ type DebianBuilder() =
                 Fail2Ban = fail2ban
                 Users = users
                 Sudo = sudo
+                Content = content
+                Services = services
             }
 
 /// Collects the singleton SSH settings and the required Debian environment.
@@ -479,7 +512,9 @@ type HostBuilder(name: string) =
                 debian.Sshd,
                 debian.Fail2Ban,
                 debian.Users,
-                debian.Sudo
+                debian.Sudo,
+                debian.Content,
+                debian.Services
             )
 
         result

@@ -22,6 +22,8 @@
     <Compile Include="Fail2Ban.fs" />
     <Compile Include="Users.fs" />
     <Compile Include="Sudo.fs" />
+    <Compile Include="Content.fs" />
+    <Compile Include="Services.fs" />
     <Compile Include="Program.fs" />
   </ItemGroup>
 </Project>
