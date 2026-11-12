@@ -155,7 +155,7 @@ module Firewalld =
             || (zone.Elements(xn "port") |> Seq.exists (portAllows context.Port))
             || (zone.Elements(xn "protocol") |> Seq.exists (fun e -> List.contains (required "value" e) [ "tcp"; "6" ]))
             || (zone.Elements(xn "service") |> Seq.exists (fun e -> serviceAllows Set.empty (required "name" e)))
-        if not allowed then fail (sprintf "Final zone %s does not allow current SSH port %d/tcp; refusing mutation." zoneName context.Port)
+        if not allowed then fail ("Final zone " + zoneName + " does not allow current SSH port " + string context.Port + "/tcp; refusing mutation.")
         for KeyValue(_, xml) in policies do
             let policy = parseXml "policy" xml
             let matches side names = policy.Elements(xn side) |> Seq.exists (fun e -> List.contains (required "name" e) names)
@@ -203,7 +203,8 @@ module Firewalld =
     let private checkedCommandResult executable arguments (result: CommandResult) =
         if result.ExitCode <> 0 then
             let detail = if String.IsNullOrWhiteSpace result.Stderr then result.Stdout else result.Stderr
-            fail (sprintf "firewalld command failed: %s %s (exit %d): %s" executable (String.concat " " arguments) result.ExitCode (diagnostic detail))
+            let commandLine = String.concat " " arguments
+            fail ("firewalld command failed: " + executable + " " + commandLine + " (exit " + string result.ExitCode + "): " + diagnostic detail)
         result.Stdout.Trim()
 
     let private command (environment: HostEnvironment) executable arguments =
