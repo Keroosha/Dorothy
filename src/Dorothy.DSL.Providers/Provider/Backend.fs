@@ -26,6 +26,37 @@ type AptSnapshot =
     { InstalledVersions: Map<string, string>
       ManagedPackages: string list }
 
+/// Bounds concurrent OpenSSH sessions per target host for the whole provider process.
+///
+/// Every native operation opens its own `ssh` process (no multiplexing), while Pulumi schedules up to
+/// `--parallel` (default 128) resource operations at once. Against one host that floods sshd's
+/// unauthenticated-connection limit (OpenSSH default `MaxStartups 10:30:100`), which randomly drops
+/// connections and, with OpenSSH 10 `PerSourcePenalties`, can penalise the deploying client itself.
+/// One provider process serves all Dorothy resources of a deployment, so a process-wide gate per
+/// `address:port` keeps each host below that limit regardless of Pulumi's parallelism.
+module internal HostSessionGate =
+    /// Leaves headroom under MaxStartups' start value (10) for other clients, such as the Docker provider.
+    [<Literal>]
+    let MaxSessionsPerHost = 4
+
+    let private gates =
+        Collections.Concurrent.ConcurrentDictionary<string, SemaphoreSlim>(StringComparer.OrdinalIgnoreCase)
+
+    let private key (connection: SshConnection) =
+        $"{connection.Address.TrimEnd('.')}:{connection.Port}"
+
+    /// Runs `work` once a session slot for the connection's host is free.
+    let run (connection: SshConnection) (cancellationToken: CancellationToken) (work: unit -> Task<'T>) : Task<'T> =
+        task {
+            let gate = gates.GetOrAdd(key connection, fun _ -> new SemaphoreSlim(MaxSessionsPerHost, MaxSessionsPerHost))
+            do! gate.WaitAsync(cancellationToken)
+
+            try
+                return! work ()
+            finally
+                gate.Release() |> ignore
+        }
+
 module SshTransport =
     let private validateConnection (connection: SshConnection) =
         let hasInvalidCharacter (value: string) =
@@ -160,7 +191,7 @@ module SshTransport =
             diagnostic
             prerequisiteHint
 
-    let private runRemoteCommand
+    let private runRemoteCommandUngated
         (connection: SshConnection)
         (operationName: string)
         (remoteCommand: string)
@@ -169,7 +200,6 @@ module SshTransport =
         (freshConnection: bool)
         =
         task {
-            validateConnection connection
             let startInfo = createStartInfo connection remoteCommand freshConnection
             use sshProcess = new Process()
             sshProcess.StartInfo <- startInfo
@@ -249,6 +279,19 @@ module SshTransport =
 
             return standardOutput
         }
+
+    let private runRemoteCommand
+        (connection: SshConnection)
+        (operationName: string)
+        (remoteCommand: string)
+        (standardInput: Stream option)
+        (cancellationToken: CancellationToken)
+        (freshConnection: bool)
+        =
+        validateConnection connection
+
+        HostSessionGate.run connection cancellationToken (fun () ->
+            runRemoteCommandUngated connection operationName remoteCommand standardInput cancellationToken freshConnection)
 
     let private quotePosix (value: string) =
         "'" + value.Replace("'", "'\"'\"'") + "'"

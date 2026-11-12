@@ -18,6 +18,7 @@
   <ItemGroup>
     <Compile Include="TestSupport.fs" />
     <Compile Include="NativeCoreTests.fs" />
+    <Compile Include="HostSessionGateTests.fs" />
     <Compile Include="AptTests.fs" />
     <Compile Include="UfwBackendTests.fs" />
     <Compile Include="FirewalldTests.fs" />
