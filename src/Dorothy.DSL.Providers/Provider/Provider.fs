@@ -22,9 +22,10 @@ module private ProviderSchema =
             use swapfileDocument = JsonDocument.Parse(SwapfileProvider.Schema)
             use usersDocument = JsonDocument.Parse(UsersProvider.Schema)
             use sudoDocument = JsonDocument.Parse(SudoProvider.Schema)
+            use contentServicesDocument = JsonDocument.Parse(ContentServicesProvider.Schema)
             use stream = new MemoryStream()
             use writer = new Utf8JsonWriter(stream)
-            let documents = [ aptDocument; ufwDocument; firewalldDocument; traefikDocument; dockerEngineDocument; dockerJobDocument; swapfileDocument; sshdDocument; fail2banDocument; usersDocument; sudoDocument ]
+            let documents = [ aptDocument; ufwDocument; firewalldDocument; traefikDocument; dockerEngineDocument; dockerJobDocument; swapfileDocument; sshdDocument; fail2banDocument; usersDocument; sudoDocument; contentServicesDocument ]
 
             let writeMergedObject (propertyName: string) =
                 writer.WritePropertyName(propertyName)
@@ -61,6 +62,8 @@ type DorothyProvider() =
     let fail2ban = Fail2BanProvider()
     let users = UsersProvider()
     let sudo = SudoProvider()
+    let contentServices = ContentServicesProvider()
+    let isContentService token = token = ContentServicesProvider.ContentToken || token = ContentServicesProvider.ServiceToken
 
     static member Version = AptProvider.Version
 
@@ -87,6 +90,7 @@ type DorothyProvider() =
         elif request.Type = Fail2BanProvider.ResourceToken then fail2ban.Check(request, ct)
         elif request.Type = UsersProvider.ResourceToken then users.Check(request, ct)
         elif request.Type = SudoProvider.ResourceToken then sudo.Check(request, ct)
+        elif isContentService request.Type then contentServices.Check(request, ct)
         else apt.Check(request, ct)
 
     override _.Diff(request: DiffRequest, ct: CancellationToken) =
@@ -100,6 +104,7 @@ type DorothyProvider() =
         elif request.Type = Fail2BanProvider.ResourceToken then fail2ban.Diff(request, ct)
         elif request.Type = UsersProvider.ResourceToken then users.Diff(request, ct)
         elif request.Type = SudoProvider.ResourceToken then sudo.Diff(request, ct)
+        elif isContentService request.Type then contentServices.Diff(request, ct)
         else apt.Diff(request, ct)
 
     override _.Create(request: CreateRequest, ct: CancellationToken) =
@@ -113,6 +118,7 @@ type DorothyProvider() =
         elif request.Type = Fail2BanProvider.ResourceToken then fail2ban.Create(request, ct)
         elif request.Type = UsersProvider.ResourceToken then users.Create(request, ct)
         elif request.Type = SudoProvider.ResourceToken then sudo.Create(request, ct)
+        elif isContentService request.Type then contentServices.Create(request, ct)
         else apt.Create(request, ct)
 
     override _.Read(request: ReadRequest, ct: CancellationToken) =
@@ -126,6 +132,7 @@ type DorothyProvider() =
         elif request.Type = Fail2BanProvider.ResourceToken then fail2ban.Read(request, ct)
         elif request.Type = UsersProvider.ResourceToken then users.Read(request, ct)
         elif request.Type = SudoProvider.ResourceToken then sudo.Read(request, ct)
+        elif isContentService request.Type then contentServices.Read(request, ct)
         else apt.Read(request, ct)
 
     override _.Update(request: UpdateRequest, ct: CancellationToken) =
@@ -139,6 +146,7 @@ type DorothyProvider() =
         elif request.Type = Fail2BanProvider.ResourceToken then fail2ban.Update(request, ct)
         elif request.Type = UsersProvider.ResourceToken then users.Update(request, ct)
         elif request.Type = SudoProvider.ResourceToken then sudo.Update(request, ct)
+        elif isContentService request.Type then contentServices.Update(request, ct)
         else apt.Update(request, ct)
 
     override _.Delete(request: DeleteRequest, ct: CancellationToken) =
@@ -152,4 +160,5 @@ type DorothyProvider() =
         elif request.Type = Fail2BanProvider.ResourceToken then fail2ban.Delete(request, ct)
         elif request.Type = UsersProvider.ResourceToken then users.Delete(request, ct)
         elif request.Type = SudoProvider.ResourceToken then sudo.Delete(request, ct)
+        elif isContentService request.Type then contentServices.Delete(request, ct)
         else apt.Delete(request, ct)

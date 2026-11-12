@@ -560,7 +560,7 @@ module SshTransport =
         (freshFinalConnection: bool)
         =
         task {
-            if helperCommand <> "apt" && helperCommand <> "ufw" && helperCommand <> "firewalld" && helperCommand <> "traefik" && helperCommand <> "docker" && helperCommand <> "docker-job" && helperCommand <> "swapfile" && helperCommand <> "sshd" && helperCommand <> "fail2ban" && helperCommand <> "users" && helperCommand <> "sudo" then
+            if helperCommand <> "apt" && helperCommand <> "ufw" && helperCommand <> "firewalld" && helperCommand <> "traefik" && helperCommand <> "docker" && helperCommand <> "docker-job" && helperCommand <> "swapfile" && helperCommand <> "sshd" && helperCommand <> "fail2ban" && helperCommand <> "users" && helperCommand <> "sudo" && helperCommand <> "content" && helperCommand <> "service" then
                 invalidArg "helperCommand" "Unsupported native helper operation."
 
             validateConnection connection

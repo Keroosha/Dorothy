@@ -1332,6 +1332,40 @@ module internal AccessResourceMappings =
         let grants = Dictionary<string, SudoGrantArgs>(StringComparer.Ordinal)
         for KeyValue(name, value) in specification.Grants do grants.Add(name, sudoGrant value)
         grants
+
+/// One independent host content resource. Payload is always a Pulumi secret and never an output.
+type HostContentArgs() =
+    inherit ResourceArgs()
+    [<Input("connection", true)>]
+    member val Connection: Input<AptConnectionArgs> = Unchecked.defaultof<_> with get, set
+    [<Input("specification", true)>]
+    member val Specification: Input<string> = Unchecked.defaultof<_> with get, set
+    [<Input("payload")>]
+    member val Payload: Input<string> = Unchecked.defaultof<_> with get, set
+
+type HostServiceArgs() =
+    inherit ResourceArgs()
+    [<Input("connection", true)>]
+    member val Connection: Input<AptConnectionArgs> = Unchecked.defaultof<_> with get, set
+    [<Input("specification", true)>]
+    member val Specification: Input<string> = Unchecked.defaultof<_> with get, set
+    [<Input("triggers")>]
+    member val Triggers: Input<string> = Unchecked.defaultof<_> with get, set
+    [<Input("restartOnChange")>]
+    member val RestartOnChange: Input<bool> = Unchecked.defaultof<_> with get, set
+
+type HostContentResource(name: string, args: HostContentArgs, options: CustomResourceOptions) =
+    inherit CustomResource("keroosha:debian:Content", name, args, options)
+    [<DefaultValue>]
+    val mutable private fingerprint: Output<string>
+    [<Output("fingerprint")>]
+    member this.Fingerprint
+        with get () = this.fingerprint
+        and private set value = this.fingerprint <- value
+
+type HostServiceResource(name: string, args: HostServiceArgs, options: CustomResourceOptions) =
+    inherit CustomResource("keroosha:debian:Service", name, args, options)
+
 module Host =
     let deploy (host: HostSpec) =
         DomainValidation.validateHostSpec host
@@ -1446,6 +1480,46 @@ module Host =
                     @ (dockerPackage |> Option.map (fun resource -> resource :> Resource) |> Option.toList)
                 let options = ProviderContract.resourceOptionsWithDependencies dependencies
                 UsersResource(host.Name + "-users", args, options))
+
+        let contentItems = host.Content |> Option.map _.Items |> Option.defaultValue []
+        let contentPrerequisites =
+            [ mainApt :> Resource ]
+            @ (usersResource |> Option.map (fun value -> value :> Resource) |> Option.toList)
+        let zstdPackage =
+            if contentItems |> List.exists (fun item -> item.Format = Some TarZst) then
+                if Map.containsKey "zstd" host.Packages then None
+                else Some(createAptPackageSet (host.Name + "-content-zstd") (Map.ofList [ "zstd", None ]) [ mainApt :> Resource ] true)
+            else None
+        let contentResources = Dictionary<HostContentItem, HostContentResource>()
+        for item in contentItems do
+            let specification, payload = HostContentInputs.resolve item
+            let args = HostContentArgs()
+            args.Connection <- Input<AptConnectionArgs>.op_Implicit connection
+            args.Specification <- Input<string>.op_Implicit specification
+            args.Payload <- Input<string>.op_Implicit payload
+            let dependencies = contentPrerequisites @ (zstdPackage |> Option.map (fun value -> value :> Resource) |> Option.toList)
+            let resource = HostContentResource(host.Name + "-content-" + item.Name, args, ProviderContract.resourceOptionsWithDependencies dependencies)
+            contentResources.Add(item, resource)
+        for service in host.Services do
+            let args = HostServiceArgs()
+            args.Connection <- Input<AptConnectionArgs>.op_Implicit connection
+            args.Specification <- Input<string>.op_Implicit(HostContentInputs.service service)
+            args.RestartOnChange <- Input<bool>.op_Implicit service.RestartOnChange
+            let fingerprints =
+                service.Uses
+                |> List.filter (fun item -> item.Ownership = ContentOwnership.Managed)
+                |> List.sortBy _.Name
+                |> List.map (fun item -> contentResources[item].Fingerprint)
+                |> List.toArray
+                |> Output.All<string>
+            args.Triggers <-
+                fingerprints.Apply(Func<ImmutableArray<string>, string>(fun values ->
+                    let result = System.Text.Json.Nodes.JsonArray()
+                    for value in values do result.Add(System.Text.Json.Nodes.JsonValue.Create value)
+                    result.ToJsonString()))
+                |> Input<string>.op_Implicit
+            let dependencies = contentPrerequisites @ (service.Uses |> List.map (fun item -> contentResources[item] :> Resource))
+            HostServiceResource(host.Name + "-service-" + service.Name, args, ProviderContract.resourceOptionsWithDependencies dependencies) |> ignore
 
         let sudoPackage =
             match host.Sudo with
