@@ -177,10 +177,11 @@ type FirewalldTests() =
                         "0:" + mode
                     | "ip", _ -> "[{\"dev\":\"eth0\"}]"
                     | "firewall-cmd", [ "--get-default-zone" ] -> "public"
-                    | "firewall-cmd", [ "--get-zone-of-interface=eth0" ] -> "public"
+                    | "firewall-cmd", [ "--get-zone-of-interface=eth0" ] -> "no zone\n"
                     | "firewall-cmd", _ -> "success"
                     | _ -> failwith ("Unexpected fixture command: " + executable)
-                { ExitCode = 0; Stdout = output; Stderr = "" }
+                let exitCode = if executable = "firewall-cmd" && arguments = [ "--get-zone-of-interface=eth0" ] then 2 else 0
+                { ExitCode = exitCode; Stdout = output; Stderr = "" }
             let environment: Dorothy.HostHelper.HostEnvironment = { Root = root; Run = run; UtcNow = fun () -> DateTimeOffset.UnixEpoch }
             action environment root calls
         finally
@@ -311,7 +312,7 @@ type FirewalldTests() =
                 { env with
                     Run = fun executable args input ->
                         let result = env.Run executable args input
-                        if args = [ "--get-zone-of-interface=eth0" ] then { result with Stdout = "runtime" } else result }
+                        if args = [ "--get-zone-of-interface=eth0" ] then { result with ExitCode = 0; Stdout = "runtime" } else result }
             let unsafe = (zone "runtime" { target FirewalldTarget.Drop }).Configuration
             Assert.Throws<NativeFirewalld.BackendError>(fun () -> this.Invoke runtime "apply" unsafe |> ignore) |> ignore
             Assert.That(File.ReadAllText file, Is.EqualTo before)
@@ -446,3 +447,66 @@ type FirewalldTests() =
     [<Test>]
     member _.``Wildcard interfaces are rejected rather than silently underguarded``() =
         Assert.Throws<ArgumentException>(fun () -> zone "vpn" { interfaces [ "wg+" ] } |> ignore) |> ignore
+
+    [<TestCase(false); TestCase(true)>]
+    member this.``Unbound runtime interface allows Apply Delete and pending recovery``(stderr: bool) =
+        this.WithHost(fun env root calls ->
+            let unbound =
+                { env with
+                    Run = fun executable args input ->
+                        let result = env.Run executable args input
+                        if args = [ "--get-zone-of-interface=eth0" ] then
+                            { result with ExitCode = 2; Stdout = (if stderr then "" else "no zone\n"); Stderr = (if stderr then "no zone\n" else "") }
+                        else result }
+            let result = this.Invoke unbound "apply" zoneConfiguration
+            Assert.That(result["inSync"].GetValue<bool>(), Is.True)
+            this.Invoke unbound "delete" zoneConfiguration |> ignore
+            let file = Path.Combine(root, "etc/firewalld/zones/external.xml")
+            Assert.That(File.Exists file, Is.False)
+            let interrupted =
+                { unbound with
+                    Run = fun executable args input ->
+                        let result = unbound.Run executable args input
+                        if args = [ "--reload" ] then { result with ExitCode = 1; Stderr = "interrupted reload" } else result }
+            Assert.Throws<NativeFirewalld.BackendError>(fun () -> this.Invoke interrupted "apply" zoneConfiguration |> ignore) |> ignore
+            let recovered = this.Invoke unbound "apply" zoneConfiguration
+            Assert.That(recovered["inSync"].GetValue<bool>(), Is.True)
+            use journal = JsonDocument.Parse(File.ReadAllText(Path.Combine(root, "var/lib/keroosha-iac/firewalld/zone-external.json")))
+            Assert.That(journal.RootElement.GetProperty("pending").ValueKind, Is.EqualTo JsonValueKind.Null)
+            this.Invoke unbound "delete" zoneConfiguration |> ignore
+            Assert.That(File.Exists file, Is.False))
+
+    [<TestCase(2, "access denied", "")>]
+    [<TestCase(1, "no zone", "")>]
+    [<TestCase(2, "no zone", "access denied")>]
+    [<TestCase(0, "", "")>]
+    member this.``Runtime interface query errors never become default-zone fallback``(code: int, stdout: string, stderr: string) =
+        this.WithHost(fun env root calls ->
+            let failing =
+                { env with
+                    Run = fun executable args input ->
+                        let result = env.Run executable args input
+                        if args = [ "--get-zone-of-interface=eth0" ] then { ExitCode = code; Stdout = stdout; Stderr = stderr }
+                        else result }
+            if code = 0 then
+                Assert.Throws<ArgumentException>(fun () -> this.Invoke failing "apply" zoneConfiguration |> ignore) |> ignore
+            else
+                Assert.Throws<NativeFirewalld.BackendError>(fun () -> this.Invoke failing "apply" zoneConfiguration |> ignore) |> ignore
+            Assert.That(File.Exists(Path.Combine(root, "etc/firewalld/zones/external.xml")), Is.False)
+            Assert.That(calls |> Seq.exists (fun args -> args = [ "firewall-cmd"; "--reload" ]), Is.False))
+
+    [<TestCase("--state"); TestCase("--get-default-zone"); TestCase("--check-config"); TestCase("--reload")>]
+    member this.``No-zone status is not accepted from other firewall commands``(command: string) =
+        this.WithHost(fun env root calls ->
+            let mutable failed = false
+            let failing =
+                { env with
+                    Run = fun executable args input ->
+                        let result = env.Run executable args input
+                        if args = [ command ] && not failed then
+                            failed <- true
+                            { result with ExitCode = 2; Stdout = "no zone"; Stderr = "" }
+                        else result }
+            let error = Assert.Throws<NativeFirewalld.BackendError>(fun () -> this.Invoke failing "apply" zoneConfiguration |> ignore)
+            Assert.That(error.Message, Does.Contain command)
+            Assert.That(File.Exists(Path.Combine(root, "etc/firewalld/zones/external.xml")), Is.False))

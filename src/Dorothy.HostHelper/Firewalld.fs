@@ -169,7 +169,6 @@ module Firewalld =
 
     let private validateRuntimeBinding context defaultZone runtimeZone zones policies serviceXml =
         validateSshGuard context defaultZone zones policies serviceXml
-        let runtimeZone = if String.IsNullOrWhiteSpace runtimeZone || runtimeZone = "no zone" then defaultZone else runtimeZone
         if not (Map.containsKey runtimeZone zones) then
             fail "SSH runtime zone is absent from final permanent configuration; reconcile the runtime binding before applying."
         // Reload can retain runtime/NM bindings. Check that outcome too, without changing it.
@@ -201,12 +200,27 @@ module Firewalld =
     let private category kind = if kind = "zone" then "zones" elif kind = "policy" then "policies" else "services"
     let private objectPath prefix kind name = prefix + "/" + category kind + "/" + name + ".xml"
 
-    let private command (environment: HostEnvironment) executable arguments =
-        let result = environment.Run executable arguments None
+    let private checkedCommandResult executable arguments (result: CommandResult) =
         if result.ExitCode <> 0 then
             let detail = if String.IsNullOrWhiteSpace result.Stderr then result.Stdout else result.Stderr
             fail (sprintf "firewalld command failed: %s %s (exit %d): %s" executable (String.concat " " arguments) result.ExitCode (diagnostic detail))
         result.Stdout.Trim()
+
+    let private command (environment: HostEnvironment) executable arguments =
+        environment.Run executable arguments None |> checkedCommandResult executable arguments
+
+    let private runtimeZoneOfInterface (environment: HostEnvironment) defaultZone iface =
+        let arguments = [ "--get-zone-of-interface=" + iface ]
+        let result = environment.Run "firewall-cmd" arguments None
+        let stdout, stderr = result.Stdout.Trim(), result.Stderr.Trim()
+        let unbound =
+            result.ExitCode = 2
+            && ((stdout = "no zone" && (stderr = "" || stderr = "no zone"))
+                || (stderr = "no zone" && stdout = ""))
+        if unbound then defaultZone
+        else
+            let name = checkedCommandResult "firewall-cmd" arguments result
+            FirewalldModel.token "runtime zone" 17 name
 
     let private firewall environment arguments = command environment "firewall-cmd" arguments
 
@@ -340,7 +354,7 @@ module Firewalld =
         let context = parseSshContext connection route
         let defaultZone = firewall environment [ "--get-default-zone" ]
         let zones, policies = finalInventory environment c proposed
-        let runtimeZone = firewall environment [ "--get-zone-of-interface=" + context.Interface ]
+        let runtimeZone = runtimeZoneOfInterface environment defaultZone context.Interface
         validateRuntimeBinding context defaultZone runtimeZone zones policies (effective environment "service")
 
     /// APT may start firewalld from its maintainer script, before any zone resource runs.

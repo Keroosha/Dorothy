@@ -1346,11 +1346,6 @@ module Host =
 
         let mainPackages =
             let declared = host.Packages |> Map.remove "ufw" |> Map.remove "firewalld"
-            // Docker's maintainer script can start the daemon. Move even an explicitly
-            // versioned docker.io into the ordered prerequisite when firewalld is declared.
-            let declared =
-                if host.Firewalld.IsSome && host.Docker.IsSome then Map.remove "docker.io" declared
-                else declared
 
             match host.Traefik with
             | Some _ ->
@@ -1365,12 +1360,19 @@ module Host =
                     declared
             | None -> declared
 
-        let mainApt = createAptPackageSet host.Name mainPackages [] false
         let firewalldPackage =
             if host.Firewalld.IsSome || Map.containsKey "firewalld" host.Packages then
                 let version = host.Packages |> Map.tryFind "firewalld" |> Option.defaultValue None
-                Some(createAptPackageSet (host.Name + "-firewalld-package") (Map.ofList [ "firewalld", version ]) [ mainApt :> Resource ] false)
+                Some(createAptPackageSet (host.Name + "-firewalld-package") (Map.ofList [ "firewalld", version ]) [] false)
             else None
+
+        // Keep explicitly declared docker.io in its original main APT owner. Ordering
+        // the whole owner after firewalld avoids both first-start races and package removal.
+        let mainDependencies =
+            if host.Docker.IsSome then
+                firewalldPackage |> Option.map (fun resource -> resource :> Resource) |> Option.toList
+            else []
+        let mainApt = createAptPackageSet host.Name mainPackages mainDependencies false
 
         let fail2banPackages =
             if host.Fail2Ban.IsSome then
@@ -1394,13 +1396,12 @@ module Host =
                 []
 
         let dockerPackage =
-            if host.Docker.IsSome && (host.Firewalld.IsSome || not (Map.containsKey "docker.io" host.Packages)) then
+            if host.Docker.IsSome && not (Map.containsKey "docker.io" host.Packages) then
                 // firewalld must be running before Docker's first startup registers its zone.
-                let version = host.Packages |> Map.tryFind "docker.io" |> Option.defaultValue None
                 let dependencies =
                     [ mainApt :> Resource ]
                     @ (firewalldPackage |> Option.map (fun resource -> resource :> Resource) |> Option.toList)
-                Some(createAptPackageSet (host.Name + "-docker-package") (Map.ofList [ "docker.io", version ]) dependencies true)
+                Some(createAptPackageSet (host.Name + "-docker-package") (Map.ofList [ "docker.io", None ]) dependencies true)
             else
                 None
         let usersResource =
@@ -1491,7 +1492,9 @@ module Host =
                     DockerEngine(
                         host.Name,
                         args,
-                        ProviderContract.resourceOptionsWithDependencies [ packageSet :> Resource ]
+                        ProviderContract.resourceOptionsWithDependencies
+                            ([ packageSet :> Resource ]
+                             @ (firewalldPackage |> Option.map (fun resource -> resource :> Resource) |> Option.toList))
                     )
 
                 Some(engine :> Resource), DockerDeployment.deploy host engine specification

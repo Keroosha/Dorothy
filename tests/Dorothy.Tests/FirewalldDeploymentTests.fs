@@ -35,7 +35,7 @@ type FirewalldDependencyStack() =
 [<TestFixture; NonParallelizable>]
 type FirewalldDeploymentTests() =
     [<TestCase(false); TestCase(true)>]
-    member _.``Docker startup and docker policy wait for firewalld including explicit package version``(explicitVersion: bool) =
+    member _.``Docker ordering preserves explicit package ownership when adding firewalld``(explicitVersion: bool) =
         let host =
             sshHost "ordered" {
                 Address "192.0.2.2"
@@ -61,13 +61,38 @@ type FirewalldDeploymentTests() =
         let dependencies key =
             let output: Output<ImmutableArray<Resource>> = InputList<Resource>.op_Implicit byName[key].Options.DependsOn
             OutputUtilities.GetValueAsync(output).Result |> Seq.map name |> Set.ofSeq
-        Assert.That(dependencies "ordered-docker-package", Does.Contain "ordered-firewalld-package")
+        if explicitVersion then Assert.That(byName.ContainsKey "ordered-docker-package", Is.False)
+        else Assert.That(dependencies "ordered-docker-package", Does.Contain "ordered-firewalld-package")
         // Resource names may match across different tokens; locate the engine by its arguments.
         let engine = captured |> Array.find (fun a -> a.Args :? DockerEngineArgs)
         let engineDependencies: Output<ImmutableArray<Resource>> = InputList<Resource>.op_Implicit engine.Options.DependsOn
-        Assert.That(OutputUtilities.GetValueAsync(engineDependencies).Result |> Seq.map name, Does.Contain "ordered-docker-package")
-        Assert.That(dependencies "ordered-firewalld-policy-docker-block", Does.Contain "ordered")
+        let engineResources = OutputUtilities.GetValueAsync(engineDependencies).Result
+        Assert.That(engineResources |> Seq.map name, Does.Contain(if explicitVersion then "ordered" else "ordered-docker-package"))
+        Assert.That(engineResources |> Seq.map name, Does.Contain "ordered-firewalld-package")
+        let policyDependencies: Output<ImmutableArray<Resource>> =
+            InputList<Resource>.op_Implicit byName["ordered-firewalld-policy-docker-block"].Options.DependsOn
+        Assert.That(OutputUtilities.GetValueAsync(policyDependencies).Result, Does.Contain engine.Resource)
         let main = captured |> Array.find (fun a -> a.Args :? AptPackageSetArgs && name a.Resource = "ordered")
         let packages = (main.Args :?> AptPackageSetArgs).Packages
         let packageOutput: Output<ImmutableDictionary<string, AptPackageArgs>> = InputMap<AptPackageArgs>.op_Implicit packages
-        Assert.That(OutputUtilities.GetValueAsync(packageOutput).Result.ContainsKey "docker.io", Is.False)
+        let resolvedPackages = OutputUtilities.GetValueAsync(packageOutput).Result
+        Assert.That(resolvedPackages.ContainsKey "docker.io", Is.EqualTo explicitVersion)
+        if explicitVersion then
+            let mainDependencies: Output<ImmutableArray<Resource>> = InputList<Resource>.op_Implicit main.Options.DependsOn
+            Assert.That(OutputUtilities.GetValueAsync(mainDependencies).Result |> Seq.map name, Does.Contain "ordered-firewalld-package")
+            let versionOutput: Output<string> = Input<string>.op_Implicit resolvedPackages["docker.io"].Version
+            let version = OutputUtilities.GetValueAsync(versionOutput).Result
+            Assert.That(version, Is.EqualTo "26.1.5+dfsg1-9")
+            // The existing main APT owner previously owned this exact package. Feed the new
+            // deployment declaration to the real planner: adopting firewalld must not remove it.
+            let installed: Dorothy.HostHelper.PackageRecord =
+                { BinaryName = "docker.io"; Name = "docker.io"; Architecture = "amd64"
+                  Status = "ii "; Version = version; Essential = false; Protected = false }
+            let state: Dorothy.HostHelper.PackageState =
+                { NativeArchitecture = "amd64"; Records = Map.ofList [ "docker.io", installed ]
+                  ByName = Map.ofList [ "docker.io", [ installed ] ] }
+            let desired =
+                resolvedPackages |> Seq.map (fun p -> p.Key, Some version) |> Map.ofSeq
+            let plan = Dorothy.HostHelper.Apt.planTransaction [ "docker.io" ] desired state
+            Assert.That(plan.Removals, Is.Empty)
+            Assert.That(plan.Installs, Is.Empty)
