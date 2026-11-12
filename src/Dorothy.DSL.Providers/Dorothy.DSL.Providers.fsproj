@@ -13,6 +13,7 @@
     <Compile Include="Provider/UfwBackend.fs" />
     <Compile Include="Provider/TraefikBackend.fs" />
     <Compile Include="Provider/DockerEngineBackend.fs" />
+    <Compile Include="Provider/DockerJobBackend.fs" />
     <Compile Include="Provider/SwapfileBackend.fs" />
     <Compile Include="Provider/UsersBackend.fs" />
     <Compile Include="Provider/SudoBackend.fs" />
@@ -20,6 +21,7 @@
     <Compile Include="Provider/UfwProvider.fs" />
     <Compile Include="Provider/TraefikProvider.fs" />
     <Compile Include="Provider/DockerEngineProvider.fs" />
+    <Compile Include="Provider/DockerJobProvider.fs" />
     <Compile Include="Provider/SwapfileProvider.fs" />
     <Compile Include="Provider/SshdProvider.fs" />
     <Compile Include="Provider/Fail2BanProvider.fs" />

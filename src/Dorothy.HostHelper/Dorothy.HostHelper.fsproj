@@ -16,6 +16,7 @@
     <Compile Include="Ufw.fs" />
     <Compile Include="Traefik.fs" />
     <Compile Include="DockerEngine.fs" />
+    <Compile Include="DockerJob.fs" />
     <Compile Include="Swapfile.fs" />
     <Compile Include="Sshd.fs" />
     <Compile Include="Fail2BanNative.fs" />

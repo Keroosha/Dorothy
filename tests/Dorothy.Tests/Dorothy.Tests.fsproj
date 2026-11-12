@@ -25,6 +25,8 @@
     <Compile Include="CertificateTests.fs" />
     <Compile Include="DockerDslTests.fs" />
     <Compile Include="DockerEngineTests.fs" />
+    <Compile Include="DockerJobTests.fs" />
+    <Compile Include="DockerJobDeploymentTests.fs" />
     <Compile Include="SwapfileTests.fs" />
     <Compile Include="SshdTests.fs" />
     <Compile Include="Fail2BanTests.fs" />

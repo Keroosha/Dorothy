@@ -344,6 +344,23 @@ type DockerEngineArgs() =
     [<Input("connection", true)>]
     member val Connection: Input<AptConnectionArgs> = Unchecked.defaultof<_> with get, set
 
+/// Completion barrier for a stopped, independently managed Docker container.
+type DockerJobArgs() =
+    inherit ResourceArgs()
+
+    [<Input("connection", true)>]
+    member val Connection: Input<AptConnectionArgs> = Unchecked.defaultof<_> with get, set
+
+    [<Input("containerId", true)>]
+    member val ContainerId: Input<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("timeoutSeconds", true)>]
+    member val TimeoutSeconds: Input<int> = Unchecked.defaultof<_> with get, set
+
+    /// Names explicitly marked secret by the caller; their values are always redacted from job logs.
+    [<Input("secretEnvironmentKeys")>]
+    member val SecretEnvironmentKeys: InputList<string> = InputList<string>() with get, set
+
 /// Native Pulumi arguments for keroosha:debian:Swapfile.
 type SwapfileArgs() =
     inherit ResourceArgs()
@@ -650,6 +667,18 @@ type DockerEngine(name: string, args: DockerEngineArgs, options: CustomResourceO
     member this.InSync
         with get () = this.inSync
         and private set value = this.inSync <- value
+
+/// Starts a stopped container and succeeds only after exit zero; retains it for diagnostics.
+type DockerJob(name: string, args: DockerJobArgs, options: CustomResourceOptions) =
+    inherit CustomResource("keroosha:debian:DockerJob", name, args, options)
+
+    [<DefaultValue>]
+    val mutable private completed: Output<bool>
+
+    [<Output("completed")>]
+    member this.Completed
+        with get () = this.completed
+        and private set value = this.completed <- value
 
 
 /// Manages one owned swap file and its persistent systemd swap unit.
@@ -1450,7 +1479,15 @@ module Host =
                         ProviderContract.resourceOptionsWithDependencies [ packageSet :> Resource ]
                     )
 
-                DockerDeployment.deploy host engine specification
+                let completeJob name (container: Pulumi.Docker.Container) timeout (secretEnvironmentKeys: Output<ImmutableArray<string>>) =
+                    let args = DockerJobArgs()
+                    args.Connection <- Input<AptConnectionArgs>.op_Implicit connection
+                    args.ContainerId <- Input<string>.op_Implicit container.Id
+                    args.TimeoutSeconds <- Input<int>.op_Implicit (DockerValidation.waitHealthySeconds timeout)
+                    args.SecretEnvironmentKeys <- InputList<string>.op_Implicit secretEnvironmentKeys
+                    let options = ProviderContract.resourceOptionsWithDependencies [ container :> Resource ]
+                    DockerJob(name, args, options) :> Resource
+                DockerDeployment.deploy host engine specification completeJob
             | None -> []
 
         let firewallPackage =

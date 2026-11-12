@@ -9,7 +9,7 @@ open System.Threading.Tasks
 open Pulumi.Experimental
 open Pulumi.Experimental.Provider
 
-module private DockerEngineProviderLogic =
+module internal DockerEngineProviderLogic =
     [<Literal>]
     let ResourceToken = "keroosha:debian:DockerEngine"
 
