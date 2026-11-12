@@ -99,7 +99,7 @@ module DockerJob =
             let mutable exitCode = 0
             if not (Int32.TryParse(waited.Stdout.Trim(), NumberStyles.None, CultureInfo.InvariantCulture, &exitCode)) then
                 fail "Docker job wait returned an invalid exit code."
-            if exitCode <> 0 then jobFailure environment id secretEnvironmentKeys container (sprintf "Docker job exited with code %d; the next apply will retry." exitCode)
+            if exitCode <> 0 then jobFailure environment id secretEnvironmentKeys container ("Docker job exited with code " + string exitCode + "; the next apply will retry.")
         | _ -> jobFailure environment id secretEnvironmentKeys container "Docker job is in an unsupported state."
         match inspect environment id with
         | Some actual when completed actual -> ()

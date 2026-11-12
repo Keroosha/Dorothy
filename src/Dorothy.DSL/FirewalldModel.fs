@@ -50,7 +50,7 @@ module FirewalldModel =
         let first = number range[0]
         let last = number range[range.Length - 1]
         if last < first then invalidArg "ports" "Reversed port range."
-        (if first = last then string first else sprintf "%d-%d" first last) + "/" + parts[1]
+        (if first = last then string first else string first + "-" + string last) + "/" + parts[1]
 
     let validate (c: Configuration) =
         if c.Kind <> "zone" && c.Kind <> "policy" then invalidArg "kind" "Expected zone or policy."
