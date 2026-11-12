@@ -679,8 +679,6 @@ type DockerContainerBuilder internal (name: string) =
             invalidArg "runOnce" "runOnce cannot be combined with restart, healthcheck, or waitHealthy."
         let dependencies = parts |> List.choose (function DockerContainerPart.DependsOn value -> Some value | _ -> None)
         DockerValidation.validateUniqueNames "dependsOn" "dependency" (dependencies |> Seq.map (fun value -> value.Name)) StringComparer.Ordinal
-        if runOnce.IsSome && (parts |> List.exists (function DockerContainerPart.Label("io.dorothy.run-once-timeout", _) -> true | _ -> false)) then
-            invalidArg "label" "The io.dorothy.run-once-timeout label is reserved for Docker jobs."
 
         let image =
             match image with
@@ -951,9 +949,9 @@ module DockerBuilders =
         ((^T or DockerFields) : (static member Image : ^T -> DockerContainerPart) value)
 
     let restart value = DockerContainerPart.Restart value
-    /// Runs a container to successful completion, at most once per container generation.
+    /// Runs to successful completion; a later apply retries a failed attempt, never a successful generation.
     let runOnce timeout = DockerContainerPart.RunOnce timeout
-    /// Waits for the referenced service readiness or job completion before creating this container.
+    /// Waits for service creation (readiness only with waitHealthy) or successful job completion.
     let dependsOn container = DockerContainerPart.DependsOn container
     let noRestart = DockerRestartPolicy.NoRestart
     let always = DockerRestartPolicy.Always

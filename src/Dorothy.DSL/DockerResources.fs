@@ -2,10 +2,12 @@ namespace Dorothy.DSL
 
 open System
 open System.Collections.Generic
+open System.Collections.Immutable
 open System.Globalization
 open System.Security.Cryptography
 open System.Text
 open System.Threading
+open System.Threading.Tasks
 open Pulumi
 open Pulumi.Docker.Inputs
 
@@ -14,6 +16,24 @@ module internal DockerDeployment =
     let private input (value: 'T) : Input<'T> = Input<'T>.op_Implicit value
     let private output (value: Output<'T>) : Input<'T> = Input<'T>.op_Implicit value
     let private strings (values: string list) = InputList<string>.op_Implicit (List.toArray values)
+
+    let private secretEnvironmentKeys (environment: Map<string, DockerStringInput>) =
+        let keys =
+            environment
+            |> Seq.map (fun (KeyValue(key, value)) ->
+                task {
+                    match value with
+                    | LiteralDockerString _ -> return None
+                    | OutputDockerString value ->
+                        // Inspect caller metadata before resolveSecret protects all env inputs in state.
+                        let! secret = Output.IsSecretAsync(value)
+                        return if secret then Some key else None
+                })
+            |> Seq.toArray
+        Output.Create<ImmutableArray<string>>(task {
+            let! keys = Task.WhenAll keys
+            return keys |> Array.choose id |> ImmutableArray.CreateRange
+        })
 
     let private physicalName (host: HostSpec) (name: string) =
         let identity = String.concat "/" [ Deployment.Instance.ProjectName; Deployment.Instance.StackName; host.Name; name ]
@@ -45,7 +65,7 @@ module internal DockerDeployment =
             let minutePart = if hours > 0L || minutes > 0L then minutes.ToString(CultureInfo.InvariantCulture) + "m" else ""
             hourPart + minutePart + seconds + "s"
 
-    let deploy (host: HostSpec) (engine: CustomResource) (specification: DockerSpec) (completeJob: string -> Pulumi.Docker.Container -> TimeSpan -> Resource) =
+    let deploy (host: HostSpec) (engine: CustomResource) (specification: DockerSpec) (completeJob: string -> Pulumi.Docker.Container -> TimeSpan -> Output<ImmutableArray<string>> -> Resource) =
         let endpoint = UriBuilder("ssh", host.Address, host.Port)
         endpoint.UserName <- host.User
         let providerArgs = Pulumi.Docker.ProviderArgs()
@@ -155,11 +175,6 @@ module internal DockerDeployment =
                 label.Label <- input key
                 label.Value <- input value
                 args.Labels.Add(input label)
-            container.RunOnce |> Option.iter (fun timeout ->
-                let label = ContainerLabelArgs()
-                label.Label <- input "io.dorothy.run-once-timeout"
-                label.Value <- input (timeout.Ticks.ToString(CultureInfo.InvariantCulture))
-                args.Labels.Add(input label))
             match container.NetworkMode with
             | Some HostNetwork -> args.NetworkMode <- input "host"
             | None -> args.NetworkMode <- input "bridge"
@@ -231,7 +246,7 @@ module internal DockerDeployment =
             let resource = Pulumi.Docker.Container(host.Name + "-container-" + container.Name, args, resourceOptions)
             let completed =
                 match container.RunOnce with
-                | Some timeout -> completeJob (host.Name + "-container-" + container.Name + "-completion") resource timeout
+                | Some timeout -> completeJob (host.Name + "-container-" + container.Name + "-completion") resource timeout (secretEnvironmentKeys container.Environment)
                 | None -> resource :> Resource
             ready.Add(container.Name, completed)
             containers.Add(completed)

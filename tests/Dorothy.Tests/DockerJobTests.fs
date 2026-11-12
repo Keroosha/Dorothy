@@ -32,6 +32,10 @@ module private DockerJobTestValues =
         let calls = ResizeArray<string * string list * string option>()
         let mutable state = initialStatus
         let mutable actualExitCode = exitCode
+        let mutable nextExitCode = exitCode
+        let mutable waitTimeout = waitTimeout
+        let mutable timeoutSeconds = 1
+        let mutable secretEnvironmentKeys = []
         let mutable exists = true
         let mutable restart = "no"
         let mutable daemonFailure = false
@@ -45,6 +49,11 @@ module private DockerJobTestValues =
             let env = JsonArray()
             env.Add(JsonValue.Create("PASSWORD=fixture-password"))
             env.Add(JsonValue.Create("MULTILINE=first-secret\nsecond-secret"))
+            env.Add(JsonValue.Create("DOTNET_NOLOGO=1"))
+            env.Add(JsonValue.Create("PORT=8080"))
+            env.Add(JsonValue.Create("ENABLED=true"))
+            env.Add(JsonValue.Create("SHORT_PIN=s7"))
+            env.Add(JsonValue.Create("SHORT_LINES=x1\nq2"))
             let config = JsonObject()
             config["Env"] <- if malformedEnvironment then null else env
             let restartNode = JsonObject()
@@ -71,7 +80,10 @@ module private DockerJobTestValues =
             | [ "--signal=KILL"; "30s"; "docker"; "container"; "start"; containerId ] when containerId = id -> state <- "running"; ok (id + "\n")
             | [ "--signal=KILL"; "1s"; "docker"; "container"; "wait"; containerId ] when containerId = id ->
                 if waitTimeout then { ExitCode = 137; Stdout = ""; Stderr = "" }
-                else state <- "exited"; ok (string actualExitCode + "\n")
+                else
+                    state <- "exited"
+                    actualExitCode <- nextExitCode
+                    ok (string actualExitCode + "\n")
             | [ "--signal=KILL"; "30s"; "docker"; "container"; "kill"; containerId ] when containerId = id ->
                 state <- "exited"
                 actualExitCode <- 137
@@ -88,8 +100,12 @@ module private DockerJobTestValues =
         member _.MalformedEnvironment with set value = malformedEnvironment <- value
         member _.LogFailure with set value = logFailure <- value
         member _.Logs with set value = logs <- value
+        member _.NextExitCode with set value = nextExitCode <- value
+        member _.WaitTimeout with set value = waitTimeout <- value
+        member _.TimeoutSeconds with set value = timeoutSeconds <- value
+        member _.SecretEnvironmentKeys with set value = secretEnvironmentKeys <- value
         member _.Run(operation) =
-            use request = JsonDocument.Parse(DockerJobBackend.serializeRequest operation id 1)
+            use request = JsonDocument.Parse(DockerJobBackend.serializeRequest operation id timeoutSeconds secretEnvironmentKeys)
             DockerJob.handle environment request.RootElement
         member _.RunRaw(json: string) =
             use request = JsonDocument.Parse(json)
@@ -121,7 +137,6 @@ type DockerJobTests() =
             fun () -> container "job" { image "image"; runOnce (TimeSpan.FromSeconds 1.); waitHealthy (TimeSpan.FromSeconds 1.) } |> ignore
             fun () -> container "job" { image "image"; runOnce (TimeSpan.FromSeconds 1.); healthcheck { healthExec [ "true" ] } } |> ignore
             fun () -> container "job" { image "image"; runOnce (TimeSpan.FromSeconds 1.); runOnce (TimeSpan.FromSeconds 2.) } |> ignore
-            fun () -> container "job" { image "image"; runOnce (TimeSpan.FromSeconds 1.); label "io.dorothy.run-once-timeout" "1" } |> ignore
         ]
         for action in invalid do Assert.Throws<ArgumentException>(TestDelegate(action)) |> ignore
 
@@ -144,21 +159,27 @@ type DockerJobTests() =
         Assert.That(changed.Diffs, Does.Contain("containerId"))
 
     [<Test>]
-    member _.``Failed jobs report exit and log tail without environment values and never retry implicitly``() =
+    member _.``Failed jobs redact diagnostics and retry once on the next apply but never after success``() =
         use fixture = new DockerJobTestValues.Fixture("created", 42, false)
         let failed = Assert.Throws<DockerJob.BackendError>(TestDelegate(fun () -> fixture.Run("apply") |> ignore))
         Assert.That(failed.Message, Does.Contain("code 42"))
         Assert.That(failed.Message, Does.Contain("useful diagnostic"))
         Assert.That(failed.Message, Does.Not.Contain("fixture-password"))
         Assert.That(failed.Message, Does.Not.Contain("second-secret"))
-        Assert.Throws<DockerJob.BackendError>(TestDelegate(fun () -> fixture.Run("apply") |> ignore)) |> ignore
+        let refreshed = fixture.Run("read")
+        Assert.That(refreshed["completed"].GetValue<bool>(), Is.False)
         Assert.That(fixture.Calls |> Seq.filter (fun (_, args, _) -> List.contains "start" args) |> Seq.length, Is.EqualTo(1))
+        fixture.NextExitCode <- 0
+        let retried = fixture.Run("apply")
+        Assert.That(retried["completed"].GetValue<bool>(), Is.True)
+        fixture.Run("apply") |> ignore
+        Assert.That(fixture.Calls |> Seq.filter (fun (_, args, _) -> List.contains "start" args) |> Seq.length, Is.EqualTo(2))
         for _, args, stdin in fixture.Calls do
             Assert.That(String.concat " " args, Does.Not.Contain("fixture-password"))
             Assert.That(stdin, Is.EqualTo(None))
 
     [<Test>]
-    member _.``Timeout kills job and reports redacted diagnostics``() =
+    member _.``Timeout kills job and a later apply retries it without input replacement``() =
         use fixture = new DockerJobTestValues.Fixture("created", 0, true)
         let failed = Assert.Throws<DockerJob.BackendError>(TestDelegate(fun () -> fixture.Run("apply") |> ignore))
         Assert.That(failed.Message, Does.Contain("timed out"))
@@ -166,6 +187,15 @@ type DockerJobTests() =
         Assert.That(failed.Message, Does.Not.Contain("fixture-password"))
         Assert.That(fixture.Status, Is.EqualTo("exited"))
         Assert.That(fixture.Calls |> Seq.exists (fun (_, args, _) -> List.contains "kill" args), Is.True)
+        let refreshed = fixture.Run("read")
+        Assert.That(refreshed["completed"].GetValue<bool>(), Is.False)
+        Assert.That(fixture.Calls |> Seq.filter (fun (_, args, _) -> List.contains "start" args) |> Seq.length, Is.EqualTo(1))
+        fixture.WaitTimeout <- false
+        fixture.NextExitCode <- 0
+        let retried = fixture.Run("apply")
+        Assert.That(retried["completed"].GetValue<bool>(), Is.True)
+        fixture.Run("apply") |> ignore
+        Assert.That(fixture.Calls |> Seq.filter (fun (_, args, _) -> List.contains "start" args) |> Seq.length, Is.EqualTo(2))
 
     [<Test>]
     member _.``Recovery waits for an already started job rather than starting it twice``() =
@@ -216,9 +246,10 @@ type DockerJobTests() =
     [<Test>]
     member _.``Helper refuses unsafe identity restart and invalid timeout before mutations``() =
         use fixture = new DockerJobTestValues.Fixture("created", 0, false)
-        let invalid = DockerJobBackend.serializeRequest "apply" "--all" 1
+        let invalid = DockerJobBackend.serializeRequest "apply" "--all" 1 []
         Assert.Throws<ArgumentException>(TestDelegate(fun () -> fixture.RunRaw invalid |> ignore)) |> ignore
-        Assert.Throws<ArgumentException>(TestDelegate(fun () -> fixture.RunRaw (DockerJobBackend.serializeRequest "apply" DockerJobTestValues.id 0) |> ignore)) |> ignore
+        Assert.Throws<ArgumentException>(TestDelegate(fun () -> fixture.RunRaw (DockerJobBackend.serializeRequest "apply" DockerJobTestValues.id 0 []) |> ignore)) |> ignore
+        Assert.Throws<ArgumentException>(TestDelegate(fun () -> fixture.RunRaw (DockerJobBackend.serializeRequest "apply" DockerJobTestValues.id 1 [ "bad=key" ]) |> ignore)) |> ignore
         Assert.That(fixture.Calls, Is.Empty)
         fixture.Restart <- "always"
         Assert.Throws<DockerJob.BackendError>(TestDelegate(fun () -> fixture.Run("apply") |> ignore)) |> ignore
@@ -244,3 +275,71 @@ type DockerJobTests() =
         Assert.That(valid.Completed, Is.True)
         for invalid in [ "{}"; "not json"; "{\"exists\":false,\"completed\":true}"; "{\"exists\":true,\"completed\":\"true\"}"; "{\"exists\":true,\"exists\":true,\"completed\":true}" ] do
             Assert.Throws<InvalidOperationException>(TestDelegate(fun () -> DockerJobBackend.parseSnapshot invalid |> ignore)) |> ignore
+
+    [<Test>]
+    member _.``Short public environment values preserve diagnostics while short explicit secrets are always redacted``() =
+        use fixture = new DockerJobTestValues.Fixture("created", 1, false)
+        fixture.SecretEnvironmentKeys <- [ "SHORT_PIN"; "SHORT_LINES" ]
+        fixture.Logs <- "status 1, port 8080, enabled true, pin s7, lines x1 and q2, password fixture-password"
+        let error = Assert.Throws<DockerJob.BackendError>(TestDelegate(fun () -> fixture.Run("apply") |> ignore))
+        Assert.That(error.Message, Does.Contain("status 1, port 8080, enabled true"))
+        Assert.That(error.Message, Does.Contain("pin [redacted], lines [redacted] and [redacted]"))
+        for secret in [ "s7"; "x1"; "q2"; "fixture-password" ] do
+            Assert.That(error.Message, Does.Not.Contain(secret))
+
+    [<Test>]
+    member _.``Diff schedules incomplete jobs for update and does not mutate helper state``() =
+        let inputs = DockerJobTestValues.inputs DockerJobTestValues.id
+        for outputs in [ inputs.SetItem("completed", PropertyValue(false)); inputs ] do
+            let diff = DockerJobTestValues.diff inputs outputs inputs
+            Assert.That(diff.Changes.Value, Is.True)
+            Assert.That(diff.Diffs, Is.EquivalentTo([ "completed" ]))
+            Assert.That(diff.Replaces, Is.Empty)
+            Assert.That(diff.DeleteBeforeReplace, Is.False)
+            Assert.That(diff.DetailedDiff["completed"].Kind, Is.EqualTo(PropertyDiffKind.Update))
+            Assert.That(diff.DetailedDiff["completed"].InputDiff, Is.False)
+
+    [<Test>]
+    member _.``Diff replaces a changed connection before create and updates only the timeout without rerunning success``() =
+        let inputs = DockerJobTestValues.inputs DockerJobTestValues.id
+        let outputs = inputs.SetItem("completed", PropertyValue(true))
+        let moved = inputs.SetItem("connection", PropertyValue(DockerJobTestValues.map [ "address", PropertyValue("192.0.2.2"); "user", PropertyValue("root") ]))
+        let replacement = DockerJobTestValues.diff inputs outputs moved
+        Assert.That(replacement.Replaces, Is.EquivalentTo([ "connection" ]))
+        Assert.That(replacement.DeleteBeforeReplace, Is.True)
+        Assert.That(replacement.DetailedDiff["connection"].Kind, Is.EqualTo(PropertyDiffKind.UpdateReplace))
+        Assert.That(replacement.DetailedDiff["connection"].InputDiff, Is.True)
+
+        let timeoutChange = DockerJobTestValues.diff inputs outputs (inputs.SetItem("timeoutSeconds", PropertyValue(2.0)))
+        Assert.That(timeoutChange.Diffs, Is.EquivalentTo([ "timeoutSeconds" ]))
+        Assert.That(timeoutChange.Replaces, Is.Empty)
+        Assert.That(timeoutChange.DeleteBeforeReplace, Is.False)
+        Assert.That(timeoutChange.DetailedDiff["timeoutSeconds"].Kind, Is.EqualTo(PropertyDiffKind.Update))
+        Assert.That(timeoutChange.DetailedDiff["timeoutSeconds"].InputDiff, Is.True)
+        use fixture = new DockerJobTestValues.Fixture("exited", 0, false)
+        fixture.TimeoutSeconds <- 2
+        let unchanged = fixture.Run("apply")
+        Assert.That(unchanged["completed"].GetValue<bool>(), Is.True)
+        Assert.That(fixture.Calls |> Seq.exists (fun (_, args, _) -> List.contains "start" args || List.contains "wait" args), Is.False)
+
+    [<Test>]
+    member _.``Diff uses stored output inputs and preserves unknown input decisions``() =
+        let inputs = DockerJobTestValues.inputs DockerJobTestValues.id
+        let outputs = inputs.SetItem("completed", PropertyValue(true))
+        let fallback = DockerJobTestValues.diff ImmutableDictionary<string, PropertyValue>.Empty outputs inputs
+        Assert.That(fallback.Changes.Value, Is.False)
+        for oldInputs, newInputs in [
+            inputs.SetItem("containerId", PropertyValue.Computed), inputs
+            inputs, inputs.SetItem("timeoutSeconds", PropertyValue.Computed)
+            inputs, inputs.SetItem("secretEnvironmentKeys", PropertyValue(ImmutableArray.Create(PropertyValue.Computed)))
+        ] do
+            Assert.That((DockerJobTestValues.diff oldInputs outputs newInputs).Changes.HasValue, Is.False)
+
+    [<Test>]
+    member _.``Provider validates secret environment names without exposing their values``() =
+        let provider = DockerJobProvider()
+        let inputs = DockerJobTestValues.inputs DockerJobTestValues.id
+        for invalid in [ PropertyValue("not an array"); PropertyValue(ImmutableArray.Create(PropertyValue("bad=key"))) ] do
+            let request = CheckRequest(DockerJobTestValues.urn, inputs, inputs.SetItem("secretEnvironmentKeys", invalid), ImmutableArray<byte>.Empty)
+            let response = provider.Check(request, CancellationToken.None).GetAwaiter().GetResult()
+            Assert.That(response.Failures |> Seq.map (fun failure -> failure.Property), Is.EquivalentTo([ "secretEnvironmentKeys" ]))

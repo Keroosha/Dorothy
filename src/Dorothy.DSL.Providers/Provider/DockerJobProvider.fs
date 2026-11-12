@@ -10,19 +10,21 @@ open Pulumi.Experimental.Provider
 
 module private DockerJobProviderLogic =
     let token = "keroosha:debian:DockerJob"
-    let inputNames = [ "connection"; "containerId"; "timeoutSeconds" ]
+    let inputNames = [ "connection"; "containerId"; "timeoutSeconds"; "secretEnvironmentKeys" ]
     let schema = """{
   "name": "keroosha", "version": "0.1.0",
   "resources": { "keroosha:debian:DockerJob": {
-    "description": "Starts a stopped Docker container once and waits for exit zero, retaining it for logs until replacement or deletion.",
+    "description": "Runs a stopped Docker container to successful completion, retrying failed attempts on a later apply and retaining it for logs.",
     "inputProperties": {
       "connection": { "$ref": "#/types/keroosha:debian:SshConnection" },
-      "containerId": { "type": "string" }, "timeoutSeconds": { "type": "integer" }
+      "containerId": { "type": "string" }, "timeoutSeconds": { "type": "integer" },
+      "secretEnvironmentKeys": { "type": "array", "items": { "type": "string" }, "default": [] }
     },
     "requiredInputs": ["connection", "containerId", "timeoutSeconds"],
     "properties": {
       "connection": { "$ref": "#/types/keroosha:debian:SshConnection" },
       "containerId": { "type": "string" }, "timeoutSeconds": { "type": "integer" },
+      "secretEnvironmentKeys": { "type": "array", "items": { "type": "string" } },
       "exists": { "type": "boolean" }, "completed": { "type": "boolean" }
     },
     "required": ["connection", "containerId", "timeoutSeconds", "exists", "completed"]
@@ -58,6 +60,20 @@ module private DockerJobProviderLogic =
                         value.TryGetNumber(&number) && number >= 1.0 && number <= 86400.0 && number = Math.Truncate number
                 if valid then result[name] <- value
                 else failures.Add(CheckFailure(name, if name = "containerId" then "Expected a full lowercase hexadecimal container ID." else "Expected an integer timeout between 1 and 86400 seconds."))
+        match values.TryGetValue "secretEnvironmentKeys" with
+        | false, _ -> result["secretEnvironmentKeys"] <- PropertyValue(ImmutableArray<PropertyValue>.Empty)
+        | true, source when source.IsComputed -> unknown <- true; result["secretEnvironmentKeys"] <- source
+        | true, source ->
+            let mutable keys = ImmutableArray<PropertyValue>.Empty
+            if not (source.TryGetArray(&keys)) then
+                failures.Add(CheckFailure("secretEnvironmentKeys", "Expected an array of environment variable names."))
+            else
+                for key in keys do
+                    let mutable text = ""
+                    if key.IsComputed then unknown <- true
+                    elif not (key.TryGetString(&text)) || String.IsNullOrWhiteSpace text || text.Contains('=') || (text |> Seq.exists Char.IsControl) then
+                        failures.Add(CheckFailure("secretEnvironmentKeys", "Expected environment variable names."))
+                result["secretEnvironmentKeys"] <- source
         result, unknown, failures
 
     let checkedInputs values =
@@ -92,7 +108,14 @@ module private DockerJobProviderLogic =
                 let mutable seconds = 0.0
                 inputs["containerId"].TryGetString(&id) |> ignore
                 inputs["timeoutSeconds"].TryGetNumber(&seconds) |> ignore
-                let! snapshot = DockerJobBackend.invoke connection.Connection operation id (int seconds) operationToken
+                let mutable keys = ImmutableArray<PropertyValue>.Empty
+                inputs["secretEnvironmentKeys"].TryGetArray(&keys) |> ignore
+                let secretEnvironmentKeys =
+                    keys |> Seq.map (fun key ->
+                        let mutable name = ""
+                        key.TryGetString(&name) |> ignore
+                        name) |> Seq.toList
+                let! snapshot = DockerJobBackend.invoke connection.Connection operation id (int seconds) secretEnvironmentKeys operationToken
                 return inputs, snapshot
             })
 
