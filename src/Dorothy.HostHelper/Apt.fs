@@ -837,6 +837,9 @@ module Apt =
         let before = readPackageState environment
         let plan = planTransaction effectiveOwned desired before
 
+        if plan.Installs |> List.exists (fun (name, _) -> name = "firewalld") then
+            Firewalld.validatePackageInstall environment
+
         if not (List.isEmpty plan.Installs) then
             updateIndexes environment
 

@@ -13,6 +13,7 @@ module private ProviderSchema =
         lazy
             use aptDocument = JsonDocument.Parse(AptProvider.Schema)
             use ufwDocument = JsonDocument.Parse(UfwProvider.Schema)
+            use firewalldDocument = JsonDocument.Parse(FirewalldProvider.Schema)
             use traefikDocument = JsonDocument.Parse(TraefikProvider.Schema)
             use dockerEngineDocument = JsonDocument.Parse(DockerEngineProvider.Schema)
             use dockerJobDocument = JsonDocument.Parse(DockerJobProvider.Schema)
@@ -23,7 +24,7 @@ module private ProviderSchema =
             use sudoDocument = JsonDocument.Parse(SudoProvider.Schema)
             use stream = new MemoryStream()
             use writer = new Utf8JsonWriter(stream)
-            let documents = [ aptDocument; ufwDocument; traefikDocument; dockerEngineDocument; dockerJobDocument; swapfileDocument; sshdDocument; fail2banDocument; usersDocument; sudoDocument ]
+            let documents = [ aptDocument; ufwDocument; firewalldDocument; traefikDocument; dockerEngineDocument; dockerJobDocument; swapfileDocument; sshdDocument; fail2banDocument; usersDocument; sudoDocument ]
 
             let writeMergedObject (propertyName: string) =
                 writer.WritePropertyName(propertyName)
@@ -51,6 +52,7 @@ type DorothyProvider() =
 
     let apt = AptProvider()
     let ufw = UfwProvider()
+    let firewalld = FirewalldProvider()
     let traefik = TraefikProvider()
     let dockerEngine = DockerEngineProvider()
     let dockerJob = DockerJobProvider()
@@ -76,6 +78,7 @@ type DorothyProvider() =
 
     override _.Check(request: CheckRequest, ct: CancellationToken) =
         if request.Type = UfwProvider.ResourceToken then ufw.Check(request, ct)
+        elif FirewalldProvider.Handles request.Type then firewalld.Check(request, ct)
         elif request.Type = TraefikProvider.ResourceToken then traefik.Check(request, ct)
         elif request.Type = DockerEngineProvider.ResourceToken then dockerEngine.Check(request, ct)
         elif request.Type = DockerJobProvider.ResourceToken then dockerJob.Check(request, ct)
@@ -88,6 +91,7 @@ type DorothyProvider() =
 
     override _.Diff(request: DiffRequest, ct: CancellationToken) =
         if request.Type = UfwProvider.ResourceToken then ufw.Diff(request, ct)
+        elif FirewalldProvider.Handles request.Type then firewalld.Diff(request, ct)
         elif request.Type = TraefikProvider.ResourceToken then traefik.Diff(request, ct)
         elif request.Type = DockerEngineProvider.ResourceToken then dockerEngine.Diff(request, ct)
         elif request.Type = DockerJobProvider.ResourceToken then dockerJob.Diff(request, ct)
@@ -100,6 +104,7 @@ type DorothyProvider() =
 
     override _.Create(request: CreateRequest, ct: CancellationToken) =
         if request.Type = UfwProvider.ResourceToken then ufw.Create(request, ct)
+        elif FirewalldProvider.Handles request.Type then firewalld.Create(request, ct)
         elif request.Type = TraefikProvider.ResourceToken then traefik.Create(request, ct)
         elif request.Type = DockerEngineProvider.ResourceToken then dockerEngine.Create(request, ct)
         elif request.Type = DockerJobProvider.ResourceToken then dockerJob.Create(request, ct)
@@ -112,6 +117,7 @@ type DorothyProvider() =
 
     override _.Read(request: ReadRequest, ct: CancellationToken) =
         if request.Type = UfwProvider.ResourceToken then ufw.Read(request, ct)
+        elif FirewalldProvider.Handles request.Type then firewalld.Read(request, ct)
         elif request.Type = TraefikProvider.ResourceToken then traefik.Read(request, ct)
         elif request.Type = DockerEngineProvider.ResourceToken then dockerEngine.Read(request, ct)
         elif request.Type = DockerJobProvider.ResourceToken then dockerJob.Read(request, ct)
@@ -124,6 +130,7 @@ type DorothyProvider() =
 
     override _.Update(request: UpdateRequest, ct: CancellationToken) =
         if request.Type = UfwProvider.ResourceToken then ufw.Update(request, ct)
+        elif FirewalldProvider.Handles request.Type then firewalld.Update(request, ct)
         elif request.Type = TraefikProvider.ResourceToken then traefik.Update(request, ct)
         elif request.Type = DockerEngineProvider.ResourceToken then dockerEngine.Update(request, ct)
         elif request.Type = DockerJobProvider.ResourceToken then dockerJob.Update(request, ct)
@@ -136,6 +143,7 @@ type DorothyProvider() =
 
     override _.Delete(request: DeleteRequest, ct: CancellationToken) =
         if request.Type = UfwProvider.ResourceToken then ufw.Delete(request, ct)
+        elif FirewalldProvider.Handles request.Type then firewalld.Delete(request, ct)
         elif request.Type = TraefikProvider.ResourceToken then traefik.Delete(request, ct)
         elif request.Type = DockerEngineProvider.ResourceToken then dockerEngine.Delete(request, ct)
         elif request.Type = DockerJobProvider.ResourceToken then dockerJob.Delete(request, ct)

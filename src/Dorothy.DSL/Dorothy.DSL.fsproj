@@ -9,6 +9,8 @@
         <Compile Include="AssemblyInfo.fs" />
         <Compile Include="Quantities.fs" />
         <Compile Include="Ufw.fs" />
+        <Compile Include="FirewalldModel.fs" />
+        <Compile Include="Firewalld.fs" />
         <Compile Include="Certificates.fs" />
         <Compile Include="Traefik.fs" />
         <Compile Include="Docker.fs" />

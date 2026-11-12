@@ -20,6 +20,8 @@
     <Compile Include="NativeCoreTests.fs" />
     <Compile Include="AptTests.fs" />
     <Compile Include="UfwBackendTests.fs" />
+    <Compile Include="FirewalldTests.fs" />
+    <Compile Include="FirewalldDeploymentTests.fs" />
     <Compile Include="TraefikBackendTests.fs" />
     <Compile Include="DslTests.fs" />
     <Compile Include="CertificateTests.fs" />
@@ -38,5 +40,8 @@
     <Compile Include="AccessDslTests.fs" />
     <Compile Include="AccessProviderTests.fs" />
     <Compile Include="PulumiCliTests.fs" />
+  </ItemGroup>
+  <ItemGroup>
+    <None Include="Fixtures/Firewalld/allow-host-ipv6.xml" CopyToOutputDirectory="PreserveNewest" />
   </ItemGroup>
 </Project>
