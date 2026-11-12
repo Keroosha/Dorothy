@@ -1297,6 +1297,9 @@ module internal AccessResourceMappings =
         | SudoArguments.Exact value ->
             args.Kind <- input "exact"
             args.Value <- input value
+        | SudoArguments.Glob pattern ->
+            args.Kind <- input "glob"
+            args.Value <- input pattern
         | SudoArguments.AnyArguments -> args.Kind <- input "any"
         args
 

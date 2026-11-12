@@ -61,6 +61,7 @@ type private SudoSubject =
 type private SudoArguments =
     | NoArguments
     | ExactArguments of string
+    | GlobArguments of string
     | AnyArguments
 
 type private SudoCommand =
@@ -255,6 +256,14 @@ module Sudo =
             fail "Exact sudo arguments must use the supported ASCII sudoers-safe character set."
         value
 
+    let private validateGlobArguments (value: string) =
+        validateExactArguments value |> ignore
+        if not (value.Contains('*') || value.Contains('?')) then
+            fail "Glob sudo arguments must contain * or ?."
+        if value.IndexOfAny([| '['; ']'; '\\' |]) >= 0 then
+            fail "Glob sudo arguments support only * and ? wildcards."
+        value
+
     let private objectProperties (element: JsonElement) (required: Set<string>) (optional: Set<string>) (description: string) =
         if element.ValueKind <> JsonValueKind.Object then fail (description + " must be a JSON object.")
         let properties = element.EnumerateObject() |> Seq.toArray
@@ -326,7 +335,10 @@ module Sudo =
         | "exact" ->
             objectProperties element (set [ "kind"; "value" ]) Set.empty "Exact sudo command settings" |> ignore
             ExactArguments(requiredString element "value" "Exact sudo command arguments" |> validateExactArguments)
-        | _ -> fail "Sudo command argument kind must be none, exact, or any."
+        | "glob" ->
+            objectProperties element (set [ "kind"; "value" ]) Set.empty "Glob sudo command settings" |> ignore
+            GlobArguments(requiredString element "value" "Glob sudo command arguments" |> validateGlobArguments)
+        | _ -> fail "Sudo command argument kind must be none, exact, glob, or any."
 
     let private parseCommand (element: JsonElement) =
         objectProperties element (set [ "path"; "arguments" ]) Set.empty "A sudo command" |> ignore
@@ -367,11 +379,37 @@ module Sudo =
                   match command.Arguments with
                   | NoArguments -> "0"
                   | ExactArguments value -> "1" + value
+                  | GlobArguments value -> "3" + value
                   | AnyArguments -> "2"
               command.Path, arguments) }
 
+    /// Whether two sudoers argument globs (`*` any run, `?` one character, everything else literal)
+    /// can match a common argument string. A literal string is a glob without wildcards.
+    let private globsIntersect (left: string) (right: string) =
+        let visited = HashSet<struct (int * int)>()
+        let pending = Stack<struct (int * int)>()
+        let push i j = if visited.Add(struct (i, j)) then pending.Push(struct (i, j))
+        push 0 0
+        let mutable found = false
+        while not found && pending.Count > 0 do
+            let struct (i, j) = pending.Pop()
+            if i = left.Length && j = right.Length then found <- true
+            else
+                let leftStar = i < left.Length && left[i] = '*'
+                let rightStar = j < right.Length && right[j] = '*'
+                // A star may match nothing.
+                if leftStar then push (i + 1) j
+                if rightStar then push i (j + 1)
+                // A star may absorb one character produced by the other side.
+                if leftStar && j < right.Length && not rightStar then push i (j + 1)
+                if rightStar && i < left.Length && not leftStar then push (i + 1) j
+                // Two single-character positions must agree.
+                if i < left.Length && j < right.Length && not leftStar && not rightStar then
+                    if left[i] = '?' || right[j] = '?' || left[i] = right[j] then push (i + 1) (j + 1)
+        found
+
     let private checkConflictingCommands (grants: SudoGrant list) =
-        let rules = ResizeArray<SudoSubject * SudoRunAs * SudoCommand option>()
+        let rules = ResizeArray<string * SudoSubject * SudoRunAs * SudoCommand option>()
         let runAsOverlaps left right =
             match left, right with
             | AllUsersAndGroups, _
@@ -387,6 +425,11 @@ module Sudo =
             | ExactArguments leftValue, ExactArguments rightValue -> leftValue = rightValue
             | NoArguments, ExactArguments value
             | ExactArguments value, NoArguments -> String.IsNullOrEmpty value
+            | GlobArguments leftPattern, GlobArguments rightPattern -> globsIntersect leftPattern rightPattern
+            | GlobArguments pattern, ExactArguments value
+            | ExactArguments value, GlobArguments pattern -> globsIntersect pattern value
+            | GlobArguments pattern, NoArguments
+            | NoArguments, GlobArguments pattern -> globsIntersect pattern ""
         let commandScopesOverlap left right =
             match left, right with
             | None, _
@@ -399,12 +442,14 @@ module Sudo =
             for subject in grant.Subjects do
                 for command in commands do
                     if rules
-                       |> Seq.exists (fun (existingSubject, existingRunAs, existingCommand) ->
+                       |> Seq.exists (fun (existingGrant, existingSubject, existingRunAs, existingCommand) ->
                            existingSubject = subject
                            && runAsOverlaps existingRunAs grant.RunAs
-                           && commandScopesOverlap existingCommand command) then
+                           // Within one grant overlapping commands share every setting; only exact repeats are errors.
+                           && (if existingGrant = grant.Name then existingCommand = command
+                               else commandScopesOverlap existingCommand command)) then
                         fail "Sudo grants contain duplicate or conflicting command settings for the same subject and overlapping run-as identities."
-                    rules.Add((subject, grant.RunAs, command))
+                    rules.Add((grant.Name, subject, grant.RunAs, command))
     let private parseRequest (request: JsonElement) =
         objectProperties request (set [ "operation"; "resourceId"; "connectionUser"; "grants" ]) Set.empty "The sudo request" |> ignore
         let operation = requiredString request "operation" "Sudo operation"
@@ -438,11 +483,22 @@ module Sudo =
                 builder.Append(character) |> ignore
         builder.ToString()
 
+    /// Same escaping as Exact, except `*` and `?` stay native sudoers wildcards.
+    let private escapeGlobArguments (value: string) =
+        let builder = StringBuilder(value.Length + 16)
+        for index in 0 .. value.Length - 1 do
+            let character = value[index]
+            if character = ',' || character = ':' || character = '=' || (index = 0 && character = '^') then
+                builder.Append('\\') |> ignore
+            builder.Append(character) |> ignore
+        builder.ToString()
+
     let private renderCommand (command: SudoCommand) =
         match command.Arguments with
         | NoArguments -> command.Path + " \"\""
         | AnyArguments -> command.Path
         | ExactArguments value -> command.Path + " " + escapeExactArguments value
+        | GlobArguments value -> command.Path + " " + escapeGlobArguments value
 
     let private renderGrant (grant: SudoGrant) =
         let subjects =
@@ -1157,6 +1213,11 @@ module Sudo =
         | ExactArguments leftValue, ExactArguments rightValue -> leftValue = rightValue
         | NoArguments, ExactArguments value
         | ExactArguments value, NoArguments -> String.IsNullOrEmpty value
+        | GlobArguments leftPattern, GlobArguments rightPattern -> globsIntersect leftPattern rightPattern
+        | GlobArguments pattern, ExactArguments value
+        | ExactArguments value, GlobArguments pattern -> globsIntersect pattern value
+        | GlobArguments pattern, NoArguments
+        | NoArguments, GlobArguments pattern -> globsIntersect pattern ""
 
     let private commandScopesOverlap (leftGrant: SudoGrant) (rightGrant: SudoGrant) =
         if leftGrant.AllCommands || rightGrant.AllCommands then true
@@ -1214,6 +1275,8 @@ module Sudo =
                         match command.Arguments with
                         | NoArguments -> None
                         | ExactArguments value -> Some value
+                        // A concrete instance of the pattern: every wildcard replaced by a probe token.
+                        | GlobArguments value -> Some(value.Replace("*", "probe" + (digest: string).Substring(0, 8)).Replace("?", "p"))
                         | AnyArguments -> Some("keroosha-iac-policy-probe-" + digest)
                     if not (checkOneEffectiveCommand environment stagedDirectory digest subjectName grant.RunAs command.Path argument grant.Authentication)
                        || not (checkFullPolicyScope environment entries digest grant.RunAs grant command) then
