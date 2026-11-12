@@ -1346,6 +1346,11 @@ module Host =
 
         let mainPackages =
             let declared = host.Packages |> Map.remove "ufw" |> Map.remove "firewalld"
+            // Docker's maintainer script can start the daemon. Move even an explicitly
+            // versioned docker.io into the ordered prerequisite when firewalld is declared.
+            let declared =
+                if host.Firewalld.IsSome && host.Docker.IsSome then Map.remove "docker.io" declared
+                else declared
 
             match host.Traefik with
             | Some _ ->
@@ -1361,6 +1366,11 @@ module Host =
             | None -> declared
 
         let mainApt = createAptPackageSet host.Name mainPackages [] false
+        let firewalldPackage =
+            if host.Firewalld.IsSome || Map.containsKey "firewalld" host.Packages then
+                let version = host.Packages |> Map.tryFind "firewalld" |> Option.defaultValue None
+                Some(createAptPackageSet (host.Name + "-firewalld-package") (Map.ofList [ "firewalld", version ]) [ mainApt :> Resource ] false)
+            else None
 
         let fail2banPackages =
             if host.Fail2Ban.IsSome then
@@ -1384,9 +1394,13 @@ module Host =
                 []
 
         let dockerPackage =
-            if host.Docker.IsSome && not (Map.containsKey "docker.io" host.Packages) then
-                // Install the shared Docker group before user access declarations are applied.
-                Some(createAptPackageSet (host.Name + "-docker-package") (Map.ofList [ "docker.io", None ]) [ mainApt :> Resource ] true)
+            if host.Docker.IsSome && (host.Firewalld.IsSome || not (Map.containsKey "docker.io" host.Packages)) then
+                // firewalld must be running before Docker's first startup registers its zone.
+                let version = host.Packages |> Map.tryFind "docker.io" |> Option.defaultValue None
+                let dependencies =
+                    [ mainApt :> Resource ]
+                    @ (firewalldPackage |> Option.map (fun resource -> resource :> Resource) |> Option.toList)
+                Some(createAptPackageSet (host.Name + "-docker-package") (Map.ofList [ "docker.io", version ]) dependencies true)
             else
                 None
         let usersResource =
@@ -1466,7 +1480,7 @@ module Host =
 
 
 
-        let dockerContainers =
+        let dockerEngine, dockerContainers =
             match host.Docker with
             | Some specification ->
                 let packageSet = defaultArg dockerPackage mainApt
@@ -1480,8 +1494,8 @@ module Host =
                         ProviderContract.resourceOptionsWithDependencies [ packageSet :> Resource ]
                     )
 
-                DockerDeployment.deploy host engine specification
-            | None -> []
+                Some(engine :> Resource), DockerDeployment.deploy host engine specification
+            | None -> None, []
 
         let firewallPackage =
             if host.Ufw.IsSome || Map.containsKey "ufw" host.Packages then
@@ -1530,11 +1544,6 @@ module Host =
             | None, _ -> None
             | Some _, None -> invalidOp "A UFW declaration must have its APT prerequisite resource."
 
-        let firewalldPackage =
-            if host.Firewalld.IsSome || Map.containsKey "firewalld" host.Packages then
-                let version = host.Packages |> Map.tryFind "firewalld" |> Option.defaultValue None
-                Some(createAptPackageSet (host.Name + "-firewalld-package") (Map.ofList [ "firewalld", version ]) [ mainApt :> Resource ] false)
-            else None
 
         match host.Firewalld, firewalldPackage with
         | Some firewall, Some packageSet ->
@@ -1553,13 +1562,16 @@ module Host =
                 zones.Add(specification.Name, resource)
                 prior <- resource
             for specification in firewall.Objects |> List.filter (fun value -> value.Kind = "policy") do
+                let referenced = specification.Value.Ingress @ specification.Value.Egress
                 let dependencies =
-                    specification.Value.Ingress @ specification.Value.Egress
+                    referenced
                     |> List.choose (fun name -> match zones.TryGetValue name with true, resource -> Some resource | _ -> None)
-                // Unmanaged zone references are checked by the helper, never adopted.
-                create specification (prior :: dependencies) |> ignore
-        | Some _, None -> invalidOp "A firewalld declaration requires its APT prerequisite."
-        | None, _ -> ()
+                let referencesUnmanagedZone =
+                    referenced |> List.exists (fun name -> name <> "ANY" && name <> "HOST" && not (zones.ContainsKey name))
+                let ownerDependencies = if referencesUnmanagedZone then Option.toList dockerEngine else []
+                // Missing unmanaged references still fail explicitly on hosts without Docker.
+                create specification (prior :: dependencies @ ownerDependencies) |> ignore
+        | _, None | None, _ -> ()
 
         let sshdConfigResource =
             match host.Sshd |> Option.bind (fun specification -> specification.Config) with

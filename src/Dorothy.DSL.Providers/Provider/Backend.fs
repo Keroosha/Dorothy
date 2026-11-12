@@ -574,7 +574,7 @@ module SshTransport =
             let remoteCommand =
                 if connection.User = "root" then
                     sprintf "exec %s %s" remotePath helperCommand
-                elif helperCommand = "sshd" || helperCommand = "firewalld" then
+                elif helperCommand = "sshd" || helperCommand = "firewalld" || helperCommand = "apt" then
                     sprintf "sudo -n -- env SSH_CONNECTION=\"${SSH_CONNECTION-}\" %s %s" remotePath helperCommand
                 else
                     sprintf "sudo -n -- %s %s" remotePath helperCommand

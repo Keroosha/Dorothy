@@ -13,10 +13,10 @@
   <ItemGroup>
     <Compile Include="Common.fs" />
     <Compile Include="Fail2BanCliData.fs" />
-    <Compile Include="Apt.fs" />
-    <Compile Include="Ufw.fs" />
     <Compile Include="../Dorothy.DSL/FirewalldModel.fs" Link="FirewalldModel.fs" />
     <Compile Include="Firewalld.fs" />
+    <Compile Include="Apt.fs" />
+    <Compile Include="Ufw.fs" />
     <Compile Include="Traefik.fs" />
     <Compile Include="DockerEngine.fs" />
     <Compile Include="Swapfile.fs" />

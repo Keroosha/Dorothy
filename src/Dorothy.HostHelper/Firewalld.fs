@@ -99,12 +99,22 @@ module Firewalld =
     let private portAllows port (element: XElement) =
         match attr "protocol" element, attr "port" element with
         | Some "tcp", Some value ->
-            if value = "" then true
+            if value = "" then false
             else
                 let canonical = FirewalldModel.port (value + "/tcp")
                 let range = (canonical.Split('/')[0]).Split('-') |> Array.map int
                 port >= range[0] && port <= range[range.Length - 1]
         | _ -> false
+
+    let private richRuleMayBlockSsh (rule: XElement) =
+        let elements = rule.Descendants() |> Seq.map (fun e -> e.Name.LocalName) |> Set.ofSeq
+        let actions = set [ "accept"; "log"; "audit" ]
+        let understood = Set.union actions (set [ "source"; "destination"; "service"; "port"; "source-port"; "protocol"; "icmp-type"; "limit" ])
+        // Accept/log/audit cannot deny traffic, regardless of selectors or rate limits.
+        // Unknown actions (including mark and forwarding) must not be treated as harmless.
+        if not (Set.isEmpty (Set.intersect elements actions)) && Set.isSubset elements understood then false
+        elif elements.Contains "icmp-type" && Set.isSubset elements (set [ "icmp-type"; "source"; "destination"; "drop"; "reject"; "limit" ]) then false
+        else true
 
     /// Pure guard over the final permanent inventory. Ambiguous source/rich rules fail closed.
     let validateSshGuard
@@ -154,8 +164,33 @@ module Firewalld =
             let outbound = matches "ingress-zone" [ "HOST" ] && matches "egress-zone" [ zoneName; "ANY" ]
             if inbound || outbound then
                 if List.contains (defaultArg (attr "target" policy) "CONTINUE") [ "DROP"; "REJECT" ]
-                   || not (policy.Elements(xn "rule") |> Seq.isEmpty) then
+                   || (policy.Elements(xn "rule") |> Seq.exists richRuleMayBlockSsh) then
                     fail "A host policy may block the current SSH connection; refusing mutation."
+
+    let private validateRuntimeBinding context defaultZone runtimeZone zones policies serviceXml =
+        validateSshGuard context defaultZone zones policies serviceXml
+        let runtimeZone = if String.IsNullOrWhiteSpace runtimeZone || runtimeZone = "no zone" then defaultZone else runtimeZone
+        if not (Map.containsKey runtimeZone zones) then
+            fail "SSH runtime zone is absent from final permanent configuration; reconcile the runtime binding before applying."
+        // Reload can retain runtime/NM bindings. Check that outcome too, without changing it.
+        let runtimeBound =
+            zones |> Map.map (fun name xml ->
+                let root = parseXml "zone" xml
+                root.Elements(xn "interface")
+                |> Seq.filter (fun element -> required "name" element = context.Interface)
+                |> Seq.toArray |> Array.iter (fun element -> element.Remove())
+                if name = runtimeZone then
+                    let element = XElement(xn "interface")
+                    element.SetAttributeValue(xn "name", context.Interface)
+                    root.Add element
+                root.ToString(SaveOptions.DisableFormatting))
+        validateSshGuard context defaultZone runtimeBound policies serviceXml
+
+    let private diagnostic (text: string) =
+        if isNull text then ""
+        else
+            text.Substring(0, min 2048 text.Length)
+            |> String.map (fun c -> if Char.IsControl c then ' ' else c)
 
     let private mode644 = UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.GroupRead ||| UnixFileMode.OtherRead
     let private mode600 = UnixFileMode.UserRead ||| UnixFileMode.UserWrite
@@ -168,7 +203,9 @@ module Firewalld =
 
     let private command (environment: HostEnvironment) executable arguments =
         let result = environment.Run executable arguments None
-        if result.ExitCode <> 0 then fail ("firewalld prerequisite or command failed: " + executable + " " + String.concat " " arguments)
+        if result.ExitCode <> 0 then
+            let detail = if String.IsNullOrWhiteSpace result.Stderr then result.Stdout else result.Stderr
+            fail (sprintf "firewalld command failed: %s %s (exit %d): %s" executable (String.concat " " arguments) result.ExitCode (diagnostic detail))
         result.Stdout.Trim()
 
     let private firewall environment arguments = command environment "firewall-cmd" arguments
@@ -303,7 +340,46 @@ module Firewalld =
         let context = parseSshContext connection route
         let defaultZone = firewall environment [ "--get-default-zone" ]
         let zones, policies = finalInventory environment c proposed
-        validateSshGuard context defaultZone zones policies (effective environment "service")
+        let runtimeZone = firewall environment [ "--get-zone-of-interface=" + context.Interface ]
+        validateRuntimeBinding context defaultZone runtimeZone zones policies (effective environment "service")
+
+    /// APT may start firewalld from its maintainer script, before any zone resource runs.
+    /// Validate that first-start permanent configuration without writing an unowned zone.
+    let validatePackageInstall (environment: HostEnvironment) =
+        let connection = Environment.GetEnvironmentVariable "SSH_CONNECTION"
+        let fields = if isNull connection then [||] else connection.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+        if fields.Length <> 4 then fail "Installing firewalld requires SSH_CONNECTION to guard package-triggered startup."
+        for index in [ 0; 2 ] do
+            match IPAddress.TryParse fields[index] with true, _ -> () | _ -> fail "Invalid SSH_CONNECTION address."
+        let route = command environment "ip" [ "-j"; "route"; "get"; fields[0]; "from"; fields[2] ]
+        let context = parseSshContext connection route
+        let defaults =
+            readFile environment "/etc/firewalld/firewalld.conf"
+            |> Option.map (fun text ->
+                text.Split('\n')
+                |> Array.map (fun line -> line.Trim())
+                |> Array.filter (fun line -> line.StartsWith("DefaultZone=", StringComparison.Ordinal))
+                |> Array.map (fun line -> line.Substring("DefaultZone=".Length).Trim()))
+            |> Option.defaultValue [||]
+        let defaultZone =
+            match defaults with
+            | [||] -> "public"
+            | [| name |] -> FirewalldModel.token "default zone" 17 name
+            | _ -> fail "Ambiguous DefaultZone in firewalld bootstrap configuration."
+        // Debian 13's package default permits SSH on 22, not the provider's configured port.
+        let stockSsh = "<service><port port=\"22\" protocol=\"tcp\"/></service>"
+        let zones = inventory environment "zone"
+        let zones =
+            if Map.containsKey "public" zones then zones
+            else Map.add "public" "<zone><port port=\"22\" protocol=\"tcp\"/></zone>" zones
+        let services name =
+            match effective environment "service" name with
+            | None when name = "ssh" -> Some stockSsh
+            | value -> value
+        try validateSshGuard context defaultZone zones (inventory environment "policy") services
+        with :? BackendError as error ->
+            fail ("Refusing firewalld package startup before zone resources: " + error.Message
+                  + " Pre-seed the permanent default/interface zone to permit the actual SSH server port before installing firewalld.")
 
     let private ensurePrerequisites environment (c: FirewalldModel.Configuration) =
         firewall environment [ "--state" ] |> ignore
@@ -312,7 +388,7 @@ module Firewalld =
         if c.Kind = "policy" then
             for name in c.Ingress @ c.Egress do
                 if name <> "ANY" && name <> "HOST" && (effective environment "zone" name |> Option.isNone) then
-                    fail ("Missing firewalld zone prerequisite: " + name)
+                    fail ("Missing firewalld zone prerequisite: " + name + "; provision its owner first (declare docker in the same host for DockerEngine ordering), or create the permanent zone before applying this policy.")
         else
             for KeyValue(name, xml) in inventory environment "zone" do
                 if name <> c.Name then
@@ -351,7 +427,7 @@ module Firewalld =
             journal["pending"] <- null
             saveJournal environment c journal
 
-    let private transact environment (c: FirewalldModel.Configuration) (journal: JsonObject) desired =
+    let private transact environment (c: FirewalldModel.Configuration) (journal: JsonObject) releaseOnRollback desired =
         let before = readFile environment (objectPath "/etc/firewalld" c.Kind c.Name)
         guardMutation environment c desired
         let pending = JsonObject()
@@ -364,15 +440,17 @@ module Firewalld =
             writeOverride environment c desired
             firewall environment [ "--check-config" ] |> ignore
             firewall environment [ "--reload" ] |> ignore
-        with _ ->
+        with originalError ->
             try
                 writeOverride environment c before
                 firewall environment [ "--reload" ] |> ignore
                 setOptional journal "managed" before
                 journal["pending"] <- null
                 saveJournal environment c journal
-            with _ -> fail "Firewalld apply failed and rollback reload failed; original permanent file restored where possible, journal retained for recovery."
-            fail "Firewalld apply failed; original permanent configuration restored and reloaded."
+            with rollbackError ->
+                fail ("Firewalld apply failed: " + diagnostic originalError.Message + "; rollback failed: " + diagnostic rollbackError.Message + "; journal retained for recovery.")
+            if releaseOnRollback then File.Delete(path environment (journalPath c))
+            fail ("Firewalld apply failed; original permanent configuration restored and reloaded: " + diagnostic originalError.Message)
         setOptional journal "managed" desired
         journal["pending"] <- null
         saveJournal environment c journal
@@ -405,7 +483,7 @@ module Firewalld =
                     |> Option.defaultWith (fun () -> newJournal owner (readFile environment (objectPath "/etc/firewalld" c.Kind c.Name)))
                 recover environment c journal
                 if operation = "apply" then
-                    transact environment c journal (Some(render c))
+                    transact environment c journal existingJournal.IsNone (Some(render c))
                     let result = snapshot environment c (Some journal)
                     if not (result["inSync"].GetValue<bool>()) then fail "Firewalld permanent configuration did not converge."
                     result
@@ -421,7 +499,7 @@ module Firewalld =
                                 // Deleted resource no longer owns any interface: use default-zone fallback.
                                 zone.Elements(xn "interface") |> Seq.toArray |> Array.iter (fun element -> element.Remove())
                                 zone.ToString(SaveOptions.DisableFormatting) + "\n")
-                    transact environment c journal restored
+                    transact environment c journal false restored
                     File.Delete(path environment (journalPath c))
                     JsonObject() :> JsonNode
         else fail "Unsupported firewalld operation."
