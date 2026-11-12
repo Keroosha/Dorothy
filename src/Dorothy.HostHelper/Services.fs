@@ -27,7 +27,7 @@ module Services =
         let configuration = text request "configuration"
         if not managed && configuration <> "" then fail "Package units cannot have a managed configuration."
         let path = HostEnvironment.path environment ("/etc/systemd/system/" + name)
-        Content.ensureSafePath path
+        if managed then Content.ensureSafePath path
         let lockPath = HostEnvironment.path environment "/run/lock/keroosha-iac-services.lock"
         Directory.CreateDirectory(Path.GetDirectoryName lockPath) |> ignore
         use held = HostFiles.lockFile lockPath
@@ -53,7 +53,8 @@ module Services =
                 Directory.CreateDirectory(Path.GetDirectoryName path) |> ignore
                 HostFiles.atomicWrite path (Encoding.UTF8.GetBytes configuration) (enum<UnixFileMode> 0o644)
                 run [ "daemon-reload" ]
-            if not (enabled initial) || fileChanged then run [ "enable"; "--"; name ]
+            if fileChanged then run [ "reenable"; "--"; name ]
+            elif not (enabled initial) then run [ "enable"; "--"; name ]
             let restart = request.GetProperty("restart").GetBoolean()
             if active initial && (fileChanged || restart) then run [ "restart"; "--"; name ]
             elif not (active initial) then run [ "start"; "--"; name ]

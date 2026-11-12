@@ -10,6 +10,11 @@ open System.Text.Json
 open System.Text.Json.Nodes
 open System.Collections.Generic
 open System.Runtime.InteropServices
+open System.Threading
+open System.Runtime.CompilerServices
+
+[<assembly: InternalsVisibleTo("Dorothy.Tests")>]
+do ()
 
 [<Struct; StructLayout(LayoutKind.Sequential, Size = 256)>]
 type private ContentStatx =
@@ -29,13 +34,15 @@ module Content =
     type Target =
         { Path: string
           Source: string
-          Mode: int
+          Mode: int option
           Owner: string option
           Group: string option }
 
     let private fail message = raise (BackendError message)
     [<DllImport("libc", EntryPoint = "statx", SetLastError = true)>]
     extern int private nativeStatx(int directoryFileDescriptor, string path, int flags, uint32 mask, ContentStatx& result)
+    [<DllImport("libc", EntryPoint = "fchown", SetLastError = true)>]
+    extern int private nativeFchown(int fileDescriptor, uint32 owner, uint32 group)
     let private text (node: JsonElement) (name: string) = node.GetProperty(name).GetString()
     let private optionalText (node: JsonElement) (name: string) =
         match node.TryGetProperty name with
@@ -69,8 +76,13 @@ module Content =
         let result =
             request.GetProperty("targets").EnumerateArray()
             |> Seq.map (fun node ->
-                let mode = node.GetProperty("mode").GetInt32()
-                if mode < 0 || mode > 0o7777 then fail "Content mode is outside the Unix permission range."
+                let mode =
+                    match node.TryGetProperty "mode" with
+                    | true, value ->
+                        let mode = value.GetInt32()
+                        if mode < 0 || mode > 0o7777 then fail "Content mode is outside the Unix permission range."
+                        Some mode
+                    | _ -> None
                 let identity name =
                     optionalText node name |> Option.map (fun value ->
                         if String.IsNullOrWhiteSpace value || value.StartsWith('-')
@@ -103,19 +115,27 @@ module Content =
         if result.ExitCode <> 0 then fail "A content filesystem operation failed."
         result.Stdout.Trim()
 
-    let private setMetadata environment (target: Target) path =
+    let private setMetadata environment (target: Target) (path: string) =
+        let mode =
+            target.Mode
+            |> Option.orElseWith (fun () ->
+                if target.Owner.IsSome || target.Group.IsSome then Some(int (File.GetUnixFileMode path))
+                else None)
         match target.Owner, target.Group with
         | None, None -> ()
         | owner, group ->
             let identity = defaultArg owner "" + (group |> Option.map ((+) ":") |> Option.defaultValue "")
             run environment "/usr/bin/chown" [ "--"; identity; path ] |> ignore
         // chown can clear set-id bits, so chmod follows it and both precede rename.
-        File.SetUnixFileMode(path, enum<UnixFileMode> target.Mode)
+        mode |> Option.iter (fun mode -> File.SetUnixFileMode(path, enum<UnixFileMode> mode))
 
     let private metadataMatches environment (target: Target) (path: string) =
-        int (File.GetUnixFileMode path) = target.Mode
-        && (target.Owner |> Option.forall (fun owner -> run environment "/usr/bin/stat" [ "-c"; "%U"; "--"; path ] = owner))
-        && (target.Group |> Option.forall (fun group -> run environment "/usr/bin/stat" [ "-c"; "%G"; "--"; path ] = group))
+        let identityMatches numeric named value =
+            let format = if value |> Seq.forall Char.IsAsciiDigit then numeric else named
+            run environment "/usr/bin/stat" [ "-c"; format; "--"; path ] = value
+        (target.Mode |> Option.forall (fun mode -> int (File.GetUnixFileMode path) = mode))
+        && (target.Owner |> Option.forall (identityMatches "%u" "%U"))
+        && (target.Group |> Option.forall (identityMatches "%g" "%G"))
 
     /// Stage in the destination filesystem, apply metadata, then publish with one rename.
     let stageFile environment target (source: Stream) =
@@ -129,6 +149,14 @@ module Content =
             use output = new FileStream(temporary, options)
             source.CopyTo output
             output.Flush(true)
+            if File.Exists destination && (target.Owner.IsNone || target.Group.IsNone) then
+                let mutable previous = Unchecked.defaultof<ContentStatx>
+                if nativeStatx(-100, destination, 0x100, 0x1u, &previous) <> 0 || previous.Mode &&& 0xF000us <> 0x8000us then
+                    fail "Unable to preserve existing content ownership."
+                let uid = if target.Owner.IsNone then previous.UserId else UInt32.MaxValue
+                let gid = if target.Group.IsNone then previous.GroupId else UInt32.MaxValue
+                if nativeFchown(int (output.SafeFileHandle.DangerousGetHandle()), uid, gid) <> 0 then
+                    fail "Unable to preserve existing content ownership."
             setMetadata environment target temporary
             output.Flush(true)
             temporary, destination
@@ -139,9 +167,62 @@ module Content =
     let private publish createOnly (temporary, destination) =
         ensureSafePath destination
         if createOnly && File.Exists destination then File.Delete temporary
-        else File.Move(temporary, destination, not createOnly)
+        else
+            File.Move(temporary, destination, not createOnly)
+            HostFiles.syncDirectory (Path.GetDirectoryName destination)
 
     let private cacheFile environment digest = HostEnvironment.path environment ("/var/cache/keroosha-iac/content/" + digest)
+
+    /// One deadline covers every redirect, response headers and the complete streamed body.
+    let internal download (client: HttpClient) (timeout: TimeSpan) (request: JsonElement) (destinationPath: string) =
+        task {
+            use deadline = new CancellationTokenSource(timeout)
+            let ct = deadline.Token
+            try
+                let uri = Uri(text request "url")
+                if uri.Scheme <> "https" && uri.Scheme <> "http" then fail "Content downloads require HTTP or HTTPS."
+                if uri.UserInfo <> "" then fail "Content URL credentials must be supplied through headers."
+                use message = new HttpRequestMessage(HttpMethod.Get, uri)
+                match request.TryGetProperty "headers" with
+                | true, headers ->
+                    for header in headers.EnumerateObject() do
+                        let value = header.Value.GetString()
+                        if String.IsNullOrEmpty header.Name || header.Name |> Seq.exists (fun c -> not (Char.IsAsciiLetterOrDigit c || "!#$%&'*+-.^_`|~".Contains c))
+                           || value |> Seq.exists (fun c -> c = '\r' || c = '\n' || c = '\000') then
+                            fail "Invalid download header."
+                        if not (message.Headers.TryAddWithoutValidation(header.Name, value)) then fail "Invalid download header."
+                | _ -> ()
+                let! initial = client.SendAsync(message, HttpCompletionOption.ResponseHeadersRead, ct)
+                let mutable response = initial
+                let mutable currentUri = uri
+                try
+                    let mutable redirects = 0
+                    while int response.StatusCode >= 300 && int response.StatusCode < 400 && redirects < 10 do
+                        let location = response.Headers.Location
+                        if isNull location then fail "Download redirect has no location."
+                        let destination = if location.IsAbsoluteUri then location else Uri(currentUri, location)
+                        if (destination.Scheme <> "https" && destination.Scheme <> "http") || destination.UserInfo <> "" then fail "Invalid download redirect."
+                        if currentUri.Scheme = "https" && destination.Scheme <> "https" then fail "Refusing download TLS downgrade."
+                        response.Dispose()
+                        use redirected = new HttpRequestMessage(HttpMethod.Get, destination)
+                        if destination.GetLeftPart(UriPartial.Authority) = uri.GetLeftPart(UriPartial.Authority) then
+                            for header in message.Headers do redirected.Headers.TryAddWithoutValidation(header.Key, header.Value) |> ignore
+                        let! next = client.SendAsync(redirected, HttpCompletionOption.ResponseHeadersRead, ct)
+                        response <- next
+                        currentUri <- destination
+                        redirects <- redirects + 1
+                    if not response.IsSuccessStatusCode then fail "Content download failed."
+                    use! input = response.Content.ReadAsStreamAsync(ct)
+                    let options = FileStreamOptions(Mode = FileMode.CreateNew, Access = FileAccess.Write, Share = FileShare.None, Options = FileOptions.Asynchronous)
+                    options.UnixCreateMode <- Nullable(enum<UnixFileMode> 0o600)
+                    use output = new FileStream(destinationPath, options)
+                    do! input.CopyToAsync(output, 65536, ct)
+                    output.Flush(true)
+                finally
+                    response.Dispose()
+            with :? OperationCanceledException ->
+                fail "Content download exceeded its connection or total transfer timeout."
+        }
 
     let private acquire environment (request: JsonElement) digest =
         let cached = cacheFile environment digest
@@ -151,49 +232,12 @@ module Content =
             Directory.CreateDirectory(Path.GetDirectoryName cached) |> ignore
             let temporary = cached + "." + Guid.NewGuid().ToString("N")
             try
-                let url = text request "url"
-                let uri = Uri url
-                if uri.Scheme <> "https" && uri.Scheme <> "http" then fail "Content downloads require HTTP or HTTPS."
-                if uri.UserInfo <> "" then fail "Content URL credentials must be supplied through headers."
-                use handler = new HttpClientHandler(AllowAutoRedirect = false)
-                use client = new HttpClient(handler, Timeout = TimeSpan.FromMinutes 15.)
-                use message = new HttpRequestMessage(HttpMethod.Get, uri)
-                match request.TryGetProperty "headers" with
-                | true, headers ->
-                    for header in headers.EnumerateObject() do
-                        let value = header.Value.GetString()
-                        if String.IsNullOrEmpty header.Name || header.Name |> Seq.exists (fun c -> not (Char.IsAsciiLetterOrDigit c || "!#$%&'*+-.^_`|~".Contains c))
-                           || value |> Seq.exists (fun c -> c = '\r' || c = '\n' || c = '\000') then
-                            fail "Invalid download header."
-                        if not (message.Headers.TryAddWithoutValidation(header.Name, header.Value.GetString())) then
-                            fail "Invalid download header."
-                | _ -> ()
-                // Explicit redirects never forward credentials to another origin.
-                let mutable response = client.Send(message, HttpCompletionOption.ResponseHeadersRead)
-                let mutable redirects = 0
-                while int response.StatusCode >= 300 && int response.StatusCode < 400 && redirects < 10 do
-                    let location = response.Headers.Location
-                    if isNull location then fail "Download redirect has no location."
-                    let destination = if location.IsAbsoluteUri then location else Uri(response.RequestMessage.RequestUri, location)
-                    if destination.Scheme <> "https" && destination.Scheme <> "http" then fail "Invalid download redirect."
-                    if uri.Scheme = "https" && destination.Scheme <> "https" then fail "Refusing download TLS downgrade."
-                    response.Dispose()
-                    use redirected = new HttpRequestMessage(HttpMethod.Get, destination)
-                    if destination.GetLeftPart(UriPartial.Authority) = uri.GetLeftPart(UriPartial.Authority) then
-                        for header in message.Headers do redirected.Headers.TryAddWithoutValidation(header.Key, header.Value) |> ignore
-                    response <- client.Send(redirected, HttpCompletionOption.ResponseHeadersRead)
-                    redirects <- redirects + 1
-                use response = response
-                if not response.IsSuccessStatusCode then fail "Content download failed."
-                use input = response.Content.ReadAsStream()
-                let options = FileStreamOptions(Mode = FileMode.CreateNew, Access = FileAccess.Write, Share = FileShare.None)
-                options.UnixCreateMode <- Nullable(enum<UnixFileMode> 0o600)
-                use output = new FileStream(temporary, options)
-                input.CopyTo output
-                output.Flush(true)
-                output.Dispose()
+                use handler = new SocketsHttpHandler(AllowAutoRedirect = false, ConnectTimeout = TimeSpan.FromSeconds 30.)
+                use client = new HttpClient(handler, Timeout = Timeout.InfiniteTimeSpan)
+                download client (TimeSpan.FromMinutes 15.) request temporary |> fun operation -> operation.GetAwaiter().GetResult()
                 if hashFile temporary <> digest then fail "Content SHA-256 verification failed."
                 File.Move(temporary, cached, true)
+                HostFiles.syncDirectory (Path.GetDirectoryName cached)
                 cached
             finally
                 File.Delete temporary
@@ -262,6 +306,7 @@ module Content =
         let createOnly = ownership = "createOnly"
         let items = targets request
         if kind <> "archive" && items.Length <> 1 then fail "Only archives support multiple targets."
+        if kind <> "directory" && items |> List.exists (fun target -> target.Mode.IsNone) then fail "File content requires a mode."
         if kind = "archive" then items |> List.iter (fun target -> validateSource target.Source |> ignore)
         let digest = optionalText request "sha256" |> Option.defaultValue ""
         if kind <> "directory" && not (validHash digest) then fail "Content requires SHA-256."
@@ -288,8 +333,9 @@ module Content =
                             let temporary = path + "." + Guid.NewGuid().ToString("N")
                             try
                                 Directory.CreateDirectory(temporary, enum<UnixFileMode> 0o700) |> ignore
-                                setMetadata environment target temporary
+                                setMetadata environment { target with Mode = Some(defaultArg target.Mode 0o755) } temporary
                                 Directory.Move(temporary, path)
+                                HostFiles.syncDirectory (Path.GetDirectoryName path)
                             finally
                                 if Directory.Exists temporary then Directory.Delete temporary
                 else

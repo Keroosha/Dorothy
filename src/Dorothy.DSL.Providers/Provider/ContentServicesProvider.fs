@@ -9,6 +9,10 @@ open System.Threading.Tasks
 open Pulumi.Experimental
 open Pulumi.Experimental.Provider
 open Dorothy.DSL
+open System.Runtime.CompilerServices
+
+[<assembly: InternalsVisibleTo("Dorothy.Tests")>]
+do ()
 
 module private HostResourceInputs =
     let contentToken = "keroosha:debian:Content"
@@ -90,8 +94,10 @@ module private HostResourceInputs =
                 if String.IsNullOrWhiteSpace path || not (path.StartsWith('/')) || path = "/" || System.IO.Path.GetFullPath path <> path || path.EndsWith('/')
                    || path.Contains("//") || path.Split('/') |> Array.exists (fun part -> part = "." || part = "..") || path |> Seq.exists Char.IsControl
                    || not (paths.Add path) then invalidOp "Content target paths must be distinct canonical absolute paths."
-                let mode = target["mode"].GetValue<int>()
-                if mode < 0 || mode > 0o7777 then invalidOp "Invalid content mode."
+                if not (isNull target["mode"]) then
+                    let mode = target["mode"].GetValue<int>()
+                    if mode < 0 || mode > 0o7777 then invalidOp "Invalid content mode."
+                elif kind <> "directory" then invalidOp "File content requires a mode."
                 for key in [ "owner"; "group" ] do
                     if not (isNull target[key]) then
                         let identity = jsonText target key
@@ -185,9 +191,14 @@ module private HostResourceInputs =
         root["resources"] <- resources
         root.ToJsonString()
 
+type internal ContentServicesBackend =
+    { Content: SshConnection -> string -> string -> string -> string -> CancellationToken -> Task<ContentBackend.Snapshot>
+      Service: SshConnection -> string -> string -> bool -> CancellationToken -> Task<ServiceBackend.Snapshot> }
+
 /// Independent content and service resources share only input/lifecycle plumbing.
-type ContentServicesProvider() =
+type ContentServicesProvider internal (backend: ContentServicesBackend) =
     inherit Pulumi.Experimental.Provider.Provider()
+    new() = ContentServicesProvider({ Content = ContentBackend.invoke; Service = ServiceBackend.invoke })
     static member ContentToken = HostResourceInputs.contentToken
     static member ServiceToken = HostResourceInputs.serviceToken
     static member Schema = HostResourceInputs.schema
@@ -238,10 +249,10 @@ type ContentServicesProvider() =
                 let spec = HostResourceInputs.specification values
                 let id = request.Urn.ToString() + "::" + connection.Address
                 if service then
-                    let! snapshot = ServiceBackend.invoke connection "apply" spec false linked.Token
+                    let! snapshot = backend.Service connection "apply" spec false linked.Token
                     return CreateResponse(Id = id, Outputs = HostResourceInputs.outputs true values snapshot.Exists snapshot.InSync "{}" "{}")
                 else
-                    let! snapshot = ContentBackend.invoke connection "apply" spec (HostResourceInputs.text "payload" "{}" values) "{}" linked.Token
+                    let! snapshot = backend.Content connection "apply" spec (HostResourceInputs.text "payload" "{}" values) "{}" linked.Token
                     return CreateResponse(Id = id, Outputs = HostResourceInputs.outputs false values snapshot.Exists snapshot.InSync snapshot.Hashes snapshot.Hashes)
         }
 
@@ -253,12 +264,12 @@ type ContentServicesProvider() =
             let connection = HostResourceInputs.connection values
             let spec = HostResourceInputs.specification values
             if service then
-                let! snapshot = ServiceBackend.invoke connection "read" spec false ct
+                let! snapshot = backend.Service connection "read" spec false ct
                 // Preserve identity when stopped/missing so drift is repaired as Update rather than seed-replacement.
                 return ReadResponse(Id = request.Id, Inputs = values, Outputs = HostResourceInputs.outputs true values snapshot.Exists snapshot.InSync "{}" "{}")
             else
                 let hashes = HostResourceInputs.hashState request.Outputs
-                let! snapshot = ContentBackend.invoke connection "read" spec "{}" hashes ct
+                let! snapshot = backend.Content connection "read" spec "{}" hashes ct
                 return ReadResponse(Id = request.Id, Inputs = values, Outputs = HostResourceInputs.outputs false values snapshot.Exists snapshot.InSync hashes snapshot.Hashes)
         }
 
@@ -276,7 +287,7 @@ type ContentServicesProvider() =
                 if service then
                     let old = HostResourceInputs.stored true request.OldInputs request.OldOutputs
                     let restart = HostResourceInputs.boolean values["restartOnChange"] && HostResourceInputs.text "triggers" "[]" old <> HostResourceInputs.text "triggers" "[]" values
-                    let! snapshot = ServiceBackend.invoke connection "apply" spec restart linked.Token
+                    let! snapshot = backend.Service connection "apply" spec restart linked.Token
                     return UpdateResponse(Outputs = HostResourceInputs.outputs true values snapshot.Exists snapshot.InSync "{}" "{}")
                 else
                     let hashes = HostResourceInputs.hashState request.OldOutputs
@@ -293,7 +304,7 @@ type ContentServicesProvider() =
                     if keepSeed then
                         return UpdateResponse(Outputs = HostResourceInputs.outputs false values true true hashes hashes)
                     else
-                        let! snapshot = ContentBackend.invoke connection "apply" spec (HostResourceInputs.text "payload" "{}" values) hashes linked.Token
+                        let! snapshot = backend.Content connection "apply" spec (HostResourceInputs.text "payload" "{}" values) hashes linked.Token
                         return UpdateResponse(Outputs = HostResourceInputs.outputs false values snapshot.Exists snapshot.InSync snapshot.Hashes snapshot.Hashes)
         }
 
@@ -306,9 +317,9 @@ type ContentServicesProvider() =
             let connection = HostResourceInputs.connection values
             let spec = HostResourceInputs.specification values
             if service then
-                let! _ = ServiceBackend.invoke connection "delete" spec false linked.Token
+                let! _ = backend.Service connection "delete" spec false linked.Token
                 ()
             elif HostResourceInputs.contentOwnership values <> "createOnly" then
-                let! _ = ContentBackend.invoke connection "delete" spec "{}" "{}" linked.Token
+                let! _ = backend.Content connection "delete" spec "{}" "{}" linked.Token
                 ()
         } :> Task

@@ -17,7 +17,7 @@ type ServiceRestart = No | Always | OnFailure | OnAbnormal | OnAbort | OnWatchdo
 type ContentMetadata = Owner of string | Group of string | Mode of int
 
 type ContentTarget =
-    { Path: string; Source: string; Owner: string option; Group: string option; Mode: int }
+    { Path: string; Source: string; Owner: string option; Group: string option; Mode: int option }
 
 module internal HostContentValidation =
     let line field (value: string) =
@@ -52,7 +52,7 @@ module internal HostContentValidation =
             | Mode value ->
                 if mode.IsSome || value < 0 || value > 0o7777 then invalidArg "mode" "Declare one valid Unix mode."
                 mode <- Some value
-        owner, group, defaultArg mode defaultMode
+        owner, group, Option.orElse defaultMode mode
 
 [<Sealed>]
 type ContentTargetBuilder internal (source: string, path: string) =
@@ -63,7 +63,7 @@ type ContentTargetBuilder internal (source: string, path: string) =
     member _.Delay(body: unit -> ContentMetadata list) = body()
     member _.For(values: seq<'T>, body: 'T -> ContentMetadata list) = values |> Seq.collect body |> Seq.toList
     member _.Run(parts: ContentMetadata list) =
-        let owner, group, mode = HostContentValidation.metadata 0o644 parts
+        let owner, group, mode = HostContentValidation.metadata (Some 0o644) parts
         { Path = HostContentValidation.path path; Source = source; Owner = owner; Group = group; Mode = mode }
 
 type ContentPart =
@@ -146,7 +146,7 @@ type ContentItemBuilder internal (name: string, kind: string) =
         let targets =
             if kind = "directory" then
                 if not targets.IsEmpty then invalidArg "directory" "Use path for a directory."
-                let owner, group, mode = HostContentValidation.metadata 0o755 metadata
+                let owner, group, mode = HostContentValidation.metadata None metadata
                 [ { Path = HostContentValidation.path (path |> Option.defaultWith (fun () -> invalidArg "path" "Directory path is required.")); Source = ""; Owner = owner; Group = group; Mode = mode } ]
             else
                 if path.IsSome || not metadata.IsEmpty then invalidArg "content" "Place file metadata inside installTo or extract."

@@ -95,7 +95,7 @@ type ContentServicesBackendTests() =
     [<Test>]
     member _.``Atomic staging keeps previous bytes until publish and sets final permissions before rename``() =
         use root = new TemporaryDirectory("dorothy-atomic-")
-        let target: Content.Target = { Path = "/target"; Source = ""; Mode = 0o640; Owner = None; Group = None }
+        let target: Content.Target = { Path = "/target"; Source = ""; Mode = Some 0o640; Owner = None; Group = None }
         let path = Path.Combine(root.Path, "target")
         File.WriteAllText(path, "old")
         use input = new MemoryStream(bytes "new")
@@ -212,7 +212,7 @@ type ContentServicesBackendTests() =
             Assert.That(stdin.IsNone, Is.True)
             calls.Add arguments
             match arguments.Head with
-            | "enable" -> enabled <- true
+            | "enable" | "reenable" -> enabled <- true
             | "disable" -> enabled <- false
             | "start" | "restart" -> active <- true
             | "stop" -> active <- false
@@ -313,3 +313,94 @@ type ContentServicesBackendTests() =
         desired["operation"] <- JsonValue.Create "read"
         desired["targets"].[0].["owner"] <- JsonValue.Create "nonexistent-owner"
         Assert.That(boolean (invoke root.Path desired) "inSync", Is.False)
+
+    [<Test>]
+    member _.``Managed directory without mode preserves adopted permissions and ignores mode drift``() =
+        use root = new TemporaryDirectory("dorothy-directory-adopt-")
+        let path = Path.Combine(root.Path, "private")
+        Directory.CreateDirectory(path, enum<UnixFileMode> 0o700) |> ignore
+        let desired = request "apply" "directory" "managed" "/private" [||]
+        desired["targets"].[0].AsObject().Remove "mode" |> ignore
+        Assert.That(boolean (invoke root.Path desired) "inSync", Is.True)
+        Assert.That(int (File.GetUnixFileMode path), Is.EqualTo 0o700)
+        desired["operation"] <- JsonValue.Create "read"
+        File.SetUnixFileMode(path, enum<UnixFileMode> 0o750)
+        Assert.That(boolean (invoke root.Path desired) "inSync", Is.True)
+        desired["targets"].[0].["mode"] <- JsonValue.Create 0o700
+        Assert.That(boolean (invoke root.Path desired) "inSync", Is.False)
+        desired["operation"] <- JsonValue.Create "apply"
+        invoke root.Path desired |> ignore
+        Assert.That(int (File.GetUnixFileMode path), Is.EqualTo 0o700)
+        desired["targets"].[0].AsObject().Remove "mode" |> ignore
+        Directory.Delete path
+        invoke root.Path desired |> ignore
+        Assert.That(int (File.GetUnixFileMode path), Is.EqualTo 0o755)
+
+    [<TestCase(false)>]
+    [<TestCase(true)>]
+    member _.``File replacement retains omitted ownership and accepts numeric identities``(numeric: bool) =
+        use root = new TemporaryDirectory("dorothy-ownership-preserve-")
+        let path = Path.Combine(root.Path, "owned")
+        File.WriteAllText(path, "old")
+        let stat format = (HostEnvironment.system.Run "/usr/bin/stat" [ "-c"; format; "--"; path ] None).Stdout.Trim()
+        let previous = stat "%u:%g"
+        let desired = request "apply" "text" "managed" "/owned" (bytes "replacement")
+        if numeric then
+            desired["targets"].[0].["owner"] <- JsonValue.Create(stat "%u")
+            desired["targets"].[0].["group"] <- JsonValue.Create(stat "%g")
+        Assert.That(boolean (invoke root.Path desired) "inSync", Is.True)
+        Assert.That(File.ReadAllText path, Is.EqualTo "replacement")
+        Assert.That(stat "%u:%g", Is.EqualTo previous)
+        desired["operation"] <- JsonValue.Create "read"
+        Assert.That(boolean (invoke root.Path desired) "inSync", Is.True)
+
+    [<Test>]
+    member _.``Changing WantedBy reenables the unit and removes the old target link``() =
+        use root = new TemporaryDirectory("dorothy-unit-links-")
+        let unitDirectory = Path.Combine(root.Path, "etc/systemd/system")
+        Directory.CreateDirectory unitDirectory |> ignore
+        for target in [ "multi-user.target"; "graphical.target" ] do
+            File.WriteAllText(Path.Combine(unitDirectory, target), "[Unit]\nDescription=Local test target\n")
+        let run executable (arguments: string list) stdin =
+            match arguments.Head with
+            | "enable" | "reenable" | "disable" ->
+                HostEnvironment.system.Run executable ([ "--root"; root.Path ] @ arguments) stdin
+            | _ ->
+                { ExitCode = 0; Stderr = ""
+                  Stdout = "LoadState=loaded\nActiveState=active\nUnitFileState=enabled\n" }
+        let environment = TestSupport.fakeHostEnvironment root.Path run (fun () -> DateTimeOffset.UnixEpoch)
+        let invoke target =
+            let request = JsonObject()
+            request["operation"] <- JsonValue.Create "apply"
+            request["name"] <- JsonValue.Create "example"
+            request["managed"] <- JsonValue.Create true
+            request["restart"] <- JsonValue.Create false
+            request["configuration"] <- JsonValue.Create("[Service]\nExecStart=/bin/true\n[Install]\nWantedBy=" + target + "\n")
+            use document = JsonDocument.Parse(request.ToJsonString())
+            Services.handle environment document.RootElement |> ignore
+        invoke "multi-user.target"
+        let first = Path.Combine(unitDirectory, "multi-user.target.wants/example.service")
+        let second = Path.Combine(unitDirectory, "graphical.target.wants/example.service")
+        Assert.That(FileInfo(first).LinkTarget, Is.Not.Null)
+        invoke "graphical.target"
+        Assert.That(FileInfo(first).LinkTarget, Is.Null)
+        Assert.That(FileInfo(second).LinkTarget, Is.Not.Null)
+
+    [<TestCase("ssh.service")>]
+    [<TestCase("/dev/null")>]
+    member _.``Package units do not inspect or remove alias and mask symlinks``(target: string) =
+        use root = new TemporaryDirectory("dorothy-vendor-link-")
+        let directory = Path.Combine(root.Path, "etc/systemd/system")
+        Directory.CreateDirectory directory |> ignore
+        let path = Path.Combine(directory, "vendor.service")
+        File.CreateSymbolicLink(path, target) |> ignore
+        let calls = ResizeArray<string list>()
+        let run _ arguments _ =
+            calls.Add arguments
+            { ExitCode = 0; Stderr = ""; Stdout = "LoadState=loaded\nActiveState=inactive\nUnitFileState=disabled\n" }
+        let environment = TestSupport.fakeHostEnvironment root.Path run (fun () -> DateTimeOffset.UnixEpoch)
+        for operation in [ "read"; "delete" ] do
+            use document = JsonDocument.Parse(sprintf """{"operation":"%s","name":"vendor","managed":false,"configuration":"","restart":false}""" operation)
+            Services.handle environment document.RootElement |> ignore
+        Assert.That(FileInfo(path).LinkTarget, Is.EqualTo target)
+        Assert.That(calls |> Seq.exists (fun arguments -> arguments.Head = "disable"), Is.True)

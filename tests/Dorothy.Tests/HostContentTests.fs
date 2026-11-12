@@ -1,6 +1,8 @@
 namespace Dorothy.Tests
 
 open System
+open System.IO
+open System.Text.Json
 open System.Collections.Immutable
 open System.Text.Json.Nodes
 open System.Threading
@@ -21,8 +23,8 @@ module private HostContentTestValues =
     let inputs item =
         let spec, payload = HostContentInputs.resolve item
         map [ "connection", PropertyValue(map [ "address", PropertyValue "192.0.2.1"; "user", PropertyValue "operator" ])
-              "specification", PropertyValue(resolve spec)
-              "payload", PropertyValue(resolve payload) ]
+              "specification", PropertyValue(resolve spec).WithSecret(Output.IsSecretAsync(spec).GetAwaiter().GetResult())
+              "payload", PropertyValue(resolve payload).WithSecret(Output.IsSecretAsync(payload).GetAwaiter().GetResult()) ]
     let urn token = Urn("urn:pulumi:test::test::" + token + "::example")
     let check token inputs =
         DorothyProvider().Check(CheckRequest(urn token, ImmutableDictionary.Empty, inputs, ImmutableArray<byte>.Empty), CancellationToken.None).GetAwaiter().GetResult()
@@ -32,6 +34,25 @@ module private HostContentTestValues =
         let mutable text = ""
         if not (value.TryGetString(&text)) then failwith "Expected string."
         text
+    let localProvider root run =
+        let environment = { Dorothy.HostHelper.HostEnvironment.system with Root = root; Run = run }
+        let backend: ContentServicesBackend =
+            { Content = fun _ operation spec payload hashes _ ->
+                use request = JsonDocument.Parse(ContentBackend.payload operation spec payload hashes)
+                let result = Dorothy.HostHelper.Content.handle environment request.RootElement
+                Task.FromResult<ContentBackend.Snapshot>(
+                    { Exists = result["exists"].GetValue<bool>()
+                      InSync = result["inSync"].GetValue<bool>()
+                      Hashes = result["hashes"].ToJsonString() })
+              Service = fun _ operation spec restart _ ->
+                use request = JsonDocument.Parse(ServiceBackend.payload operation spec restart)
+                let result = Dorothy.HostHelper.Services.handle environment request.RootElement
+                Task.FromResult<ServiceBackend.Snapshot>(
+                    { Exists = result["exists"].GetValue<bool>()
+                      InSync = result["inSync"].GetValue<bool>()
+                      Active = result["active"].GetValue<bool>()
+                      Enabled = result["enabled"].GetValue<bool>() }) }
+        ContentServicesProvider(backend)
 
 [<Sealed>]
 type private ContentMocks() =
@@ -159,3 +180,74 @@ type HostContentTests() =
         Assert.That(unbox<string> app.Inputs["triggers"], Does.Contain "managed-digest")
         Assert.That(unbox<string> app.Inputs["triggers"], Does.Not.Contain "seed-digest")
         Assert.That(unbox<string> wg.Inputs["triggers"], Is.EqualTo "[]")
+
+    [<Test>]
+    member _.``Directory mode remains optional through DSL mapping and provider Check``() =
+        let item = directory "private" { path "/etc/private" }
+        Assert.That(item.Targets.Head.Mode.IsNone, Is.True)
+        let inputs = HostContentTestValues.inputs item
+        let specification = JsonNode.Parse(HostContentTestValues.stringValue inputs["specification"])
+        Assert.That(specification["targets"].[0].AsObject().ContainsKey "mode", Is.False)
+        Assert.That((HostContentTestValues.check ContentServicesProvider.ContentToken inputs).Failures, Is.Empty)
+
+    [<Test>]
+    member _.``Secret text keeps specification and provider content fingerprints secret``() =
+        use root = new TemporaryDirectory("dorothy-secret-content-")
+        let item = text "private" { value (Output.CreateSecret "private seed"); installTo "/etc/private" { mode 0o600 } }
+        let spec, payload = HostContentInputs.resolve item
+        Assert.That(Output.IsSecretAsync(spec).GetAwaiter().GetResult(), Is.True)
+        Assert.That(Output.IsSecretAsync(payload).GetAwaiter().GetResult(), Is.True)
+        let inputs = HostContentTestValues.inputs item
+        let provider = HostContentTestValues.localProvider root.Path Dorothy.HostHelper.HostEnvironment.system.Run
+        let created = provider.Create(CreateRequest(HostContentTestValues.urn ContentServicesProvider.ContentToken, inputs, TimeSpan.FromSeconds 5., false), CancellationToken.None).GetAwaiter().GetResult()
+        for key in [ "specification"; "hashes"; "actualHashes"; "fingerprint" ] do
+            Assert.That(created.Outputs[key].IsSecret, Is.True, key)
+        Assert.That(created.Outputs.ContainsKey "payload", Is.False)
+        Assert.That(File.ReadAllText(Path.Combine(root.Path, "etc/private")), Is.EqualTo "private seed")
+
+    [<TestCase(true, true, false)>]
+    [<TestCase(true, false, false)>]
+    [<TestCase(false, true, false)>]
+    [<TestCase(true, true, true)>]
+    [<TestCase(true, false, true)>]
+    [<TestCase(false, true, true)>]
+    member _.``Provider Update restarts only changed enabled triggers including secret values``(changed: bool, restartEnabled: bool, secret: bool) =
+        use root = new TemporaryDirectory("dorothy-provider-restart-")
+        let calls = ResizeArray<string list>()
+        let run _ arguments _ : Dorothy.HostHelper.CommandResult =
+            calls.Add arguments
+            { ExitCode = 0; Stderr = ""
+              Stdout = "LoadState=loaded\nActiveState=active\nUnitFileState=enabled\n" }
+        let provider = HostContentTestValues.localProvider root.Path run
+        let specification = service "app" { exec "/bin/true" } |> HostContentInputs.service
+        let make trigger =
+            HostContentTestValues.map [
+                "connection", PropertyValue(HostContentTestValues.map [ "address", PropertyValue "192.0.2.1"; "user", PropertyValue "operator" ])
+                "specification", PropertyValue specification
+                "triggers", PropertyValue(trigger: string).WithSecret(secret)
+                "restartOnChange", PropertyValue restartEnabled ]
+        let before = make "[\"old\"]"
+        let after = make (if changed then "[\"new\"]" else "[\"old\"]")
+        let urn = HostContentTestValues.urn ContentServicesProvider.ServiceToken
+        let created = provider.Create(CreateRequest(urn, before, TimeSpan.FromSeconds 5., false), CancellationToken.None).GetAwaiter().GetResult()
+        calls.Clear()
+        let outputs = ImmutableDictionary.CreateRange<string, PropertyValue>(created.Outputs)
+        let diff = provider.Diff(DiffRequest(urn, created.Id, outputs, after, ImmutableArray<string>.Empty, before), CancellationToken.None).GetAwaiter().GetResult()
+        Assert.That(diff.Changes.Value, Is.EqualTo changed)
+        let update = UpdateRequest(urn, created.Id, outputs, after, TimeSpan.FromSeconds 5., ImmutableArray<string>.Empty, false, before)
+        provider.Update(update, CancellationToken.None).GetAwaiter().GetResult() |> ignore
+        Assert.That(calls |> Seq.exists (fun arguments -> arguments.Head = "restart"), Is.EqualTo(changed && restartEnabled))
+
+    [<Test>]
+    member _.``CreateOnly Delete never invokes a backend and retains edited seed``() =
+        use root = new TemporaryDirectory("dorothy-provider-retain-")
+        let seed = text "seed" { value "first"; installTo "/seed"; ownership ContentOwnership.CreateOnly }
+        let inputs = HostContentTestValues.inputs seed
+        File.WriteAllText(Path.Combine(root.Path, "seed"), "runtime")
+        let backend: ContentServicesBackend =
+            { Content = fun _ _ _ _ _ _ -> failwith "CreateOnly Delete must not contact the content backend."
+              Service = fun _ _ _ _ _ -> failwith "CreateOnly Delete must not contact the service backend." }
+        let provider = ContentServicesProvider(backend)
+        let request = DeleteRequest(HostContentTestValues.urn ContentServicesProvider.ContentToken, "existing", inputs.Remove "payload", TimeSpan.FromSeconds 5., inputs)
+        provider.Delete(request, CancellationToken.None).GetAwaiter().GetResult()
+        Assert.That(File.ReadAllText(Path.Combine(root.Path, "seed")), Is.EqualTo "runtime")

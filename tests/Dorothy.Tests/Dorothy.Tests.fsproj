@@ -22,6 +22,7 @@
     <Compile Include="UfwBackendTests.fs" />
     <Compile Include="TraefikBackendTests.fs" />
     <Compile Include="ContentServicesBackendTests.fs" />
+    <Compile Include="ContentDownloadTests.fs" />
     <Compile Include="HostContentTests.fs" />
     <Compile Include="DslTests.fs" />
     <Compile Include="CertificateTests.fs" />

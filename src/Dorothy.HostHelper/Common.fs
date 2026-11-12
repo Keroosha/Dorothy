@@ -160,7 +160,7 @@ module HostFiles =
         | Some _ -> raise (IOException("Refusing to replace non-regular filesystem object '" + path + "'."))
         | None -> ()
 
-    let private syncDirectory (path: string) =
+    let internal syncDirectory (path: string) =
         // Linux flags: O_RDONLY | O_DIRECTORY | O_CLOEXEC | O_NOFOLLOW.
         let descriptor = nativeOpen(path, 0x10000 ||| 0x80000 ||| 0x20000, 0)
 

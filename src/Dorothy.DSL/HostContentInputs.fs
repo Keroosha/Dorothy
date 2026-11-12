@@ -50,7 +50,7 @@ module HostContentInputs =
                     let entry = JsonObject()
                     entry["path"] <- JsonValue.Create target.Path
                     entry["source"] <- JsonValue.Create target.Source
-                    entry["mode"] <- JsonValue.Create target.Mode
+                    target.Mode |> Option.iter (fun value -> entry["mode"] <- JsonValue.Create value)
                     target.Owner |> Option.iter (fun value -> entry["owner"] <- JsonValue.Create value)
                     target.Group |> Option.iter (fun value -> entry["group"] <- JsonValue.Create value)
                     targets.Add entry
