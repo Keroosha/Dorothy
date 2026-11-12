@@ -2,10 +2,12 @@ namespace Dorothy.DSL
 
 open System
 open System.Collections.Generic
+open System.Collections.Immutable
 open System.Globalization
 open System.Security.Cryptography
 open System.Text
 open System.Threading
+open System.Threading.Tasks
 open Pulumi
 open Pulumi.Docker.Inputs
 
@@ -14,6 +16,24 @@ module internal DockerDeployment =
     let private input (value: 'T) : Input<'T> = Input<'T>.op_Implicit value
     let private output (value: Output<'T>) : Input<'T> = Input<'T>.op_Implicit value
     let private strings (values: string list) = InputList<string>.op_Implicit (List.toArray values)
+
+    let private secretEnvironmentKeys (environment: Map<string, DockerStringInput>) =
+        let keys =
+            environment
+            |> Seq.map (fun (KeyValue(key, value)) ->
+                task {
+                    match value with
+                    | LiteralDockerString _ -> return None
+                    | OutputDockerString value ->
+                        // Inspect caller metadata before resolveSecret protects all env inputs in state.
+                        let! secret = Output.IsSecretAsync(value)
+                        return if secret then Some key else None
+                })
+            |> Seq.toArray
+        Output.Create<ImmutableArray<string>>(task {
+            let! keys = Task.WhenAll keys
+            return keys |> Array.choose id |> ImmutableArray.CreateRange
+        })
 
     let private physicalName (host: HostSpec) (name: string) =
         let identity = String.concat "/" [ Deployment.Instance.ProjectName; Deployment.Instance.StackName; host.Name; name ]
@@ -45,7 +65,7 @@ module internal DockerDeployment =
             let minutePart = if hours > 0L || minutes > 0L then minutes.ToString(CultureInfo.InvariantCulture) + "m" else ""
             hourPart + minutePart + seconds + "s"
 
-    let deploy (host: HostSpec) (engine: CustomResource) (specification: DockerSpec) =
+    let deploy (host: HostSpec) (engine: CustomResource) (specification: DockerSpec) (completeJob: string -> Pulumi.Docker.Container -> TimeSpan -> Output<ImmutableArray<string>> -> Resource) =
         let endpoint = UriBuilder("ssh", host.Address, host.Port)
         endpoint.UserName <- host.User
         let providerArgs = Pulumi.Docker.ProviderArgs()
@@ -117,6 +137,7 @@ module internal DockerDeployment =
             volumes.Add(volume.Name, Pulumi.Docker.Volume(host.Name + "-volume-" + volume.Name, args, resourceOptions))
 
         let containers = ResizeArray<Resource>()
+        let ready = Dictionary<string, Resource>(StringComparer.Ordinal)
         for container in specification.Containers do
             let imageArgs = Pulumi.Docker.RemoteImageArgs()
             imageArgs.Name <- output (DockerStringInput.resolveRequired "image reference" container.Image)
@@ -126,8 +147,9 @@ module internal DockerDeployment =
             let args = Pulumi.Docker.ContainerArgs()
             args.Name <- input (physicalName host container.Name)
             args.Image <- output image.ImageId
-            args.MustRun <- input true
-            args.Start <- input true
+            // Jobs are created stopped: only the native completion resource may start them.
+            args.MustRun <- input container.RunOnce.IsNone
+            args.Start <- input container.RunOnce.IsNone
             args.Rm <- input false
             args.RemoveVolumes <- input false
             args.DestroyGraceSeconds <- input 10
@@ -147,7 +169,7 @@ module internal DockerDeployment =
             container.ReadOnlyRootFilesystem |> Option.iter (fun value -> args.ReadOnly <- input value)
             container.Init |> Option.iter (fun value -> args.Init <- input value)
             for KeyValue(key, value) in container.Environment do
-                args.Envs.Add(output ((DockerStringInput.resolve value).Apply(Func<string, string>(fun text -> key + "=" + text))))
+                args.Envs.Add(output ((DockerStringInput.resolveSecret value).Apply(Func<string, string>(fun text -> key + "=" + text))))
             for KeyValue(key, value) in container.Labels do
                 let label = ContainerLabelArgs()
                 label.Label <- input key
@@ -213,8 +235,19 @@ module internal DockerDeployment =
                 value.ContentBase64 <- output (DockerContent.resolve CancellationToken.None file.Content file.Secret)
                 args.Uploads.Add(input value)
             let resourceOptions = options ()
+            resourceOptions.DependsOn <-
+                InputList<Resource>.op_Implicit
+                    (Array.ofList ((engine :> Resource) :: (container.Dependencies |> List.map (fun dependency -> ready[dependency.Name]))))
+            // Even Docker's normally mutable inputs describe a new job generation.
+            if container.RunOnce.IsSome then resourceOptions.ReplaceOnChanges <- List<string>([ "*" ])
             // Fixed names and published ports cannot coexist during a replacement.
             resourceOptions.DeleteBeforeReplace <- Nullable true
             resourceOptions.AdditionalSecretOutputs <- List<string>([| "envs"; "uploads" |])
-            containers.Add(Pulumi.Docker.Container(host.Name + "-container-" + container.Name, args, resourceOptions))
+            let resource = Pulumi.Docker.Container(host.Name + "-container-" + container.Name, args, resourceOptions)
+            let completed =
+                match container.RunOnce with
+                | Some timeout -> completeJob (host.Name + "-container-" + container.Name + "-completion") resource timeout (secretEnvironmentKeys container.Environment)
+                | None -> resource :> Resource
+            ready.Add(container.Name, completed)
+            containers.Add(completed)
         List.ofSeq containers

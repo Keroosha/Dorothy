@@ -230,7 +230,9 @@ type DockerContainerSpec internal (
     publishedPorts: DockerPublishedPort list,
     healthcheck: DockerHealthcheckSpec option,
     waitHealthy: TimeSpan option,
-    files: DockerFileSpec list
+    files: DockerFileSpec list,
+    runOnce: TimeSpan option,
+    dependencies: DockerContainerSpec list
 ) =
     member _.Name = name
     member _.Image = image
@@ -252,6 +254,8 @@ type DockerContainerSpec internal (
     member _.Healthcheck = healthcheck
     member _.WaitHealthy = waitHealthy
     member _.Files = files
+    member _.RunOnce = runOnce
+    member _.Dependencies = dependencies
 
 type DockerSpec internal (
     networks: DockerNetworkSpec list,
@@ -326,6 +330,8 @@ type DockerContainerPart =
     | Healthcheck of DockerHealthcheckSpec
     | WaitHealthy of TimeSpan
     | File of DockerFileSpec
+    | RunOnce of TimeSpan
+    | DependsOn of DockerContainerSpec
 
 [<RequireQualifiedAccess>]
 type DockerDeclaration =
@@ -665,6 +671,14 @@ type DockerContainerBuilder internal (name: string) =
         let networkMode = select "networkMode" (function DockerContainerPart.NetworkMode value -> Some value | _ -> None)
         let healthcheck = select "healthcheck" (function DockerContainerPart.Healthcheck value -> Some value | _ -> None)
         let waitHealthy = select "waitHealthy" (function DockerContainerPart.WaitHealthy value -> Some value | _ -> None)
+        let runOnce = select "runOnce" (function DockerContainerPart.RunOnce value -> Some value | _ -> None)
+        runOnce |> Option.iter (fun value ->
+            if value <= TimeSpan.Zero || value > TimeSpan.FromDays(1.0) then
+                invalidArg "runOnce" "A Docker job timeout must be positive and at most one day.")
+        if runOnce.IsSome && (restart.IsSome || healthcheck.IsSome || waitHealthy.IsSome) then
+            invalidArg "runOnce" "runOnce cannot be combined with restart, healthcheck, or waitHealthy."
+        let dependencies = parts |> List.choose (function DockerContainerPart.DependsOn value -> Some value | _ -> None)
+        DockerValidation.validateUniqueNames "dependsOn" "dependency" (dependencies |> Seq.map (fun value -> value.Name)) StringComparer.Ordinal
 
         let image =
             match image with
@@ -680,6 +694,7 @@ type DockerContainerBuilder internal (name: string) =
                 retries |> Option.iter (fun value -> DockerValidation.validatePositiveRetries "restart" "on-failure retry count" value |> ignore)
                 OnFailure retries
             | Some value -> value
+            | None when runOnce.IsSome -> NoRestart
             | None -> invalidArg "container" "A Docker service container requires an explicit restart policy."
 
         let cpu =
@@ -802,7 +817,9 @@ type DockerContainerBuilder internal (name: string) =
             publishedPorts,
             healthcheck,
             waitHealthy,
-            files
+            files,
+            runOnce,
+            dependencies
         )
 
 [<Sealed>]
@@ -855,10 +872,26 @@ type DockerBuilder() =
                     invalidArg "docker" (sprintf "Container '%s' references a managed volume that is not registered in this Docker block." container.Name)
                 | _ -> ()
 
+            for dependency in container.Dependencies do
+                if not (containers |> List.exists (fun declared -> Object.ReferenceEquals(dependency, declared))) then
+                    invalidArg "dependsOn" "A container dependency must be registered in the same Docker block."
+
+        // Register resources in dependency order, independent of declaration order.
+        let ordered = ResizeArray<DockerContainerSpec>()
+        let visiting = HashSet<string>(StringComparer.Ordinal)
+        let visited = HashSet<string>(StringComparer.Ordinal)
+        let rec visit (container: DockerContainerSpec) =
+            if not (visited.Contains container.Name) then
+                if not (visiting.Add container.Name) then invalidArg "dependsOn" "Docker container dependencies contain a cycle."
+                for dependency in container.Dependencies do visit dependency
+                visiting.Remove container.Name |> ignore
+                visited.Add container.Name |> ignore
+                ordered.Add container
+        for container in containers do visit container
         let allPublishedPorts = containers |> Seq.collect (fun container -> container.PublishedPorts)
         DockerValidation.validateNoOverlappingPorts allPublishedPorts
 
-        DockerSpec(networks, volumes, containers, registries)
+        DockerSpec(networks, volumes, List.ofSeq ordered, registries)
 
 [<AbstractClass; Sealed>]
 type DockerFields private () =
@@ -916,6 +949,10 @@ module DockerBuilders =
         ((^T or DockerFields) : (static member Image : ^T -> DockerContainerPart) value)
 
     let restart value = DockerContainerPart.Restart value
+    /// Runs to successful completion; a later apply retries a failed attempt, never a successful generation.
+    let runOnce timeout = DockerContainerPart.RunOnce timeout
+    /// Waits for service creation (readiness only with waitHealthy) or successful job completion.
+    let dependsOn container = DockerContainerPart.DependsOn container
     let noRestart = DockerRestartPolicy.NoRestart
     let always = DockerRestartPolicy.Always
     let unlessStopped = DockerRestartPolicy.UnlessStopped

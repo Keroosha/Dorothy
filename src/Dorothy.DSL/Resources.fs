@@ -344,6 +344,23 @@ type DockerEngineArgs() =
     [<Input("connection", true)>]
     member val Connection: Input<AptConnectionArgs> = Unchecked.defaultof<_> with get, set
 
+/// Completion barrier for a stopped, independently managed Docker container.
+type DockerJobArgs() =
+    inherit ResourceArgs()
+
+    [<Input("connection", true)>]
+    member val Connection: Input<AptConnectionArgs> = Unchecked.defaultof<_> with get, set
+
+    [<Input("containerId", true)>]
+    member val ContainerId: Input<string> = Unchecked.defaultof<_> with get, set
+
+    [<Input("timeoutSeconds", true)>]
+    member val TimeoutSeconds: Input<int> = Unchecked.defaultof<_> with get, set
+
+    /// Names explicitly marked secret by the caller; their values are always redacted from job logs.
+    [<Input("secretEnvironmentKeys")>]
+    member val SecretEnvironmentKeys: InputList<string> = InputList<string>() with get, set
+
 /// Native Pulumi arguments for keroosha:debian:Swapfile.
 type SwapfileArgs() =
     inherit ResourceArgs()
@@ -356,6 +373,14 @@ type SwapfileArgs() =
 
     [<Input("sizeMiB", true)>]
     member val SizeMiB: Input<int> = Unchecked.defaultof<_> with get, set
+
+/// Arguments shared by an independently owned firewalld zone or policy.
+type FirewalldArgs() =
+    inherit ResourceArgs()
+    [<Input("connection", true)>]
+    member val Connection: Input<AptConnectionArgs> = Unchecked.defaultof<_> with get, set
+    [<Input("configuration", true)>]
+    member val Configuration: Input<string> = Unchecked.defaultof<_> with get, set
 
 /// Native Pulumi arguments for keroosha:debian:Ufw.
 type UfwArgs() =
@@ -577,6 +602,28 @@ module private ProviderContract =
         options.DependsOn <- InputList<Resource>.op_Implicit(dependencies |> List.toArray)
         options
 
+/// Manages one complete firewalld permanent zone or policy.
+type FirewalldResource(token: string, name: string, args: FirewalldArgs, options: CustomResourceOptions) =
+    inherit CustomResource(token, name, args, options)
+    [<DefaultValue>]
+    val mutable private exists: Output<bool>
+    [<DefaultValue>]
+    val mutable private inSync: Output<bool>
+    [<DefaultValue>]
+    val mutable private actual: Output<string>
+    [<Output("exists")>]
+    member this.Exists
+        with get () = this.exists
+        and private set value = this.exists <- value
+    [<Output("inSync")>]
+    member this.InSync
+        with get () = this.inSync
+        and private set value = this.inSync <- value
+    [<Output("actual")>]
+    member this.Actual
+        with get () = this.actual
+        and private set value = this.actual <- value
+
 /// Manages the owned users and groups on one SSH host; deletion retains identities and revokes owned access.
 type UsersResource(name: string, args: UsersArgs, options: CustomResourceOptions) =
     inherit CustomResource(ProviderContract.UsersResourceToken, name, args, options)
@@ -650,6 +697,18 @@ type DockerEngine(name: string, args: DockerEngineArgs, options: CustomResourceO
     member this.InSync
         with get () = this.inSync
         and private set value = this.inSync <- value
+
+/// Starts a stopped container and succeeds only after exit zero; retains it for diagnostics.
+type DockerJob(name: string, args: DockerJobArgs, options: CustomResourceOptions) =
+    inherit CustomResource("keroosha:debian:DockerJob", name, args, options)
+
+    [<DefaultValue>]
+    val mutable private completed: Output<bool>
+
+    [<Output("completed")>]
+    member this.Completed
+        with get () = this.completed
+        and private set value = this.completed <- value
 
 
 /// Manages one owned swap file and its persistent systemd swap unit.
@@ -1273,6 +1332,40 @@ module internal AccessResourceMappings =
         let grants = Dictionary<string, SudoGrantArgs>(StringComparer.Ordinal)
         for KeyValue(name, value) in specification.Grants do grants.Add(name, sudoGrant value)
         grants
+
+/// One independent host content resource. Payload is always a Pulumi secret and never an output.
+type HostContentArgs() =
+    inherit ResourceArgs()
+    [<Input("connection", true)>]
+    member val Connection: Input<AptConnectionArgs> = Unchecked.defaultof<_> with get, set
+    [<Input("specification", true)>]
+    member val Specification: Input<string> = Unchecked.defaultof<_> with get, set
+    [<Input("payload")>]
+    member val Payload: Input<string> = Unchecked.defaultof<_> with get, set
+
+type HostServiceArgs() =
+    inherit ResourceArgs()
+    [<Input("connection", true)>]
+    member val Connection: Input<AptConnectionArgs> = Unchecked.defaultof<_> with get, set
+    [<Input("specification", true)>]
+    member val Specification: Input<string> = Unchecked.defaultof<_> with get, set
+    [<Input("triggers")>]
+    member val Triggers: Input<string> = Unchecked.defaultof<_> with get, set
+    [<Input("restartOnChange")>]
+    member val RestartOnChange: Input<bool> = Unchecked.defaultof<_> with get, set
+
+type HostContentResource(name: string, args: HostContentArgs, options: CustomResourceOptions) =
+    inherit CustomResource("keroosha:debian:Content", name, args, options)
+    [<DefaultValue>]
+    val mutable private fingerprint: Output<string>
+    [<Output("fingerprint")>]
+    member this.Fingerprint
+        with get () = this.fingerprint
+        and private set value = this.fingerprint <- value
+
+type HostServiceResource(name: string, args: HostServiceArgs, options: CustomResourceOptions) =
+    inherit CustomResource("keroosha:debian:Service", name, args, options)
+
 module Host =
     let deploy (host: HostSpec) =
         DomainValidation.validateHostSpec host
@@ -1315,7 +1408,7 @@ module Host =
             AptPackageSet(name, args, options)
 
         let mainPackages =
-            let declared = Map.remove "ufw" host.Packages
+            let declared = host.Packages |> Map.remove "ufw" |> Map.remove "firewalld"
 
             match host.Traefik with
             | Some _ ->
@@ -1330,7 +1423,19 @@ module Host =
                     declared
             | None -> declared
 
-        let mainApt = createAptPackageSet host.Name mainPackages [] false
+        let firewalldPackage =
+            if host.Firewalld.IsSome || Map.containsKey "firewalld" host.Packages then
+                let version = host.Packages |> Map.tryFind "firewalld" |> Option.defaultValue None
+                Some(createAptPackageSet (host.Name + "-firewalld-package") (Map.ofList [ "firewalld", version ]) [] false)
+            else None
+
+        // Keep explicitly declared docker.io in its original main APT owner. Ordering
+        // the whole owner after firewalld avoids both first-start races and package removal.
+        let mainDependencies =
+            if host.Docker.IsSome then
+                firewalldPackage |> Option.map (fun resource -> resource :> Resource) |> Option.toList
+            else []
+        let mainApt = createAptPackageSet host.Name mainPackages mainDependencies false
 
         let fail2banPackages =
             if host.Fail2Ban.IsSome then
@@ -1355,8 +1460,11 @@ module Host =
 
         let dockerPackage =
             if host.Docker.IsSome && not (Map.containsKey "docker.io" host.Packages) then
-                // Install the shared Docker group before user access declarations are applied.
-                Some(createAptPackageSet (host.Name + "-docker-package") (Map.ofList [ "docker.io", None ]) [ mainApt :> Resource ] true)
+                // firewalld must be running before Docker's first startup registers its zone.
+                let dependencies =
+                    [ mainApt :> Resource ]
+                    @ (firewalldPackage |> Option.map (fun resource -> resource :> Resource) |> Option.toList)
+                Some(createAptPackageSet (host.Name + "-docker-package") (Map.ofList [ "docker.io", None ]) dependencies true)
             else
                 None
         let usersResource =
@@ -1372,6 +1480,46 @@ module Host =
                     @ (dockerPackage |> Option.map (fun resource -> resource :> Resource) |> Option.toList)
                 let options = ProviderContract.resourceOptionsWithDependencies dependencies
                 UsersResource(host.Name + "-users", args, options))
+
+        let contentItems = host.Content |> Option.map _.Items |> Option.defaultValue []
+        let contentPrerequisites =
+            [ mainApt :> Resource ]
+            @ (usersResource |> Option.map (fun value -> value :> Resource) |> Option.toList)
+        let zstdPackage =
+            if contentItems |> List.exists (fun item -> item.Format = Some TarZst) then
+                if Map.containsKey "zstd" host.Packages then None
+                else Some(createAptPackageSet (host.Name + "-content-zstd") (Map.ofList [ "zstd", None ]) [ mainApt :> Resource ] true)
+            else None
+        let contentResources = Dictionary<HostContentItem, HostContentResource>()
+        for item in contentItems do
+            let specification, payload = HostContentInputs.resolve item
+            let args = HostContentArgs()
+            args.Connection <- Input<AptConnectionArgs>.op_Implicit connection
+            args.Specification <- Input<string>.op_Implicit specification
+            args.Payload <- Input<string>.op_Implicit payload
+            let dependencies = contentPrerequisites @ (zstdPackage |> Option.map (fun value -> value :> Resource) |> Option.toList)
+            let resource = HostContentResource(host.Name + "-content-" + item.Name, args, ProviderContract.resourceOptionsWithDependencies dependencies)
+            contentResources.Add(item, resource)
+        for service in host.Services do
+            let args = HostServiceArgs()
+            args.Connection <- Input<AptConnectionArgs>.op_Implicit connection
+            args.Specification <- Input<string>.op_Implicit(HostContentInputs.service service)
+            args.RestartOnChange <- Input<bool>.op_Implicit service.RestartOnChange
+            let fingerprints =
+                service.Uses
+                |> List.filter (fun item -> item.Ownership = ContentOwnership.Managed)
+                |> List.sortBy _.Name
+                |> List.map (fun item -> contentResources[item].Fingerprint)
+                |> List.toArray
+                |> Output.All<string>
+            args.Triggers <-
+                fingerprints.Apply(Func<ImmutableArray<string>, string>(fun values ->
+                    let result = System.Text.Json.Nodes.JsonArray()
+                    for value in values do result.Add(System.Text.Json.Nodes.JsonValue.Create value)
+                    result.ToJsonString()))
+                |> Input<string>.op_Implicit
+            let dependencies = contentPrerequisites @ (service.Uses |> List.map (fun item -> contentResources[item] :> Resource))
+            HostServiceResource(host.Name + "-service-" + service.Name, args, ProviderContract.resourceOptionsWithDependencies dependencies) |> ignore
 
         let sudoPackage =
             match host.Sudo with
@@ -1436,7 +1584,7 @@ module Host =
 
 
 
-        let dockerContainers =
+        let dockerEngine, dockerContainers =
             match host.Docker with
             | Some specification ->
                 let packageSet = defaultArg dockerPackage mainApt
@@ -1447,11 +1595,21 @@ module Host =
                     DockerEngine(
                         host.Name,
                         args,
-                        ProviderContract.resourceOptionsWithDependencies [ packageSet :> Resource ]
+                        ProviderContract.resourceOptionsWithDependencies
+                            ([ packageSet :> Resource ]
+                             @ (firewalldPackage |> Option.map (fun resource -> resource :> Resource) |> Option.toList))
                     )
 
-                DockerDeployment.deploy host engine specification
-            | None -> []
+                let completeJob name (container: Pulumi.Docker.Container) timeout (secretEnvironmentKeys: Output<ImmutableArray<string>>) =
+                    let args = DockerJobArgs()
+                    args.Connection <- Input<AptConnectionArgs>.op_Implicit connection
+                    args.ContainerId <- Input<string>.op_Implicit container.Id
+                    args.TimeoutSeconds <- Input<int>.op_Implicit (DockerValidation.waitHealthySeconds timeout)
+                    args.SecretEnvironmentKeys <- InputList<string>.op_Implicit secretEnvironmentKeys
+                    let options = ProviderContract.resourceOptionsWithDependencies [ container :> Resource ]
+                    DockerJob(name, args, options) :> Resource
+                Some(engine :> Resource), DockerDeployment.deploy host engine specification completeJob
+            | None -> None, []
 
         let firewallPackage =
             if host.Ufw.IsSome || Map.containsKey "ufw" host.Packages then
@@ -1499,6 +1657,35 @@ module Host =
                 )
             | None, _ -> None
             | Some _, None -> invalidOp "A UFW declaration must have its APT prerequisite resource."
+
+
+        match host.Firewalld, firewalldPackage with
+        | Some firewall, Some packageSet ->
+            let zones = Collections.Generic.Dictionary<string, Resource>(StringComparer.Ordinal)
+            let create (specification: FirewalldObjectSpec) dependencies =
+                let args = FirewalldArgs()
+                args.Connection <- Input<AptConnectionArgs>.op_Implicit connection
+                args.Configuration <- Input<string>.op_Implicit specification.Configuration
+                let token = if specification.Kind = "zone" then "keroosha:debian:FirewalldZone" else "keroosha:debian:FirewalldPolicy"
+                FirewalldResource(token, host.Name + "-firewalld-" + specification.Kind + "-" + specification.Name,
+                                  args, ProviderContract.resourceOptionsWithDependencies dependencies) :> Resource
+            // Zones are serialized so an interface transfer cannot race another managed zone.
+            let mutable prior = packageSet :> Resource
+            for specification in firewall.Objects |> List.filter (fun value -> value.Kind = "zone") do
+                let resource = create specification [ prior ]
+                zones.Add(specification.Name, resource)
+                prior <- resource
+            for specification in firewall.Objects |> List.filter (fun value -> value.Kind = "policy") do
+                let referenced = specification.Value.Ingress @ specification.Value.Egress
+                let dependencies =
+                    referenced
+                    |> List.choose (fun name -> match zones.TryGetValue name with true, resource -> Some resource | _ -> None)
+                let referencesUnmanagedZone =
+                    referenced |> List.exists (fun name -> name <> "ANY" && name <> "HOST" && not (zones.ContainsKey name))
+                let ownerDependencies = if referencesUnmanagedZone then Option.toList dockerEngine else []
+                // Missing unmanaged references still fail explicitly on hosts without Docker.
+                create specification (prior :: dependencies @ ownerDependencies) |> ignore
+        | _, None | None, _ -> ()
 
         let sshdConfigResource =
             match host.Sshd |> Option.bind (fun specification -> specification.Config) with
