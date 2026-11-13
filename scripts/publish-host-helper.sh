@@ -13,6 +13,7 @@ output="$repo_root/src/Dorothy.DSL.Providers/Provider/helper/$rid"
 
 # Run this on the matching Linux build host/toolchain; native AOT output is not part of normal builds.
 # On Debian 13, the provider bootstraps missing libicu76 before helper dispatch; targets still need libc/OpenSSL and ICU. AOT removes the target .NET runtime, not OS libraries.
+# .github/workflows/ci.yml checks linux-x64 in a fresh job without bin/obj caches so ILC warnings cannot be hidden by reused output.
 dotnet publish "$project" \
   --configuration Release \
   --runtime "$rid" \
