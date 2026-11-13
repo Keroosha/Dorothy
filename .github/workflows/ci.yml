@@ -1,0 +1,53 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build-and-test:
+    name: DSL build and tests
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+      # CLI tests use an isolated local backend; no Pulumi credentials are needed.
+      - uses: pulumi/actions@v6
+        with:
+          pulumi-version: '3.273.0'
+      - name: Install test utilities
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes sudo zstd
+      - name: Build DSL
+        run: dotnet build src/Dorothy.DSL/Dorothy.DSL.fsproj --configuration Release
+      # CLI fixtures resolve their provider and program from Release output paths.
+      - name: Run tests
+        run: dotnet test tests/Dorothy.Tests --configuration Release
+
+  native-aot:
+    name: Clean Native AOT publish (linux-x64)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 20
+    steps:
+      # Keep this in a fresh job without bin/obj caches: reused ILC output can hide warnings.
+      - uses: actions/checkout@v7
+      - uses: actions/setup-dotnet@v6
+        with:
+          dotnet-version: '10.0.x'
+      - name: Install Native AOT toolchain
+        run: |
+          sudo apt-get update
+          sudo apt-get install --yes clang zlib1g-dev
+      - name: Publish host helper
+        run: bash scripts/publish-host-helper.sh linux-x64
