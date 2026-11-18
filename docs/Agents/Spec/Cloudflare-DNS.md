@@ -10,7 +10,7 @@ module CloudflareQuickstart =
 
     let dns =
         cloudflare {
-            domain "cybergulag.today" {
+            domain "example.com" {
                 // Optional: accountId "..." filters lookup; zoneId "..." bypasses it.
                 dns {
                     a "edge-wildcard" {
@@ -62,10 +62,10 @@ Tags follow Cloudflare `name:value` syntax: maximum 20, name 1–32 ASCII letter
  - TXT `text` is emitted as DNS presentation strings, quoted and escaped, with UTF-8 octets split at character boundaries into at most 255-octet strings. Explicit `segments` preserves boundaries and rejects any segment over 255 octets. SPF/DKIM/TXT payload bytes are preserved.
  - Reject invalid logical keys, missing required fields, duplicate `(canonical domain, logical key)` identities, duplicate static records after canonicalization, repeated singleton fields, unsupported proxy/TTL combinations, and the provider-hard numeric limits below. Distinct RRset members at one owner remain allowed.
 
-Each resource name is exactly `cloudflare-dns-{canonicalDomain.Length}-{canonicalDomain}-{logicalKey.Length}-{logicalKey}`; domain is lowercase Punycode without a final dot and key is the validated caller spelling. Length fields make domains/keys unambiguous. For the example, the resource name is `cloudflare-dns-16-cybergulag.today-13-edge-wildcard`. Import uses `cloudflare:index/dnsRecord:DnsRecord` and `<zoneId>/<recordId>`:
+Each resource name is exactly `cloudflare-dns-{canonicalDomain.Length}-{canonicalDomain}-{logicalKey.Length}-{logicalKey}`; domain is lowercase Punycode without a final dot and key is the validated caller spelling. Length fields make domains/keys unambiguous. For the example, the resource name is `cloudflare-dns-11-example.com-13-edge-wildcard`. Import uses `cloudflare:index/dnsRecord:DnsRecord` and `<zoneId>/<recordId>`:
 
 ```sh
-pulumi import cloudflare:index/dnsRecord:DnsRecord cloudflare-dns-16-cybergulag.today-13-edge-wildcard <zoneId>/<recordId>
+pulumi import cloudflare:index/dnsRecord:DnsRecord cloudflare-dns-11-example.com-13-edge-wildcard <zoneId>/<recordId>
 ```
 
 ## Zone resolution and package policy

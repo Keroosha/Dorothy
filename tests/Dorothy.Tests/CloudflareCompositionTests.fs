@@ -13,7 +13,7 @@ module private CloudflareQuickstart =
 
     let records =
         cloudflare {
-            domain "cybergulag.today" {
+            domain "example.com" {
                 dns {
                     a "edge-wildcard" {
                         name "*"
@@ -81,7 +81,7 @@ module private CloudflareOptionsFixture =
 type CloudflareCompositionTests() =
     [<Test>]
     member _.``Scoped quickstarts compose Cloudflare and Host DSLs without token collisions``() =
-        let mocks = CloudflareMocks([ "cybergulag.today", "0123456789abcdef0123456789abcdef" ])
+        let mocks = CloudflareMocks([ "example.com", "0123456789abcdef0123456789abcdef" ])
         Deployment.TestAsync<MixedStack>(mocks, TestOptions()).GetAwaiter().GetResult() |> ignore
         let cloudflareRecords =
             mocks.Resources.Values

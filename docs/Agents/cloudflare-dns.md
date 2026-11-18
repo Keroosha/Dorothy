@@ -8,7 +8,7 @@ module CloudflareQuickstart =
 
     let records =
         cloudflare {
-            domain "cybergulag.today" {
+            domain "example.com" {
                 dns {
                     a "edge-wildcard" {
                         name "*"
@@ -38,7 +38,7 @@ module AccountFilteredDns =
 
     let records =
         cloudflare {
-            domain "cybergulag.today" {
+            domain "example.com" {
                 accountId "cloudflare-account-id"
                 dns { a "apex" { name "@"; address "192.0.2.10" } }
             }
@@ -53,7 +53,7 @@ module ExplicitZoneDns =
 
     let records =
         cloudflare {
-            domain "cybergulag.today" {
+            domain "example.com" {
                 zoneId "023e105f4ecef8ad9ca31a8372d0c353"
                 dns { a "apex" { name "@"; address "192.0.2.10" } }
             }
@@ -107,12 +107,12 @@ The Pulumi logical resource name is exactly:
 cloudflare-dns-{canonicalDomain.Length}-{canonicalDomain}-{logicalKey.Length}-{logicalKey}
 ```
 
-`canonicalDomain` is lowercase Punycode without a final dot; the validated ASCII logical key keeps its caller spelling. Length fields make the pair unambiguous. This name does not change with record type/content, order, TTL, or zone selector. For the example above it is `cloudflare-dns-16-cybergulag.today-13-edge-wildcard`.
+`canonicalDomain` is lowercase Punycode without a final dot; the validated ASCII logical key keeps its caller spelling. Length fields make the pair unambiguous. This name does not change with record type/content, order, TTL, or zone selector. For the example above it is `cloudflare-dns-11-example.com-13-edge-wildcard`.
 
 Import one record with Pulumi's Cloudflare DnsRecord token and `<zoneId>/<recordId>` provider ID:
 
 ```sh
-pulumi import cloudflare:index/dnsRecord:DnsRecord cloudflare-dns-16-cybergulag.today-13-edge-wildcard <zoneId>/<recordId>
+pulumi import cloudflare:index/dnsRecord:DnsRecord cloudflare-dns-11-example.com-13-edge-wildcard <zoneId>/<recordId>
 ```
 
 Duplicate `(canonical domain, logical key)` identities and exact duplicate static records are rejected. Distinct keys can represent distinct members of the same RRset. `Dorothy.DSL.Cloudflare.deploy` registers one `Pulumi.Cloudflare.DnsRecord` per declaration; it does not create zones or wrapper components. Construction validates locally; no live apply or refresh has been verified. After CLI import, inspect `pulumi preview --diff` before applying because this DSL owns only its declared fields and does not model unrelated DNS settings.

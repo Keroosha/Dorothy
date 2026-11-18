@@ -128,7 +128,7 @@ type CloudflareTests() =
 
     let allTypesSpec =
         cloudflare {
-            domain "cybergulag.today" {
+            domain "example.com" {
                 zoneId testZoneId
                 dns {
                     a "edge-wildcard" { name "*"; address "192.0.2.10"; proxy DnsOnly; comment "edge"; tags [ "owner:dns"; "env:test" ] }
@@ -189,13 +189,13 @@ type CloudflareTests() =
         let dataNum kind field = dataNumber (record kind) field
         let owners =
             Map.ofList [
-                "A", "*.cybergulag.today"; "AAAA", "ipv6.cybergulag.today"; "CNAME", "alias.cybergulag.today"
-                "MX", "cybergulag.today"; "NS", "delegated.cybergulag.today"; "OPENPGPKEY", "openpgpkey.cybergulag.today"
-                "PTR", "1.cybergulag.today"; "TXT", "cybergulag.today"; "CAA", "cybergulag.today"
-                "CERT", "cert.cybergulag.today"; "DNSKEY", "cybergulag.today"; "DS", "cybergulag.today"
-                "HTTPS", "cybergulag.today"; "LOC", "loc.cybergulag.today"; "NAPTR", "_service._tcp.cybergulag.today"
-                "SMIMEA", "smimea.cybergulag.today"; "SRV", "_sip._tcp.cybergulag.today"; "SSHFP", "sshfp.cybergulag.today"
-                "SVCB", "cybergulag.today"; "TLSA", "_443._tcp.cybergulag.today"; "URI", "_service.cybergulag.today"
+                "A", "*.example.com"; "AAAA", "ipv6.example.com"; "CNAME", "alias.example.com"
+                "MX", "example.com"; "NS", "delegated.example.com"; "OPENPGPKEY", "openpgpkey.example.com"
+                "PTR", "1.example.com"; "TXT", "example.com"; "CAA", "example.com"
+                "CERT", "cert.example.com"; "DNSKEY", "example.com"; "DS", "example.com"
+                "HTTPS", "example.com"; "LOC", "loc.example.com"; "NAPTR", "_service._tcp.example.com"
+                "SMIMEA", "smimea.example.com"; "SRV", "_sip._tcp.example.com"; "SSHFP", "sshfp.example.com"
+                "SVCB", "example.com"; "TLSA", "_443._tcp.example.com"; "URI", "_service.example.com"
             ]
         for KeyValue(kind, owner) in owners do
             Assert.That(text kind "name", Is.EqualTo owner, kind)
@@ -307,18 +307,18 @@ type CloudflareTests() =
         Assert.That((record "A").Inputs["comment"], Is.EqualTo "edge")
         Assert.That((record "A").Inputs.ContainsKey "tags", Is.True)
         Assert.That(mocks.Calls, Is.Empty)
-        Assert.That((record "A").Name, Is.EqualTo "cloudflare-dns-16-cybergulag.today-13-edge-wildcard")
+        Assert.That((record "A").Name, Is.EqualTo "cloudflare-dns-11-example.com-13-edge-wildcard")
 
     [<Test>]
     member _.``IDN owners preserve underscores wildcards and avoid double zone suffixes``() =
         let spec =
             cloudflare {
-                domain "münich.example" {
+                domain "пример.example" {
                     zoneId testZoneId
                     dns {
                         a "underscore" { name "_sip._tcp"; address "192.0.2.1" }
-                        a "wildcard" { name "*.bücher"; address "192.0.2.2" }
-                        a "absolute" { name "www.xn--mnich-kva.example."; address "192.0.2.3" }
+                        a "wildcard" { name "*.пример"; address "192.0.2.2" }
+                        a "absolute" { name "www.xn--e1afmkfd.example."; address "192.0.2.3" }
                         a "apex" { name "@"; address "192.0.2.4" }
                     }
                 }
@@ -326,25 +326,25 @@ type CloudflareTests() =
         let mocks = CloudflareMocks([])
         run mocks spec
         let byKey = dnsResources mocks |> Array.map (fun resource -> resource.Name, resource) |> Map.ofArray
-        Assert.That(stringInput byKey["cloudflare-dns-21-xn--mnich-kva.example-10-underscore"] "name", Is.EqualTo "_sip._tcp.xn--mnich-kva.example")
-        Assert.That(stringInput byKey["cloudflare-dns-21-xn--mnich-kva.example-8-wildcard"] "name", Is.EqualTo "*.xn--bcher-kva.xn--mnich-kva.example")
-        Assert.That(stringInput byKey["cloudflare-dns-21-xn--mnich-kva.example-8-absolute"] "name", Is.EqualTo "www.xn--mnich-kva.example")
-        Assert.That(stringInput byKey["cloudflare-dns-21-xn--mnich-kva.example-4-apex"] "name", Is.EqualTo "xn--mnich-kva.example")
+        Assert.That(stringInput byKey["cloudflare-dns-20-xn--e1afmkfd.example-10-underscore"] "name", Is.EqualTo "_sip._tcp.xn--e1afmkfd.example")
+        Assert.That(stringInput byKey["cloudflare-dns-20-xn--e1afmkfd.example-8-wildcard"] "name", Is.EqualTo "*.xn--e1afmkfd.xn--e1afmkfd.example")
+        Assert.That(stringInput byKey["cloudflare-dns-20-xn--e1afmkfd.example-8-absolute"] "name", Is.EqualTo "www.xn--e1afmkfd.example")
+        Assert.That(stringInput byKey["cloudflare-dns-20-xn--e1afmkfd.example-4-apex"] "name", Is.EqualTo "xn--e1afmkfd.example")
 
     [<Test>]
     member _.``Zone lookup requires one exact normalized match and accepts an account filter``() =
         let spec =
             cloudflare {
-                domain "CYBERGULAG\u3002today\uFF0e" {
+                domain "EXAMPLE\u3002com\uFF0e" {
                     accountId "account-id"
                     dns { a "edge" { name "@"; address "192.0.2.1" } }
                 }
             }
-        let mocks = CloudflareMocks([ "other.example", "other-zone"; "CYBERGULAG.TODAY.", "exact-zone" ])
+        let mocks = CloudflareMocks([ "other.example", "other-zone"; "EXAMPLE.COM.", "exact-zone" ])
         run mocks spec
         Assert.That(mocks.Calls, Has.Count.EqualTo 1)
         let call = mocks.Calls |> Seq.exactlyOne
-        Assert.That(call.Args["name"], Is.EqualTo "cybergulag.today")
+        Assert.That(call.Args["name"], Is.EqualTo "example.com")
         let account = call.Args["account"] :?> ImmutableDictionary<string, obj>
         Assert.That(account["id"], Is.EqualTo "account-id")
         Assert.That(stringInput (dnsResources mocks |> Array.exactlyOne) "zoneId", Is.EqualTo "exact-zone")
