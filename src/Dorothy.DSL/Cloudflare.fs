@@ -552,10 +552,13 @@ module Cloudflare =
                         | _ -> invalid label (label + " must use canonical dotted-decimal IPv4 notation."))
                 String.Join(".", parsed)
             | AddressFamily.InterNetworkV6 ->
-                match IPAddress.TryParse text with
-                | true, address when address.AddressFamily = AddressFamily.InterNetworkV6 && address.ScopeId = 0L ->
-                    address.ToString().ToLowerInvariant()
-                | _ -> invalid label (label + " must be a valid unscoped IPv6 address.")
+                if text.IndexOf('[') >= 0 || text.IndexOf(']') >= 0 || text.IndexOf('%') >= 0 then
+                    invalid label (label + " must be a bare, unscoped IPv6 address.")
+                else
+                    match IPAddress.TryParse text with
+                    | true, address when address.AddressFamily = AddressFamily.InterNetworkV6 && address.ScopeId = 0L ->
+                        address.ToString().ToLowerInvariant()
+                    | _ -> invalid label (label + " must be a valid unscoped IPv6 address.")
             | _ -> invalidArg "family" "Only IPv4 and IPv6 DNS address families are supported."
 
         let private normalizeAddress label family = function

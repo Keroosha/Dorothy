@@ -598,6 +598,38 @@ type CloudflareTests() =
                 }
             } |> ignore) |> ignore
 
+
+    [<Test>]
+    member _.``IPv6 address inputs reject bracketed endpoints and scopes``() =
+        let invalidAddresses = [ "[2001:db8::7]:443"; "fe80::7%0" ]
+        for invalidAddress in invalidAddresses do
+            let literalFailure =
+                Assert.Throws<ArgumentException>(TestDelegate(fun () ->
+                    cloudflare {
+                        domain "example.test" {
+                            zoneId testZoneId
+                            dns { aaaa "literal" { name "@"; address invalidAddress } }
+                        }
+                    } |> ignore))
+            Assert.That(literalFailure.Message, Does.Contain "bare, unscoped IPv6")
+            let outputFailure =
+                Assert.Catch<Exception>(TestDelegate(fun () ->
+                    Deployment.TestAsync(
+                        CloudflareMocks([]),
+                        TestOptions(),
+                        Action(fun () ->
+                            let spec =
+                                cloudflare {
+                                    domain "example.test" {
+                                        zoneId testZoneId
+                                        dns { aaaa "output" { name "@"; addressOutput (Output.Create<string>(invalidAddress)) } }
+                                    }
+                                }
+                            CF.deploy spec |> ignore)
+                    ).GetAwaiter().GetResult() |> ignore))
+            Assert.That(outputFailure, Is.Not.Null)
+            Assert.That(outputFailure.ToString(), Does.Contain "bare, unscoped IPv6")
+
     [<Test>]
     member _.``MX and LOC accept provider boundaries and reject values outside them``() =
         let valid =
