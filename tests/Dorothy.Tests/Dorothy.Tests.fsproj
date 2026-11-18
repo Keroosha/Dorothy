@@ -23,7 +23,9 @@
     <Compile Include="UfwBackendTests.fs" />
     <Compile Include="FirewalldTests.fs" />
     <Compile Include="FirewalldDeploymentTests.fs" />
+    <Compile Include="TraefikBackendTests.fs" />
     <Compile Include="CloudflareTests.fs" />
+    <Compile Include="CloudflareCompositionTests.fs" />
     <Compile Include="ContentServicesBackendTests.fs" />
     <Compile Include="ContentDownloadTests.fs" />
     <Compile Include="HostContentTests.fs" />

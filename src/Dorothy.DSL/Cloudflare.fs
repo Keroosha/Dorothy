@@ -121,6 +121,8 @@ module Cloudflare =
         | Proxy of Proxy
         | Comment of string
         | RecordTags of string list
+        | Protect of bool
+        | RecordAliases of Alias list
 
     [<Sealed>]
     type RecordSpec internal
@@ -134,6 +136,8 @@ module Cloudflare =
          proxy: Proxy,
          comment: string option,
          tags: string list,
+         protect: bool option,
+         aliases: Alias list,
          fingerprint: string option) =
         member _.LogicalKey = logicalKey
         member _.OwnerName = ownerName
@@ -168,6 +172,8 @@ module Cloudflare =
         member internal _.Proxy = proxy
         member internal _.Comment = comment
         member internal _.Tags = tags
+        member internal _.Protect = protect
+        member internal _.Aliases = aliases
         member internal _.Fingerprint = fingerprint
 
     [<Sealed>]
@@ -178,13 +184,15 @@ module Cloudflare =
         internal
         | AccountId of string
         | ZoneId of string
+        | ZoneProvider of ProviderResource
         | Dns of DnsSpec
 
     [<Sealed>]
-    type DomainSpec internal (name: string, accountId: string option, zoneId: string option, records: RecordSpec list) =
+    type DomainSpec internal (name: string, accountId: string option, zoneId: string option, provider: ProviderResource option, records: RecordSpec list) =
         member _.Name = name
         member _.AccountId = accountId
         member _.ZoneId = zoneId
+        member _.Provider = provider
         member _.Records = records
 
     [<Sealed>]
@@ -197,6 +205,14 @@ module Cloudflare =
         let private invalid label message = invalidArg label message
 
         let private isAscii value = value |> Seq.forall (fun character -> int character <= 0x7f)
+        let private validateZoneId (value: string) =
+            if String.IsNullOrWhiteSpace value
+               || value.Length <> 32
+               || not (value |> Seq.forall (fun character ->
+                   Char.IsAsciiDigit character
+                   || (character >= 'a' && character <= 'f')
+                   || (character >= 'A' && character <= 'F'))) then
+                invalid "zoneId" "A Cloudflare zone ID must be 32 hexadecimal characters."
 
         let private idnAscii label (value: string) =
             try
@@ -204,6 +220,8 @@ module Cloudflare =
                 idn.UseStd3AsciiRules <- true
                 idn.GetAscii(value).ToLowerInvariant()
             with :? ArgumentException -> invalid "name" (sprintf "Invalid DNS label '%s'." label)
+        let private normalizeSeparators (value: string) =
+            value.Replace('\u3002', '.').Replace('\uff0e', '.').Replace('\uff61', '.')
 
         let private ownerLabel (label: string) =
             if String.IsNullOrEmpty label then invalid "name" "DNS names cannot contain empty labels."
@@ -224,6 +242,7 @@ module Cloudflare =
 
         let normalizeDomain (value: string) =
             if String.IsNullOrWhiteSpace value then invalid "domain" "A non-empty Cloudflare zone name is required."
+            let value = normalizeSeparators value
             let withoutFinalDot = if value.EndsWith(".", StringComparison.Ordinal) then value.Substring(0, value.Length - 1) else value
             if String.IsNullOrEmpty withoutFinalDot then invalid "domain" "A non-empty Cloudflare zone name is required."
             let labels = withoutFinalDot.Split('.')
@@ -237,6 +256,7 @@ module Cloudflare =
 
         let normalizeOwner (domain: string) (value: string) =
             if String.IsNullOrWhiteSpace value then invalid "name" "A DNS record owner name is required."
+            let value = normalizeSeparators value
             if value = "@" then domain
             else
                 let trailingDot = value.EndsWith(".", StringComparison.Ordinal)
@@ -244,7 +264,10 @@ module Cloudflare =
                 if String.IsNullOrEmpty withoutFinalDot then invalid "name" "A DNS record owner name is required."
                 let labels = withoutFinalDot.Split('.')
                 if labels |> Array.exists String.IsNullOrEmpty then invalid "name" "A DNS record owner cannot contain empty labels."
-                let canonical = String.Join(".", labels |> Array.map ownerLabel)
+                let canonicalLabels = labels |> Array.map ownerLabel
+                if canonicalLabels |> Array.mapi (fun index label -> index, label) |> Array.exists (fun (index, label) -> label = "*" && index <> 0) then
+                    invalid "name" "A wildcard owner label is only valid at the leftmost position."
+                let canonical = String.Join(".", canonicalLabels)
                 let inZone =
                     String.Equals(canonical, domain, StringComparison.OrdinalIgnoreCase)
                     || canonical.EndsWith("." + domain, StringComparison.OrdinalIgnoreCase)
@@ -257,6 +280,7 @@ module Cloudflare =
 
         let normalizeTarget (value: string) =
             if isNull value then invalid "target" "A DNS target cannot be null."
+            let value = normalizeSeparators value
             if value = "." then "."
             else
                 if String.IsNullOrWhiteSpace value then invalid "target" "A DNS target cannot be empty."
@@ -265,9 +289,12 @@ module Cloudflare =
                 if String.IsNullOrEmpty withoutFinalDot then invalid "target" "A DNS target cannot be empty."
                 let labels = withoutFinalDot.Split('.')
                 if labels |> Array.exists String.IsNullOrEmpty then invalid "target" "A DNS target cannot contain empty labels."
-                let canonical = String.Join(".", labels |> Array.map ownerLabel)
+                let canonicalLabels = labels |> Array.map ownerLabel
+                if canonicalLabels |> Array.exists ((=) "*") then invalid "target" "DNS hostname targets cannot contain wildcard labels."
+                if canonicalLabels.Length < 2 then invalid "target" "DNS hostname targets must contain at least two labels, or be root '.'."
+                let canonical = String.Join(".", canonicalLabels)
                 if Encoding.ASCII.GetByteCount(canonical) > 253 then invalid "target" "A DNS target cannot exceed 253 octets."
-                if trailingDot then canonical + "." else canonical
+                canonical
 
 
         let private mapInput (transform: string -> string) (value: StringInput) : Input<string> =
@@ -319,7 +346,8 @@ module Cloudflare =
             | RecordContent _ -> "content"
             | TxtText _ -> "text"
             | TxtSegments _ -> "segments"
-            | NumberFlags _ | TextFlags _ -> "flags"
+            | NumberFlags _ -> "flags"
+            | TextFlags _ -> "naptrFlags"
             | CaaTag _ -> "tag"
             | DataValue _ -> "value"
             | Algorithm _ -> "algorithm"
@@ -353,6 +381,8 @@ module Cloudflare =
             | Proxy _ -> "proxy"
             | Comment _ -> "comment"
             | RecordTags _ -> "tags"
+            | Protect _ -> "protect"
+            | RecordAliases _ -> "aliases"
 
         let private recordType = function
             | A -> "A"
@@ -378,7 +408,7 @@ module Cloudflare =
             | Uri -> "URI"
 
         let private allowedFields kind =
-            let common = [ "name"; "ttl"; "comment"; "tags" ]
+            let common = [ "name"; "ttl"; "comment"; "tags"; "protect"; "aliases" ]
             let specific =
                 match kind with
                 | A | Aaaa -> [ "address"; "proxy" ]
@@ -393,7 +423,7 @@ module Cloudflare =
                 | Ds -> [ "algorithm"; "digest"; "digestType"; "keyTag" ]
                 | Https | Svcb -> [ "priority"; "target"; "value" ]
                 | Loc -> [ "latitude"; "longitude"; "altitude"; "size"; "precisionHorz"; "precisionVert" ]
-                | Naptr -> [ "flags"; "order"; "preference"; "regex"; "replacement"; "service" ]
+                | Naptr -> [ "naptrFlags"; "order"; "preference"; "regex"; "replacement"; "service" ]
                 | Smimea | Tlsa -> [ "certificate"; "matchingType"; "selector"; "usage" ]
                 | Srv -> [ "port"; "priority"; "target"; "weight" ]
                 | Sshfp -> [ "algorithm"; "fingerprint"; "fingerprintType" ]
@@ -490,38 +520,82 @@ module Cloudflare =
                 invalid key (sprintf "%s must be between %d and %d." key minimum maximum)
             value
 
-        let private checkedFinite label value =
-            if not (Double.IsFinite value) then invalid label (label + " must be a finite number.")
+        let private checkedFloatRange label minimum maximum value =
+            if not (Double.IsFinite value) || value < minimum || value > maximum then
+                invalid label (sprintf "%s must be between %s and %s." label (minimum.ToString("R", CultureInfo.InvariantCulture)) (maximum.ToString("R", CultureInfo.InvariantCulture)))
             value
 
         let private validateCoordinate label allowedHemispheres maxDegrees coordinate =
             if coordinate.Degrees < 0 || coordinate.Degrees > maxDegrees then invalid label (label + " degrees are out of range.")
             if coordinate.Minutes < 0 || coordinate.Minutes > 59 then invalid label (label + " minutes must be between 0 and 59.")
-            if not (Double.IsFinite coordinate.Seconds) || coordinate.Seconds < 0.0 || coordinate.Seconds >= 60.0 then
-                invalid label (label + " seconds must be finite and between 0 and 60.")
+            if not (Double.IsFinite coordinate.Seconds) || coordinate.Seconds < 0.0 || coordinate.Seconds > 59.999 then
+                invalid label (label + " seconds must be between 0 and 59.999.")
             if coordinate.Degrees = maxDegrees && (coordinate.Minutes <> 0 || coordinate.Seconds <> 0.0) then
                 invalid label (label + " cannot exceed its maximum degree value.")
             if not (List.contains coordinate.Hemisphere allowedHemispheres) then
                 invalid label (label + " has an invalid hemisphere.")
             coordinate
 
+        let private normalizeAddressText label family (text: string) =
+            if isNull text then invalid label (label + " cannot be null.")
+            match family with
+            | AddressFamily.InterNetwork ->
+                let octets = text.Split('.')
+                if octets.Length <> 4 then invalid label (label + " must use canonical dotted-decimal IPv4 notation.")
+                let parsed =
+                    octets
+                    |> Array.map (fun octet ->
+                        if String.IsNullOrEmpty octet || not (octet |> Seq.forall (fun value -> value >= '0' && value <= '9')) then
+                            invalid label (label + " must use canonical dotted-decimal IPv4 notation.")
+                        match Int32.TryParse(octet, NumberStyles.None, CultureInfo.InvariantCulture) with
+                        | true, value when value >= 0 && value <= 255 && octet = string value -> value
+                        | _ -> invalid label (label + " must use canonical dotted-decimal IPv4 notation."))
+                String.Join(".", parsed)
+            | AddressFamily.InterNetworkV6 ->
+                match IPAddress.TryParse text with
+                | true, address when address.AddressFamily = AddressFamily.InterNetworkV6 && address.ScopeId = 0L ->
+                    address.ToString().ToLowerInvariant()
+                | _ -> invalid label (label + " must be a valid unscoped IPv6 address.")
+            | _ -> invalidArg "family" "Only IPv4 and IPv6 DNS address families are supported."
+
+        let private normalizeAddress label family = function
+            | LiteralString text -> LiteralString(normalizeAddressText label family text)
+            | OutputString output -> OutputString(output.Apply(Func<string, string>(normalizeAddressText label family)))
+
         let private validateStringValue label allowEmpty = function
             | LiteralString value when isNull value -> invalid label (label + " cannot be null.")
             | LiteralString value when not allowEmpty && String.IsNullOrWhiteSpace value -> invalid label (label + " cannot be empty.")
             | _ -> ()
 
-        let private validateAddress label family value =
-            match value with
-            | LiteralString text ->
-                match IPAddress.TryParse text with
-                | true, address when address.AddressFamily = family && (family <> AddressFamily.InterNetworkV6 || address.ScopeId = 0L) -> ()
-                | _ -> invalid label (label + " must be a valid IP address of the declared record family.")
-            | OutputString _ -> ()
 
         let private validCaaTag (value: string) =
             not (String.IsNullOrEmpty value)
             && value.Length <= 15
             && (value |> Seq.forall (fun character -> Char.IsAsciiLetterOrDigit character || character = '-'))
+
+        let private validateComment (comment: string option) =
+            comment
+            |> Option.iter (fun value ->
+                if isNull value then invalid "comment" "A DNS record comment cannot be null."
+                if value.IndexOf('\n') >= 0 || value.IndexOf('\r') >= 0 then
+                    invalid "comment" "A DNS record comment cannot contain line breaks.")
+
+        let private validateTags (tags: string list) =
+            if tags.Length > 20 then invalid "tags" "A DNS record cannot have more than 20 tags."
+            for tag in tags do
+                if isNull tag then invalid "tags" "A DNS record tag cannot be null."
+                let separator = tag.IndexOf(':')
+                if separator <= 0 then invalid "tags" "A DNS record tag must use name:value syntax."
+                let name = tag.Substring(0, separator)
+                let value = tag.Substring(separator + 1)
+                if name.Length > 32
+                   || not (name |> Seq.forall (fun character -> Char.IsAsciiLetterOrDigit character || character = '-' || character = '_')) then
+                    invalid "tags" "A DNS record tag name must use at most 32 ASCII letters, digits, hyphens or underscores."
+                if value.IndexOf('\n') >= 0 || value.IndexOf('\r') >= 0 then
+                    invalid "tags" "A DNS record tag value cannot contain line breaks."
+                let mutable valueLength = 0
+                for _ in value.EnumerateRunes() do valueLength <- valueLength + 1
+                if valueLength > 100 then invalid "tags" "A DNS record tag value cannot exceed 100 Unicode characters."
 
         let private fieldFingerprint kind (parts: RecordField list) =
             let values = ResizeArray<string * string>()
@@ -535,15 +609,17 @@ module Cloudflare =
             let addNumber key value = values.Add(key, Convert.ToString(box value, CultureInfo.InvariantCulture))
             for part in parts do
                 match part with
-                | OwnerName _ | Ttl _ | Proxy _ | Comment _ | RecordTags _ -> ()
-                | RecordAddress value -> addString "address" value id
+                | OwnerName _ | Ttl _ | Proxy _ | Comment _ | RecordTags _ | Protect _ | RecordAliases _ -> ()
+                | RecordAddress value ->
+                    let family = if kind = A then AddressFamily.InterNetwork else AddressFamily.InterNetworkV6
+                    addString "address" value (normalizeAddressText "address" family)
                 | RecordTarget value ->
                     addString "target" value (if kind = Uri then id else normalizeTarget)
                 | RecordContent value -> addString "content" value id
                 | TxtText value -> addString "content" value encodeTxtText
                 | TxtSegments segments -> values.Add("content", encodeTxtSegments segments)
                 | NumberFlags value -> addNumber "flags" value
-                | TextFlags value -> values.Add("flags", value)
+                | TextFlags value -> values.Add("naptrFlags", value)
                 | CaaTag value -> values.Add("tag", value.ToLowerInvariant())
                 | DataValue value -> addString "value" value id
                 | Algorithm value -> addNumber "algorithm" value
@@ -589,9 +665,9 @@ module Cloudflare =
             let allowed = allowedFields kind
             let seen = HashSet<string>(StringComparer.Ordinal)
             for part in parts do
-                let name = fieldName part
-                if not (seen.Add name) then invalid "record" (sprintf "Field '%s' may only be declared once." name)
-                if not (allowed.Contains name) then invalid "record" (sprintf "Field '%s' is not supported for %s records." name (recordType kind))
+                let field = fieldName part
+                if not (seen.Add field) then invalid "record" (sprintf "Field '%s' may only be declared once." field)
+                if not (allowed.Contains field) then invalid "record" (sprintf "Field '%s' is not supported for %s records." field (recordType kind))
 
             let rawOwner = getString "name" parts |> Option.defaultWith (fun () -> invalid "record" (sprintf "A %s record requires 'name'." (recordType kind)))
             if String.IsNullOrWhiteSpace rawOwner then invalid "name" "A DNS record owner name is required."
@@ -606,16 +682,18 @@ module Cloudflare =
             if proxy = Proxied && ttl <> Auto then invalid "proxy" "Proxied records require automatic TTL."
             let comment = parts |> List.tryPick (function Comment value -> Some value | _ -> None)
             let tags = parts |> List.tryPick (function RecordTags values -> Some values | _ -> None) |> Option.defaultValue []
-            let priority = getInt "priority" parts
+            validateComment comment
+            validateTags tags
+            let protect = parts |> List.tryPick (function Protect value -> Some value | _ -> None)
+            let aliases = parts |> List.tryPick (function RecordAliases values -> Some values | _ -> None) |> Option.defaultValue []
+            let priority = if kind = Mx || kind = Srv || kind = Uri then getInt "priority" parts else None
             let value, data =
                 match kind with
                 | A ->
-                    let address = requiredText kind "address" parts
-                    validateAddress "address" AddressFamily.InterNetwork address
+                    let address = requiredText kind "address" parts |> normalizeAddress "address" AddressFamily.InterNetwork
                     Some(AddressValue address), None
                 | Aaaa ->
-                    let address = requiredText kind "address" parts
-                    validateAddress "address" AddressFamily.InterNetworkV6 address
+                    let address = requiredText kind "address" parts |> normalizeAddress "address" AddressFamily.InterNetworkV6
                     Some(AddressValue address), None
                 | Cname | Mx | Ns | Ptr ->
                     let target = requiredText kind "target" parts
@@ -639,7 +717,7 @@ module Cloudflare =
                     if not (validCaaTag tag) then invalid "tag" "A CAA tag must contain 1–15 ASCII letters, digits or hyphens."
                     let value = requiredText kind "value" parts
                     validateStringValue "value" true value
-                    None, Some(CaaData(flags, tag, value))
+                    None, Some(CaaData(flags, tag.ToLowerInvariant(), value))
                 | Cert ->
                     let algorithm = requiredInt kind "algorithm" parts |> checkedRange "algorithm" 0 255
                     let certificate = requiredText kind "certificate" parts
@@ -651,6 +729,7 @@ module Cloudflare =
                     let flags = requiredInt kind "flags" parts |> checkedRange "flags" 0 65535
                     let algorithm = requiredInt kind "algorithm" parts |> checkedRange "algorithm" 0 255
                     let protocol = requiredInt kind "protocol" parts |> checkedRange "protocol" 0 255
+                    if protocol <> 3 then invalid "protocol" "A DNSKEY record protocol must be 3."
                     let publicKey = requiredText kind "publicKey" parts
                     validateStringValue "publicKey" false publicKey
                     None, Some(DnsKeyData(flags, algorithm, protocol, publicKey))
@@ -674,12 +753,13 @@ module Cloudflare =
                     let latitude = validateCoordinate "latitude" [ North; South ] 90 latitude
                     let longitude = validateCoordinate "longitude" [ East; West ] 180 longitude
                     let altitude, size, precisionHorz, precisionVert = getFloat "altitude" parts, getFloat "size" parts, getFloat "precisionHorz" parts, getFloat "precisionVert" parts
-                    altitude |> Option.iter (checkedFinite "altitude" >> ignore)
+                    altitude |> Option.iter (checkedFloatRange "altitude" (-100000.0) 42849672.95 >> ignore)
                     for label, value in [ "size", size; "precisionHorz", precisionHorz; "precisionVert", precisionVert ] do
-                        value |> Option.iter (fun number -> checkedFinite label number |> ignore; if number < 0.0 then invalid label (label + " cannot be negative."))
+                        value |> Option.iter (checkedFloatRange label 0.0 90000000.0 >> ignore)
                     None, Some(LocData(latitude, longitude, altitude, size, precisionHorz, precisionVert))
                 | Naptr ->
-                    let flags = getString "flags" parts |> Option.defaultWith (fun () -> invalid "record" "A NAPTR record requires 'flags'.")
+                    let flags = getString "naptrFlags" parts |> Option.defaultWith (fun () -> invalid "record" "A NAPTR record requires 'naptrFlags'.")
+                    if not (flags |> Seq.forall Char.IsAsciiLetterOrDigit) then invalid "naptrFlags" "NAPTR flags must contain only ASCII letters and digits."
                     let order = requiredInt kind "order" parts |> checkedRange "order" 0 65535
                     let preference = requiredInt kind "preference" parts |> checkedRange "preference" 0 65535
                     let regex = requiredText kind "regex" parts
@@ -732,12 +812,13 @@ module Cloudflare =
 
             match kind, priority with
             | Mx, None -> invalid "record" "An MX record requires 'priority'."
+            | Mx, Some value -> checkedRange "priority" 0 65535 value |> ignore
             | Uri, None -> invalid "record" "A URI record requires top-level 'priority'."
             | Srv, Some value -> checkedRange "priority" 0 65535 value |> ignore
             | _ -> ()
 
             let fingerprint = fieldFingerprint kind parts
-            RecordSpec(logicalKey, kind, rawOwner, value, data, priority, ttl, proxy, comment, tags, fingerprint)
+            RecordSpec(logicalKey, kind, rawOwner, value, data, priority, ttl, proxy, comment, tags, protect, aliases, fingerprint)
 
         let private mergeOption label left right =
             match left, right with
@@ -749,6 +830,7 @@ module Cloudflare =
             let canonicalName = normalizeDomain name
             let mutable accountId = None
             let mutable zoneId = None
+            let mutable provider = None
             let records = ResizeArray<RecordSpec>()
             let seen = HashSet<string>(StringComparer.Ordinal)
             for field in fields do
@@ -759,8 +841,12 @@ module Cloudflare =
                     accountId <- Some value
                 | ZoneId value ->
                     if not (seen.Add "zoneId") then invalid "domain" "zoneId may only be declared once per domain block."
-                    if String.IsNullOrWhiteSpace value then invalid "zoneId" "A Cloudflare zone ID cannot be empty."
+                    validateZoneId value
                     zoneId <- Some value
+                | ZoneProvider value ->
+                    if not (seen.Add "zoneProvider") then invalid "domain" "zoneProvider may only be declared once per domain block."
+                    if isNull (box value) then invalid "zoneProvider" "A Cloudflare provider resource cannot be null."
+                    provider <- Some value
                 | Dns dns -> records.AddRange dns.Records
             if accountId.IsSome && zoneId.IsSome then invalid "domain" "Choose accountId lookup or explicit zoneId, not both."
             let records =
@@ -768,9 +854,9 @@ module Cloudflare =
                 |> Seq.map (fun record ->
                     let ownerName = normalizeOwner canonicalName record.OwnerName
                     let fingerprint = record.Fingerprint |> Option.map (fun value -> ownerName + ":" + value)
-                    RecordSpec(record.LogicalKey, record.Kind, ownerName, record.Value, record.Data, record.Priority, record.Ttl, record.Proxy, record.Comment, record.Tags, fingerprint))
+                    RecordSpec(record.LogicalKey, record.Kind, ownerName, record.Value, record.Data, record.Priority, record.Ttl, record.Proxy, record.Comment, record.Tags, record.Protect, record.Aliases, fingerprint))
                 |> Seq.toList
-            DomainSpec(canonicalName, accountId, zoneId, records)
+            DomainSpec(canonicalName, accountId, zoneId, provider, records)
 
         let mergeDomains (domains: DomainSpec list) =
             let merged = Dictionary<string, DomainSpec>(StringComparer.Ordinal)
@@ -780,8 +866,9 @@ module Cloudflare =
                 | true, previous ->
                     let account = mergeOption "accountId" previous.AccountId domain.AccountId
                     let zone = mergeOption "zoneId" previous.ZoneId domain.ZoneId
+                    let provider = mergeOption "zoneProvider" previous.Provider domain.Provider
                     if account.IsSome && zone.IsSome then invalid "domain" "Choose accountId lookup or explicit zoneId, not both."
-                    merged[domain.Name] <- DomainSpec(domain.Name, account, zone, previous.Records @ domain.Records)
+                    merged[domain.Name] <- DomainSpec(domain.Name, account, zone, provider, previous.Records @ domain.Records)
             let result = merged.Values |> Seq.sortBy (fun domain -> domain.Name) |> Seq.toList
             for domain in result do
                 let keys = HashSet<string>(StringComparer.Ordinal)
@@ -923,6 +1010,8 @@ module Cloudflare =
             match domain.ZoneId with
             | Some zoneId -> Output.Create<string>(zoneId)
             | None ->
+                let invokeOptions = InvokeOptions()
+                domain.Provider |> Option.iter (fun provider -> invokeOptions.Provider <- provider)
                 let lookup = Pulumi.Cloudflare.GetZonesInvokeArgs()
                 lookup.Name <- Input<string>.op_Implicit domain.Name
                 lookup.Match <- Input<string>.op_Implicit "all"
@@ -932,7 +1021,7 @@ module Cloudflare =
                     let account = Pulumi.Cloudflare.Inputs.GetZonesAccountInputArgs()
                     account.Id <- Input<string>.op_Implicit accountId
                     lookup.Account <- Input<Pulumi.Cloudflare.Inputs.GetZonesAccountInputArgs>.op_Implicit account)
-                Pulumi.Cloudflare.GetZones.Invoke(lookup).Apply(Func<Pulumi.Cloudflare.GetZonesResult, string>(fun result ->
+                Pulumi.Cloudflare.GetZones.Invoke(lookup, invokeOptions).Apply(Func<Pulumi.Cloudflare.GetZonesResult, string>(fun result ->
                     let exact =
                         result.Results
                         |> Seq.filter (fun zone ->
@@ -962,7 +1051,11 @@ module Cloudflare =
                         for tag in record.Tags do args.Tags.Add(Input<string>.op_Implicit tag)
                         record.Value |> Option.iter (setContent record.Kind args)
                         record.Data |> Option.iter (fun data -> args.Data <- Input<Pulumi.Cloudflare.Inputs.DnsRecordDataArgs>.op_Implicit (createData data))
-                        resources.Add(Pulumi.Cloudflare.DnsRecord(resourceName domain.Name record.LogicalKey, args))
+                        let options = CustomResourceOptions()
+                        domain.Provider |> Option.iter (fun provider -> options.Provider <- provider)
+                        record.Protect |> Option.iter (fun protect -> options.Protect <- Nullable protect)
+                        for alias in record.Aliases do options.Aliases.Add(Input<Alias>.op_Implicit alias)
+                        resources.Add(Pulumi.Cloudflare.DnsRecord(resourceName domain.Name record.LogicalKey, args, options))
             List.ofSeq resources
 
     type RecordBuilder internal (kind: RecordKind, logicalKey: string) =
@@ -1035,58 +1128,64 @@ module Cloudflare =
 
     let accountId value = AccountId value
     let zoneId value = ZoneId value
+    let zoneProvider (provider: ProviderResource) = ZoneProvider provider
     let name value = OwnerName value
     let address (value: string) = RecordAddress(LiteralString value)
-    let addressOutput (value: Output<string>) = RecordAddress(OutputString value)
-    let target (value: string) = RecordTarget(LiteralString value)
-    let targetOutput (value: Output<string>) = RecordTarget(OutputString value)
-    let content (value: string) = RecordContent(LiteralString value)
-    let contentOutput (value: Output<string>) = RecordContent(OutputString value)
-    let text (value: string) = TxtText(LiteralString value)
-    let textOutput (value: Output<string>) = TxtText(OutputString value)
-    let segments values = TxtSegments(Seq.toList values)
-    let flags (value: int) = NumberFlags value
-    let naptrFlags (value: string) = TextFlags value
-    let tag value = CaaTag value
-    let value (input: string) = DataValue(LiteralString input)
-    let valueOutput (input: Output<string>) = DataValue(OutputString input)
-    let algorithm value = Algorithm value
-    let certificate (input: string) = Certificate(LiteralString input)
-    let certificateOutput (input: Output<string>) = Certificate(OutputString input)
-    let keyTag value = KeyTag value
-    let certificateType value = CertificateType value
-    let protocol value = Protocol value
-    let publicKey (input: string) = PublicKey(LiteralString input)
-    let publicKeyOutput (input: Output<string>) = PublicKey(OutputString input)
-    let digest (input: string) = Digest(LiteralString input)
-    let digestOutput (input: Output<string>) = Digest(OutputString input)
-    let digestType value = DigestType value
-    let priority value = Priority value
-    let port value = Port value
-    let weight value = Weight value
-    let latitude value = Latitude value
-    let longitude value = Longitude value
-    let altitude value = Altitude value
-    let size value = Size value
-    let precisionHorz value = PrecisionHorz value
-    let precisionVert value = PrecisionVert value
-    let order value = NaptrOrder value
-    let preference value = Preference value
-    let regex (input: string) = Regex(LiteralString input)
-    let regexOutput (input: Output<string>) = Regex(OutputString input)
-    let replacement (input: string) = Replacement(LiteralString input)
-    let replacementOutput (input: Output<string>) = Replacement(OutputString input)
-    let service (input: string) = Service(LiteralString input)
-    let serviceOutput (input: Output<string>) = Service(OutputString input)
-    let matchingType value = MatchingType value
-    let selector value = Selector value
-    let usage value = Usage value
-    let fingerprint (input: string) = Fingerprint(LiteralString input)
-    let fingerprintOutput (input: Output<string>) = Fingerprint(OutputString input)
-    let fingerprintType value = FingerprintType value
-    let ttl value = Ttl value
     let proxy value = Proxy value
-    let comment value = Comment value
-    let tags values = RecordTags(Seq.toList values)
+
+    [<RequireQualifiedAccess>]
+    module Fields =
+        let addressOutput (value: Output<string>) = RecordAddress(OutputString value)
+        let target (value: string) = RecordTarget(LiteralString value)
+        let targetOutput (value: Output<string>) = RecordTarget(OutputString value)
+        let content (value: string) = RecordContent(LiteralString value)
+        let contentOutput (value: Output<string>) = RecordContent(OutputString value)
+        let text (value: string) = TxtText(LiteralString value)
+        let textOutput (value: Output<string>) = TxtText(OutputString value)
+        let segments values = TxtSegments(Seq.toList values)
+        let flags (value: int) = NumberFlags value
+        let naptrFlags (value: string) = TextFlags value
+        let tag value = CaaTag value
+        let value (input: string) = DataValue(LiteralString input)
+        let valueOutput (input: Output<string>) = DataValue(OutputString input)
+        let algorithm value = Algorithm value
+        let certificate (input: string) = Certificate(LiteralString input)
+        let certificateOutput (input: Output<string>) = Certificate(OutputString input)
+        let keyTag value = KeyTag value
+        let certificateType value = CertificateType value
+        let protocol value = Protocol value
+        let publicKey (input: string) = PublicKey(LiteralString input)
+        let publicKeyOutput (input: Output<string>) = PublicKey(OutputString input)
+        let digest (input: string) = Digest(LiteralString input)
+        let digestOutput (input: Output<string>) = Digest(OutputString input)
+        let digestType value = DigestType value
+        let priority value = Priority value
+        let port value = Port value
+        let weight value = Weight value
+        let latitude value = Latitude value
+        let longitude value = Longitude value
+        let altitude value = Altitude value
+        let size value = Size value
+        let precisionHorz value = PrecisionHorz value
+        let precisionVert value = PrecisionVert value
+        let order value = NaptrOrder value
+        let preference value = Preference value
+        let regex (input: string) = Regex(LiteralString input)
+        let regexOutput (input: Output<string>) = Regex(OutputString input)
+        let replacement (input: string) = Replacement(LiteralString input)
+        let replacementOutput (input: Output<string>) = Replacement(OutputString input)
+        let service (input: string) = Service(LiteralString input)
+        let serviceOutput (input: Output<string>) = Service(OutputString input)
+        let matchingType value = MatchingType value
+        let selector value = Selector value
+        let usage value = Usage value
+        let fingerprint (input: string) = Fingerprint(LiteralString input)
+        let fingerprintOutput (input: Output<string>) = Fingerprint(OutputString input)
+        let fingerprintType value = FingerprintType value
+        let ttl value = Ttl value
+        let comment value = Comment value
+        let tags values = RecordTags(Seq.toList values)
+        let protect value = Protect value
+        let aliases values = RecordAliases(Seq.toList values)
 
     let deploy spec = Validation.deploy spec
