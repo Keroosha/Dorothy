@@ -11,6 +11,7 @@
         <Compile Include="Ufw.fs" />
         <Compile Include="FirewalldModel.fs" />
         <Compile Include="Firewalld.fs" />
+        <Compile Include="Cloudflare.fs" />
         <Compile Include="Certificates.fs" />
         <Compile Include="Traefik.fs" />
         <Compile Include="Docker.fs" />
@@ -26,7 +27,8 @@
         <Compile Include="Resources.fs" />
     </ItemGroup>
     <ItemGroup>
-        <PackageReference Include="Pulumi" Version="3.116.2" />
+        <PackageReference Include="Pulumi" Version="3.118.0" />
+        <PackageReference Include="Pulumi.Cloudflare" Version="6.24.0" />
         <PackageReference Include="Pulumi.Docker" Version="5.2.0" />
         <PackageReference Include="OpenTelemetry.Exporter.OpenTelemetryProtocol" Version="1.15.3" />
     </ItemGroup>
