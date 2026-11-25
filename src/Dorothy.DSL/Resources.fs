@@ -1431,14 +1431,36 @@ module Host =
                 let version = host.Packages |> Map.tryFind "firewalld" |> Option.defaultValue None
                 Some(createAptPackageSet (host.Name + "-firewalld-package") (Map.ofList [ "firewalld", version ]) [] false)
             else None
+        let firewalldSettingsResource =
+            match host.Firewalld |> Option.bind _.StrictForwardPorts, firewalldPackage with
+            | Some enabled, Some packageSet ->
+                let configuration =
+                    { FirewalldModel.empty "settings" "strict-forward-ports" with StrictForwardPorts = Some enabled }
+                    |> FirewalldModel.toJson
+                let args = FirewalldArgs()
+                args.Connection <- Input<AptConnectionArgs>.op_Implicit connection
+                args.Configuration <- Input<string>.op_Implicit configuration
+                Some(
+                    FirewalldResource(
+                        "keroosha:debian:FirewalldSettings",
+                        host.Name + "-firewalld-strict-forward-ports",
+                        args,
+                        ProviderContract.resourceOptionsWithDependencies [ packageSet :> Resource ]
+                    )
+                )
+            | Some _, None -> invalidOp "A firewalld global setting requires its APT package prerequisite."
+            | None, _ -> None
+
 
         // Keep explicitly declared docker.io in its original main APT owner. Ordering
         // the whole owner after firewalld avoids both first-start races and package removal.
         let mainDependencies =
             if host.Docker.IsSome then
-                firewalldPackage |> Option.map (fun resource -> resource :> Resource) |> Option.toList
+                (firewalldPackage |> Option.map (fun resource -> resource :> Resource) |> Option.toList)
+                @ (firewalldSettingsResource |> Option.map (fun resource -> resource :> Resource) |> Option.toList)
             else []
         let mainApt = createAptPackageSet host.Name mainPackages mainDependencies false
+
 
         let fail2banPackages =
             if host.Fail2Ban.IsSome then
@@ -1463,10 +1485,10 @@ module Host =
 
         let dockerPackage =
             if host.Docker.IsSome && not (Map.containsKey "docker.io" host.Packages) then
-                // firewalld must be running before Docker's first startup registers its zone.
                 let dependencies =
                     [ mainApt :> Resource ]
                     @ (firewalldPackage |> Option.map (fun resource -> resource :> Resource) |> Option.toList)
+                    @ (firewalldSettingsResource |> Option.map (fun resource -> resource :> Resource) |> Option.toList)
                 Some(createAptPackageSet (host.Name + "-docker-package") (Map.ofList [ "docker.io", None ]) dependencies true)
             else
                 None
@@ -1666,43 +1688,45 @@ module Host =
             | Some _, None -> invalidOp "A UFW declaration must have its APT prerequisite resource."
 
 
-        let dockerGuardPolicies =
-            match host.Firewalld, firewalldPackage with
-            | Some firewall, Some packageSet ->
-                let zones = Collections.Generic.Dictionary<string, Resource>(StringComparer.Ordinal)
-                let dockerPolicies = ResizeArray<Resource>()
-                let create (specification: FirewalldObjectSpec) dependencies =
-                    let args = FirewalldArgs()
-                    args.Connection <- Input<AptConnectionArgs>.op_Implicit connection
-                    args.Configuration <- Input<string>.op_Implicit specification.Configuration
-                    let token = if specification.Kind = "zone" then "keroosha:debian:FirewalldZone" else "keroosha:debian:FirewalldPolicy"
-                    FirewalldResource(token, host.Name + "-firewalld-" + specification.Kind + "-" + specification.Name,
-                                      args, ProviderContract.resourceOptionsWithDependencies dependencies) :> Resource
-                // Zones are serialized so an interface transfer cannot race another managed zone.
-                let mutable prior = packageSet :> Resource
-                for specification in firewall.Objects |> List.filter (fun value -> value.Kind = "zone") do
-                    let resource = create specification [ prior ]
-                    zones.Add(specification.Name, resource)
-                    prior <- resource
-                for specification in firewall.Objects |> List.filter (fun value -> value.Kind = "policy") do
-                    let referenced = specification.Value.Ingress @ specification.Value.Egress
-                    let dependencies =
-                        referenced
-                        |> List.choose (fun name -> match zones.TryGetValue name with true, resource -> Some resource | _ -> None)
-                    let referencesUnmanagedZone =
-                        referenced |> List.exists (fun name -> name <> "ANY" && name <> "HOST" && not (zones.ContainsKey name))
-                    let ownerDependencies =
-                        if referencesUnmanagedZone then dockerEngine |> Option.map (fun engine -> [ engine :> Resource ]) |> Option.defaultValue []
-                        else []
-                    let resource = create specification (prior :: dependencies @ ownerDependencies)
-                    if List.contains "docker" specification.Value.Egress then dockerPolicies.Add resource
-                List.ofSeq dockerPolicies
-            | _, None | None, _ -> []
+        let firewalldResources = Dictionary<FirewalldObjectSpec, Resource>()
+        match host.Firewalld, firewalldPackage with
+        | Some firewall, Some packageSet ->
+            let zones = Collections.Generic.Dictionary<string, Resource>(StringComparer.Ordinal)
+            let create (specification: FirewalldObjectSpec) dependencies =
+                let args = FirewalldArgs()
+                args.Connection <- Input<AptConnectionArgs>.op_Implicit connection
+                args.Configuration <- Input<string>.op_Implicit specification.Configuration
+                let token = if specification.Kind = "zone" then "keroosha:debian:FirewalldZone" else "keroosha:debian:FirewalldPolicy"
+                FirewalldResource(token, host.Name + "-firewalld-" + specification.Kind + "-" + specification.Name,
+                                  args, ProviderContract.resourceOptionsWithDependencies dependencies) :> Resource
+            // Zones are serialized so an interface transfer cannot race another managed zone.
+            let mutable prior =
+                firewalldSettingsResource
+                |> Option.map (fun resource -> resource :> Resource)
+                |> Option.defaultValue (packageSet :> Resource)
+            for specification in firewall.Objects |> List.filter (fun value -> value.Kind = "zone") do
+                let resource = create specification [ prior ]
+                zones.Add(specification.Name, resource)
+                firewalldResources.Add(specification, resource)
+                prior <- resource
+            for specification in firewall.Objects |> List.filter (fun value -> value.Kind = "policy") do
+                let referenced = specification.Value.Ingress @ specification.Value.Egress
+                let dependencies =
+                    referenced
+                    |> List.choose (fun name -> match zones.TryGetValue name with true, resource -> Some resource | _ -> None)
+                let referencesUnmanagedZone =
+                    referenced |> List.exists (fun name -> name <> "ANY" && name <> "HOST" && not (zones.ContainsKey name))
+                let ownerDependencies =
+                    if referencesUnmanagedZone then dockerEngine |> Option.map (fun engine -> [ engine :> Resource ]) |> Option.defaultValue []
+                    else []
+                let resource = create specification (prior :: dependencies @ ownerDependencies)
+                firewalldResources.Add(specification, resource)
+        | _, None | None, _ -> ()
 
         let dockerContainers =
             match host.Docker, dockerEngine with
             | Some specification, Some engine ->
-                DockerDeployment.deploy host engine specification hostContentDirectories dockerGuardPolicies completeJob
+                DockerDeployment.deploy host engine specification hostContentDirectories firewalldResources completeJob
             | Some _, None -> invalidOp "A Docker declaration must have its engine prerequisite resource."
             | None, _ -> []
 

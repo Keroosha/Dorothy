@@ -252,6 +252,23 @@ type TraefikBackendTests() =
         let actualUrl = firstServer.GetProperty("url").GetString()
         Assert.That(actualUrl, Is.EqualTo("http://127.0.0.1:9000"))
 
+
+    [<Test>]
+    member _.``ACME resolver omits an unset contact email``() =
+        use request =
+            JsonDocument.Parse("""{
+              "operation":"apply",
+              "ownerId":"unit-test-traefik",
+              "entryPoints":{"web":80},
+              "resolvers":{"le":{"httpChallengeEntryPoint":"web","caServer":"http://localhost:14000/dir"}},
+              "routers":{},
+              "certificates":{},
+              "adminPort":19080
+            }""")
+        use staticConfig = JsonDocument.Parse(Traefik.renderStaticConfig request.RootElement paths "127.0.0.1")
+        let acme = staticConfig.RootElement.GetProperty("certificatesResolvers").GetProperty("le").GetProperty("acme")
+        Assert.That(acme.EnumerateObject() |> Seq.exists (fun property -> property.Name = "email"), Is.False)
+        Assert.That(acme.GetProperty("httpChallenge").GetProperty("entryPoint").GetString(), Is.EqualTo "web")
     [<Test>]
     member _.``Host rules canonicalize IPv6 and IDN names``() =
         // Arrange

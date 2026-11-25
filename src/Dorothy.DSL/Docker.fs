@@ -241,7 +241,8 @@ type DockerContainerSpec internal (
     files: DockerFileSpec list,
     runOnce: TimeSpan option,
     dependencies: DockerContainerSpec list,
-    hostContentDirectories: HostContentDirectory list
+    hostContentDirectories: HostContentDirectory list,
+    firewalldPolicyDependencies: FirewalldObjectSpec list
 ) =
     member _.Name = name
     member _.Image = image
@@ -266,6 +267,7 @@ type DockerContainerSpec internal (
     member _.RunOnce = runOnce
     member _.Dependencies = dependencies
     member _.HostContentDirectories = hostContentDirectories
+    member _.FirewalldPolicyDependencies = firewalldPolicyDependencies
 
 type DockerSpec internal (
     networks: DockerNetworkSpec list,
@@ -343,6 +345,7 @@ type DockerContainerPart =
     | RunOnce of TimeSpan
     | DependsOn of DockerContainerSpec
     | DirectoryDependency of HostContentDirectory
+    | FirewalldPolicyDependency of FirewalldObjectSpec
 
 
 [<RequireQualifiedAccess>]
@@ -835,8 +838,10 @@ type DockerContainerBuilder internal (name: string) =
             (mounts
              |> List.choose (fun mount -> match mount.Source with DockerMountSource.HostDirectory directory -> Some directory | _ -> None))
             @ (parts |> List.choose (function DockerContainerPart.DirectoryDependency value -> Some value | _ -> None))
-            |> List.distinct
-
+            |> List.distinct,
+            (parts
+             |> List.choose (function DockerContainerPart.FirewalldPolicyDependency policy -> Some policy | _ -> None)
+             |> List.distinct)
         )
 
 [<Sealed>]
@@ -972,6 +977,8 @@ module DockerBuilders =
     let dependsOn container = DockerContainerPart.DependsOn container
     /// Waits for the declared host directory to exist with its requested metadata before start.
     let usesDirectory directory = DockerContainerPart.DirectoryDependency directory
+    /// Adds an explicit dependency on a declared firewalld policy resource.
+    let dependsOnFirewalld policy = DockerContainerPart.FirewalldPolicyDependency policy
     let noRestart = DockerRestartPolicy.NoRestart
     let always = DockerRestartPolicy.Always
     let unlessStopped = DockerRestartPolicy.UnlessStopped

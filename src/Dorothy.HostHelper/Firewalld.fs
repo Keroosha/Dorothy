@@ -470,6 +470,248 @@ module Firewalld =
         journal["pending"] <- null
         saveJournal environment c journal
 
+    let private strictConfigPath = "/etc/firewalld/firewalld.conf"
+    let private vendorStrictConfigPath = "/usr/lib/firewalld/firewalld.conf"
+
+    let private strictValue (text: string) =
+        let values =
+            text.Split('\n')
+            |> Array.choose (fun sourceLine ->
+                let line = sourceLine.Trim()
+                if line = "" || line.StartsWith("#", StringComparison.Ordinal) || line.StartsWith(";", StringComparison.Ordinal) then None
+                else
+                    let separator = line.IndexOf('=')
+                    if separator < 0 then
+                        if line = "StrictForwardPorts" then fail "Invalid StrictForwardPorts setting."
+                        None
+                    elif line.Substring(0, separator).Trim() = "StrictForwardPorts" then
+                        Some(line.Substring(separator + 1).Trim())
+                    else None)
+        match values with
+        | [||] -> None
+        | [| value |] when [ "yes"; "true"; "no"; "false" ] |> List.contains (value.ToLowerInvariant()) -> Some(value.ToLowerInvariant())
+        | [| _ |] -> fail "Invalid StrictForwardPorts value in firewalld.conf."
+        | _ -> fail "Duplicate StrictForwardPorts settings in firewalld.conf."
+
+    let private strictBoolean value =
+        match value with
+        | Some "yes" | Some "true" -> true
+        | Some "no" | Some "false" | None -> false
+        | Some _ -> fail "Invalid StrictForwardPorts value."
+
+    let private setStrictValue (text: string) value =
+        strictValue text |> ignore
+        let newline = if text.Contains("\r\n", StringComparison.Ordinal) then "\r\n" else "\n"
+        let normalized = text.Replace("\r\n", "\n").Replace("\r", "\n")
+        let trailingNewline = normalized.EndsWith("\n", StringComparison.Ordinal)
+        let sourceLines = normalized.Split('\n')
+        let sourceLines = if trailingNewline then Array.take (sourceLines.Length - 1) sourceLines else sourceLines
+        let result = ResizeArray<string>()
+        let mutable found = false
+        for line in sourceLines do
+            let trimmed = line.Trim()
+            let separator = trimmed.IndexOf('=')
+            if separator >= 0 && trimmed.Substring(0, separator).Trim() = "StrictForwardPorts" then
+                if found then fail "Duplicate StrictForwardPorts settings in firewalld.conf."
+                found <- true
+                value |> Option.iter (fun item -> result.Add("StrictForwardPorts=" + item))
+            else
+                result.Add line
+        if not found then value |> Option.iter (fun item -> result.Add("StrictForwardPorts=" + item))
+        if result.Count = 0 then ""
+        else String.concat newline result + newline
+
+    let private strictEffectiveText environment =
+        match readFile environment strictConfigPath with
+        | Some value -> Some value
+        | None -> readFile environment vendorStrictConfigPath
+
+    let private strictFileMode environment contents =
+        match contents with
+        | None -> 0o600
+        | Some _ ->
+            let physical = regularPath environment strictConfigPath
+            let owner = command environment "stat" [ "-c"; "%u:%g"; "--"; physical ]
+            if owner <> "0:0" then fail "firewalld.conf must be owned by root:root."
+            File.GetUnixFileMode physical |> int
+
+    let private writeStrictConfig environment (contents: string option) (mode: int) =
+        let physical = regularPath environment strictConfigPath
+        match contents with
+        | Some value ->
+            HostFiles.atomicWrite physical (Encoding.UTF8.GetBytes value) (enum<UnixFileMode> mode)
+        | None ->
+            if File.Exists physical then
+                File.Delete physical
+                HostFiles.syncDirectory (Path.GetDirectoryName physical)
+
+    let private strictBaseline environment (etcContents: string option) (vendorContents: string option) =
+        let baseline = JsonObject()
+        baseline["etcExists"] <- JsonValue.Create(etcContents.IsSome)
+        setOptional baseline "etcContents" etcContents
+        setOptional baseline "vendorContents" vendorContents
+        baseline["etcMode"] <- JsonValue.Create(strictFileMode environment etcContents)
+        baseline.ToJsonString()
+
+    let private parseStrictBaseline (text: string) =
+        let baseline = JsonNode.Parse(text).AsObject()
+        let expected = set [ "etcExists"; "etcContents"; "vendorContents"; "etcMode" ]
+        if baseline.Count <> expected.Count || (baseline |> Seq.map (fun pair -> pair.Key) |> Set.ofSeq) <> expected then
+            fail "Invalid StrictForwardPorts ownership baseline."
+        baseline["etcExists"].GetValue<bool>(),
+        optionalString baseline "etcContents",
+        optionalString baseline "vendorContents",
+        baseline["etcMode"].GetValue<int>()
+
+    let private writeStrictSnapshot (exists: bool) (actual: bool) (inSync: bool) =
+        let result = JsonObject()
+        result["exists"] <- JsonValue.Create exists
+        result["actual"] <- JsonValue.Create(if actual then "yes" else "no")
+        result["inSync"] <- JsonValue.Create inSync
+        result :> JsonNode
+
+    let private strictSnapshot (environment: HostEnvironment) (owner: string) (c: FirewalldModel.Configuration) =
+        let etcContents = readFile environment strictConfigPath
+        let effective = etcContents |> Option.orElse (readFile environment vendorStrictConfigPath)
+        let actual = effective |> Option.bind strictValue |> strictBoolean
+        let journal = loadJournal environment c owner
+        let owned =
+            journal
+            |> Option.exists (fun value ->
+                isNull value["pending"]
+                && (optionalString value "managed" |> Option.bind strictValue |> strictBoolean) = actual)
+        writeStrictSnapshot (effective.IsSome) actual (owned && c.StrictForwardPorts = Some actual)
+
+    let private guardCurrentConfiguration environment =
+        let connection = Environment.GetEnvironmentVariable "SSH_CONNECTION"
+        let fields = if isNull connection then [||] else connection.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+        if fields.Length <> 4 then fail "SSH_CONNECTION is required before any firewalld mutation."
+        for index in [ 0; 2 ] do
+            match IPAddress.TryParse fields[index] with true, _ -> () | _ -> fail "Invalid SSH_CONNECTION address."
+        let route = command environment "ip" [ "-j"; "route"; "get"; fields[0]; "from"; fields[2] ]
+        let context = parseSshContext connection route
+        let defaultZone = firewall environment [ "--get-default-zone" ]
+        let zones, policies = inventory environment "zone", inventory environment "policy"
+        let runtimeZone = runtimeZoneOfInterface environment defaultZone context.Interface
+        validateRuntimeBinding context defaultZone runtimeZone zones policies (effective environment "service")
+
+    let private saveStrictPending (journal: JsonObject) (before: string option) (after: string option) (beforeMode: int) (afterMode: int) =
+        let pending = JsonObject()
+        setOptional pending "before" before
+        setOptional pending "after" after
+        pending["beforeMode"] <- JsonValue.Create beforeMode
+        pending["afterMode"] <- JsonValue.Create afterMode
+        journal["pending"] <- pending
+
+    let private recoverStrictSetting environment (c: FirewalldModel.Configuration) (journal: JsonObject) =
+        match journal["pending"] with
+        | null -> ()
+        | pending ->
+            let pending = pending.AsObject()
+            if pending.Count <> 4 then fail "Invalid StrictForwardPorts pending transaction."
+            let before, after = optionalString pending "before", optionalString pending "after"
+            let beforeMode, afterMode = pending["beforeMode"].GetValue<int>(), pending["afterMode"].GetValue<int>()
+            let current = readFile environment strictConfigPath
+            if current <> before && current <> after then fail "firewalld.conf changed during a StrictForwardPorts transaction; refusing recovery."
+            guardCurrentConfiguration environment
+            writeStrictConfig environment before beforeMode
+            firewall environment [ "--check-config" ] |> ignore
+            firewall environment [ "--reload" ] |> ignore
+            setOptional journal "managed" before
+            journal["pending"] <- null
+            saveJournal environment c journal
+
+    let private transactStrictSetting (environment: HostEnvironment) (c: FirewalldModel.Configuration) (journal: JsonObject) (releaseOnRollback: bool) (before: string option) (beforeMode: int) (after: string option) (afterMode: int) =
+        guardCurrentConfiguration environment
+        saveStrictPending journal before after beforeMode afterMode
+        saveJournal environment c journal
+        try
+            writeStrictConfig environment after afterMode
+            firewall environment [ "--check-config" ] |> ignore
+            firewall environment [ "--reload" ] |> ignore
+        with originalError ->
+            try
+                writeStrictConfig environment before beforeMode
+                firewall environment [ "--reload" ] |> ignore
+                setOptional journal "managed" before
+                journal["pending"] <- null
+                saveJournal environment c journal
+            with rollbackError ->
+                fail ("StrictForwardPorts apply failed: " + diagnostic originalError.Message + "; rollback failed: " + diagnostic rollbackError.Message + "; journal retained for recovery.")
+            if releaseOnRollback then File.Delete(path environment (journalPath c))
+            fail ("StrictForwardPorts apply failed; original firewalld.conf restored and reloaded: " + diagnostic originalError.Message)
+        setOptional journal "managed" after
+        journal["pending"] <- null
+        saveJournal environment c journal
+
+    let private strictSettings (environment: HostEnvironment) (operation: string) (owner: string) (c: FirewalldModel.Configuration) =
+        let desired = c.StrictForwardPorts |> Option.defaultWith (fun () -> fail "StrictForwardPorts setting value is required.")
+        let lockFile = path environment lockPath
+        if operation = "read" then
+            use _lock =
+                if File.Exists lockFile then HostFiles.lockFile lockFile
+                else { new IDisposable with member _.Dispose() = () }
+            strictSnapshot environment owner c
+        elif operation = "apply" || operation = "delete" then
+            use _lock = HostFiles.lockFile lockFile
+            let existingJournal = loadJournal environment c owner
+            if operation = "delete" && existingJournal.IsNone then
+                JsonObject() :> JsonNode
+            else
+                firewall environment [ "--state" ] |> ignore
+                let journal =
+                    existingJournal
+                    |> Option.defaultWith (fun () ->
+                        let etcContents = readFile environment strictConfigPath
+                        let vendorContents = readFile environment vendorStrictConfigPath
+                        let baseline = strictBaseline environment etcContents vendorContents
+                        newJournal owner (Some baseline))
+                if existingJournal.IsSome then recoverStrictSetting environment c journal
+                let current = readFile environment strictConfigPath
+                let currentMode = strictFileMode environment current
+                let currentEffective =
+                    match current, readFile environment vendorStrictConfigPath with
+                    | Some value, _ -> value
+                    | None, Some value -> value
+                    | None, None -> ""
+                let currentValue = strictValue currentEffective
+                let managedContents = optionalString journal "managed"
+                let managedValue = managedContents |> Option.bind strictValue
+                if existingJournal.IsSome && strictBoolean currentValue <> strictBoolean managedValue then
+                    fail "StrictForwardPorts changed independently; refusing to overwrite firewalld.conf."
+                if operation = "apply" then
+                    let after = Some(setStrictValue currentEffective (Some(if desired then "yes" else "no")))
+                    if existingJournal.IsSome && current = after then
+                        setOptional journal "managed" current
+                        saveJournal environment c journal
+                    else
+                        let afterMode = if current.IsSome then currentMode else 0o600
+                        transactStrictSetting environment c journal existingJournal.IsNone current currentMode after afterMode
+                    strictSnapshot environment owner c
+                else
+                    let baselineText = optionalString journal "baseline" |> Option.defaultWith (fun () -> fail "Missing StrictForwardPorts baseline.")
+                    let baselineExists, baselineEtc, baselineVendor, baselineMode = parseStrictBaseline baselineText
+                    let baselineEffective =
+                        match baselineEtc, baselineVendor with
+                        | Some value, _ -> value
+                        | None, Some value -> value
+                        | None, None -> ""
+                    let baselineValue = strictValue baselineEffective
+                    let restoredContents =
+                        let candidate = setStrictValue currentEffective baselineValue
+                        if baselineExists then
+                            if current = managedContents then baselineEtc
+                            else Some candidate
+                        else
+                            let vendorBaseline = defaultArg baselineVendor ""
+                            if current = managedContents || candidate = vendorBaseline then None else Some candidate
+                    let restoreMode =
+                        if baselineExists && current = managedContents then baselineMode
+                        else currentMode
+                    transactStrictSetting environment c journal false current currentMode restoredContents restoreMode
+                    File.Delete(path environment (journalPath c))
+                    JsonObject() :> JsonNode
+        else fail "Unsupported StrictForwardPorts operation."
     let handle (environment: HostEnvironment) (request: JsonElement) : JsonNode =
         let keys = request.EnumerateObject() |> Seq.map (fun p -> p.Name) |> Seq.toList
         if keys.Length <> 3 || Set.ofList keys <> set [ "operation"; "ownerId"; "configuration" ] then fail "Invalid firewalld request fields."
@@ -479,42 +721,45 @@ module Firewalld =
         let c =
             try FirewalldModel.parse (request.GetProperty("configuration").GetString())
             with _ -> fail "Invalid firewalld configuration."
-        let lockFile = path environment lockPath
-        if operation = "read" then
-            use _lock =
-                if File.Exists lockFile then HostFiles.lockFile lockFile
-                else { new IDisposable with member _.Dispose() = () }
-            snapshot environment c (loadJournal environment c owner)
-        elif operation = "apply" || operation = "delete" then
-            use _lock = HostFiles.lockFile lockFile
-            let existingJournal = loadJournal environment c owner
-            if operation = "delete" && existingJournal.IsNone then
-                // Never delete an unowned object, including a resource whose Create guard failed.
-                JsonObject() :> JsonNode
-            else
-                ensurePrerequisites environment (if operation = "delete" then { c with Interfaces = []; Services = []; Ingress = []; Egress = [] } else c)
-                let journal =
-                    existingJournal
-                    |> Option.defaultWith (fun () -> newJournal owner (readFile environment (objectPath "/etc/firewalld" c.Kind c.Name)))
-                recover environment c journal
-                if operation = "apply" then
-                    transact environment c journal existingJournal.IsNone (Some(render c))
-                    let result = snapshot environment c (Some journal)
-                    if not (result["inSync"].GetValue<bool>()) then fail "Firewalld permanent configuration did not converge."
-                    result
-                else
-                    let current = readFile environment (objectPath "/etc/firewalld" c.Kind c.Name)
-                    if current <> optionalString journal "managed" then fail "Owned firewalld file changed independently; refusing Delete."
-                    let baseline = optionalString journal "baseline"
-                    let restored =
-                        baseline |> Option.map (fun xml ->
-                            if c.Kind <> "zone" then xml
-                            else
-                                let zone = parseXml "zone" xml
-                                // Deleted resource no longer owns any interface: use default-zone fallback.
-                                zone.Elements(xn "interface") |> Seq.toArray |> Array.iter (fun element -> element.Remove())
-                                zone.ToString(SaveOptions.DisableFormatting) + "\n")
-                    transact environment c journal false restored
-                    File.Delete(path environment (journalPath c))
+        if c.Kind = "settings" then
+            strictSettings environment operation owner c
+        else
+            let lockFile = path environment lockPath
+            if operation = "read" then
+                use _lock =
+                    if File.Exists lockFile then HostFiles.lockFile lockFile
+                    else { new IDisposable with member _.Dispose() = () }
+                snapshot environment c (loadJournal environment c owner)
+            elif operation = "apply" || operation = "delete" then
+                use _lock = HostFiles.lockFile lockFile
+                let existingJournal = loadJournal environment c owner
+                if operation = "delete" && existingJournal.IsNone then
+                    // Never delete an unowned object, including a resource whose Create guard failed.
                     JsonObject() :> JsonNode
-        else fail "Unsupported firewalld operation."
+                else
+                    ensurePrerequisites environment (if operation = "delete" then { c with Interfaces = []; Services = []; Ingress = []; Egress = [] } else c)
+                    let journal =
+                        existingJournal
+                        |> Option.defaultWith (fun () -> newJournal owner (readFile environment (objectPath "/etc/firewalld" c.Kind c.Name)))
+                    recover environment c journal
+                    if operation = "apply" then
+                        transact environment c journal existingJournal.IsNone (Some(render c))
+                        let result = snapshot environment c (Some journal)
+                        if not (result["inSync"].GetValue<bool>()) then fail "Firewalld permanent configuration did not converge."
+                        result
+                    else
+                        let current = readFile environment (objectPath "/etc/firewalld" c.Kind c.Name)
+                        if current <> optionalString journal "managed" then fail "Owned firewalld file changed independently; refusing Delete."
+                        let baseline = optionalString journal "baseline"
+                        let restored =
+                            baseline |> Option.map (fun xml ->
+                                if c.Kind <> "zone" then xml
+                                else
+                                    let zone = parseXml "zone" xml
+                                    // Deleted resource no longer owns any interface: use default-zone fallback.
+                                    zone.Elements(xn "interface") |> Seq.toArray |> Array.iter (fun element -> element.Remove())
+                                    zone.ToString(SaveOptions.DisableFormatting) + "\n")
+                        transact environment c journal false restored
+                        File.Delete(path environment (journalPath c))
+                        JsonObject() :> JsonNode
+            else fail "Unsupported firewalld operation."

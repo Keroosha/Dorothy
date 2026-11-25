@@ -386,10 +386,15 @@ module Traefik =
                     requireObject "resolver" value |> ignore
                     let allowedResolver = set [ "email"; "httpChallengeEntryPoint"; "caServer" ]
                     if not (Set.isEmpty (Set.difference (objectNames value) allowedResolver)) then fail "resolver configuration is invalid"
-                    let email = requiredProperty value "email" "resolver email is invalid" |> stringValue "resolver email is invalid"
-                    if email.Length > 254
-                       || ((email |> Seq.filter ((=) '@') |> Seq.length) <> 1)
-                       || (email |> Seq.exists (fun character -> int character < 33 || int character = 127)) then
+                    let email =
+                        match tryProperty value "email" with
+                        | None -> ""
+                        | Some property when property.ValueKind = JsonValueKind.Null -> ""
+                        | Some property -> stringValue "resolver email is invalid" property
+                    if email <> ""
+                       && (email.Length > 254
+                           || ((email |> Seq.filter ((=) '@') |> Seq.length) <> 1)
+                           || (email |> Seq.exists (fun character -> int character < 33 || int character = 127))) then
                         fail "resolver email is invalid"
                     let challenge = requiredProperty value "httpChallengeEntryPoint" "httpChallengeEntryPoint contains an unsafe name" |> stringValue "httpChallengeEntryPoint contains an unsafe name"
                     validateName "httpChallengeEntryPoint" [] challenge |> ignore
@@ -545,7 +550,7 @@ module Traefik =
         let resolvers = JsonObject()
         for KeyValue(name, resolver) in normalized.Resolvers do
             let acme = JsonObject()
-            acme["email"] <- JsonValue.Create(resolver.Email)
+            if not (String.IsNullOrEmpty resolver.Email) then acme["email"] <- JsonValue.Create(resolver.Email)
             acme["storage"] <- JsonValue.Create(Path.Combine(paths.StateDir, "acme-" + sha256Text name + ".json"))
             let challenge = JsonObject()
             challenge["entryPoint"] <- JsonValue.Create(resolver.HttpChallengeEntryPoint)

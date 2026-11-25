@@ -23,12 +23,14 @@ module FirewalldModel =
           Forward: bool
           Ingress: string list
           Egress: string list
-          Priority: int }
+          Priority: int
+          StrictForwardPorts: bool option }
 
     let empty kind name =
         { Kind = kind; Name = name; Target = if kind = "zone" then "default" else "CONTINUE"
           Interfaces = []; Services = []; Ports = []; Protocols = []; Masquerade = false
-          Forward = false; Ingress = []; Egress = []; Priority = -1 }
+          Forward = false; Ingress = []; Egress = []; Priority = -1; StrictForwardPorts = None }
+
 
     let token label maxLength (value: string) =
         if String.IsNullOrEmpty value || value.Length > maxLength
@@ -53,33 +55,44 @@ module FirewalldModel =
         (if first = last then string first else string first + "-" + string last) + "/" + parts[1]
 
     let validate (c: Configuration) =
-        if c.Kind <> "zone" && c.Kind <> "policy" then invalidArg "kind" "Expected zone or policy."
+        if c.Kind <> "zone" && c.Kind <> "policy" && c.Kind <> "settings" then invalidArg "kind" "Expected zone, policy, or settings."
         token "name" (if c.Kind = "zone" then 17 else 128) c.Name |> ignore
         if c.Name.Contains('.') then invalidArg "name" "Zone and policy names cannot contain dots."
-        let targets = if c.Kind = "zone" then [ "default"; "ACCEPT"; "DROP"; "%%REJECT%%" ] else [ "CONTINUE"; "ACCEPT"; "DROP"; "REJECT" ]
-        if not (List.contains c.Target targets) then invalidArg "target" "Invalid firewalld target."
-        let normalized label length values = values |> List.map (token label length) |> List.distinct |> List.sort
-        let interfaces = normalized "interface" 15 c.Interfaces
-        let services = normalized "service" 128 c.Services
-        let protocols = normalized "protocol" 128 c.Protocols
-        let zones values =
-            values |> List.map (fun value -> if value = "ANY" || value = "HOST" then value else token "zone" 17 value)
-            |> List.distinct |> List.sort
-        let ingress, egress = zones c.Ingress, zones c.Egress
-        if c.Kind = "zone" && (not ingress.IsEmpty || not egress.IsEmpty || c.Priority <> -1) then
-            invalidArg "zone" "Ingress, egress and priority belong to policies."
-        if c.Kind = "policy" then
-            if not interfaces.IsEmpty || not services.IsEmpty || not c.Ports.IsEmpty || not protocols.IsEmpty || c.Forward then
-                invalidArg "policy" "Policy supports only ingress, egress, target, priority and masquerade."
-            if ingress.IsEmpty || egress.IsEmpty then invalidArg "policy" "Policy requires ingress and egress zones."
-            for values in [ ingress; egress ] do
-                if values.Length > 1 && (List.contains "ANY" values || List.contains "HOST" values) then
-                    invalidArg "policy" "ANY and HOST cannot be combined with other zones."
-            if ingress = [ "HOST" ] && egress = [ "HOST" ] then invalidArg "policy" "Both policy sides cannot be HOST."
-            if c.Priority = 0 || c.Priority < -32768 || c.Priority > 32767 then
-                invalidArg "priority" "Policy priority must be -32768..32767, excluding zero."
-        { c with Interfaces = interfaces; Services = services; Ports = c.Ports |> List.map port |> List.distinct |> List.sort
-                 Protocols = protocols; Ingress = ingress; Egress = egress }
+        if c.Kind = "settings" then
+            if c.Name <> "strict-forward-ports" || c.StrictForwardPorts.IsNone then
+                invalidArg "settings" "StrictForwardPorts settings require the strict-forward-ports resource and an explicit value."
+            if c.Target <> "CONTINUE" || not c.Interfaces.IsEmpty || not c.Services.IsEmpty
+               || not c.Ports.IsEmpty || not c.Protocols.IsEmpty || c.Masquerade || c.Forward
+               || not c.Ingress.IsEmpty || not c.Egress.IsEmpty || c.Priority <> -1 then
+                invalidArg "settings" "Global firewalld settings cannot include zone or policy fields."
+            c
+        else
+            if c.StrictForwardPorts.IsSome then
+                invalidArg "strictForwardPorts" "StrictForwardPorts is a global setting, not a zone or policy field."
+            let targets = if c.Kind = "zone" then [ "default"; "ACCEPT"; "DROP"; "%%REJECT%%" ] else [ "CONTINUE"; "ACCEPT"; "DROP"; "REJECT" ]
+            if not (List.contains c.Target targets) then invalidArg "target" "Invalid firewalld target."
+            let normalized label length values = values |> List.map (token label length) |> List.distinct |> List.sort
+            let interfaces = normalized "interface" 15 c.Interfaces
+            let services = normalized "service" 128 c.Services
+            let protocols = normalized "protocol" 128 c.Protocols
+            let zones values =
+                values |> List.map (fun value -> if value = "ANY" || value = "HOST" then value else token "zone" 17 value)
+                |> List.distinct |> List.sort
+            let ingress, egress = zones c.Ingress, zones c.Egress
+            if c.Kind = "zone" && (not ingress.IsEmpty || not egress.IsEmpty || c.Priority <> -1) then
+                invalidArg "zone" "Ingress, egress and priority belong to policies."
+            if c.Kind = "policy" then
+                if not interfaces.IsEmpty || not services.IsEmpty || not c.Ports.IsEmpty || not protocols.IsEmpty || c.Forward then
+                    invalidArg "policy" "Policy supports only ingress, egress, target, priority and masquerade."
+                if ingress.IsEmpty || egress.IsEmpty then invalidArg "policy" "Policy requires ingress and egress zones."
+                for values in [ ingress; egress ] do
+                    if values.Length > 1 && (List.contains "ANY" values || List.contains "HOST" values) then
+                        invalidArg "policy" "ANY and HOST cannot be combined with other zones."
+                if ingress = [ "HOST" ] && egress = [ "HOST" ] then invalidArg "policy" "Both policy sides cannot be HOST."
+                if c.Priority = 0 || c.Priority < -32768 || c.Priority > 32767 then
+                    invalidArg "priority" "Policy priority must be -32768..32767, excluding zero."
+            { c with Interfaces = interfaces; Services = services; Ports = c.Ports |> List.map port |> List.distinct |> List.sort
+                     Protocols = protocols; Ingress = ingress; Egress = egress }
 
     let toJson (configuration: Configuration) =
         let c = validate configuration
@@ -92,6 +105,8 @@ module FirewalldModel =
             result[name] <- array
         result["masquerade"] <- JsonValue.Create c.Masquerade
         result["forward"] <- JsonValue.Create c.Forward
+        c.StrictForwardPorts |> Option.iter (fun value -> result["strictForwardPorts"] <- JsonValue.Create value)
+
         result["priority"] <- JsonValue.Create c.Priority
         result.ToJsonString()
 
@@ -99,8 +114,10 @@ module FirewalldModel =
         use document = JsonDocument.Parse text
         let root = document.RootElement
         let expected = set [ "kind"; "name"; "target"; "interfaces"; "services"; "ports"; "protocols"; "ingress"; "egress"; "masquerade"; "forward"; "priority" ]
-        let properties = root.EnumerateObject() |> Seq.toArray
-        if properties.Length <> expected.Count || (properties |> Seq.map (fun p -> p.Name) |> Set.ofSeq) <> expected then
+        let properties = root.EnumerateObject() |> Seq.map (fun p -> p.Name) |> Set.ofSeq
+        let strictForwardPorts = properties.Contains "strictForwardPorts"
+        let allowed = if strictForwardPorts then Set.add "strictForwardPorts" expected else expected
+        if properties <> allowed then
             invalidArg "configuration" "Firewalld configuration requires exactly the documented fields."
         let str name = root.GetProperty(name: string).GetString()
         let strings name = root.GetProperty(name: string).EnumerateArray() |> Seq.map (fun v -> v.GetString()) |> Seq.toList
@@ -109,4 +126,5 @@ module FirewalldModel =
               Interfaces = strings "interfaces"; Services = strings "services"; Ports = strings "ports"; Protocols = strings "protocols"
               Ingress = strings "ingress"; Egress = strings "egress"
               Masquerade = root.GetProperty("masquerade").GetBoolean(); Forward = root.GetProperty("forward").GetBoolean()
-              Priority = root.GetProperty("priority").GetInt32() }
+              Priority = root.GetProperty("priority").GetInt32()
+              StrictForwardPorts = if strictForwardPorts then Some(root.GetProperty("strictForwardPorts").GetBoolean()) else None }

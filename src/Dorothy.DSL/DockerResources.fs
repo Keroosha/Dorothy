@@ -65,7 +65,7 @@ module internal DockerDeployment =
             let minutePart = if hours > 0L || minutes > 0L then minutes.ToString(CultureInfo.InvariantCulture) + "m" else ""
             hourPart + minutePart + seconds + "s"
 
-    let deploy (host: HostSpec) (engine: CustomResource) (specification: DockerSpec) (hostContentDirectories: IReadOnlyDictionary<HostContentDirectory, Resource>) (firewallPolicies: Resource list) (completeJob: string -> Pulumi.Docker.Container -> TimeSpan -> Output<ImmutableArray<string>> -> Resource) =
+    let deploy (host: HostSpec) (engine: CustomResource) (specification: DockerSpec) (hostContentDirectories: IReadOnlyDictionary<HostContentDirectory, Resource>) (firewalldResources: IReadOnlyDictionary<FirewalldObjectSpec, Resource>) (completeJob: string -> Pulumi.Docker.Container -> TimeSpan -> Output<ImmutableArray<string>> -> Resource) =
 
 
         let endpoint = UriBuilder("ssh", host.Address, host.Port)
@@ -243,11 +243,14 @@ module internal DockerDeployment =
             let directoryDependencies =
                 container.HostContentDirectories
                 |> List.map (fun directory -> hostContentDirectories[directory])
+            let firewallDependencies =
+                container.FirewalldPolicyDependencies
+                |> List.map (fun policy -> firewalldResources[policy])
             let dependencies =
                 [ engine :> Resource ]
                 @ (container.Dependencies |> List.map (fun dependency -> ready[dependency.Name]))
                 @ directoryDependencies
-                @ firewallPolicies
+                @ firewallDependencies
             resourceOptions.DependsOn <- InputList<Resource>.op_Implicit(Array.ofList dependencies)
 
             // Even Docker's normally mutable inputs describe a new job generation.

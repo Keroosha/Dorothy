@@ -28,6 +28,9 @@ type FirewalldTests() =
               "configuration", PropertyValue configuration ]
     let urn token = Pulumi.Urn("urn:pulumi:test::test::" + token + "::firewall")
     let zoneConfiguration = (zone "external" { services [ "ssh" ]; interfaces [ "eth0" ] }).Configuration
+    let strictConfiguration =
+        { FirewalldModel.empty "settings" "strict-forward-ports" with StrictForwardPorts = Some true }
+        |> FirewalldModel.toJson
     // Upstream firewalld v2.3.1, as shipped in Debian 13.
     let vendorPolicy = File.ReadAllText(Path.Combine(AppContext.BaseDirectory, "Fixtures/Firewalld/allow-host-ipv6.xml"))
 
@@ -139,6 +142,12 @@ type FirewalldTests() =
         let preview = provider.Create(create, CancellationToken.None).Result
         Assert.That(preview.Id, Is.Empty)
         Assert.That(preview.Outputs["inSync"].IsComputed, Is.True)
+        let settingsCheck =
+            CheckRequest(urn FirewalldProvider.SettingsToken, ImmutableDictionary.Empty, inputs strictConfiguration, ImmutableArray<byte>.Empty)
+        Assert.That(provider.Check(settingsCheck, CancellationToken.None).Result.Failures, Is.Empty)
+        let settingsPreview =
+            provider.Create(CreateRequest(urn FirewalldProvider.SettingsToken, inputs strictConfiguration, TimeSpan.Zero, true), CancellationToken.None).Result
+        Assert.That(settingsPreview.Id, Is.Empty)
 
     [<Test>]
     member _.``Diff repairs drift replaces renamed zones and never contacts SSH``() =
@@ -172,6 +181,7 @@ type FirewalldTests() =
                 calls.Add(executable :: arguments)
                 let output =
                     match executable, arguments with
+                    | "stat", [ "-c"; "%u:%g"; "--"; _ ] -> "0:0"
                     | "stat", _ ->
                         let mode = File.GetUnixFileMode(List.last arguments) |> int |> fun value -> Convert.ToString(value, 8)
                         "0:" + mode
@@ -217,6 +227,75 @@ type FirewalldTests() =
             Assert.That(File.ReadAllText unrelated, Is.EqualTo "<zone target=\"ACCEPT\"><interface name=\"docker0\"/></zone>")
             Assert.That(calls |> Seq.filter (fun args -> args = [ "firewall-cmd"; "--reload" ]) |> Seq.length, Is.EqualTo 2)
             Assert.That(File.Exists journal, Is.False))
+    [<Test>]
+    member _.``StrictForwardPorts is a global firewalld setting and not a policy field``() =
+        let spec = firewalld { strictForwardPorts true }
+        Assert.That(spec.StrictForwardPorts, Is.EqualTo(Some true))
+        let configuration = FirewalldModel.parse strictConfiguration
+        Assert.That(configuration.Kind, Is.EqualTo "settings")
+        Assert.That(configuration.StrictForwardPorts, Is.EqualTo(Some true))
+        let invalidPolicy =
+            { FirewalldModel.empty "policy" "invalid" with
+                Ingress = [ "public" ]
+                Egress = [ "docker" ]
+                StrictForwardPorts = Some true }
+        Assert.Throws<ArgumentException>(fun () -> FirewalldModel.toJson invalidPolicy |> ignore) |> ignore
+
+    [<Test>]
+    member this.``StrictForwardPorts apply persists and delete restores the vendor baseline``() =
+        this.WithHost(fun env root calls ->
+            let vendorPath = Path.Combine(root, "usr/lib/firewalld/firewalld.conf")
+            let vendor = "DefaultZone=public\nStrictForwardPorts=no\n"
+            File.WriteAllText(vendorPath, vendor)
+            let result = this.Invoke env "apply" strictConfiguration
+            Assert.That(result["actual"].GetValue<string>(), Is.EqualTo "yes")
+            Assert.That(result["inSync"].GetValue<bool>(), Is.True)
+            let overridePath = Path.Combine(root, "etc/firewalld/firewalld.conf")
+            let managed = "DefaultZone=public\nStrictForwardPorts=yes\n"
+            Assert.That(File.ReadAllText overridePath, Is.EqualTo managed)
+            Assert.That(int (File.GetUnixFileMode overridePath), Is.EqualTo 0o600)
+            let read = this.Invoke env "read" strictConfiguration
+            Assert.That(read["actual"].GetValue<string>(), Is.EqualTo "yes")
+            Assert.That(read["inSync"].GetValue<bool>(), Is.True)
+            this.Invoke env "delete" strictConfiguration |> ignore
+            Assert.That(File.Exists overridePath, Is.False)
+            Assert.That(File.ReadAllText vendorPath, Is.EqualTo vendor)
+            Assert.That(File.Exists(Path.Combine(root, "var/lib/keroosha-iac/firewalld/settings-strict-forward-ports.json")), Is.False)
+            Assert.That(calls |> Seq.filter (fun args -> args = [ "firewall-cmd"; "--reload" ]) |> Seq.length, Is.EqualTo 2))
+
+    [<Test>]
+    member this.``StrictForwardPorts refuses foreign setting changes without overwriting``() =
+        this.WithHost(fun env root calls ->
+            let configPath = Path.Combine(root, "etc/firewalld/firewalld.conf")
+            let baseline = "DefaultZone=public\nStrictForwardPorts=no\n"
+            File.WriteAllText(configPath, baseline)
+            this.Invoke env "apply" strictConfiguration |> ignore
+            let foreign = "DefaultZone=public\nStrictForwardPorts=no\n# external edit\n"
+            File.WriteAllText(configPath, foreign)
+            Assert.Throws<NativeFirewalld.BackendError>(fun () -> this.Invoke env "apply" strictConfiguration |> ignore) |> ignore
+            Assert.That(File.ReadAllText(configPath), Is.EqualTo foreign)
+            Assert.Throws<NativeFirewalld.BackendError>(fun () -> this.Invoke env "delete" strictConfiguration |> ignore) |> ignore
+            Assert.That(File.ReadAllText(configPath), Is.EqualTo foreign))
+
+    [<Test>]
+    member this.``StrictForwardPorts failed first reload restores config and releases ownership``() =
+        this.WithHost(fun env root calls ->
+            let configPath = Path.Combine(root, "etc/firewalld/firewalld.conf")
+            let baseline = "DefaultZone=public\nStrictForwardPorts=no\n"
+            File.WriteAllText(configPath, baseline)
+            let mutable failed = false
+            let failing =
+                { env with
+                    Run = fun executable arguments input ->
+                        let result = env.Run executable arguments input
+                        if executable = "firewall-cmd" && arguments = [ "--reload" ] && not failed then
+                            failed <- true
+                            { result with ExitCode = 1; Stderr = "reload unavailable" }
+                        else result }
+            Assert.Throws<NativeFirewalld.BackendError>(fun () -> this.Invoke failing "apply" strictConfiguration |> ignore) |> ignore
+            Assert.That(File.ReadAllText configPath, Is.EqualTo baseline)
+            Assert.That(File.Exists(Path.Combine(root, "var/lib/keroosha-iac/firewalld/settings-strict-forward-ports.json")), Is.False)
+            Assert.That(calls |> Seq.filter (fun args -> args = [ "firewall-cmd"; "--reload" ]) |> Seq.length, Is.EqualTo 2))
 
     [<Test>]
     member this.``Custom zone delete removes created XML and WireGuard binding is permanent only``() =

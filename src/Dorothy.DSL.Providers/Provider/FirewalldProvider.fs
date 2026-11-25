@@ -10,11 +10,16 @@ open Pulumi.Experimental
 open Pulumi.Experimental.Provider
 
 module private FirewalldProviderLogic =
-    let tokens = [ "keroosha:debian:FirewalldZone"; "keroosha:debian:FirewalldPolicy" ]
+    let zoneToken = "keroosha:debian:FirewalldZone"
+    let policyToken = "keroosha:debian:FirewalldPolicy"
+    let settingsToken = "keroosha:debian:FirewalldSettings"
+    let tokens = [ zoneToken; policyToken; settingsToken ]
     let kind token =
-        if token = tokens[0] then "zone"
-        elif token = tokens[1] then "policy"
+        if token = zoneToken then "zone"
+        elif token = policyToken then "policy"
+        elif token = settingsToken then "settings"
         else invalidOp "Unexpected firewalld resource token."
+
 
     let schema =
         let resource = """{"inputProperties":{"connection":{"$ref":"#/types/keroosha:debian:SshConnection"},"configuration":{"type":"string"}},"requiredInputs":["connection","configuration"],"properties":{"connection":{"$ref":"#/types/keroosha:debian:SshConnection"},"configuration":{"type":"string"},"exists":{"type":"boolean"},"actual":{"type":"string"},"inSync":{"type":"boolean"}},"required":["connection","configuration","exists","actual","inSync"]}"""
@@ -277,11 +282,12 @@ module private FirewalldProviderLogic =
             response.DeleteBeforeReplace <- replaces.Count > 0
         response
 
-/// One provider implementation for independently owned zone and policy resources.
+/// One provider implementation for independently owned zones, policies, and global settings.
 [<Sealed>]
 type FirewalldProvider() =
     inherit Pulumi.Experimental.Provider.Provider()
     static member ZoneToken = "keroosha:debian:FirewalldZone"
+    static member SettingsToken = FirewalldProviderLogic.settingsToken
     static member PolicyToken = "keroosha:debian:FirewalldPolicy"
     static member Handles token = List.contains token FirewalldProviderLogic.tokens
     static member Schema = FirewalldProviderLogic.schema

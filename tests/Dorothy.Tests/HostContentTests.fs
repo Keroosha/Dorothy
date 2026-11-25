@@ -75,45 +75,61 @@ type private ContentMocks() =
 
 module private HostContentDependencyStackValues =
     let host () =
-        let root = directory "docker-root" {
-            path "/var/lib/myiac-docker"
-            owner "root"
-            group "root"
-            mode 0o755
-        }
-        let storage = directory "app-data" {
-            path "/var/lib/myiac-docker/app"
-            owner "10001"
-            group "10001"
-            mode 0o750
-        }
-        let unused = directory "unused-data" {
-            path "/var/lib/myiac-docker/unused"
-            owner "10002"
-            group "10002"
-            mode 0o750
-        }
+        let root =
+            directory "content-root" {
+                path "/srv/host-content-fixture"
+                owner "root"
+                group "root"
+                mode 0o755
+            }
+        let storage =
+            directory "app-data" {
+                path "/srv/host-content-fixture/app"
+                owner "10001"
+                group "10001"
+                mode 0o750
+            }
+        let unused =
+            directory "unused-data" {
+                path "/srv/host-content-fixture/unused"
+                owner "10002"
+                group "10002"
+                mode 0o750
+            }
+        let dockerBlock =
+            Dorothy.DSL.Firewalld.policy "docker-block" {
+                Dorothy.DSL.Firewalld.ingressZones [ "public" ]
+                Dorothy.DSL.Firewalld.egressZones [ "docker" ]
+                Dorothy.DSL.Firewalld.target FirewalldTarget.Drop
+                Dorothy.DSL.Firewalld.priority -10
+            }
+        let unrelatedPolicy =
+            Dorothy.DSL.Firewalld.policy "unrelated-policy" {
+                Dorothy.DSL.Firewalld.ingressZones [ "public" ]
+                Dorothy.DSL.Firewalld.egressZones [ "public" ]
+                Dorothy.DSL.Firewalld.target FirewalldTarget.Drop
+                Dorothy.DSL.Firewalld.priority 10
+            }
         let firewall =
             Dorothy.DSL.Firewalld.firewalld {
+                Dorothy.DSL.Firewalld.strictForwardPorts true
                 Dorothy.DSL.Firewalld.zone "public" {
                     Dorothy.DSL.Firewalld.services [ "ssh"; "http"; "https" ]
                 }
-                Dorothy.DSL.Firewalld.policy "docker-block" {
-                    Dorothy.DSL.Firewalld.ingressZones [ "public" ]
-                    Dorothy.DSL.Firewalld.egressZones [ "docker" ]
-                    Dorothy.DSL.Firewalld.target FirewalldTarget.Drop
-                    Dorothy.DSL.Firewalld.priority -10
+                dockerBlock
+                unrelatedPolicy
+            }
+        let app =
+            container "app" {
+                DockerBuilders.restart unlessStopped
+                image "example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+                mount {
+                    DockerBuilders.hostDirectory storage.Directory.Value
+                    DockerBuilders.target "/data"
                 }
+                usesDirectory root.Directory.Value
+                DockerBuilders.dependsOnFirewalld dockerBlock
             }
-        let app = container "app" {
-            DockerBuilders.restart unlessStopped
-            image "example/app@sha256:aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
-            mount {
-                DockerBuilders.hostDirectory storage.Directory.Value
-                DockerBuilders.target "/data"
-            }
-            usesDirectory root.Directory.Value
-        }
         sshHost "storage-host" {
             Address "192.0.2.1"
             User "operator"
@@ -121,6 +137,35 @@ module private HostContentDependencyStackValues =
                 docker { app }
                 firewall
                 content { root; storage; unused }
+            }
+        }
+
+    let independentHost () =
+        let dockerPolicy =
+            Dorothy.DSL.Firewalld.policy "docker-policy" {
+                Dorothy.DSL.Firewalld.ingressZones [ "public" ]
+                Dorothy.DSL.Firewalld.egressZones [ "docker" ]
+                Dorothy.DSL.Firewalld.target FirewalldTarget.Drop
+                Dorothy.DSL.Firewalld.priority -10
+            }
+        let firewall =
+            Dorothy.DSL.Firewalld.firewalld {
+                Dorothy.DSL.Firewalld.zone "public" {
+                    Dorothy.DSL.Firewalld.services [ "ssh" ]
+                }
+                dockerPolicy
+            }
+        let app =
+            container "other" {
+                DockerBuilders.restart unlessStopped
+                image "example/other@sha256:bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb"
+            }
+        sshHost "independent-host" {
+            Address "192.0.2.2"
+            User "operator"
+            debian {
+                docker { app }
+                firewall
             }
         }
 
@@ -137,6 +182,13 @@ type private DockerContentDependencyStack(captured: System.Collections.Concurren
     do Host.deploy (HostContentDependencyStackValues.host()) |> ignore
     member _.Captured = captured
     new() = DockerContentDependencyStack(System.Collections.Concurrent.ConcurrentDictionary())
+
+[<Sealed>]
+type private IndependentDockerDependencyStack(captured: System.Collections.Concurrent.ConcurrentDictionary<Resource, ResourceTransformationArgs>) =
+    inherit Stack(HostContentDependencyStackValues.stackOptions captured)
+    do Host.deploy (HostContentDependencyStackValues.independentHost()) |> ignore
+    member _.Captured = captured
+    new() = IndependentDockerDependencyStack(System.Collections.Concurrent.ConcurrentDictionary())
 
 [<TestFixture>]
 type HostContentTests() =
@@ -260,13 +312,12 @@ type HostContentTests() =
         Assert.That((HostContentTestValues.check ContentServicesProvider.ContentToken inputs).Failures, Is.Empty)
     [<Test>]
     [<NonParallelizable>]
-    member _.``Docker bind mount waits for exactly its declared host directory``() =
+    member _.``Docker bind mount waits for declared directories and the selected policy``() =
         let mocks = ContentMocks()
         let resources = Deployment.TestAsync<DockerContentDependencyStack>(mocks, TestOptions()).GetAwaiter().GetResult()
         let stack = resources |> Seq.pick (function :? DockerContentDependencyStack as value -> Some value | _ -> None)
-        let captured = stack.Captured
         let appArgs =
-            captured
+            stack.Captured
             |> Seq.pick (fun entry ->
                 if HostContentTestValues.resourceName entry.Key = "storage-host-container-app" then Some entry.Value
                 else None)
@@ -276,27 +327,80 @@ type HostContentTests() =
             |> Seq.map HostContentTestValues.resourceName
             |> Set.ofSeq
         Assert.That(dependencies, Does.Contain "storage-host-content-app-data")
-        Assert.That(dependencies, Does.Contain "storage-host-content-docker-root")
+        Assert.That(dependencies, Does.Contain "storage-host-content-content-root")
         Assert.That(dependencies, Does.Contain "storage-host-firewalld-policy-docker-block")
+        Assert.That(dependencies, Does.Not.Contain "storage-host-firewalld-policy-unrelated-policy")
         Assert.That(dependencies, Does.Not.Contain "storage-host-content-unused-data")
         let dockerArgs = appArgs.Args :?> Pulumi.Docker.ContainerArgs
         let mounts = OutputUtilities.GetValueAsync(dockerArgs.Mounts.ToOutput()).GetAwaiter().GetResult()
         Assert.That(mounts, Has.Length.EqualTo 1)
-        Assert.That(OutputUtilities.GetValueAsync(mounts[0].Source.ToOutput()).GetAwaiter().GetResult(), Is.EqualTo "/var/lib/myiac-docker/app")
+        Assert.That(OutputUtilities.GetValueAsync(mounts[0].Source.ToOutput()).GetAwaiter().GetResult(), Is.EqualTo "/srv/host-content-fixture/app")
         Assert.That(OutputUtilities.GetValueAsync(mounts[0].ReadOnly.ToOutput()).GetAwaiter().GetResult(), Is.False)
 
-        let undeclared = directory "unowned" { path "/var/lib/myiac-docker/unowned" }
+        let undeclared = directory "unowned" { path "/srv/host-content-fixture/unowned" }
         let invalidApp = container "invalid" {
             DockerBuilders.restart unlessStopped
             image "example/app:latest"
             mount { DockerBuilders.hostDirectory undeclared.Directory.Value; DockerBuilders.target "/data" }
         }
-        Assert.Throws<ArgumentException>(fun () ->
-            sshHost "invalid-host" {
-                Address "192.0.2.2"
-                User "operator"
-                debian { docker { invalidApp } }
-            } |> ignore) |> ignore
+        let invalidUseOnly = container "invalid-use-only" {
+            DockerBuilders.restart unlessStopped
+            image "example/app:latest"
+            usesDirectory undeclared.Directory.Value
+        }
+        let assertRejected (app: DockerContainerSpec) =
+            let error =
+                Assert.Throws<ArgumentException>(fun () ->
+                    sshHost "invalid-host" {
+                        Address "192.0.2.2"
+                        User "operator"
+                        debian { docker { app } }
+                    } |> ignore)
+            Assert.That(error.ParamName, Is.EqualTo "usesDirectory")
+        assertRejected invalidApp
+        assertRejected invalidUseOnly
+        let undeclaredPolicy =
+            Dorothy.DSL.Firewalld.policy "unowned-docker-block" {
+                Dorothy.DSL.Firewalld.ingressZones [ "public" ]
+                Dorothy.DSL.Firewalld.egressZones [ "docker" ]
+                Dorothy.DSL.Firewalld.target FirewalldTarget.Drop
+            }
+        let invalidPolicyApp = container "invalid-policy" {
+            DockerBuilders.restart unlessStopped
+            image "example/app:latest"
+            DockerBuilders.dependsOnFirewalld undeclaredPolicy
+        }
+        let policyError =
+            Assert.Throws<ArgumentException>(fun () ->
+                sshHost "invalid-policy-host" {
+                    Address "192.0.2.3"
+                    User "operator"
+                    debian {
+                        docker { invalidPolicyApp }
+                        Dorothy.DSL.Firewalld.firewalld {
+                            Dorothy.DSL.Firewalld.zone "public" { Dorothy.DSL.Firewalld.services [ "ssh" ] }
+                        }
+                    }
+                } |> ignore)
+        Assert.That(policyError.ParamName, Is.EqualTo "dependsOnFirewalld")
+
+    [<Test>]
+    [<NonParallelizable>]
+    member _.``Docker container does not inherit an unrelated firewalld policy``() =
+        let mocks = ContentMocks()
+        let resources = Deployment.TestAsync<IndependentDockerDependencyStack>(mocks, TestOptions()).GetAwaiter().GetResult()
+        let stack = resources |> Seq.pick (function :? IndependentDockerDependencyStack as value -> Some value | _ -> None)
+        let appArgs =
+            stack.Captured
+            |> Seq.pick (fun entry ->
+                if HostContentTestValues.resourceName entry.Key = "independent-host-container-other" then Some entry.Value
+                else None)
+        let dependencies =
+            OutputUtilities.GetValueAsync((appArgs.Options :?> CustomResourceOptions).DependsOn.ToOutput()).GetAwaiter().GetResult()
+            |> Seq.map HostContentTestValues.resourceName
+            |> Set.ofSeq
+        Assert.That(dependencies, Does.Not.Contain "independent-host-firewalld-policy-docker-policy")
+        Assert.That(dependencies, Does.Contain "independent-host")
 
     [<Test>]
     member _.``Secret text keeps specification and provider content fingerprints secret``() =

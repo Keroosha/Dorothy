@@ -185,21 +185,21 @@ type AcmeResolverBuilder internal (name: string) =
             if values.Length > 1 then invalidArg "acmeResolver" (sprintf "Resolver field '%s' may be declared only once." name)
             values |> List.tryHead
 
-        let email = select "email" (function ResolverPart.Email value -> Some value | _ -> None)
+        let email = select "email" (function ResolverPart.Email value -> Some value | _ -> None) |> Option.defaultValue (LiteralString "")
         let challenge = select "challenge" (function ResolverPart.Challenge value -> Some value | _ -> None)
         let caServer =
             select "caServer" (function ResolverPart.CaServer value -> Some value | _ -> None)
             |> Option.defaultValue (LiteralString "https://acme-v02.api.letsencrypt.org/directory")
 
-        match email, challenge with
-        | Some emailValue, Some challengeValue ->
+        match challenge with
+        | Some challengeValue ->
             let challengeEntryPoint =
                 match challengeValue with
                 | AcmeChallenge.Http01 entryPoint -> LiteralString entryPoint
                 | AcmeChallenge.Http01Output entryPoint -> OutputString entryPoint
 
-            TraefikAcmeResolverSpec(name, emailValue, challengeEntryPoint, caServer)
-        | _ -> invalidArg "acmeResolver" "An ACME resolver requires email and challenge."
+            TraefikAcmeResolverSpec(name, email, challengeEntryPoint, caServer)
+        | None -> invalidArg "acmeResolver" "An ACME resolver requires an HTTP-01 challenge."
 
 [<Sealed>]
 type PemCertificateBuilder internal (name: string) =
@@ -324,9 +324,11 @@ module private TraefikValidation =
 
     let validateEmail (value: string) =
         try
-            if String.IsNullOrWhiteSpace value then invalidArg "email" "An ACME email is required."
-            let parsed = MailAddress(value)
-            if not (String.Equals(parsed.Address, value, StringComparison.Ordinal)) then invalidArg "email" "An ACME email address is invalid."
+            if value = "" then ()
+            elif String.IsNullOrWhiteSpace value then invalidArg "email" "An ACME email address is invalid."
+            else
+                let parsed = MailAddress(value)
+                if not (String.Equals(parsed.Address, value, StringComparison.Ordinal)) then invalidArg "email" "An ACME email address is invalid."
         with
         | :? ArgumentException -> reraise ()
         | _ -> invalidArg "email" "An ACME email address is invalid."
@@ -702,7 +704,7 @@ module TraefikBuilders =
         TraefikValidation.validateName "acmeResolver" name
         AcmeResolverBuilder(name)
 
-    /// Sets an ACME account email.
+    /// Sets an optional ACME account contact email.
     let inline email (value: ^T) : ResolverPart =
         ((^T or TraefikFields) : (static member Email : ^T -> ResolverPart) value)
 
