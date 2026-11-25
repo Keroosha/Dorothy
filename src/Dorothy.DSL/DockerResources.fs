@@ -65,7 +65,9 @@ module internal DockerDeployment =
             let minutePart = if hours > 0L || minutes > 0L then minutes.ToString(CultureInfo.InvariantCulture) + "m" else ""
             hourPart + minutePart + seconds + "s"
 
-    let deploy (host: HostSpec) (engine: CustomResource) (specification: DockerSpec) (completeJob: string -> Pulumi.Docker.Container -> TimeSpan -> Output<ImmutableArray<string>> -> Resource) =
+    let deploy (host: HostSpec) (engine: CustomResource) (specification: DockerSpec) (hostContentDirectories: IReadOnlyDictionary<HostContentDirectory, Resource>) (firewallPolicies: Resource list) (completeJob: string -> Pulumi.Docker.Container -> TimeSpan -> Output<ImmutableArray<string>> -> Resource) =
+
+
         let endpoint = UriBuilder("ssh", host.Address, host.Port)
         endpoint.UserName <- host.User
         let providerArgs = Pulumi.Docker.ProviderArgs()
@@ -201,6 +203,9 @@ module internal DockerDeployment =
                 | Bind path ->
                     value.Type <- input "bind"
                     value.Source <- input path
+                | HostDirectory directory ->
+                    value.Type <- input "bind"
+                    value.Source <- input directory.Path
                 | Tmpfs(DockerTmpfs size) ->
                     value.Type <- input "tmpfs"
                     size |> Option.iter (fun size ->
@@ -235,9 +240,16 @@ module internal DockerDeployment =
                 value.ContentBase64 <- output (DockerContent.resolve CancellationToken.None file.Content file.Secret)
                 args.Uploads.Add(input value)
             let resourceOptions = options ()
-            resourceOptions.DependsOn <-
-                InputList<Resource>.op_Implicit
-                    (Array.ofList ((engine :> Resource) :: (container.Dependencies |> List.map (fun dependency -> ready[dependency.Name]))))
+            let directoryDependencies =
+                container.HostContentDirectories
+                |> List.map (fun directory -> hostContentDirectories[directory])
+            let dependencies =
+                [ engine :> Resource ]
+                @ (container.Dependencies |> List.map (fun dependency -> ready[dependency.Name]))
+                @ directoryDependencies
+                @ firewallPolicies
+            resourceOptions.DependsOn <- InputList<Resource>.op_Implicit(Array.ofList dependencies)
+
             // Even Docker's normally mutable inputs describe a new job generation.
             if container.RunOnce.IsSome then resourceOptions.ReplaceOnChanges <- List<string>([ "*" ])
             // Fixed names and published ports cannot coexist during a replacement.

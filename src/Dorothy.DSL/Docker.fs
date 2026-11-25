@@ -62,6 +62,13 @@ module DockerStringInput =
         |> resolveRequired description
         |> Output.CreateSecret<string>
 
+/// Typed identity for one declared host directory consumed by a Docker container.
+/// The matching HostContentItem is validated by the Debian host builder.
+[<Sealed>]
+type HostContentDirectory internal (name: string, path: string) =
+    member _.Name = name
+    member _.Path = path
+
 type internal DockerContentKind =
     | DockerText of DockerStringInput
     | DockerBase64 of DockerStringInput
@@ -161,6 +168,7 @@ type DockerMountSource =
     | ExistingVolume of volume: DockerExistingVolume
     | Bind of hostPath: string
     | Tmpfs of DockerTmpfs
+    | HostDirectory of directory: HostContentDirectory
 
 type DockerMountAccess =
     | ReadOnly
@@ -232,7 +240,8 @@ type DockerContainerSpec internal (
     waitHealthy: TimeSpan option,
     files: DockerFileSpec list,
     runOnce: TimeSpan option,
-    dependencies: DockerContainerSpec list
+    dependencies: DockerContainerSpec list,
+    hostContentDirectories: HostContentDirectory list
 ) =
     member _.Name = name
     member _.Image = image
@@ -256,6 +265,7 @@ type DockerContainerSpec internal (
     member _.Files = files
     member _.RunOnce = runOnce
     member _.Dependencies = dependencies
+    member _.HostContentDirectories = hostContentDirectories
 
 type DockerSpec internal (
     networks: DockerNetworkSpec list,
@@ -332,6 +342,8 @@ type DockerContainerPart =
     | File of DockerFileSpec
     | RunOnce of TimeSpan
     | DependsOn of DockerContainerSpec
+    | DirectoryDependency of HostContentDirectory
+
 
 [<RequireQualifiedAccess>]
 type DockerDeclaration =
@@ -819,7 +831,12 @@ type DockerContainerBuilder internal (name: string) =
             waitHealthy,
             files,
             runOnce,
-            dependencies
+            dependencies,
+            (mounts
+             |> List.choose (fun mount -> match mount.Source with DockerMountSource.HostDirectory directory -> Some directory | _ -> None))
+            @ (parts |> List.choose (function DockerContainerPart.DirectoryDependency value -> Some value | _ -> None))
+            |> List.distinct
+
         )
 
 [<Sealed>]
@@ -953,6 +970,8 @@ module DockerBuilders =
     let runOnce timeout = DockerContainerPart.RunOnce timeout
     /// Waits for service creation (readiness only with waitHealthy) or successful job completion.
     let dependsOn container = DockerContainerPart.DependsOn container
+    /// Waits for the declared host directory to exist with its requested metadata before start.
+    let usesDirectory directory = DockerContainerPart.DirectoryDependency directory
     let noRestart = DockerRestartPolicy.NoRestart
     let always = DockerRestartPolicy.Always
     let unlessStopped = DockerRestartPolicy.UnlessStopped
@@ -982,6 +1001,7 @@ module DockerBuilders =
     let inline source (value: ^T) : DockerMountPart =
         ((^T or DockerFields) : (static member Source : ^T -> DockerMountPart) value)
 
+    let hostDirectory directory = DockerMountPart.Source(DockerMountSource.HostDirectory directory)
     let target value = DockerMountPart.Target value
     let access value = DockerMountPart.Access value
     let bind path = DockerMountSource.Bind path

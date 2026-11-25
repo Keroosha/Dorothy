@@ -421,6 +421,15 @@ type DebianBuilder() =
                     invalidArg "uses" "Every referenced content item must be declared in this environment's content block."
             if service.Managed && List.contains ("/etc/systemd/system/" + service.Name) targetPaths then
                 invalidArg "content" "Content and service cannot own the same unit file."
+        for container in docker |> Option.map _.Containers |> Option.defaultValue [] do
+            for directory in container.HostContentDirectories do
+                let declared =
+                    contentItems
+                    |> List.exists (fun item ->
+                        item.Directory
+                        |> Option.exists (fun reference -> Object.ReferenceEquals(reference, directory)))
+                if not declared then
+                    invalidArg "usesDirectory" (sprintf "Container '%s' references a host directory that is not declared in this Debian environment's content block." container.Name)
 
         let packages =
             aptBlocks

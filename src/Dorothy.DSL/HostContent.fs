@@ -81,7 +81,7 @@ type ContentPart =
 [<Sealed>]
 type HostContentItem internal (name: string, kind: string, url: string option, digest: string option, format: ArchiveFormat option,
                                headers: (string * DockerStringInput) list, source: string option, value: DockerStringInput option,
-                               targets: ContentTarget list, ownership: ContentOwnership) =
+                               targets: ContentTarget list, ownership: ContentOwnership, directory: HostContentDirectory option) =
     member _.Name = name
     member _.Kind = kind
     member _.Url = url
@@ -92,6 +92,7 @@ type HostContentItem internal (name: string, kind: string, url: string option, d
     member _.Value = value
     member _.Targets = targets
     member _.Ownership = ownership
+    member _.Directory = directory
 
 [<Sealed>]
 type ContentItemBuilder internal (name: string, kind: string) =
@@ -163,7 +164,12 @@ type ContentItemBuilder internal (name: string, kind: string) =
         HostContentValidation.unique "headers" (headers |> List.map (fun (name, _) -> name.ToLowerInvariant()))
         for name, _ in headers do
             if String.IsNullOrEmpty name || name |> Seq.exists (fun c -> not (Char.IsAsciiLetterOrDigit c || "!#$%&'*+-.^_`|~".Contains c)) then invalidArg "header" "Invalid HTTP header name."
-        HostContentItem(name, kind, url, digest |> Option.map _.ToLowerInvariant(), format, headers, source, value, targets, ownership)
+        let directory =
+            if kind = "directory" then
+                targets |> List.tryHead |> Option.map (fun target -> HostContentDirectory(name, target.Path))
+            else None
+        HostContentItem(name, kind, url, digest |> Option.map _.ToLowerInvariant(), format, headers, source, value, targets, ownership, directory)
+
 
 [<Sealed>]
 type HostContentSpec internal (items: HostContentItem list) =
