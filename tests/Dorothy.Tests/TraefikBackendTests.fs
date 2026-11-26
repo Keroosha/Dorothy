@@ -503,6 +503,92 @@ type TraefikBackendTests() =
         Assert.That(Traefik.apiMatchesRuntime (Some wrongVersion) (Some staticData) (Some(Encoding.UTF8.GetBytes(dynamic))), Is.False)
 
     [<Test>]
+    member _.``UDP withdrawal restarts only when a bound listener loses its final router``() =
+        let staticData =
+            Encoding.UTF8.GetBytes(
+                """{"entryPoints":{"udp-a":{"address":"127.0.0.1:43001/udp"},"udp-b":{"address":"127.0.0.1:43002/udp"}}}""")
+        let dynamic (routes: (string * string list) list) (destination: string) (httpRule: string option) =
+            let root = JsonObject()
+            let udp = JsonObject()
+            let routers = JsonObject()
+            for name, entryPoints in routes do
+                let router = JsonObject()
+                let values = JsonArray()
+                for entryPoint in entryPoints do values.Add(JsonValue.Create(entryPoint))
+                router["entryPoints"] <- values
+                router["service"] <- JsonValue.Create("echo")
+                routers[name] <- router
+            udp["routers"] <- routers
+            let services = JsonObject()
+            let service = JsonObject()
+            let loadBalancer = JsonObject()
+            let servers = JsonArray()
+            let server = JsonObject()
+            server["address"] <- JsonValue.Create(destination)
+            servers.Add(server)
+            loadBalancer["servers"] <- servers
+            service["loadBalancer"] <- loadBalancer
+            services["echo"] <- service
+            udp["services"] <- services
+            root["udp"] <- udp
+            match httpRule with
+            | Some rule ->
+                let http = JsonObject()
+                let httpRouters = JsonObject()
+                let httpRouter = JsonObject()
+                httpRouter["rule"] <- JsonValue.Create(rule)
+                httpRouters["site"] <- httpRouter
+                http["routers"] <- httpRouters
+                root["http"] <- http
+            | None -> ()
+            Encoding.UTF8.GetBytes(root.ToJsonString())
+        let requires previous next =
+            Traefik.udpWithdrawalRequiresRestart (Some previous) (Some next) (Some staticData)
+        let shared = dynamic [ "first", [ "udp-a" ]; "second", [ "udp-a" ] ] "127.0.0.1:9000" None
+        let oneReferenceRemains = dynamic [ "second", [ "udp-a" ] ] "127.0.0.1:9000" None
+        let noRoutes = dynamic [] "127.0.0.1:9000" None
+        let routeA = dynamic [ "stream", [ "udp-a" ] ] "127.0.0.1:9000" None
+        let routeB = dynamic [ "stream", [ "udp-b" ] ] "127.0.0.1:9000" None
+        let tcpOnlyStatic =
+            Encoding.UTF8.GetBytes("""{"entryPoints":{"web":{"address":"127.0.0.1:8080"}}}""")
+
+        let multipleEndpoints = dynamic [ "stream", [ "udp-a"; "udp-b" ] ] "127.0.0.1:9000" None
+        let remainingEndpoint = dynamic [ "stream", [ "udp-b" ] ] "127.0.0.1:9000" None
+        Assert.That(
+            requires multipleEndpoints remainingEndpoint,
+            Is.True,
+            "A router leaving one of its entrypoints must clear the old listener handler.")
+        Assert.That(requires shared oneReferenceRemains, Is.False, "Removing one of multiple routers must preserve the listener handler.")
+        Assert.That(requires shared noRoutes, Is.True, "Removing the final router must restart the still-bound listener.")
+        Assert.That(requires routeA routeB, Is.True, "Moving a router must clear the old listener handler.")
+        Assert.That(requires routeB routeA, Is.True, "Rollback of a move must clear the candidate listener handler.")
+        Assert.That(requires noRoutes routeA, Is.False, "Adding a UDP route must not restart the service.")
+        Assert.That(requires routeA noRoutes, Is.True, "Rollback that removes an added route must restart the service.")
+        Assert.That(
+            requires routeA (dynamic [ "stream", [ "udp-a" ] ] "127.0.0.1:9001" None),
+            Is.False,
+            "Changing only the UDP service must not restart the service.")
+        Assert.That(
+            requires
+                (dynamic [ "stream", [ "udp-a" ] ] "127.0.0.1:9000" (Some "Host(`old.example.test`)"))
+                (dynamic [ "stream", [ "udp-a" ] ] "127.0.0.1:9000" (Some "Host(`new.example.test`)")),
+            Is.False,
+            "An unrelated HTTP-only route change must not restart the service.")
+        Assert.That(requires noRoutes noRoutes, Is.False, "An already-unrouted UDP listener is idle.")
+        Assert.That(
+            Traefik.udpWithdrawalRequiresRestart (Some routeA) (Some noRoutes) (Some tcpOnlyStatic),
+            Is.False,
+            "A withdrawn route must not restart Traefik when its listener is no longer bound.")
+
+        let malformedPrevious =
+            Encoding.UTF8.GetBytes(
+                """{"udp":{"routers":{"broken":{"entryPoints":"udp-a","service":"echo"}},"services":{"echo":{"loadBalancer":{"servers":[{"address":"127.0.0.1:9000"}]}}}}}""")
+        Assert.That(
+            Traefik.udpWithdrawalRequiresRestart (Some malformedPrevious) (Some noRoutes) (Some staticData),
+            Is.True,
+            "An ambiguous prior UDP graph must conservatively restart bound UDP listeners.")
+
+    [<Test>]
     member _.``API comparison requires the generation marker for API-masked TLS options``() =
         use request = JsonDocument.Parse("""{
           "operation":"apply","ownerId":"unit-test-traefik","entryPoints":{"web":31080},

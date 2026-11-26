@@ -708,6 +708,169 @@ module Traefik =
         (jsonText dynamicConfig).Replace("{{", "\\u007b\\u007b", StringComparison.Ordinal)
 
     let renderDynamicConfig request paths = renderDynamic (validateRequest request) paths
+    let private udpGraphEntryPoints (dynamicData: byte[] option) : Set<string> option =
+        match dynamicData with
+        | None -> Some Set.empty
+        | Some bytes ->
+            let malformed () = raise (InvalidDataException())
+            let requireObject (element: JsonElement) =
+                if element.ValueKind <> JsonValueKind.Object then malformed ()
+                element
+            let uniqueNames (element: JsonElement) =
+                let mutable names = Set.empty
+                for property in (requireObject element).EnumerateObject() do
+                    if Set.contains property.Name names then malformed ()
+                    names <- Set.add property.Name names
+                names
+            let stringProperty (element: JsonElement) (name: string) =
+                match tryProperty element name with
+                | Some value when value.ValueKind = JsonValueKind.String ->
+                    match value.GetString() with
+                    | null -> malformed ()
+                    | text -> text
+                | _ -> malformed ()
+            let requiredObjectProperty (element: JsonElement) (name: string) =
+                match tryProperty element name with
+                | Some value -> requireObject value
+                | None -> malformed ()
+            try
+                use document = JsonDocument.Parse(bytes, JsonDocumentOptions(MaxDepth = 64, AllowDuplicateProperties = false))
+                let root = requireObject document.RootElement
+                match tryProperty root "udp" with
+                | None -> Some Set.empty
+                | Some udp ->
+                    let udp = requireObject udp
+                    let udpNames = uniqueNames udp
+                    if not (Set.isSubset udpNames (set [ "routers"; "services" ])) then malformed ()
+                    match tryProperty udp "routers" with
+                    | None -> Some Set.empty
+                    | Some routers ->
+                        let routers = requireObject routers
+                        let routerNames = uniqueNames routers
+                        if Set.isEmpty routerNames then Some Set.empty
+                        else
+                            let services = requiredObjectProperty udp "services"
+                            uniqueNames services |> ignore
+                            let validatedServices = HashSet<string>(StringComparer.Ordinal)
+                            let activeServices = HashSet<string>(StringComparer.Ordinal)
+                            let normalizeServiceName (value: string) =
+                                if value.EndsWith("@file", StringComparison.Ordinal) then
+                                    value.Substring(0, value.Length - 5)
+                                else value
+                            let rec validateService depth (rawName: string) =
+                                let name = normalizeServiceName rawName
+                                if String.IsNullOrWhiteSpace(name) || depth > 128 then malformed ()
+                                elif validatedServices.Contains(name) then ()
+                                elif not (activeServices.Add(name)) then malformed ()
+                                else
+                                    try
+                                        let service = requiredObjectProperty services name
+                                        let serviceNames = uniqueNames service
+                                        if serviceNames = set [ "loadBalancer" ] then
+                                            let loadBalancer = requiredObjectProperty service "loadBalancer"
+                                            if uniqueNames loadBalancer <> set [ "servers" ] then malformed ()
+                                            match tryProperty loadBalancer "servers" with
+                                            | Some servers when servers.ValueKind = JsonValueKind.Array && servers.GetArrayLength() > 0 ->
+                                                for server in servers.EnumerateArray() do
+                                                    let serverNames = uniqueNames server
+                                                    if serverNames <> set [ "address" ] then malformed ()
+                                                    let address = stringProperty server "address"
+                                                    if String.IsNullOrWhiteSpace(address) then malformed ()
+                                            | _ -> malformed ()
+                                        elif serviceNames = set [ "weighted" ] then
+                                            let weighted = requiredObjectProperty service "weighted"
+                                            if uniqueNames weighted <> set [ "services" ] then malformed ()
+                                            match tryProperty weighted "services" with
+                                            | Some children when children.ValueKind = JsonValueKind.Array && children.GetArrayLength() > 0 ->
+                                                for child in children.EnumerateArray() do
+                                                    let childNames = uniqueNames child
+                                                    if not (Set.isSubset childNames (set [ "name"; "weight" ]))
+                                                       || not (Set.contains "name" childNames) then
+                                                        malformed ()
+                                                    match tryProperty child "weight" with
+                                                    | Some weight ->
+                                                        let mutable value = 0
+                                                        if weight.ValueKind <> JsonValueKind.Number || not (weight.TryGetInt32(&value)) then malformed ()
+                                                    | None -> ()
+                                                    validateService (depth + 1) (stringProperty child "name")
+                                            | _ -> malformed ()
+                                        else malformed ()
+                                        activeServices.Remove(name) |> ignore
+                                        validatedServices.Add(name) |> ignore
+                                    with error ->
+                                        activeServices.Remove(name) |> ignore
+                                        raise error
+                            let mutable entryPoints = Set.empty
+                            for routerName in routerNames do
+                                let router = requiredObjectProperty routers routerName
+                                if uniqueNames router <> set [ "entryPoints"; "service" ] then malformed ()
+                                let service = stringProperty router "service"
+                                validateService 0 service
+                                match tryProperty router "entryPoints" with
+                                | Some values when values.ValueKind = JsonValueKind.Array && values.GetArrayLength() > 0 ->
+                                    let mutable routeEntryPoints = Set.empty
+                                    for value in values.EnumerateArray() do
+                                        if value.ValueKind <> JsonValueKind.String then malformed ()
+                                        match value.GetString() with
+                                        | null
+                                        | "" -> malformed ()
+                                        | name ->
+                                            if Set.contains name routeEntryPoints then malformed ()
+                                            routeEntryPoints <- Set.add name routeEntryPoints
+                                    entryPoints <- Set.union entryPoints routeEntryPoints
+                                | _ -> malformed ()
+                            Some entryPoints
+            with _ -> None
+
+    let private boundUdpEntryPoints (staticData: byte[] option) : Set<string> option =
+        match staticData with
+        | None -> Some Set.empty
+        | Some bytes ->
+            try
+                use document = JsonDocument.Parse(bytes, JsonDocumentOptions(MaxDepth = 64, AllowDuplicateProperties = false))
+                let root = document.RootElement
+                if root.ValueKind <> JsonValueKind.Object then None
+                else
+                    match tryProperty root "entryPoints" with
+                    | Some entryPoints when entryPoints.ValueKind = JsonValueKind.Object ->
+                        let result =
+                            entryPoints.EnumerateObject()
+                            |> Seq.choose (fun entryPoint ->
+                                match tryProperty entryPoint.Value "address" with
+                                | Some address when address.ValueKind = JsonValueKind.String ->
+                                    match address.GetString() with
+                                    | null -> None
+                                    | value when value.EndsWith("/udp", StringComparison.OrdinalIgnoreCase) -> Some entryPoint.Name
+                                    | _ -> None
+                                | _ -> None)
+                            |> Set.ofSeq
+                        Some result
+                    | _ -> None
+            with _ -> None
+    // Rawdata can confirm route removal, but cannot observe an already-open peer session
+    // using the removed UDP handler. Restart when its last route disappears to clear it.
+    let udpWithdrawalRequiresRestart
+        (previousDynamic: byte[] option)
+        (nextDynamic: byte[] option)
+        (targetStatic: byte[] option)
+        : bool =
+        let previous = udpGraphEntryPoints previousDynamic
+        let next = udpGraphEntryPoints nextDynamic
+        let bound = boundUdpEntryPoints targetStatic
+        match previous, next, bound with
+        | None, _, Some entryPoints -> not (Set.isEmpty entryPoints)
+        | None, _, None -> true
+        | Some previous, Some next, Some bound ->
+            Set.difference previous next
+            |> Set.intersect bound
+            |> Set.isEmpty
+            |> not
+        | Some previous, None, Some bound ->
+            Set.intersect previous bound |> Set.isEmpty |> not
+        | Some previous, Some next, None ->
+            not (Set.isEmpty (Set.difference previous next))
+        | Some previous, None, None -> not (Set.isEmpty previous)
+
 
     let private credentialData (configuration: JsonObject option) : byte[] option =
         let values = TraefikTlsSettings.dnsEnvironment configuration
@@ -3201,14 +3364,20 @@ module Traefik =
             let currentUnit = safeUnitStatus environment paths.UnitPath ownerId
             if currentUnit.IsSome then ensureEffectiveUnit environment paths
             elif isActive environment || isEnabled environment then fail "interrupted Traefik service has no owned unit"
+            let oldStatic = journal.Static
+            let oldDynamic = journal.Dynamic
+            let oldUnit = journal.Unit
+            let oldCredentials = journal.Credentials
+            let currentStatic = readOptional environment (Path.Combine(paths.ConfigDir, "static.yml"))
+            let currentDynamic = readOptional environment (Path.Combine(paths.DynamicDir, "current.yml"))
             let currentSync = observeRuntime environment request "" true
-            if currentSync["inSync"].GetValue<bool>() then removePendingTransaction environment paths ownerId
+            if currentSync["inSync"].GetValue<bool>() then
+                if currentStatic = oldStatic && udpWithdrawalRequiresRestart oldDynamic currentDynamic currentStatic then
+                    restartService environment
+                    let result = waitForActivation environment request paths activationTimeout
+                    if not (result["inSync"].GetValue<bool>()) then fail "interrupted Traefik UDP withdrawal did not recover"
+                removePendingTransaction environment paths ownerId
             else
-                let oldStatic = journal.Static
-                let oldDynamic = journal.Dynamic
-                let oldUnit = journal.Unit
-                let oldCredentials = journal.Credentials
-                let currentStatic = readOptional environment (Path.Combine(paths.ConfigDir, "static.yml"))
                 let currentCredentials = readCredentialSnapshot environment paths
                 let currentBinaryExists = assertRegular environment paths.BinaryPath "Traefik binary"
                 let currentBinaryHash = if currentBinaryExists then Some(binarySha256 environment paths.BinaryPath) else None
@@ -3224,7 +3393,11 @@ module Traefik =
                             with _ -> false
                         | None -> false
                     else true
-                let restartRequired = currentStatic <> oldStatic || currentCredentials <> oldCredentials || currentUnit <> oldUnit || currentBinaryHash <> journal.BinarySha256 || not liveStaticMatches
+                let restartRequired =
+                    currentStatic <> oldStatic || currentCredentials <> oldCredentials || currentUnit <> oldUnit
+                    || currentBinaryHash <> journal.BinarySha256 || not liveStaticMatches
+                    || udpWithdrawalRequiresRestart oldDynamic currentDynamic oldStatic
+                    || udpWithdrawalRequiresRestart currentDynamic oldDynamic oldStatic
                 if currentUnit.IsSome && (restartRequired || not journal.WasActive || not currentActive) then
                     stopOwnedService environment paths ownerId
                 restoreFile environment (Path.Combine(paths.ConfigDir, "static.yml")) oldStatic 0o640 (Some groupId)
@@ -3289,8 +3462,9 @@ module Traefik =
         let oldReleaseMarker = readOptional environment (Path.Combine(paths.InstallDir, ".keroosha-release.json"))
         let oldUnitBytes = oldUnit
         let currentUnit = Encoding.UTF8.GetBytes(unitText paths request.OwnerId request.Configuration)
-        let staticData = Encoding.UTF8.GetBytes(renderStaticConfig requestElement paths "")
-        let dynamicData = Encoding.UTF8.GetBytes(renderDynamicConfig requestElement paths)
+        let staticData = Encoding.UTF8.GetBytes(renderStatic request paths "")
+        let dynamicData = Encoding.UTF8.GetBytes(renderDynamic request paths)
+        let udpWithdrawalRestart = udpWithdrawalRequiresRestart oldDynamic (Some dynamicData) (Some staticData)
         let currentCredentials = credentialData request.Configuration
         let credentialsChanged = oldCredentials <> currentCredentials
         let liveStaticMatches =
@@ -3315,7 +3489,7 @@ module Traefik =
                 daemonReload environment
             if not (isEnabled environment) then enableService environment
             if not (isActive environment) then startService environment
-            elif binaryChanged || oldStatic <> Some staticData || unitChanged || credentialsChanged || not liveStaticMatches then restartService environment
+            elif binaryChanged || oldStatic <> Some staticData || unitChanged || credentialsChanged || not liveStaticMatches || udpWithdrawalRestart then restartService environment
             let result = waitForActivation environment requestElement paths activationTimeout
             if not (result["inSync"].GetValue<bool>()) then fail "Traefik activation did not satisfy the bounded readiness checks"
             removePendingTransaction environment paths request.OwnerId
@@ -3329,7 +3503,11 @@ module Traefik =
                 | _ -> error.GetType().Name
             try
                 let currentOwnedUnit = safeUnitStatus environment paths.UnitPath request.OwnerId
-                let restartRequired = binaryChanged || oldStatic <> Some staticData || unitChanged || credentialsChanged || not liveStaticMatches
+                let currentDynamic = readOptional environment (Path.Combine(paths.DynamicDir, "current.yml"))
+                let rollbackUdpWithdrawal = udpWithdrawalRequiresRestart currentDynamic oldDynamic oldStatic
+                let restartRequired =
+                    binaryChanged || oldStatic <> Some staticData || unitChanged || credentialsChanged
+                    || not liveStaticMatches || udpWithdrawalRestart || rollbackUdpWithdrawal
                 let currentActive = isActive environment
                 if currentOwnedUnit.IsSome && (restartRequired || not wasActive || not currentActive) then
                     stopOwnedService environment paths request.OwnerId
