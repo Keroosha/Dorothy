@@ -4,7 +4,7 @@ Target: Debian 13, firewalld 2.3.1. This is the implementation and acceptance pl
 
 ## Resource and migration contract
 
-Each named definition, zone, policy, and daemon key has one owner. A reference within a declaration resolves to its declared owner or to an existing external definition; external references create no ownership. Detect cycles and multi-owner bindings before deploying. Preserve existing resource tokens/names, IDs, journal owners, legacy port and strict-setting serialization. Preview is offline. An unchanged legacy configuration must not request a replacement, reload or restart. An identity-changing replacement cannot reuse another generation's journal.
+Each named definition, zone, policy, and daemon key has one owner. A reference within a declaration resolves to its declared owner or to an existing external definition; external references create no ownership. Preserve resource tokens/names, checkpoint IDs, journal owners and legacy wire defaults. Preview stays offline. See the explicit Docker gate migration below; upgrading must not silently restart a running Docker workload or remove an existing protective policy.
 
 A port range belongs to its transport; a service describes traffic, not a listener. For example, a service admitting TCP 8440–8443 can be attached to a named source zone → `HOST` policy without granting traffic from that zone to any other zone. DNAT has an independent original transport/port and a destination address and/or port. Neither implies general forwarding. Rich-rule ordering and restrictions must survive wire and native round trips. A closed native vocabulary is not arbitrary XML, shell, paths or direct rules.
 
@@ -12,7 +12,7 @@ A port range belongs to its transport; a service describes traffic, not a listen
 open Dorothy.DSL
 open Dorothy.DSL.Firewalld
 
-let api = service "example-api" {
+let api = Defined.service "example-api" {
     transportPorts [portRange 8440 8443 FirewalldTransport.Tcp]
 }
 let firewall = firewalld {
@@ -27,9 +27,25 @@ let firewall = firewalld {
 }
 ```
 
-`services ["ssh"]` references an external definition if the host does not declare `service "ssh"`. In contrast, `services [api.Name]` above finds the declared definition. Removing `api` while leaving a reference is not a safe way to change owners: remove references first or explicitly provision the external definition. For transitions between bindings, keep a working management path at every step, not just in the final declaration.
+`services ["ssh"]` references an external definition if the host does not declare `Defined.service "ssh"`. In contrast, `services [api.Name]` above finds the declared definition. Remove references before removing a definition. For transitions between bindings, keep both the management path and the data-plane access restrictions valid at every step.
+
+**Moving a restricted source between zones is not atomic.** If the fallback could grant access, use separate confirmed applies: (1) fence the selector, (2) remove the old binding, (3) add the new binding and verify it in permanent **and** runtime state, (4) remove the fences. The recognized fences are priority `-32768`, target `CONTINUE`: `ANY → HOST` with a source DROP, and `ANY → ANY` with source and destination DROPs. If the move can bypass a host-output restriction, also fence `HOST → ANY` with a destination DROP. Use an independent management path: these DROPs include legitimate traffic from or to the moving selector. A filter fence cannot undo prerouting NAT or marks; detach the relevant translation in an earlier confirmed change, or establish a restrictive fallback first. Do not make either zone permissive to get past preflight.
 
 The implicit `firewalld` package is a retained prerequisite. Removing the firewall configuration restores its objects and keys; it must not uninstall the daemon that enforces the remaining policy. An explicit APT `firewalld` declaration keeps its original package ownership and removal semantics. **Existing stacks:** apply the new DSL once while the firewalld block is still present, and verify `retainOnDelete: true` on the implicit package in the exported checkpoint before removing the block or destroying the stack. A destroy using only an old checkpoint cannot pick up a new resource option.
+
+**Strict Docker deployments have a one-time in-place update**, not the six-unchanged migration described for a host without Docker. The existing `Service` URN now carries the expected fence policies as typed data. The helper checks loaded strict DNAT and the complete live policy inventory before installing a systemd gate bound to its content-addressed executable. Migrating an already active gate validates the new predicate and reloads systemd's unit definitions without restarting the active gate. The gate participates in subsequent Docker starts and restarts. This is a startup check, not continuous policing of an independently administered firewall.
+
+A dedicated fence must be a negative-priority, exception-free DROP for transit ingress to `docker`. A legacy policy with masquerade, rich or direct pass rules, or an earlier overlapping permit is not an equivalent fence. Keep legitimate HOST authorizations in a separate policy and establish a valid fence before migrating; do not make the default zone permissive. Check preview, then verify the loaded policy and workload identity. Non-Docker hosts do not register this gate.
+
+The supported pre-PR high-level DSL retains its unqualified names under `open Dorothy.DSL.Firewalld`. New names that would shadow host `service`, user `description` or firewall actions are qualified under `Defined` and `RichRule`. The low-level `FirewalldModel.Configuration` record gained fields: recompile consumers and use `{ FirewalldModel.empty kind name with ... }` instead of complete old record literals. This is wire/checkpoint compatibility, **not** constructor or binary ABI compatibility. Debian 13 rejects policy names longer than 18 characters; an offline Diff can plan a rename even if the old provider accepted that spelling. A successful deployment of such a policy on this native target is not promised.
+
+**First acquisition is not a replacement.** Declare existing ports, bindings, services, metadata, rules and effective target/priority. A declaration may add features but must not drop a baseline feature just because `Delete` could put it back. To intentionally remove a previously external rule, acquire the complete baseline first; make the removal a separate reviewed update. There is no raw XML or unchecked takeover flag.
+
+**Ambiguous Create acknowledgement.** Each non-preview Create uses a fresh owner generation and writes a private recovery receipt under the invoking user's `PULUMI_HOME` before the first SSH request. A failed acknowledgement does not grant a later Create permission to take that generation. Retain the originating diagnostic and its opaque `fw-recover:` ticket. With that same private receipt directory, project and stack, use `pulumi import --protect=false <type> <resource-name> fw-recover:<ticket>` for a committed but uncheckpointed object. Import observes the exact journaled owner and declared configuration; it will not steal another generation or confirm a pending mutation. Do not put a receipt, connection details, private keys or a full checkpoint in a review log.
+
+If the provider process died before printing the ticket, inspect the private `keroosha-iac/firewalld` directory under the original `PULUMI_HOME`. Each JSON filename's stem is one ticket; identify the original URN and configuration locally, not by guessing the most recent file. Use the original parent and provider when importing a child resource. A corrupt or mismatched ticket is not authority to import a resource; leave it intact for reconciliation. A subsequent checkpointed Read retires a matching local receipt.
+
+**Ambiguous legacy records.** A pre-proof pending transaction is not evidence of a working rollback policy. Likewise, the original mode of an adopted override is not derivable from an old journal lacking `baselineMode`. Do not invent a mode, delete the marker, or use `--runtime-to-permanent`. Preserve the checkpoint, journal, current disk and observed runtime; use an independent management path and the original backup to reconcile the native policy and metadata. Verify a fresh SSH connection and the original traffic controls before retiring the old ownership record. Without an independently established baseline, automatic release is refused.
 
 ## Implementation and acceptance matrix
 
@@ -50,6 +66,12 @@ The implicit `firewalld` package is a retained prerequisite. Removing the firewa
 Out of scope: legacy direct/passthrough rules, arbitrary nftables or shell commands, sysctls and management of other software's runtime rules. They are not an extension mechanism. The acceptance environment is a disposable guest and file backend; transport and traffic checks must not change the workstation firewall. A compiled catalogue, native load, runtime read and packet probe are different evidence. Record each separately; unsupported or untested behavior is not a pass.
 
 ### Native catalogue notes
+
+Native packet and parser acceptance can differ. On the Debian 13 nftables backend a positive-priority `ANY → HOST` policy translated a test TCP port to a listening local port. The same forward-port in a positive-priority, concrete `public → HOST` policy passed `--check-config` but **failed native activation** (missing nftables chain); there is no packet result for the rejected rule. An independently tested positive-priority `public → HOST` rich DROP did block a listener even with zone target `ACCEPT`.
+
+To export the catalogue from a compiled public consumer, set `DOROTHY_FIREWALLD_CATALOGUE_DIR` to a new empty directory and run `dotnet test tests/Dorothy.Tests/Dorothy.Tests.fsproj --filter FullyQualifiedName~ExportsPublicFirewalldNativeCatalogue`. Copy that directory and `scripts/check-firewalld-catalogue.pl` to a disposable Debian 13 VM with `firewalld` and `libxml-parser-perl`. Run `sudo perl check-firewalld-catalogue.pl GENERATED-DIRECTORY` **inside the guest**. This compares against the guest's installed parser dictionaries, ipset types/options and daemon keys before running `firewall-offline-cmd --check-config` on the generated tree; it does not reload the firewall.
+
+On Debian's 2.3.1 native oracle, the compiled consumer produced all 202 supported features out of 210 declarations. The eight printed exclusions are deprecated identity, family, `immutable` and masquerade spellings, not additional enforcement capabilities. A passing catalogue says nothing about actual packet delivery, loaded settings or SSH rollback.
 
 * The filename identifies a definition. The old root `name` and zone `immutable` attributes have no authority in 2.3.1. A split zone is a merge of several files, not several independently removable owners of one live zone. Do not discard unrecognized fragments when adopting an existing configuration.
 * Zone attributes `ingress-priority` and `egress-priority` classify traffic; policy `priority` orders policies. Rich-rule `priority` orders rules. Equal rich priorities do not imply source-file order on the wire. A trailing `+` on an interface is a kernel prefix match (`eth+` matches `eth0`), not the literal interface name `eth+`.
@@ -73,7 +95,7 @@ Out of scope: legacy direct/passthrough rules, arbitrary nftables or shell comma
 
 For a key without an exact getter, `runtimeObserved=false` and `runtimeInSync=false` distinguish a confirmed activation from a measured live value. Failure to query an observable setting must not silently count as a successful observation. A named object's live query concerns firewalld's selectors, not every rule in the kernel. In particular, independently administered policies and other packet filters may change actual reachability; use packet probes for that claim.
 
-## Acceptance evidence
+## Previous acceptance evidence (reviewed revision `302a654`)
 
 Debian 13 amd64, firewalld `2.3.1-1+deb13u1`, a dedicated SSH identity, a local Pulumi file backend and network namespaces used as independent packet sources. No workstation or production firewall was used.
 

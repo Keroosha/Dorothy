@@ -17,6 +17,9 @@ module internal FirewalldReferences =
                 | "service" -> attribute "name" node |> Option.map (fun n -> "service", n)
                 | "include" -> attribute "service" node |> Option.map (fun n -> "service", n)
                 | "helper" -> attribute "name" node |> Option.map (fun n -> "helper", n)
+                | "module" ->
+                    attribute "name" node
+                    |> Option.map (fun moduleName -> "helper", FirewalldModel.helperNameForModule moduleName)
                 | "icmp-block" | "icmp-type" -> attribute "name" node |> Option.map (fun n -> "icmptype", n)
                 | "source" | "destination" -> attribute "ipset" node |> Option.map (fun n -> "ipset", n)
                 | "ingress-zone" | "egress-zone" ->

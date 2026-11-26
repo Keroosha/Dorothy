@@ -74,9 +74,14 @@ module private HostResourceInputs =
                || name |> Seq.exists (fun c -> not (Char.IsAsciiLetterOrDigit c || "_.@:-\\".Contains c)) then invalidOp "Invalid service name."
             let managed = node["managed"].GetValue<bool>()
             let config = jsonText node "configuration"
-            if managed && (String.IsNullOrWhiteSpace config || not (config.Contains "ExecStart=")) then invalidOp "A managed service requires ExecStart."
-            if not managed && config <> "" then invalidOp "A package service cannot own configuration."
-            if node.Count <> 3 then invalidOp "Unsupported service specification fields."
+            if node.ContainsKey "dockerFence" then
+                if node.Count <> 4 || not managed || config <> "" || not (name.EndsWith("-docker-firewall-guard.service", StringComparison.Ordinal)) then
+                    invalidOp "Expected a managed, typed Docker firewall gate without a user-supplied unit."
+                FirewalldGateModel.decode node["dockerFence"] |> ignore
+            else
+                if managed && (String.IsNullOrWhiteSpace config || not (config.Contains "ExecStart=")) then invalidOp "A managed service requires ExecStart."
+                if not managed && config <> "" then invalidOp "A package service cannot own configuration."
+                if node.Count <> 3 then invalidOp "Unsupported service specification fields."
         else
             let kind = jsonText node "kind"
             if not (List.contains kind [ "archive"; "download"; "file"; "text"; "directory" ]) then invalidOp "Invalid content kind."

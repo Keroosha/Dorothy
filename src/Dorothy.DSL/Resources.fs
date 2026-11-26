@@ -1800,11 +1800,10 @@ module Host =
                 if guardPolicies.IsEmpty then None
                 else
                     let unitName = FirewalldGuardUnit.name host.Name
-                    let configuration = FirewalldGuardUnit.configuration guardPolicies
-                    let specification = HostServiceSpec(unitName, true, configuration, [], true)
+                    let specification = FirewalldGuardUnit.specification unitName guardPolicies
                     let args = HostServiceArgs()
                     args.Connection <- Input<AptConnectionArgs>.op_Implicit connection
-                    args.Specification <- Input<string>.op_Implicit(HostContentInputs.service specification)
+                    args.Specification <- Input<string>.op_Implicit specification
                     args.Triggers <-
                         Input<string>.op_Implicit(
                             System.Text.Json.JsonSerializer.Serialize(

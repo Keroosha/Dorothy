@@ -10,6 +10,15 @@ open Pulumi
 open Pulumi.Testing
 open Pulumi.Utilities
 
+module private FirewalldMixedDslConsumer =
+    open Dorothy.DSL.HostContent
+    open Dorothy.DSL.Firewalld
+
+    let hostService = service "mixed-unit" { exec "/bin/true" }
+    let firewalldService = Defined.service "mixed-firewall-service" { servicePorts [ tcpPort 8443 ] }
+    let userDescription = description "Legacy user description"
+    let alternate = ufw { reject { toPort 9443; proto Tcp } }
+
 module private FirewalldDeploymentFixture =
     let mutable host: HostSpec option = None
     let captured = ResizeArray<ResourceTransformationArgs>()
@@ -105,11 +114,14 @@ type FirewalldDeploymentTests() =
     member _.``Compiled Firewalld catalogue resolves declared references and keeps typed consumer syntax``() =
         let specification =
             firewalld {
-                service "application" { includes [ "transport" ] }
+                Defined.service "application" { includes [ "transport" ] }
                 zone "external" {
                     interfaces [ "enp+" ]
                     services [ "application" ]
                     transportPorts [ tcpPortRange 8440 8443; udpPort 53 ]
+                    sourcePorts [ tcpPort 1024 ]
+                    Zone.ingressPriority -20
+                    Zone.egressPriority 10
                     forwardPort (tcpPort 8444) (Some "192.0.2.50") (Some (tcpPort 444))
                     icmpBlocks [ "echo-request" ]
                     icmpBlockInversion
@@ -119,19 +131,23 @@ type FirewalldDeploymentTests() =
                               family FirewalldFamily.IPv4
                               sourceAddress "198.51.100.0/24"
                               richService "application"
-                              accept
-                              limit 10 FirewalldLimitUnit.Minute
+                              RichRule.accept
+                              RichRule.limitBurst 10 FirewalldLimitUnit.Minute 3
                           }
                           richRule {
                               family FirewalldFamily.IPv4
                               sourceMac "02:00:00:00:00:02"
                               richService "application"
-                              drop
+                              RichRule.drop
                           }
                           richRule {
                               family FirewalldFamily.IPv4
                               sourceAddress "192.0.2.0/24"
                               forwardPort (tcpPort 8443) (Some "192.0.2.50") (Some (tcpPort 443))
+                          }
+                          richRule {
+                              family FirewalldFamily.IPv4
+                              RichRule.tcpMssClamp
                           } ]
                 }
                 ipset "trusted" {
@@ -139,12 +155,12 @@ type FirewalldDeploymentTests() =
                     ipsetOptions [ "family", "inet" ]
                     entries [ "192.0.2.0/24" ]
                 }
-                service "transport" {
+                Defined.service "transport" {
                     servicePorts [ tcpPortRange 8440 8443; udpPort 53 ]
                     sourcePorts [ tcpPort 1024 ]
                     includes [ "vendor-base" ]
                     helpers [ "ftp" ]
-                    modules [ "nf_conntrack" ]
+                    modules [ "nf_conntrack_ftp" ]
                 }
                 helper "ftp" {
                     helperModule "nf_conntrack_ftp"
@@ -157,8 +173,14 @@ type FirewalldDeploymentTests() =
                     ingressZones [ "external" ]
                     egressZones [ "HOST" ]
                     services [ "application" ]
+                    sourcePorts [ udpPort 5353 ]
                     target FirewalldTarget.Accept
                     priority -10
+                }
+                policy "inactive-stage" {
+                    ingressZones []
+                    egressZones [ "external" ]
+                    priority -2
                 }
             }
         let ordered = specification.Objects |> List.map (fun item -> item.Kind, item.Name)
@@ -177,6 +199,17 @@ type FirewalldDeploymentTests() =
         let external = specification.Objects |> List.find (fun item -> item.Kind = "zone" && item.Name = "external")
         let externalConfiguration = FirewalldModel.parse external.Configuration
         Assert.That(externalConfiguration.Ports, Does.Contain("8440-8443/tcp"))
+        Assert.That(externalConfiguration.Attributes["ingress-priority"], Is.EqualTo "-20")
+        Assert.That(externalConfiguration.Attributes["egress-priority"], Is.EqualTo "10")
+        Assert.That(externalConfiguration.Elements |> List.exists (fun element -> element.Name = "source-port"), Is.True)
+        let transport = specification.Objects |> List.find (fun item -> item.Kind = "service" && item.Name = "transport")
+        Assert.That(FirewalldModel.references transport.Value, Does.Contain(("helper", "ftp")))
+        let inactive = specification.Objects |> List.find (fun item -> item.Kind = "policy" && item.Name = "inactive-stage")
+        Assert.That(inactive.Value.Ingress, Is.Empty)
+        Assert.That(inactive.Value.Egress, Is.EquivalentTo [ "external" ])
+        let hostWeb = specification.Objects |> List.find (fun item -> item.Kind = "policy" && item.Name = "host-web")
+        let hostWebConfiguration = FirewalldModel.parse hostWeb.Configuration
+        Assert.That(hostWebConfiguration.Elements |> List.exists (fun element -> element.Name = "source-port"), Is.True)
         Assert.That(FirewalldModel.references external.Value, Does.Contain(("service", "application")))
         Assert.That(FirewalldModel.references external.Value, Does.Contain(("ipset", "trusted")))
         Assert.That(FirewalldModel.references external.Value, Does.Contain(("icmptype", "echo-request")))
@@ -185,12 +218,29 @@ type FirewalldDeploymentTests() =
         Assert.That((FirewalldModel.parse legacy.Configuration).Ports, Does.Contain("80/tcp"))
 
     [<Test>]
+    member _.``Mixed DSL keeps legacy host service, user description and UFW reject resolvable``() =
+        Assert.That(FirewalldMixedDslConsumer.hostService.Configuration, Does.Contain "ExecStart=/bin/true")
+        Assert.That(FirewalldMixedDslConsumer.firewalldService.Value.Ports, Is.EquivalentTo ["8443/tcp"])
+        Assert.That(FirewalldMixedDslConsumer.userDescription, Is.EqualTo(UserDescription "Legacy user description"))
+        Assert.That(FirewalldMixedDslConsumer.alternate.Rules, Does.Contain ["reject"; "in"; "proto"; "tcp"; "to"; "any"; "port"; "9443"])
+
+    [<Test>]
+    member _.``Public richRules accept only rules and rich forward-ports require a family``() =
+        let sourcePort : FirewalldModel.Element =
+            { Name = "source-port"; Attributes = Map.ofList [ "port", "1024"; "protocol", "tcp" ]; Text = None; Children = [] }
+        Assert.Throws<ArgumentException>(fun () ->
+            zone "smuggled" { richRules [ sourcePort ] } |> ignore) |> ignore
+        let portOnly = richRule { forwardPort (tcpPort 8123) None (Some (tcpPort 8124)) }
+        Assert.Throws<ArgumentException>(fun () ->
+            zone "missing-family" { richRules [ portOnly ] } |> ignore) |> ignore
+
+    [<Test>]
     member _.``Firewalld rejects dependency cycles and ambiguous ownership``() =
         let invalid =
             [ (fun () ->
                   firewalld {
-                      service "first" { includes [ "second" ] }
-                      service "second" { includes [ "first" ] }
+                      Defined.service "first" { includes [ "second" ] }
+                      Defined.service "second" { includes [ "first" ] }
                   }
                   |> ignore)
               (fun () ->
@@ -237,7 +287,7 @@ type FirewalldDeploymentTests() =
                 egressZones [ "docker" ]
                 target FirewalldTarget.Drop
                 priority -10
-                richRules [ richRule { richService "ssh"; accept } ]
+                richRules [ richRule { richService "ssh"; RichRule.accept } ]
             }
         let safeRichGuard =
             policy "docker-block" {
@@ -245,7 +295,7 @@ type FirewalldDeploymentTests() =
                 egressZones [ "docker" ]
                 target FirewalldTarget.Drop
                 priority -10
-                richRules [ richRule { richService "ssh"; drop } ]
+                richRules [ richRule { richService "ssh"; RichRule.drop } ]
             }
         let earlierAllow =
             policy "docker-allow" {
@@ -260,7 +310,7 @@ type FirewalldDeploymentTests() =
                 egressZones [ "HOST" ]
                 target FirewalldTarget.Accept
                 priority -15
-                richRules [ richRule { richService "ssh"; accept } ]
+                richRules [ richRule { richService "ssh"; RichRule.accept } ]
             }
         let hostOriginated =
             policy "host-originated" {
@@ -360,23 +410,8 @@ type FirewalldDeploymentTests() =
             |> Array.find (fun args -> args.Args :? HostServiceArgs && name args.Resource = "guarded-docker-firewall-guard")
         let specification: Output<string> = Input<string>.op_Implicit((guardResource.Args :?> HostServiceArgs).Specification)
         let encoded = OutputUtilities.GetValueAsync(specification).Result
-        use specificationDocument = System.Text.Json.JsonDocument.Parse encoded
-        let unit = specificationDocument.RootElement.GetProperty("configuration").GetString()
-        Assert.That(unit, Is.EqualTo(FirewalldGuardUnit.configuration [ guard ]))
-        Assert.That(unit, Does.Contain("--policy=docker-block"))
-        Assert.That(unit, Does.Not.Contain("--policy=host-ssh"))
-        Assert.That(unit, Does.Contain("--info-policy=docker-block"))
-        Assert.That(unit, Does.Contain("target: DROP"))
-        Assert.That(unit, Does.Contain("priority: -10"))
-        Assert.That(unit, Does.Contain("ingress-zones: public"))
-        Assert.That(unit, Does.Contain("egress-zones: docker"))
-        Assert.That(unit, Does.Contain("--list-services"))
-        Assert.That(unit, Does.Contain("--list-ports"))
-        Assert.That(unit, Does.Contain("--list-protocols"))
-        Assert.That(unit, Does.Contain("--list-source-ports"))
-        Assert.That(unit, Does.Contain("--list-forward-ports"))
-        Assert.That(unit, Does.Contain("--list-rich-rules"))
-        Assert.That(unit, Does.Contain("ExecStart=:/bin/sh -ec"))
+        let fences = FirewalldGateModel.decode (System.Text.Json.Nodes.JsonNode.Parse(encoded)["dockerFence"])
+        Assert.That(fences, Is.EquivalentTo [ FirewalldGateModel.ofPolicy guard.Value ])
         let dependencies: Output<ImmutableArray<Resource>> = InputList<Resource>.op_Implicit guardResource.Options.DependsOn
         let dependencyNames = OutputUtilities.GetValueAsync(dependencies).Result |> Seq.map name |> Set.ofSeq
         Assert.That(dependencyNames, Does.Contain("guarded-firewalld-policy-docker-block"))
@@ -384,8 +419,8 @@ type FirewalldDeploymentTests() =
 
     [<Test>]
     member _.``Firewalld resources depend on declared parents and ignore external definitions``() =
-        let baseService = service "base" { servicePorts [ tcpPort 8080 ] }
-        let apiService = service "api" { includes [ "base"; "vendor-base" ] }
+        let baseService = Defined.service "base" { servicePorts [ tcpPort 8080 ] }
+        let apiService = Defined.service "api" { includes [ "base"; "vendor-base" ] }
         let firewall =
             firewalld {
                 apiService

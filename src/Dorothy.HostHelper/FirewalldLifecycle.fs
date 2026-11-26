@@ -7,17 +7,27 @@ open System.Text.Json.Nodes
 open System.Text.RegularExpressions
 
 module FirewalldLifecycle =
+    type RecoveryPhase =
+        | ActiveDaemon
+        | BootBeforeFirewalld
+        | BootAfterFirewalld
+
     type PendingTransaction =
-        { Nonce: string
+        { SchemaVersion: int
+          Nonce: string
           OwnerId: string
           Configuration: FirewalldModel.Configuration
           Path: string
+          Scope: JsonObject option
           Before: string option
           BeforeMode: int
           After: string option
           AfterMode: int
           ManagedBefore: string option
           ManagedAfter: string option
+          RollbackProof: JsonObject option
+          ActivationStarted: bool
+          AwaitingPostBoot: bool
           ReleaseOnRollback: bool
           DeleteOnConfirm: bool
           Status: string }
@@ -30,8 +40,16 @@ module FirewalldLifecycle =
     let private serviceName = "keroosha-iac-firewalld-rollback.service"
     let private timerName = "keroosha-iac-firewalld-rollback.timer"
     let private bootServicePath = "/etc/systemd/system/keroosha-iac-firewalld-boot-recovery.service"
+    let private postBootServicePath = "/etc/systemd/system/keroosha-iac-firewalld-postboot-recovery.service"
+    let private postBootServiceName = "keroosha-iac-firewalld-postboot-recovery.service"
     let private bootServiceName = "keroosha-iac-firewalld-boot-recovery.service"
     let private ownerMarker = "# Dorothy firewalld transaction recovery"
+    let private timerText =
+        String.concat "\n"
+            [ ownerMarker; "[Unit]"; "Description=Dorothy firewalld transaction rollback watchdog"; "[Timer]"; "OnActiveSec=2min"; "AccuracySec=1s"; "Unit=" + serviceName; "[Install]"; "WantedBy=timers.target"; "" ]
+    let private legacyTimerText =
+        String.concat "\n"
+            [ ownerMarker; "[Unit]"; "Description=Dorothy firewalld transaction rollback watchdog"; "[Timer]"; "OnActiveSec=2min"; "Unit=" + serviceName; "[Install]"; "WantedBy=timers.target"; "" ]
     let private strictUtf8 = UTF8Encoding(false, true)
     let private fileMode = UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.GroupRead ||| UnixFileMode.OtherRead
     let private privateFileMode = UnixFileMode.UserRead ||| UnixFileMode.UserWrite
@@ -111,8 +129,85 @@ module FirewalldLifecycle =
     let private getInt (node: JsonObject) (key: string) =
         match node[key] with null -> fail ("Missing firewalld transaction field " + key + ".") | value -> value.GetValue<int>()
 
+    let private getOptionalObject (node: JsonObject) (key: string) =
+        if not (node.ContainsKey key) then fail ("Missing firewalld transaction field " + key + ".")
+        match node[key] with
+        | null -> None
+        | :? JsonObject as value -> Some(value.DeepClone().AsObject())
+        | _ -> fail ("Invalid firewalld transaction field " + key + ".")
     let private setOptionalString (node: JsonObject) (key: string) (value: string option) =
         node[key] <- match value with None -> null | Some text -> JsonValue.Create text :> JsonNode
+    let private setOptionalObject (node: JsonObject) (key: string) (value: JsonObject option) =
+        node[key] <- match value with None -> null | Some objectValue -> objectValue.DeepClone()
+    let private pendingNode (pending: PendingTransaction) =
+        let node = JsonObject()
+        node["version"] <- JsonValue.Create 2
+        node["nonce"] <- JsonValue.Create pending.Nonce
+        node["ownerId"] <- JsonValue.Create pending.OwnerId
+        node["configuration"] <- JsonValue.Create(FirewalldModel.toJson pending.Configuration)
+        node["path"] <- JsonValue.Create pending.Path
+        setOptionalObject node "scope" pending.Scope
+        setOptionalString node "before" pending.Before
+        node["beforeMode"] <- JsonValue.Create pending.BeforeMode
+        setOptionalString node "after" pending.After
+        node["afterMode"] <- JsonValue.Create pending.AfterMode
+        setOptionalString node "managedBefore" pending.ManagedBefore
+        setOptionalString node "managedAfter" pending.ManagedAfter
+        setOptionalObject node "rollbackProof" pending.RollbackProof
+        node["activationStarted"] <- JsonValue.Create pending.ActivationStarted
+        node["awaitingPostBoot"] <- JsonValue.Create pending.AwaitingPostBoot
+        node["releaseOnRollback"] <- JsonValue.Create pending.ReleaseOnRollback
+        node["deleteOnConfirm"] <- JsonValue.Create pending.DeleteOnConfirm
+        node["status"] <- JsonValue.Create pending.Status
+        node
+
+    let private parsePendingNode (node: JsonObject) =
+        let fieldsV1 =
+            set [ "version"; "nonce"; "ownerId"; "configuration"; "path"; "before"; "beforeMode"; "after"; "afterMode"; "managedBefore"; "managedAfter"; "releaseOnRollback"; "deleteOnConfirm"; "status" ]
+        let fieldsV2 =
+            Set.union fieldsV1 (set [ "scope"; "rollbackProof"; "activationStarted"; "awaitingPostBoot" ])
+        let actual = node |> Seq.map (fun pair -> pair.Key) |> Set.ofSeq
+        let version = getInt node "version"
+        if (version <> 1 && version <> 2)
+           || (version = 1 && actual <> fieldsV1)
+           || (version = 2 && actual <> fieldsV2) then
+            fail "Invalid firewalld transaction record."
+        let nonce = getString node "nonce"
+        if not (Regex.IsMatch(nonce, "^[0-9a-f]{32}$", RegexOptions.CultureInvariant)) then fail "Invalid firewalld transaction nonce."
+        let owner = getString node "ownerId"
+        if String.IsNullOrWhiteSpace owner || owner |> Seq.exists Char.IsControl then fail "Invalid firewalld transaction owner."
+        let c = FirewalldModel.parse(getString node "configuration")
+        let path = getString node "path"
+        if path <> expectedPath c then fail "Invalid firewalld transaction file path."
+        let beforeMode, afterMode = getInt node "beforeMode", getInt node "afterMode"
+        if beforeMode < 0 || beforeMode > 0o7777 || afterMode < 0 || afterMode > 0o7777 then fail "Invalid firewalld transaction file mode."
+        let status = getString node "status"
+        if status <> "pending" && status <> "confirmed" then fail "Invalid firewalld transaction status."
+        let scope = if version = 1 then None else getOptionalObject node "scope"
+        let rollbackProof = if version = 1 then None else getOptionalObject node "rollbackProof"
+        let activationStarted = if version = 1 then status = "pending" else getBool node "activationStarted"
+        let awaitingPostBoot = if version = 1 then false else getBool node "awaitingPostBoot"
+        if version = 2 && c.Kind = "settings" && scope.IsNone then fail "Invalid firewalld settings transaction scope."
+        if activationStarted && rollbackProof.IsNone then fail "Firewalld transaction lacks required runtime rollback proof."
+        if awaitingPostBoot && not activationStarted then fail "Invalid firewalld post-boot recovery state."
+        { SchemaVersion = version
+          Nonce = nonce
+          OwnerId = owner
+          Configuration = c
+          Path = path
+          Scope = scope
+          Before = getOptionalString node "before"
+          BeforeMode = beforeMode
+          After = getOptionalString node "after"
+          AfterMode = afterMode
+          ManagedBefore = getOptionalString node "managedBefore"
+          ManagedAfter = getOptionalString node "managedAfter"
+          RollbackProof = rollbackProof
+          ActivationStarted = activationStarted
+          AwaitingPostBoot = awaitingPostBoot
+          ReleaseOnRollback = getBool node "releaseOnRollback"
+          DeleteOnConfirm = getBool node "deleteOnConfirm"
+          Status = status }
 
     let private decodeFile (bytes: byte array) =
         if bytes.Length >= 3 && bytes[0] = 0xEFuy && bytes[1] = 0xBBuy && bytes[2] = 0xBFuy then
@@ -145,52 +240,6 @@ module FirewalldLifecycle =
 
     let private journalOwner (journal: JsonObject) = getString journal "ownerId"
 
-    let private pendingNode (pending: PendingTransaction) =
-        let node = JsonObject()
-        node["version"] <- JsonValue.Create 1
-        node["nonce"] <- JsonValue.Create pending.Nonce
-        node["ownerId"] <- JsonValue.Create pending.OwnerId
-        node["configuration"] <- JsonValue.Create(FirewalldModel.toJson pending.Configuration)
-        node["path"] <- JsonValue.Create pending.Path
-        setOptionalString node "before" pending.Before
-        node["beforeMode"] <- JsonValue.Create pending.BeforeMode
-        setOptionalString node "after" pending.After
-        node["afterMode"] <- JsonValue.Create pending.AfterMode
-        setOptionalString node "managedBefore" pending.ManagedBefore
-        setOptionalString node "managedAfter" pending.ManagedAfter
-        node["releaseOnRollback"] <- JsonValue.Create pending.ReleaseOnRollback
-        node["deleteOnConfirm"] <- JsonValue.Create pending.DeleteOnConfirm
-        node["status"] <- JsonValue.Create pending.Status
-        node
-
-    let private parsePendingNode (node: JsonObject) =
-        let expected = set [ "version"; "nonce"; "ownerId"; "configuration"; "path"; "before"; "beforeMode"; "after"; "afterMode"; "managedBefore"; "managedAfter"; "releaseOnRollback"; "deleteOnConfirm"; "status" ]
-        let actual = node |> Seq.map (fun pair -> pair.Key) |> Set.ofSeq
-        if actual <> expected || getInt node "version" <> 1 then fail "Invalid firewalld transaction record."
-        let nonce = getString node "nonce"
-        if not (Regex.IsMatch(nonce, "^[0-9a-f]{32}$", RegexOptions.CultureInvariant)) then fail "Invalid firewalld transaction nonce."
-        let owner = getString node "ownerId"
-        if String.IsNullOrWhiteSpace owner || owner |> Seq.exists Char.IsControl then fail "Invalid firewalld transaction owner."
-        let c = FirewalldModel.parse(getString node "configuration")
-        let path = getString node "path"
-        if path <> expectedPath c then fail "Invalid firewalld transaction file path."
-        let beforeMode, afterMode = getInt node "beforeMode", getInt node "afterMode"
-        if beforeMode < 0 || beforeMode > 0o7777 || afterMode < 0 || afterMode > 0o7777 then fail "Invalid firewalld transaction file mode."
-        let status = getString node "status"
-        if status <> "pending" && status <> "confirmed" then fail "Invalid firewalld transaction status."
-        { Nonce = nonce
-          OwnerId = owner
-          Configuration = c
-          Path = path
-          Before = getOptionalString node "before"
-          BeforeMode = beforeMode
-          After = getOptionalString node "after"
-          AfterMode = afterMode
-          ManagedBefore = getOptionalString node "managedBefore"
-          ManagedAfter = getOptionalString node "managedAfter"
-          ReleaseOnRollback = getBool node "releaseOnRollback"
-          DeleteOnConfirm = getBool node "deleteOnConfirm"
-          Status = status }
 
     let pending (environment: HostEnvironment) =
         match getJournalText environment pendingPath with
@@ -238,9 +287,16 @@ module FirewalldLifecycle =
         setOptionalString journal "managed" contents
         journal["managedMode"] <- JsonValue.Create mode
 
-    let private finishConfirmed (environment: HostEnvironment) (transaction: PendingTransaction) (journal: JsonObject option) =
+
+    let private finishConfirmed
+        (environment: HostEnvironment)
+        (transaction: PendingTransaction)
+        (journal: JsonObject option)
+        (readState: JsonObject option -> string option -> string option)
+        =
         let current, currentMode = readPath environment transaction.Path
-        if current <> transaction.After || (transaction.After.IsSome && currentMode <> transaction.AfterMode) then
+        let state = if transaction.SchemaVersion = 1 then current else readState transaction.Scope current
+        if state <> transaction.After || (transaction.After.IsSome && currentMode <> transaction.AfterMode) then
             fail "Confirmed firewalld configuration changed before transaction finalization."
         match journal with
         | Some value ->
@@ -258,43 +314,77 @@ module FirewalldLifecycle =
         (environment: HostEnvironment)
         (transaction: PendingTransaction)
         (journal: JsonObject option)
-        (write: string option -> int -> unit)
-        (activate: unit -> unit)
+        (readState: JsonObject option -> string option -> string option)
+        (writeState: JsonObject option -> string option -> string option -> int -> unit)
+        (restoreRuntime: PendingTransaction -> RecoveryPhase -> unit)
+        (phase: RecoveryPhase)
         =
         let current, currentMode = readPath environment transaction.Path
-        if current <> transaction.Before && current <> transaction.After then
+        let state = if transaction.SchemaVersion = 1 then current else readState transaction.Scope current
+        if state <> transaction.Before && state <> transaction.After then
             fail "Firewalld configuration changed during an interrupted transaction; refusing recovery."
-        if transaction.Before.IsSome && current = transaction.Before && currentMode <> transaction.BeforeMode then
+        if transaction.Before.IsSome && state = transaction.Before && currentMode <> transaction.BeforeMode then
             fail "Firewalld configuration mode changed during interrupted transaction; refusing recovery."
-        if transaction.After.IsSome && current = transaction.After && currentMode <> transaction.AfterMode then
+        if transaction.After.IsSome && state = transaction.After && currentMode <> transaction.AfterMode then
             fail "Firewalld configuration mode changed during interrupted transaction; refusing recovery."
-        if transaction.Before <> transaction.After || (transaction.Before.IsSome && transaction.BeforeMode <> transaction.AfterMode) then
-            write transaction.Before transaction.BeforeMode
-            activate ()
-        match journal with
-        | Some value ->
-            if transaction.ReleaseOnRollback then removeJournal environment transaction.Configuration transaction.OwnerId
-            else
-                updateManaged value transaction.ManagedBefore transaction.BeforeMode
-                clearJournalPending value
-                if value.ContainsKey "deleteOnConfirm" then value.Remove "deleteOnConfirm" |> ignore
-                saveJournal environment transaction.Configuration value
-        | None ->
-            if not transaction.ReleaseOnRollback then fail "Firewalld owner journal is missing during recovery."
-        clearPending environment
+        if transaction.SchemaVersion <> 2 && transaction.Status = "pending" then
+            fail "Legacy firewalld transaction lacks a durable runtime rollback proof; refusing recovery."
+        writeState transaction.Scope state transaction.Before transaction.BeforeMode
+        if transaction.ActivationStarted then
+            match phase with
+            | BootBeforeFirewalld ->
+                let waiting = { transaction with AwaitingPostBoot = true }
+                savePending environment waiting
+                match journal with
+                | Some value ->
+                    writeJournalPending value waiting
+                    saveJournal environment transaction.Configuration value
+                | None when transaction.ReleaseOnRollback -> ()
+                | None -> fail "Firewalld owner journal is missing during boot recovery."
+            | BootAfterFirewalld when transaction.AwaitingPostBoot ->
+                if state <> transaction.Before then
+                    fail "Firewalld permanent preimage changed before post-boot runtime recovery."
+                restoreRuntime transaction BootAfterFirewalld
+            | _ -> restoreRuntime transaction phase
+        if not (transaction.ActivationStarted && phase = BootBeforeFirewalld) then
+            match journal with
+            | Some value ->
+                if transaction.ReleaseOnRollback then removeJournal environment transaction.Configuration transaction.OwnerId
+                else
+                    updateManaged value transaction.ManagedBefore transaction.BeforeMode
+                    clearJournalPending value
+                    if value.ContainsKey "deleteOnConfirm" then value.Remove "deleteOnConfirm" |> ignore
+                    saveJournal environment transaction.Configuration value
+            | None ->
+                if not transaction.ReleaseOnRollback then fail "Firewalld owner journal is missing during recovery."
+            clearPending environment
 
-    let private readLegacyPending (journal: JsonObject) =
+    let private hasOwnerPending (journal: JsonObject) =
         match journal["pending"] with
-        | null -> None
-        | :? JsonObject as pending ->
-            if pending.ContainsKey "nonce" then None
-            else
-                let keys = pending |> Seq.map (fun pair -> pair.Key) |> Set.ofSeq
-                if keys <> set [ "before"; "after" ] && keys <> set [ "before"; "after"; "beforeMode"; "afterMode" ] then
-                    fail "Invalid legacy firewalld pending transaction."
-                let mode key = if pending.ContainsKey key then Some(getInt pending key) else None
-                Some(getOptionalString pending "before", getOptionalString pending "after", mode "beforeMode")
-        | _ -> fail "Invalid firewalld pending transaction."
+        | null -> false
+        | :? JsonObject -> true
+        | _ -> fail "Invalid firewalld owner pending transaction."
+
+    let private ensureNoOrphanedOwnerPending (environment: HostEnvironment) =
+        let directory = logicalPath environment journalDirectory
+        if Directory.Exists directory then
+            checkPrivateDirectory environment |> ignore
+            for physical in Directory.EnumerateFiles(directory, "*.json") do
+                let logical = journalDirectory + "/" + Path.GetFileName physical
+                match getJournalText environment logical with
+                | None -> ()
+                | Some text ->
+                    let journal = JsonNode.Parse(text).AsObject()
+                    if hasOwnerPending journal then
+                        fail "An owner journal contains an unpaired firewalld transaction; refusing new mutations."
+
+    let private ensureNoLegacyPending (journal: JsonObject) =
+        if hasOwnerPending journal then
+            fail "A legacy firewalld owner transaction has no matching host recovery marker; refusing recovery."
+
+    let private ensureRecoverablePending (transaction: PendingTransaction) =
+        if transaction.Status = "pending" && transaction.SchemaVersion <> 2 then
+            fail "Legacy firewalld host transaction lacks a durable runtime rollback proof; refusing recovery."
 
 
     let private createRecoveryUnits (environment: HostEnvironment) =
@@ -303,13 +393,19 @@ module FirewalldLifecycle =
             fail "Cannot arm firewalld rollback without a canonical native helper executable path."
         let serviceText =
             String.concat "\n"
-                [ ownerMarker; "[Unit]"; "Description=Dorothy firewalld transaction rollback"; "DefaultDependencies=no"; "After=local-fs.target"; "[Service]"; "Type=oneshot"; "ExecStart=" + helper + " firewalld-recover"; "" ]
+                [ ownerMarker; "[Unit]"; "Description=Dorothy firewalld transaction rollback"; "DefaultDependencies=no"; "After=local-fs.target"; "StartLimitIntervalSec=0"; "[Service]"; "Type=oneshot"; "TimeoutStartSec=3min"; "Restart=on-failure"; "RestartSec=30s"; "ExecStart=" + helper + " firewalld-recover"; "" ]
         let bootServiceText =
             String.concat "\n"
-                [ ownerMarker; "[Unit]"; "Description=Dorothy firewalld boot recovery"; "DefaultDependencies=no"; "After=local-fs.target"; "Before=firewalld.service"; "[Service]"; "Type=oneshot"; "ExecStart=" + helper + " firewalld-recover-boot"; "[Install]"; "WantedBy=multi-user.target"; "" ]
-        let timerText =
+                [ ownerMarker; "[Unit]"; "Description=Dorothy firewalld boot recovery"; "DefaultDependencies=no"; "After=local-fs.target"; "Before=firewalld.service"; "[Service]"; "Type=oneshot"; "RemainAfterExit=yes"; "TimeoutStartSec=90s"; "ExecStart=" + helper + " firewalld-recover-boot"; "[Install]"; "WantedBy=multi-user.target"; "RequiredBy=firewalld.service"; "" ]
+        let postBootServiceText =
             String.concat "\n"
-                [ ownerMarker; "[Unit]"; "Description=Dorothy firewalld transaction rollback watchdog"; "[Timer]"; "OnActiveSec=2min"; "Unit=" + serviceName; "[Install]"; "WantedBy=timers.target"; "" ]
+                [ ownerMarker; "[Unit]"; "Description=Dorothy firewalld post-boot recovery"; "DefaultDependencies=no"; "After=firewalld.service"; "Requires=firewalld.service"; "[Service]"; "Type=oneshot"; "TimeoutStartSec=90s"; "ExecStart=" + helper + " firewalld-recover-postboot"; "[Install]"; "WantedBy=multi-user.target"; "" ]
+        let legacyServiceText =
+            String.concat "\n"
+                [ ownerMarker; "[Unit]"; "Description=Dorothy firewalld transaction rollback"; "DefaultDependencies=no"; "After=local-fs.target"; "[Service]"; "Type=oneshot"; "ExecStart=" + helper + " firewalld-recover"; "" ]
+        let legacyBootServiceText =
+            String.concat "\n"
+                [ ownerMarker; "[Unit]"; "Description=Dorothy firewalld boot recovery"; "DefaultDependencies=no"; "After=local-fs.target"; "Before=firewalld.service"; "[Service]"; "Type=oneshot"; "ExecStart=" + helper + " firewalld-recover-boot"; "[Install]"; "WantedBy=multi-user.target"; "" ]
         let matchesOwnedUnit (expectedText: string) (actualText: string) =
             let expectedLines = expectedText.Split('\n')
             let actualLines = actualText.Split('\n')
@@ -331,7 +427,7 @@ module FirewalldLifecycle =
                             || Regex.IsMatch(oldExecutable, "^/var/cache/keroosha-iac/helper/(linux-x64|linux-arm64)/[0-9a-f]{64}$", RegexOptions.CultureInvariant))
             expectedLines.Length = actualLines.Length
             && Array.forall2 (fun expected actual -> expected = actual || executableLine expected actual) expectedLines actualLines
-        let writeOwned (logical: string) (text: string) =
+        let writeOwned (logical: string) (text: string) (legacyTexts: string list) =
             let physical = regularPath environment logical
             let expected = strictUtf8.GetBytes(text)
             let currentBytes =
@@ -341,7 +437,8 @@ module FirewalldLifecycle =
                         fail "A firewalld recovery systemd unit is not root-owned mode 0644."
                     let bytes = File.ReadAllBytes physical
                     let current = strictUtf8.GetString bytes
-                    if not (matchesOwnedUnit text current) then
+                    if not (matchesOwnedUnit text current
+                            || legacyTexts |> List.exists (fun legacy -> matchesOwnedUnit legacy current)) then
                         fail "A firewalld recovery systemd unit collides with an unowned or modified unit."
                     Some bytes
                 elif Directory.Exists physical || not (isNull (FileInfo(physical).LinkTarget)) then
@@ -365,74 +462,176 @@ module FirewalldLifecycle =
                 if actualTarget <> expectedTarget then
                     fail "A firewalld recovery systemd enable link points to an unowned unit."
         validateEnableLink ("/etc/systemd/system/multi-user.target.wants/" + bootServiceName) bootServicePath
+        validateEnableLink ("/etc/systemd/system/firewalld.service.requires/" + bootServiceName) bootServicePath
+        validateEnableLink ("/etc/systemd/system/multi-user.target.wants/" + postBootServiceName) postBootServicePath
         validateEnableLink ("/etc/systemd/system/timers.target.wants/" + timerName) timerPath
         ensureDirectory environment "/etc/systemd/system" (int unitDirectoryMode) |> ignore
-        writeOwned servicePath serviceText
-        writeOwned bootServicePath bootServiceText
-        writeOwned timerPath timerText
+        writeOwned servicePath serviceText [ legacyServiceText ]
+        writeOwned bootServicePath bootServiceText [ legacyBootServiceText ]
+        writeOwned postBootServicePath postBootServiceText []
+        writeOwned timerPath timerText [ legacyTimerText ]
         run environment "/usr/bin/systemctl" [ "daemon-reload" ] |> ignore
         run environment "/usr/bin/systemctl" [ "enable"; bootServiceName ] |> ignore
-        run environment "/usr/bin/systemctl" [ "enable"; "--now"; timerName ] |> ignore
+        // Latch this boot before timer activation or staging. With RemainAfterExit=yes,
+        // a daemon restart cannot re-run the lock-taking preboot hook.
+        run environment "/usr/bin/systemctl" [ "start"; bootServiceName ] |> ignore
+        run environment "/usr/bin/systemctl" [ "enable"; postBootServiceName ] |> ignore
+        // This caller holds the mutation lock and verified there is no pending
+        // intent. Cancel any previous generation's delayed callback before
+        // arming a new full confirmation interval; retry only FAILED recoveries.
+        run environment "/usr/bin/systemctl" [ "stop"; timerName ] |> ignore
+        run environment "/usr/bin/systemctl" [ "stop"; serviceName ] |> ignore
+        run environment "/usr/bin/systemctl" [ "enable"; timerName ] |> ignore
         run environment "/usr/bin/systemctl" [ "restart"; timerName ] |> ignore
 
-    let private makeTransaction
-        (environment: HostEnvironment)
-        (c: FirewalldModel.Configuration)
-        (journal: JsonObject)
-        (releaseOnRollback: bool)
-        (path: string)
-        (before: string option)
-        (beforeMode: int)
-        (after: string option)
-        (afterMode: int)
-        =
-        if path <> expectedPath c then fail "Firewalld transaction path does not match its declared object."
-        let owner = journalOwner journal
-        let nonce = Guid.NewGuid().ToString("N")
-        let managedBefore = getOptionalString journal "managed"
-        let managedAfter = after
-        { Nonce = nonce
-          OwnerId = owner
-          Configuration = c
-          Path = path
-          Before = before
-          BeforeMode = beforeMode
-          After = after
-          AfterMode = afterMode
-          ManagedBefore = managedBefore
-          ManagedAfter = managedAfter
-          ReleaseOnRollback = releaseOnRollback
-          DeleteOnConfirm =
-            match journal["deleteOnConfirm"] with
-            | null -> false
-            | value -> value.GetValue<bool>()
-          Status = "pending" }
+    let private stopRetryTimer (environment: HostEnvironment) =
+        let physical = regularPath environment timerPath
+        if Directory.Exists physical then
+            fail "The firewalld retry timer path is not a regular file."
+        elif File.Exists physical then
+            let owner = run environment "stat" [ "-c"; "%u:%g"; "--"; physical ]
+            let contents = decodeFile(File.ReadAllBytes physical)
+            if owner <> "0:0" || File.GetUnixFileMode physical <> fileMode
+               || (contents <> timerText && contents <> legacyTimerText) then
+                fail "Refusing to stop a modified or unowned firewalld retry timer."
+            run environment "/usr/bin/systemctl" [ "stop"; timerName ] |> ignore
 
-    let transact
+    let private hasOwnerJournalFiles (environment: HostEnvironment) =
+        let directory = logicalPath environment journalDirectory
+        if not (Directory.Exists directory) then false
+        else
+            checkPrivateDirectory environment |> ignore
+            Directory.EnumerateFiles(directory, "*.json")
+            |> Seq.exists (fun path -> Path.GetFileName path <> Path.GetFileName pendingPath)
+
+    let private verifyOwnedUnitFile (environment: HostEnvironment) (logical: string) =
+        let physical = regularPath environment logical
+        if Directory.Exists physical then fail "A firewalld recovery systemd unit path is not a regular file."
+        elif File.Exists physical then
+            let owner = run environment "stat" [ "-c"; "%u:%g"; "--"; physical ]
+            let text = decodeFile(File.ReadAllBytes physical)
+            if owner <> "0:0" || File.GetUnixFileMode physical <> fileMode
+               || not (text.StartsWith(ownerMarker + "\n", StringComparison.Ordinal)) then
+                fail "A firewalld recovery systemd unit is not an owned root:root mode 0644 unit."
+
+    let private ownedEnableLink
         (environment: HostEnvironment)
+        (logicalLink: string)
+        (logicalTarget: string)
+        =
+        regularPath environment (Path.GetDirectoryName logicalLink) |> ignore
+        let physicalLink = logicalPath environment logicalLink
+        let expectedTarget = Path.GetFullPath(logicalPath environment logicalTarget)
+        match FileInfo(physicalLink).LinkTarget with
+        | null when File.Exists physicalLink || Directory.Exists physicalLink ->
+            fail "A firewalld recovery systemd enable link collides with an unowned path."
+        | null -> None
+        | target ->
+            let actualTarget =
+                if Path.IsPathRooted target then Path.GetFullPath target
+                else Path.GetFullPath(Path.Combine(Path.GetDirectoryName physicalLink, target))
+            if actualTarget <> expectedTarget then
+                fail "A firewalld recovery systemd enable link points to an unowned unit."
+            Some physicalLink
+
+    let private reconcileRecoveryUnits (environment: HostEnvironment) =
+        match pending environment with
+        | Some _ -> fail "Cannot detach firewalld recovery units while a transaction is pending."
+        | None ->
+            stopRetryTimer environment
+            if not (hasOwnerJournalFiles environment) then
+                for logical in [ servicePath; bootServicePath; postBootServicePath; timerPath ] do
+                    verifyOwnedUnitFile environment logical
+                let links =
+                    [ "/etc/systemd/system/multi-user.target.wants/" + bootServiceName, bootServicePath
+                      "/etc/systemd/system/firewalld.service.requires/" + bootServiceName, bootServicePath
+                      "/etc/systemd/system/multi-user.target.wants/" + postBootServiceName, postBootServicePath
+                      "/etc/systemd/system/timers.target.wants/" + timerName, timerPath ]
+                    |> List.choose (fun (logicalLink, logicalTarget) -> ownedEnableLink environment logicalLink logicalTarget)
+                for link in links do
+                    File.Delete link
+                    HostFiles.syncDirectory (Path.GetDirectoryName link)
+                if not links.IsEmpty then
+                    run environment "/usr/bin/systemctl" [ "daemon-reload" ] |> ignore
+
+    let private makeTransaction
         (c: FirewalldModel.Configuration)
         (journal: JsonObject)
         (releaseOnRollback: bool)
+        (deleteOnConfirm: bool)
         (path: string)
+        (scope: JsonObject option)
         (before: string option)
         (beforeMode: int)
         (after: string option)
         (afterMode: int)
         (managedBefore: string option)
         (managedAfter: string option)
-        (write: string option -> int -> unit)
-        (validate: string option -> unit)
+        (rollbackProof: JsonObject option)
+        =
+        if path <> expectedPath c then fail "Firewalld transaction path does not match its declared object."
+        let owner = journalOwner journal
+        { SchemaVersion = 2
+          Nonce = Guid.NewGuid().ToString("N")
+          OwnerId = owner
+          Configuration = c
+          Path = path
+          Scope = scope |> Option.map (fun value -> value.DeepClone().AsObject())
+          Before = before
+          BeforeMode = beforeMode
+          After = after
+          AfterMode = afterMode
+          ManagedBefore = managedBefore
+          ManagedAfter = managedAfter
+          RollbackProof = rollbackProof |> Option.map (fun value -> value.DeepClone().AsObject())
+          ActivationStarted = false
+          AwaitingPostBoot = false
+          ReleaseOnRollback = releaseOnRollback
+          DeleteOnConfirm = deleteOnConfirm
+          Status = "pending" }
+
+    /// The original writer always installed managed zone/policy XML as 0644.
+    /// This authenticates the managed mode, not a pre-acquisition baseline mode.
+    let preMetadataJournal (journal: JsonObject) =
+        journal.Count = 5 && isNull journal["pending"]
+        && journal.ContainsKey "version" && journal.ContainsKey "ownerId" && journal.ContainsKey "pending"
+        && journal.ContainsKey "baseline" && journal.ContainsKey "managed"
+
+    let transact
+        (environment: HostEnvironment)
+        (c: FirewalldModel.Configuration)
+        (journal: JsonObject)
+        (releaseOnRollback: bool)
+        (deleteOnConfirm: bool)
+        (path: string)
+        (scope: JsonObject option)
+        (before: string option)
+        (beforeMode: int)
+        (after: string option)
+        (afterMode: int)
+        (managedBefore: string option)
+        (managedAfter: string option)
+        (rollbackProof: JsonObject option)
+        (readState: JsonObject option -> string option -> string option)
+        (writeState: JsonObject option -> string option -> string option -> int -> unit)
+        (validate: JsonObject option -> string option -> unit)
         (activate: unit -> unit)
+        (restoreRuntime: PendingTransaction -> RecoveryPhase -> unit)
         : string =
+        if path <> expectedPath c then fail "Firewalld transaction path does not match its declared object."
+        if c.Kind = "settings" && scope.IsNone then fail "Firewalld settings transactions must be scoped to one daemon key."
+        if rollbackProof.IsNone then fail "Firewalld transaction has no durable runtime rollback proof; refusing mutation."
         match pending environment with
         | Some _ -> fail "Another firewalld transaction is awaiting confirmation or recovery."
-        | None -> ()
-        validate after
+        | None -> ensureNoOrphanedOwnerPending environment
+        validate scope after
         let actual, actualMode = readPath environment path
-        if actual <> before || (before.IsSome && actualMode <> beforeMode) then
+        let actualState = readState scope actual
+        if actualState <> before || (before.IsSome && actualMode <> beforeMode) then
             fail "Firewalld configuration changed before transaction staging."
         if managedBefore <> getOptionalString journal "managed" then
             fail "Firewalld managed configuration changed before transaction staging."
+        let legacyObject = not releaseOnRollback && (c.Kind = "zone" || c.Kind = "policy") && preMetadataJournal journal
         if not (journal.ContainsKey "baselineMode") || isNull journal["baselineMode"] then
             match getOptionalString journal "baseline", c.Kind, releaseOnRollback with
             | Some _, ("zone" | "policy" | "service" | "ipset" | "icmptype" | "helper"), false -> ()
@@ -440,43 +639,53 @@ module FirewalldLifecycle =
         let managedMode =
             if journal.ContainsKey "managedMode" && not (isNull journal["managedMode"]) then
                 getInt journal "managedMode"
+            elif legacyObject then 0o644
             elif c.Kind = "settings" then beforeMode
             else
                 if before.IsSome && not (List.contains beforeMode [ 0o600; 0o640; 0o644 ]) then
                     fail "Managed firewalld object mode is unsafe; refusing to replace it."
                 beforeMode
         if before.IsSome && managedMode <> beforeMode then
-            fail "Managed firewalld file mode changed independently; refusing to overwrite it."
+            fail "Firewalld managed file mode changed independently; refusing to overwrite it."
         journal["managedMode"] <- JsonValue.Create managedMode
-        let transaction = makeTransaction environment c journal releaseOnRollback path before beforeMode after afterMode
-        let transaction = { transaction with ManagedBefore = managedBefore; ManagedAfter = managedAfter }
-        writeJournalPending journal transaction
-        saveJournal environment c journal
-        try
-            savePending environment transaction
-        with error ->
-            clearJournalPending journal
-            if journal.ContainsKey "deleteOnConfirm" then journal.Remove "deleteOnConfirm" |> ignore
-            if releaseOnRollback then removeJournal environment c transaction.OwnerId else saveJournal environment c journal
-            fail ("Could not persist firewalld recovery state before mutation: " + diagnostic error.Message)
+        if journal.ContainsKey "deleteOnConfirm" then journal.Remove "deleteOnConfirm" |> ignore
+        let transaction =
+            makeTransaction c journal releaseOnRollback deleteOnConfirm path scope before beforeMode after afterMode
+                managedBefore managedAfter rollbackProof
         try
             createRecoveryUnits environment
         with error ->
-            clearJournalPending journal
-            if journal.ContainsKey "deleteOnConfirm" then journal.Remove "deleteOnConfirm" |> ignore
-            if releaseOnRollback then removeJournal environment c transaction.OwnerId else saveJournal environment c journal
-            clearPending environment
+            try reconcileRecoveryUnits environment with _ -> ()
             fail ("Could not arm independent firewalld recovery before mutation: " + diagnostic error.Message)
+        // This is the sole authoritative reservation. Persist it before the owner journal
+        // projection so interruption cannot leave an unpaired per-owner pending record.
+        try
+            savePending environment transaction
+        with error ->
+            try reconcileRecoveryUnits environment with _ -> ()
+            fail ("Could not persist firewalld recovery state before mutation: " + diagnostic error.Message)
+        writeJournalPending journal transaction
+        saveJournal environment c journal
+        let mutable staged = transaction
         try
             if before <> after || (before.IsSome && beforeMode <> afterMode) then
-                write after afterMode
+                writeState scope before after afterMode
+            let activating = { transaction with ActivationStarted = true }
+            savePending environment activating
+            staged <- activating
+            writeJournalPending journal activating
+            saveJournal environment c journal
             activate ()
         with originalError ->
             try
-                restorePending environment transaction (Some journal) write activate
+                restorePending environment staged (Some journal) readState writeState restoreRuntime ActiveDaemon
             with rollbackError ->
                 fail ("Firewalld apply failed: " + diagnostic originalError.Message + "; rollback failed: " + diagnostic rollbackError.Message + "; journal retained for independent recovery.")
-            fail ("Firewalld apply failed; original permanent configuration restored and reloaded: " + diagnostic originalError.Message)
+            try
+                reconcileRecoveryUnits environment
+            with cleanupError ->
+                fail ("Firewalld apply failed and was rolled back, but recovery-unit cleanup failed: " + diagnostic cleanupError.Message)
+            fail ("Firewalld apply failed; the permanent preimage and recorded working runtime were restored: " + diagnostic originalError.Message)
         transaction.Nonce
 
     let recover
@@ -484,83 +693,107 @@ module FirewalldLifecycle =
         (c: FirewalldModel.Configuration)
         (journal: JsonObject)
         (path: string)
-        (write: string option -> int -> unit)
-        (validate: string option -> unit)
-        (activate: unit -> unit)
+        (readState: JsonObject option -> string option -> string option)
+        (writeState: JsonObject option -> string option -> string option -> int -> unit)
+        (restoreRuntime: PendingTransaction -> RecoveryPhase -> unit)
         =
         if path <> expectedPath c then fail "Firewalld recovery path does not match its declared object."
         match pending environment with
         | Some transaction when transaction.OwnerId = journalOwner journal && transaction.Configuration.Kind = c.Kind && transaction.Configuration.Name = c.Name ->
             validateIdentity c journal transaction
-            if transaction.Status = "confirmed" then finishConfirmed environment transaction (Some journal)
-            else fail "A firewalld transaction is awaiting its fresh-connection confirmation; refusing to take it over."
-        | Some _ ->
-            match readLegacyPending journal with
-            | None -> ()
-            | Some _ -> fail "A different firewalld host transaction is pending; refusing concurrent recovery."
-        | None ->
-            match readLegacyPending journal with
-            | None -> ()
-            | Some(before, after, recordedBeforeMode) ->
-                let current, _ = readPath environment path
-                if current <> before && current <> after then
-                    fail "Firewalld configuration changed during an interrupted transaction; refusing recovery."
-                let beforeMode =
-                    match recordedBeforeMode, before with
-                    | Some mode, _ -> mode
-                    | None, None -> 0o644
-                    | None, Some _ -> fail "Legacy firewalld transaction lacks the original file mode; refusing an inexact recovery."
-                if not (String.IsNullOrWhiteSpace(Environment.GetEnvironmentVariable "SSH_CONNECTION")) then
-                    validate before
-                write before beforeMode
-                activate ()
-                updateManaged journal before beforeMode
-                clearJournalPending journal
-                saveJournal environment c journal
+            if transaction.Status = "confirmed" then finishConfirmed environment transaction (Some journal) readState
+            else
+                ensureRecoverablePending transaction
+                restorePending environment transaction (Some journal) readState writeState restoreRuntime ActiveDaemon
+            reconcileRecoveryUnits environment
+        | Some _ -> fail "A different firewalld host transaction is pending; refusing recovery."
+        | None -> ensureNoLegacyPending journal
+
     let recoverPendingTransaction
         (environment: HostEnvironment)
         (c: FirewalldModel.Configuration)
         (journal: JsonObject)
         (path: string)
-        (write: string option -> int -> unit)
-        (activate: unit -> unit)
+        (phase: RecoveryPhase)
+        (readState: JsonObject option -> string option -> string option)
+        (writeState: JsonObject option -> string option -> string option -> int -> unit)
+        (restoreRuntime: PendingTransaction -> RecoveryPhase -> unit)
         =
         if path <> expectedPath c then fail "Firewalld recovery path does not match its declared object."
         match pending environment with
         | Some transaction when transaction.OwnerId = journalOwner journal && transaction.Configuration.Kind = c.Kind && transaction.Configuration.Name = c.Name ->
             validateIdentity c journal transaction
-            if transaction.Status = "confirmed" then finishConfirmed environment transaction (Some journal)
-            else restorePending environment transaction (Some journal) write activate
+            if transaction.Status = "confirmed" then finishConfirmed environment transaction (Some journal) readState
+            else
+                ensureRecoverablePending transaction
+                restorePending environment transaction (Some journal) readState writeState restoreRuntime phase
         | _ -> fail "No matching firewalld host transaction is pending recovery."
 
-    let confirm (environment: HostEnvironment) (c: FirewalldModel.Configuration) (journal: JsonObject) (nonce: string) =
+    let confirm
+        (environment: HostEnvironment)
+        (c: FirewalldModel.Configuration)
+        (journal: JsonObject)
+        (nonce: string)
+        (readState: JsonObject option -> string option -> string option)
+        =
         match pending environment with
         | None -> fail "No firewalld transaction is awaiting confirmation."
         | Some transaction ->
             validateIdentity c journal transaction
             if transaction.Nonce <> nonce then fail "Firewalld transaction confirmation nonce does not match."
-            if transaction.Status <> "pending" then fail "Firewalld transaction has already been confirmed."
             let current, currentMode = readPath environment transaction.Path
-            if current <> transaction.After || (transaction.After.IsSome && currentMode <> transaction.AfterMode) then
+            let currentState = if transaction.SchemaVersion = 1 then current else readState transaction.Scope current
+            if currentState <> transaction.After || (transaction.After.IsSome && currentMode <> transaction.AfterMode) then
                 fail "Firewalld configuration changed before fresh-connection confirmation."
-            let committed = { transaction with Status = "confirmed" }
-            savePending environment committed
-            finishConfirmed environment committed (Some journal)
+            let committed =
+                if transaction.Status = "confirmed" then transaction
+                else
+                    let value = { transaction with Status = "confirmed" }
+                    savePending environment value
+                    value
+            finishConfirmed environment committed (Some journal) readState
+            reconcileRecoveryUnits environment
+
+
+    let private recoverPendingAt
+        (environment: HostEnvironment)
+        (phase: RecoveryPhase)
+        (recover: PendingTransaction -> JsonObject option -> unit)
+        =
+        let path = logicalPath environment lockPath
+        use _lock = HostFiles.lockFile path
+        match pending environment with
+        | None ->
+            ensureNoOrphanedOwnerPending environment
+            if phase <> BootBeforeFirewalld then reconcileRecoveryUnits environment
+        | Some current ->
+            ensureRecoverablePending current
+            let journal =
+                match getJournalText environment (journalPath current.Configuration) with
+                | Some text -> Some(JsonNode.Parse(text).AsObject())
+                | None -> None
+            recover current journal
+            match pending environment with
+            | None when phase <> BootBeforeFirewalld -> reconcileRecoveryUnits environment
+            | Some waiting when phase = BootBeforeFirewalld && waiting.AwaitingPostBoot -> ()
+            | _ -> ()
 
     let recoverPending
         (environment: HostEnvironment)
         (recover: PendingTransaction -> JsonObject option -> unit)
         =
+        recoverPendingAt environment ActiveDaemon recover
+
+    let recoverPendingBoot
+        (environment: HostEnvironment)
+        (recover: PendingTransaction -> JsonObject option -> unit)
+        =
         match pending environment with
-        | None -> ()
-        | Some _ ->
-            let path = logicalPath environment lockPath
-            use _lock = HostFiles.lockFile path
-            match pending environment with
-            | None -> ()
-            | Some current ->
-                let journal =
-                    match getJournalText environment (journalPath current.Configuration) with
-                    | Some text -> Some(JsonNode.Parse(text).AsObject())
-                    | None -> None
-                recover current journal
+        | None -> ensureNoOrphanedOwnerPending environment
+        | Some _ -> recoverPendingAt environment BootBeforeFirewalld recover
+
+    let recoverPendingPostBoot
+        (environment: HostEnvironment)
+        (recover: PendingTransaction -> JsonObject option -> unit)
+        =
+        recoverPendingAt environment BootAfterFirewalld recover

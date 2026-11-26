@@ -36,14 +36,10 @@ module FirewalldRuntime =
     type RuntimeObservation =
         { Observed: bool
           InSync: bool }
-    let private categories =
-        Map.ofList
-            [ "zone", 17
-              "policy", 18
-              "service", 128
-              "ipset", 32
-              "icmptype", 128
-              "helper", 128 ]
+    type private RichToken =
+        { Value: string
+          IsAttribute: bool
+          IsQuoted: bool }
 
     let private run (environment: HostEnvironment) arguments =
         try
@@ -63,10 +59,16 @@ module FirewalldRuntime =
             match kind with
             | "zone" -> Some [ "--get-zones" ]
             | "policy" -> Some [ "--get-policies" ]
+            | "service" -> Some [ "--get-services" ]
+            | "ipset" -> Some [ "--get-ipsets" ]
+            | "icmptype" -> Some [ "--get-icmptypes" ]
+            | "helper" -> Some [ "--get-helpers" ]
             | _ -> None
+
         arguments
         |> Option.bind (fun args -> run environment args)
         |> Option.map (fun output -> words [ output ] |> List.distinct |> List.sort)
+
 
 
     let private parseFields (text: string) : Map<string, string list> =
@@ -210,6 +212,28 @@ module FirewalldRuntime =
                       if toAddress <> "" && toAddress <> "None" then yield "to-addr", toAddress ]
                 Some(element "forward-port" attributes)
 
+    /// Renders a typed forward-port element in firewalld's list-all value format.
+    let canonicalForwardPortValue (forwardPort: FirewalldModel.Element) : string option =
+        try
+            if forwardPort.Name <> "forward-port" then None
+            else
+                let required key =
+                    Map.tryFind key forwardPort.Attributes
+                    |> Option.defaultWith (fun () -> invalidOp ("Missing forward-port attribute " + key))
+                let port = required "port"
+                let protocol = required "protocol"
+                let canonicalPort value = (FirewalldModel.port (value + "/" + protocol)).Split('/')[0]
+                let targetPort =
+                    Map.tryFind "to-port" forwardPort.Attributes
+                    |> Option.map canonicalPort
+                    |> Option.defaultValue "None"
+                let targetAddress = Map.tryFind "to-addr" forwardPort.Attributes |> Option.defaultValue "None"
+                let value =
+                    "port=" + canonicalPort port + ":proto=" + protocol
+                    + ":toport=" + targetPort + ":toaddr=" + targetAddress
+                forwardPortElement value |> Option.map (fun _ -> value)
+        with _ -> None
+
     let private emptySnapshot (kind: string) (name: string) (unknown: Map<string, string list>) : RuntimeSnapshot =
         { Kind = kind
           Name = name
@@ -252,30 +276,36 @@ module FirewalldRuntime =
         let malformed = parsed |> List.countBy fst |> List.exists (fun (_, count) -> count > 1)
         map, malformed
 
-    let private validateRuntimeName kind maxLength (name: string) =
-        match kind with
-        | "zone" | "policy" ->
-            FirewalldModel.token "name" maxLength name |> ignore
-            if name.Contains('.') then invalidArg "name" "Zone and policy names cannot contain dots."
-        | "ipset" ->
-            if String.IsNullOrEmpty name
-               || name.Length > maxLength
-               || not (Char.IsAsciiLetterOrDigit name[0])
-               || not (name |> Seq.forall (fun character ->
-                    Char.IsAsciiLetterOrDigit character
-                    || character = '_' || character = '-' || character = ':' || character = '.')) then
-                invalidArg "name" "Invalid ipset name."
-        | _ -> invalidArg "kind" "Unsupported runtime object kind."
+    let private validateRuntimeName kind name = FirewalldModel.nativeReference kind "name" name |> ignore
 
-    /// Read a named runtime object directly. Unlike --get-active-zones, per-object
-    /// list-all works for quiet zones and inactive policies. Unknown native fields,
-    /// source selectors and rich-rule strings remain explicit for safety callers.
-    let inspectRuntime (environment: HostEnvironment) (kind: string) (name: string) : RuntimeSnapshot option =
+    /// Maps a definition kind to the firewalld information option.
+    let private infoArguments kind name =
+
+        match kind with
+        | "service" -> "--info-service=" + name
+        | "ipset" -> "--info-ipset=" + name
+        | "icmptype" -> "--info-icmptype=" + name
+        | "helper" -> "--info-helper=" + name
+        | _ -> ""
+    let private commonFieldSet kind =
+        match kind with
+        | "service" -> set [ "ports"; "protocols"; "source-ports"; "modules"; "destination"; "includes"; "helpers" ]
+        | "ipset" -> set [ "type"; "options"; "entries" ]
+        | "icmptype" -> set [ "destination" ]
+        | "helper" -> set [ "family"; "module"; "ports" ]
+        | _ -> Set.empty
+    /// Reads a named runtime or permanent object. Zone and policy list-all getters
+    /// cover quiet objects; unsupported native fields remain explicit to callers.
+    let private inspectRuntimeWith (environment: HostEnvironment) (permanent: bool) (kind: string) (name: string) : RuntimeSnapshot option =
+
+        let mode = if permanent then [ "--permanent" ] else []
+
         try
-            match Map.tryFind kind categories with
-            | Some maxLength when kind = "ipset" ->
-                validateRuntimeName kind maxLength name
-                match run environment [ "--info-ipset=" + name ] with
+            match kind with
+            | "ipset" ->
+                validateRuntimeName kind name
+                match run environment (mode @ [ "--info-ipset=" + name ]) with
+
                 | None -> None
                 | Some output ->
                     let fields = parseFields output
@@ -293,10 +323,11 @@ module FirewalldRuntime =
                             IpSetOptions = options
                             IpSetEntries = Map.tryFind "entries" fields |> Option.defaultValue [] |> words
                             NativeFields = fields }
-            | Some maxLength when kind = "zone" || kind = "policy" ->
-                validateRuntimeName kind maxLength name
+            | "zone" | "policy" ->
+                validateRuntimeName kind name
                 let selector = if kind = "zone" then "--zone=" + name else "--policy=" + name
-                match run environment [ selector; "--list-all" ] with
+                match run environment (mode @ [ selector; "--list-all" ]) with
+
                 | None -> None
                 | Some output ->
                     let fields = parseFields output
@@ -353,8 +384,32 @@ module FirewalldRuntime =
                             IcmpBlocks = Map.tryFind "icmp-blocks" fields |> Option.defaultValue [] |> words
                             IcmpBlockInversion = defaultArg icmpInversion false
                             RichRules = rules |> List.filter (String.IsNullOrWhiteSpace >> not) }
+            | "service" | "icmptype" | "helper" ->
+                validateRuntimeName kind name
+                match run environment (mode @ [ infoArguments kind name ]) with
+                | None -> None
+                | Some output ->
+                    let fields = parseFields output
+                    let known = commonFieldSet kind
+                    let mutable unknown = unknownFields known fields
+                    for key in known do
+                        if not (Map.containsKey key fields) then unknown <- Map.add key [] unknown
+                    Some { emptySnapshot kind name unknown with NativeFields = fields }
             | _ -> None
         with _ -> None
+    let inspectRuntime (environment: HostEnvironment) (kind: string) (name: string) : RuntimeSnapshot option =
+        inspectRuntimeWith environment false kind name
+    let inspectPermanent (environment: HostEnvironment) (kind: string) (name: string) : RuntimeSnapshot option =
+        inspectRuntimeWith environment true kind name
+    let queryRuntime (environment: HostEnvironment) (kind: string) (name: string) : Result<RuntimeSnapshot option, string> =
+        match listRuntime environment kind with
+        | None -> Error("Unable to enumerate runtime firewalld " + kind + " objects.")
+        | Some names when not (List.contains name names) -> Ok None
+        | Some _ ->
+            match inspectRuntime environment kind name with
+            | Some snapshot -> Ok(Some snapshot)
+            | None -> Error("Unable to inspect runtime firewalld " + kind + " " + name + ".")
+
 
     let private listValues (text: string) =
         text.Split([| ' '; '\t'; '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
@@ -366,13 +421,84 @@ module FirewalldRuntime =
     let private listFields =
         set [ "services"; "ports"; "protocols"; "sources"; "ingress-zones"; "egress-zones"; "source-ports"; "icmp-blocks"; "forward-ports"; "modules"; "destination"; "includes"; "helpers"; "options"; "entries" ]
 
+    let private portTuple (value: string) =
+        try
+            let normalized = FirewalldModel.port value
+            let parts = normalized.Split('/')
+            let range = parts[0].Split('-')
+            let first = Int32.Parse(range[0], Globalization.CultureInfo.InvariantCulture)
+            let last = Int32.Parse(range[range.Length - 1], Globalization.CultureInfo.InvariantCulture)
+            Some(parts[1], first, last)
+        with _ -> None
+
+    let private normalizePortValues (values: string list) =
+        let parsed = values |> List.choose portTuple
+        let invalid = values |> List.filter (portTuple >> Option.isNone)
+        let merged =
+            parsed
+            |> List.groupBy (fun (protocol, _, _) -> protocol)
+            |> List.collect (fun (protocol, ranges) ->
+                let ordered = ranges |> List.map (fun (_, first, last) -> first, last) |> List.sort
+                let ranges =
+                    ordered
+                    |> List.fold (fun state (first, last) ->
+                        match state with
+                        | (previousFirst, previousLast) :: rest when first <= previousLast ->
+                            (previousFirst, max previousLast last) :: rest
+                        | _ -> (first, last) :: state) []
+                    |> List.rev
+                ranges
+                |> List.map (fun (first, last) ->
+                    (if first = last then string first else string first + "-" + string last) + "/" + protocol))
+        (merged @ invalid) |> List.distinct |> List.sort
+
+    let private portValuesOverlap (left: string list) (right: string list) =
+        let parse values =
+            let parsed = values |> List.map portTuple
+            if parsed |> List.exists Option.isNone then None
+            else Some(parsed |> List.choose id)
+        match parse left, parse right with
+        | Some leftRanges, Some rightRanges ->
+            Some(
+                leftRanges
+                |> List.exists (fun (leftProtocol, leftFirst, leftLast) ->
+                    rightRanges
+                    |> List.exists (fun (rightProtocol, rightFirst, rightLast) ->
+                        leftProtocol = rightProtocol && leftFirst <= rightLast && rightFirst <= leftLast)))
+        | _ -> None
+
+    /// Canonicalizes native list-valued fields for comparison and bounded repair proofs.
+    let normalizeFieldValues (kind: string) (fieldName: string) (values: string list) : string list =
+        if fieldName = "ports" || fieldName = "source-ports" then
+            normalizePortValues (words values)
+        elif kind = "service" && fieldName = "modules" then
+            words values
+            |> List.map FirewalldModel.helperNameForModule
+            |> List.distinct
+            |> List.sort
+        elif kind = "icmptype" && fieldName = "destination" then
+            words values
+            |> List.choose (fun value ->
+                let separator = value.IndexOf('=')
+                if separator < 0 then Some value
+                elif value.Substring(separator + 1) = "yes" then Some(value.Substring(0, separator))
+                else None)
+            |> List.distinct
+            |> List.sort
+        else
+            words values |> List.distinct |> List.sort
+
+    let private exactSetDifference live disk removed =
+        Set.difference disk live = removed
+        && Set.difference live disk = Set.empty
+
     let private normalizeFields kind (fields: Map<string, string list>) =
         let ignored = set [ "interfaces"; "sources"; "forward-ports"; "rich rules" ]
         fields
         |> Map.filter (fun key _ -> not (Set.contains key ignored))
         |> Map.map (fun key values ->
             if key = "target" then values |> List.map (fun value -> if value = "%%REJECT%%" then "REJECT" else value)
-            elif Set.contains key listFields then words values |> List.distinct |> List.sort
+            elif Set.contains key listFields then normalizeFieldValues kind key values
             else values)
 
     let private field key values =
@@ -409,6 +535,17 @@ module FirewalldRuntime =
                 + (if parts.Length = 1 then "" else "/" + String.Join("/", parts |> Array.skip 1))
             | _ -> value
 
+
+    let private normalizeCompleteFields kind (fields: Map<string, string list>) =
+        fields
+        |> Map.map (fun key values ->
+            if key = "target" then values |> List.map (fun value -> if value = "%%REJECT%%" then "REJECT" else value)
+            elif key = "sources" then words values |> List.map normalizeSource |> List.distinct |> List.sort
+            elif key = "interfaces" then normalizeFieldValues kind key values
+            elif key = "forward-ports" || key = "rich rules" then
+                values |> List.filter (String.IsNullOrWhiteSpace >> not) |> List.distinct |> List.sort
+            elif Set.contains key listFields then normalizeFieldValues kind key values
+            else values)
     let private isTrue (value: string) =
         match value.ToLowerInvariant() with
         | "yes" | "true" -> true
@@ -418,6 +555,140 @@ module FirewalldRuntime =
         if value.Contains('"') || value.Contains('\n') || value.Contains('\r') then
             invalidOp "Rich-rule value cannot be represented by the native display grammar."
         "\"" + value + "\""
+    let private richTokens (text: string) =
+        let tokens = ResizeArray<RichToken>()
+        let mutable index = 0
+        let mutable valid = true
+        let isWhitespace character = Char.IsWhiteSpace character
+        let quotedValue () =
+            if index >= text.Length || text[index] <> '"' then None
+            else
+                index <- index + 1
+                let start = index
+                let mutable closed = false
+                while index < text.Length && not closed do
+                    if text[index] = '\\' && index + 1 < text.Length then index <- index + 2
+                    elif text[index] = '"' then closed <- true
+                    else index <- index + 1
+                if not closed then None
+                else
+                    let value = text.Substring(start, index - start)
+                    index <- index + 1
+                    Some value
+        while index < text.Length && valid do
+            while index < text.Length && isWhitespace text[index] do index <- index + 1
+            if index < text.Length then
+                if text[index] = '"' then
+                    match quotedValue () with
+                    | Some value -> tokens.Add { Value = value; IsAttribute = false; IsQuoted = true }
+                    | None -> valid <- false
+                else
+                    let start = index
+                    while index < text.Length && not (isWhitespace text[index]) && text[index] <> '=' do
+                        index <- index + 1
+                    if start = index then valid <- false
+                    else
+                        let key = text.Substring(start, index - start)
+                        if index < text.Length && text[index] = '=' then
+                            index <- index + 1
+                            let value =
+                                if index < text.Length && text[index] = '"' then quotedValue ()
+                                else
+                                    let valueStart = index
+                                    while index < text.Length && not (isWhitespace text[index]) do index <- index + 1
+                                    Some(text.Substring(valueStart, index - valueStart))
+                            match value with
+                            | Some value -> tokens.Add { Value = key + "=" + value; IsAttribute = true; IsQuoted = false }
+                            | None -> valid <- false
+                        else
+                            tokens.Add { Value = key; IsAttribute = false; IsQuoted = false }
+        if valid then Some(List.ofSeq tokens) else None
+    let private missingSelectorsMatch kind fieldName (values: string list) (runtime: RuntimeSnapshot) (permanent: RuntimeSnapshot) =
+        if values.IsEmpty || (values |> List.distinct).Length <> values.Length then false
+        else
+            let rawValues snapshot =
+                Map.tryFind fieldName snapshot.NativeFields |> Option.defaultValue [] |> words
+            match fieldName with
+            | "services" | "protocols" | "icmp-blocks" ->
+                let canonicalValues =
+                    values
+                    |> List.forall (fun value -> normalizeFieldValues kind fieldName [ value ] = [ value ])
+                canonicalValues
+                && exactSetDifference
+                    (Set.ofList (normalizeFieldValues kind fieldName (rawValues runtime)))
+                    (Set.ofList (normalizeFieldValues kind fieldName (rawValues permanent)))
+                    (Set.ofList values)
+            | "ports" | "source-ports" ->
+                let canonicalValues =
+                    values
+                    |> List.forall (fun value ->
+                        portTuple value |> Option.isSome
+                        && normalizeFieldValues kind fieldName [ value ] = [ value ])
+                match portValuesOverlap (rawValues runtime) values with
+                | Some false when canonicalValues ->
+                    let expected = normalizeFieldValues kind fieldName (rawValues permanent)
+                    normalizeFieldValues kind fieldName (rawValues runtime @ values) = expected
+                | _ -> false
+            | "rich rules" ->
+                values |> List.forall (richTokens >> Option.isSome)
+                && exactSetDifference
+                    (Set.ofList runtime.RichRules)
+                    (Set.ofList permanent.RichRules)
+                    (Set.ofList values)
+            | "forward-ports" ->
+                let parseCanonical value =
+                    forwardPortElement value
+                    |> Option.bind (fun element ->
+                        canonicalForwardPortValue element
+                        |> Option.filter ((=) value)
+                        |> Option.map (fun _ -> element))
+                let requested = values |> List.map parseCanonical
+                if requested |> List.exists Option.isNone then false
+                else
+                    exactSetDifference
+                        (Set.ofList runtime.ForwardPorts)
+                        (Set.ofList permanent.ForwardPorts)
+                        (requested |> List.choose id |> Set.ofList)
+            | _ -> false
+
+    let private richRuleAction (rule: string) =
+        richTokens rule
+        |> Option.bind (fun tokens ->
+            let actions =
+                tokens
+                |> List.filter (fun token ->
+                    not token.IsAttribute
+                    && not token.IsQuoted
+                    && List.contains token.Value [ "accept"; "reject"; "drop"; "mark" ])
+                |> List.map (fun token -> token.Value)
+            match actions with
+            | [ action ] -> Some action
+            | _ -> None)
+
+    let isRestrictiveRichRule (rule: string) : bool =
+        match richRuleAction rule with
+        | Some("drop" | "reject") -> true
+        | _ -> false
+
+    let private richRuleReferences (rule: string) =
+        richTokens rule
+        |> Option.map (fun tokens ->
+            let services = ResizeArray<string>()
+            let icmpTypes = ResizeArray<string>()
+            let ipsets = ResizeArray<string>()
+            let values = List.toArray tokens
+            for index in 0 .. values.Length - 1 do
+                let token = values[index]
+                if token.IsAttribute && token.Value.StartsWith("ipset=", StringComparison.Ordinal) then
+                    ipsets.Add(token.Value.Substring("ipset=".Length))
+                elif not token.IsAttribute && not token.IsQuoted && index + 1 < values.Length then
+                    let next = values[index + 1]
+                    if next.IsAttribute && next.Value.StartsWith("name=", StringComparison.Ordinal) then
+                        let name = next.Value.Substring("name=".Length)
+                        if token.Value = "service" then services.Add name
+                        elif token.Value = "icmp-block" || token.Value = "icmp-type" then icmpTypes.Add name
+            Set.ofSeq services, Set.ofSeq icmpTypes, Set.ofSeq ipsets)
+
 
     let private canonicalInteger (value: string) =
         match Int32.TryParse(value, Globalization.NumberStyles.Integer, Globalization.CultureInfo.InvariantCulture) with
@@ -491,7 +762,7 @@ module FirewalldRuntime =
         | "tcp-mss-clamp" ->
             match richAttribute "value" node with
             | Some value when value <> "None" && value <> "" -> "tcp-mss-clamp " + quotedRichAttribute "value" value
-            | _ -> "tcp-mss-clamp"
+            | _ -> "tcp-mss-clamp value=\"pmtu\""
         | "forward-port" ->
             "forward-port "
             + quotedRichAttribute "port" (requiredRichAttribute "port" node) + " "
@@ -536,6 +807,7 @@ module FirewalldRuntime =
             richAttribute "family" rule |> Option.iter (fun value -> parts.Add(quotedRichAttribute "family" value))
             rule.Children
             |> List.filter (fun node -> node.Name = "source" || node.Name = "destination")
+            |> List.sortBy (fun node -> if node.Name = "source" then 0 else 1)
             |> List.iter (fun node -> parts.Add(renderRichSelector node))
             let elementNames =
                 [ "service"; "port"; "protocol"; "tcp-mss-clamp"; "icmp-block"; "icmp-type"; "masquerade"; "forward-port"; "source-port" ]
@@ -554,21 +826,11 @@ module FirewalldRuntime =
             Some(String.concat " " parts)
         with _ -> None
 
-    let private infoArguments kind name =
-        match kind with
-        | "service" -> "--info-service=" + name
-        | "ipset" -> "--info-ipset=" + name
-        | "icmptype" -> "--info-icmptype=" + name
-        | "helper" -> "--info-helper=" + name
-        | _ -> ""
+    /// Renders one rich-rule element in firewalld's native display syntax.
+    let canonicalRichRule (rule: FirewalldModel.Element) : string option =
+        renderRichRule rule
 
-    let private commonFieldSet kind =
-        match kind with
-        | "service" -> set [ "ports"; "protocols"; "source-ports"; "modules"; "destination"; "includes"; "helpers" ]
-        | "ipset" -> set [ "type"; "options"; "entries" ]
-        | "icmptype" -> set [ "destination" ]
-        | "helper" -> set [ "family"; "module"; "ports" ]
-        | _ -> Set.empty
+
 
     let private expectedZonePolicyFields (c: FirewalldModel.Configuration) =
         let combine name key legacy =
@@ -640,6 +902,34 @@ module FirewalldRuntime =
             |> Set.ofList
         fields, interfaces, sources, Set.ofList forwardPorts, richRules
 
+    /// Returns the native rich-rule strings expected from a valid zone or policy configuration.
+    let expectedRichRuleStrings (configuration: FirewalldModel.Configuration) : string list option =
+        try
+            let c = FirewalldModel.validate configuration
+            if c.Kind <> "zone" && c.Kind <> "policy" then None
+            else
+                let _, _, _, _, rules = expectedZonePolicyFields c
+                rules |> Option.map Set.toList
+        with _ -> None
+
+    /// Returns the canonical native forward-port elements expected for a zone or policy.
+    let expectedForwardPortElements (configuration: FirewalldModel.Configuration) : FirewalldModel.Element list option =
+        try
+            let c = FirewalldModel.validate configuration
+            if c.Kind <> "zone" && c.Kind <> "policy" then None
+            else
+                let _, _, _, forwardPorts, _ = expectedZonePolicyFields c
+                Some(Set.toList forwardPorts)
+        with _ -> None
+
+    /// Returns the expected forward-port values in firewalld's list-all format.
+    let expectedForwardPortValues (configuration: FirewalldModel.Configuration) : string list option =
+        expectedForwardPortElements configuration
+        |> Option.bind (fun elements ->
+            let values = elements |> List.map canonicalForwardPortValue
+            if values |> List.exists Option.isNone then None
+            else Some(values |> List.choose id))
+
     let private expectedDefinitionFields (c: FirewalldModel.Configuration) =
         let elementValues name key =
             directElements c name |> List.choose (elementAttribute key)
@@ -695,9 +985,86 @@ module FirewalldRuntime =
                     node.Attributes
                     |> Map.toList
                     |> List.choose (fun (family, value) -> if isTrue value then Some family else None))
-            let destinations = if (directElements c "destination").IsEmpty then [ "ipv4"; "ipv6" ] else destinations
+            // An empty native destination list is displayed and enforced as both
+            // families, whether absent in XML or specified as two disabled flags.
+            let destinations = if destinations.IsEmpty then [ "ipv4"; "ipv6" ] else destinations
             Map.ofList [ field "destination" destinations ]
         | _ -> Map.empty
+
+    let private snapshotFromConfiguration (c: FirewalldModel.Configuration) : Result<RuntimeSnapshot, string> =
+        try
+            let c = FirewalldModel.validate c
+            let scalar (fields: Map<string, string list>) key =
+                Map.tryFind key fields |> Option.bind List.tryHead
+            let values (fields: Map<string, string list>) key =
+                Map.tryFind key fields |> Option.defaultValue []
+            let integer fields key =
+                scalar fields key
+                |> Option.bind (fun value ->
+                    match Int32.TryParse(value, Globalization.NumberStyles.Integer, Globalization.CultureInfo.InvariantCulture) with
+                    | true, number -> Some number
+                    | _ -> None)
+            let boolean fields key = scalar fields key = Some "yes"
+            match c.Kind with
+            | "zone" | "policy" ->
+                let fields, interfaces, _, forwardPorts, richRules = expectedZonePolicyFields c
+                match richRules with
+                | None -> Error "A rich rule cannot be represented in the native firewalld display syntax."
+                | Some rules ->
+                    let forwardPortValues = forwardPorts |> Set.toList |> List.map canonicalForwardPortValue
+                    if forwardPortValues |> List.exists Option.isNone then
+                        Error "A forward port cannot be represented in the native firewalld display syntax."
+                    else
+                        let fields =
+                            fields
+                            |> Map.add "forward-ports" (forwardPortValues |> List.choose id)
+                            |> Map.add "rich rules" (Set.toList rules)
+                        Ok
+                            { emptySnapshot c.Kind c.Name Map.empty with
+                                NativeFields = fields
+                                Target = scalar fields "target" |> Option.defaultValue ""
+                                Priority = integer fields "priority"
+                                IngressPriority = integer fields "ingress-priority"
+                                EgressPriority = integer fields "egress-priority"
+                                Ingress = values fields "ingress-zones" |> words
+                                Egress = values fields "egress-zones" |> words
+                                Interfaces = interfaces
+                                SourcesRaw = values fields "sources" |> words
+                                Sources = directElements c "source"
+                                Services = values fields "services" |> words
+                                Ports = values fields "ports" |> words
+                                Protocols = values fields "protocols" |> words
+                                SourcePorts = values fields "source-ports" |> words
+                                ForwardPorts = Set.toList forwardPorts
+                                Masquerade = boolean fields "masquerade"
+                                Forward = boolean fields "forward"
+                                IcmpBlocks = values fields "icmp-blocks" |> words
+                                IcmpBlockInversion = boolean fields "icmp-block-inversion"
+                                RichRules = Set.toList rules }
+            | "service" | "ipset" | "icmptype" | "helper" ->
+                let fields = expectedDefinitionFields c
+                let ipSetType = scalar fields "type"
+                let options, malformedOptions = ipSetOptions (values fields "options")
+                if malformedOptions then Error "The projected ipset options are ambiguous."
+                else
+                    Ok
+                        { emptySnapshot c.Kind c.Name Map.empty with
+                            NativeFields = fields
+                            IpSetType = ipSetType
+                            IpSetOptions = options
+                            IpSetEntries = values fields "entries" |> words }
+            | _ -> Error "The configuration kind is not a firewalld XML object."
+        with error -> Error error.Message
+
+    /// Projects effective XML into a complete expected runtime selector snapshot.
+    /// Unsupported or ambiguous native XML fails closed; `None` represents absence.
+    let snapshotFromXml (kind: string) (name: string) (effectiveXml: string option) : Result<RuntimeSnapshot option, string> =
+        match effectiveXml with
+        | None -> Ok None
+        | Some xml ->
+            match FieldRuntime.parseConfiguration kind name xml with
+            | Error reason -> Error reason
+            | Ok configuration -> snapshotFromConfiguration configuration |> Result.map Some
 
     let private fieldsHaveExpectedKeys (expected: Map<string, string list>) (actual: Map<string, string list>) =
         (actual |> Map.keys |> Set.ofSeq) = (expected |> Map.keys |> Set.ofSeq)
@@ -708,7 +1075,15 @@ module FirewalldRuntime =
     let private unavailable : RuntimeObservation =
         { Observed = false; InSync = false }
 
-    let private observeZonePolicy (environment: HostEnvironment) (c: FirewalldModel.Configuration) =
+    let private networkManagerAssignsZone (environment: HostEnvironment) (interfaceName: string) (zone: string) =
+        match environment.Run "nmcli" [ "-g"; "GENERAL.CON-UUID"; "device"; "show"; interfaceName ] None with
+        | { ExitCode = 0; Stdout = connection } when fst (Guid.TryParseExact(connection.Trim(), "D")) ->
+            match environment.Run "nmcli" [ "-g"; "connection.zone"; "connection"; "show"; "uuid"; connection.Trim() ] None with
+            | { ExitCode = 0; Stdout = configuredZone } -> configuredZone.Trim() = zone
+            | _ -> false
+        | _ -> false
+
+    let private observeZonePolicy (allowCoexistingAdditions: bool) (environment: HostEnvironment) (c: FirewalldModel.Configuration) =
         match inspectRuntime environment c.Kind c.Name with
         | None -> unavailable
         | Some runtime when not runtime.UnknownFields.IsEmpty -> unavailable
@@ -728,10 +1103,25 @@ module FirewalldRuntime =
                     let knownFields = if c.Kind = "zone" then knownZoneFields else knownPolicyFields
                     let keysMatch = (runtime.NativeFields |> Map.keys |> Set.ofSeq) = knownFields
                     let fieldsMatch = normalizeFields c.Kind runtime.NativeFields = normalizeFields c.Kind expectedFields
-                    let interfacesMatch = c.Kind <> "zone" || Set.ofList currentInterfaces = Set.ofList expectedInterfaces
+                    let interfacesMatch =
+                        if c.Kind <> "zone" then true
+                        else
+                            let expected = Set.ofList expectedInterfaces
+                            let actual = Set.ofList currentInterfaces
+                            if allowCoexistingAdditions then
+                                Set.isSubset expected actual
+                                && (Set.difference actual expected
+                                    |> Set.forall (fun interfaceName -> networkManagerAssignsZone environment interfaceName c.Name))
+                            else actual = expected
                     let sourcesMatch = Set.ofList (runtime.SourcesRaw |> List.map normalizeSource) = expectedSources
                     let forwardPortsMatch = Set.ofList runtime.ForwardPorts = expectedForwardPorts
-                    let richRulesMatch = Set.ofList runtime.RichRules = expectedRules
+                    let actualRules = Set.ofList runtime.RichRules
+                    let richRulesMatch =
+                        if allowCoexistingAdditions then
+                            let foreignRules = Set.difference actualRules expectedRules
+                            Set.isSubset expectedRules actualRules
+                            && (foreignRules |> Set.forall isRestrictiveRichRule)
+                        else actualRules = expectedRules
                     if not keysMatch then unavailable
                     else available (fieldsMatch && interfacesMatch && sourcesMatch && forwardPortsMatch && richRulesMatch)
 
@@ -761,21 +1151,421 @@ module FirewalldRuntime =
                 if not complete then unavailable
                 else available (normalizeFields c.Kind actual = normalizeFields c.Kind expected)
 
-    /// Runtime selector state is observed independently of permanent-file drift using
-    /// firewalld 2.3.1's named-object `--list-all` and `--info-*` getters. These APIs do
-    /// not observe direct/passthrough rules, arbitrary nftables state, or packet behavior.
-    /// `Observed=false` means a getter failed or exposed an unsupported shape; consumers
-    /// must not interpret that as an in-sync runtime observation.
-    let observe (environment: HostEnvironment) (configuration: FirewalldModel.Configuration) : RuntimeObservation =
+    let private observeWithCoexistingAdditions (allowCoexistingAdditions: bool) (environment: HostEnvironment) (configuration: FirewalldModel.Configuration) : RuntimeObservation =
         try
             let c = FirewalldModel.validate configuration
             match c.Kind with
-            | "zone" | "policy" -> observeZonePolicy environment c
+            | "zone" | "policy" -> observeZonePolicy allowCoexistingAdditions environment c
             | "service" | "ipset" | "icmptype" | "helper" -> observeDefinition environment c
             | _ -> unavailable
         with _ -> unavailable
+
+    /// Runtime selector state uses firewalld's named-object getters. This does not
+    /// observe direct/passthrough rules, arbitrary nftables state, or packet behavior.
+    let observe (environment: HostEnvironment) (configuration: FirewalldModel.Configuration) : RuntimeObservation =
+        observeWithCoexistingAdditions true environment configuration
+
+    /// Requires exact runtime selector equality, without safe rich-rule or
+    /// NetworkManager-interface supersets.
+    let observeExactly (environment: HostEnvironment) (configuration: FirewalldModel.Configuration) : RuntimeObservation =
+        observeWithCoexistingAdditions false environment configuration
+
+    /// Compares the live target against a pure XML projection without accepting
+    /// independently-owned rule or interface supersets.
+    let observeSnapshotExactly (environment: HostEnvironment) (expected: RuntimeSnapshot) : RuntimeObservation =
+        match inspectRuntime environment expected.Kind expected.Name with
+        | None -> unavailable
+        | Some actual when not actual.UnknownFields.IsEmpty || not expected.UnknownFields.IsEmpty -> unavailable
+        | Some actual ->
+            let fieldsMatch =
+                normalizeCompleteFields expected.Kind actual.NativeFields = normalizeCompleteFields expected.Kind expected.NativeFields
+            let interfacesMatch =
+                if expected.Kind <> "zone" then true
+                else
+                    run environment [ "--zone=" + expected.Name; "--list-interfaces" ]
+                    |> Option.map (fun output -> Set.ofList (listValues output) = Set.ofList expected.Interfaces)
+                    |> Option.defaultValue false
+            let sourcesMatch =
+                let normalized sources = sources |> Seq.map normalizeSource |> Set.ofSeq
+                normalized actual.SourcesRaw = normalized expected.SourcesRaw
+            let forwardPortsMatch = Set.ofList actual.ForwardPorts = Set.ofList expected.ForwardPorts
+            let richRulesMatch = Set.ofList actual.RichRules = Set.ofList expected.RichRules
+            let ipsetMatch =
+                expected.Kind <> "ipset"
+                || (actual.IpSetType = expected.IpSetType
+                    && actual.IpSetOptions = expected.IpSetOptions
+                    && Set.ofList actual.IpSetEntries = Set.ofList expected.IpSetEntries)
+            available (fieldsMatch && interfacesMatch && sourcesMatch && forwardPortsMatch && richRulesMatch && ipsetMatch)
 
     let inSync (environment: HostEnvironment) (configuration: FirewalldModel.Configuration) : bool =
         let result = observe environment configuration
         result.Observed && result.InSync
 
+
+    let private listObjectNames (environment: HostEnvironment) (permanent: bool) (kind: string) =
+        let arguments =
+            match kind with
+            | "zone" -> Some [ "--get-zones" ]
+            | "policy" -> Some [ "--get-policies" ]
+            | "service" -> Some [ "--get-services" ]
+            | "ipset" -> Some [ "--get-ipsets" ]
+            | "icmptype" -> Some [ "--get-icmptypes" ]
+            | "helper" -> Some [ "--get-helpers" ]
+            | _ -> None
+        arguments
+        |> Option.bind (fun args ->
+            let mode = if permanent then [ "--permanent" ] else []
+            run environment (mode @ args))
+        |> Option.map (fun output -> words [ output ] |> List.distinct |> List.sort)
+    let queryPermanent (environment: HostEnvironment) (kind: string) (name: string) : Result<RuntimeSnapshot option, string> =
+        match listObjectNames environment true kind with
+        | None -> Error("Unable to enumerate permanent firewalld " + kind + " objects.")
+        | Some names when not (List.contains name names) -> Ok None
+        | Some _ ->
+            match inspectPermanent environment kind name with
+            | Some snapshot -> Ok(Some snapshot)
+            | None -> Error("Unable to inspect permanent firewalld " + kind + " " + name + ".")
+
+    let private normalizedObjectFields kind (snapshot: RuntimeSnapshot) =
+        let fields = normalizeCompleteFields kind snapshot.NativeFields
+        if kind = "zone" then Map.remove "interfaces" fields else fields
+
+    let private normalizedInterfaces (environment: HostEnvironment) (permanent: bool) (zone: string) =
+        let mode = if permanent then [ "--permanent" ] else []
+        run environment (mode @ [ "--zone=" + zone; "--list-interfaces" ])
+        |> Option.map listValues
+
+    let private referencesFromZonePolicy (snapshot: RuntimeSnapshot) =
+        let fieldValues name =
+            Map.tryFind name snapshot.NativeFields |> Option.defaultValue [] |> words |> Set.ofList
+        let services = fieldValues "services"
+        let icmpTypes = fieldValues "icmp-blocks"
+        let ipsets =
+            snapshot.SourcesRaw
+            |> List.choose (fun source ->
+                if source.StartsWith("ipset:", StringComparison.Ordinal) then Some(source.Substring("ipset:".Length))
+                else None)
+            |> Set.ofList
+        let mutable valid = true
+        let mutable richServices = Set.empty
+        let mutable richIcmpTypes = Set.empty
+        let mutable richIpsets = Set.empty
+        for rule in snapshot.RichRules do
+            match richRuleReferences rule with
+            | Some(ruleServices, ruleIcmpTypes, ruleIpsets) ->
+                richServices <- Set.union richServices ruleServices
+                richIcmpTypes <- Set.union richIcmpTypes ruleIcmpTypes
+                richIpsets <- Set.union richIpsets ruleIpsets
+            | None -> valid <- false
+        (valid,
+         Set.union services richServices,
+         Set.union icmpTypes richIcmpTypes,
+         Set.union ipsets richIpsets)
+
+    /// Refuses a daemon-wide activation unless every loaded selector and active
+    /// referenced definition matches permanent data, except active NetworkManager
+    /// interface bindings which firewalld restores from NetworkManager on reload.
+    /// This is a read-only preflight; it never copies runtime state into permanent data.
+    let private validateReloadCore
+        (environment: HostEnvironment)
+        (allowance: (string * string * (string * string) list) option)
+        (excludedTarget: (string * string) option)
+        : Result<unit, string> =
+        try
+            let mutable failure: string option = None
+            let refuse reason =
+                if failure.IsNone then failure <- Some reason
+            let mutable allowanceObserved = allowance.IsNone
+            let mutable excludedTargetObserved = excludedTarget.IsNone
+            let names kind permanent =
+                match listObjectNames environment permanent kind with
+                | Some values -> values
+                | None ->
+                    refuse ("Unable to enumerate " + (if permanent then "permanent " else "runtime ") + "firewalld " + kind + " objects.")
+                    []
+            let runtimeZones = names "zone" false
+            let permanentZones = names "zone" true
+            let runtimePolicies = names "policy" false
+            let permanentPolicies = names "policy" true
+            let runtimeIpSets = names "ipset" false
+            let permanentIpSets = names "ipset" true
+            let excludedRuntimeNames, excludedPermanentNames =
+                match excludedTarget with
+                | Some("zone", _) -> runtimeZones, permanentZones
+                | Some("policy", _) -> runtimePolicies, permanentPolicies
+                | Some("ipset", _) -> runtimeIpSets, permanentIpSets
+                | Some(kind, _) -> names kind false, names kind true
+                | None -> [], []
+            let sameNames left right = Set.ofList left = Set.ofList right
+            let namesMatch kind left right =
+                let leftNames, rightNames = Set.ofList left, Set.ofList right
+                match excludedTarget with
+                | Some(targetKind, targetName) when targetKind = kind ->
+                    Set.remove targetName leftNames = Set.remove targetName rightNames
+                | _ -> leftNames = rightNames
+            if not (namesMatch "zone" runtimeZones permanentZones) then refuse "Runtime and permanent firewalld zone inventories differ."
+            if not (namesMatch "policy" runtimePolicies permanentPolicies) then refuse "Runtime and permanent firewalld policy inventories differ."
+            if not (namesMatch "ipset" runtimeIpSets permanentIpSets) then refuse "Runtime and permanent firewalld ipset inventories differ."
+            match excludedTarget with
+            | Some(_, name) ->
+                excludedTargetObserved <- List.contains name excludedRuntimeNames || List.contains name excludedPermanentNames
+            | None -> ()
+
+            let mutable services = Set.empty<string>
+            let mutable icmpTypes = Set.empty<string>
+            let mutable activeIpSets = Set.empty<string>
+            let recordReferences snapshot =
+                let valid, objectServices, objectIcmpTypes, objectIpSets = referencesFromZonePolicy snapshot
+                if not valid then false
+                else
+                    services <- Set.union services objectServices
+                    icmpTypes <- Set.union icmpTypes objectIcmpTypes
+                    activeIpSets <- Set.union activeIpSets objectIpSets
+                    true
+            let compareZonePolicy kind name =
+                match inspectRuntimeWith environment false kind name, inspectRuntimeWith environment true kind name with
+                | Some runtime, Some permanent
+                    when runtime.UnknownFields.IsEmpty && permanent.UnknownFields.IsEmpty ->
+                    let isExcluded = excludedTarget = Some(kind, name)
+                    let fieldsMatch =
+                        if isExcluded then true
+                        else
+                            match allowance |> Option.filter (fun (allowedKind, allowedName, _) -> allowedKind = kind && allowedName = name) with
+                            | None -> normalizedObjectFields kind runtime = normalizedObjectFields kind permanent
+                            | Some(_, _, selectors) ->
+                                let fields = selectors |> List.map fst |> List.distinct
+                                let stripAllowed current =
+                                    fields |> List.fold (fun value fieldName -> Map.remove fieldName value) current
+                                let runtimeFields = normalizedObjectFields kind runtime
+                                let permanentFields = normalizedObjectFields kind permanent
+                                let otherFieldsMatch = stripAllowed runtimeFields = stripAllowed permanentFields
+                                let groups = selectors |> List.groupBy fst
+                                let selectorsMatch =
+                                    groups
+                                    |> List.forall (fun (fieldName, pairs) ->
+                                        missingSelectorsMatch kind fieldName (pairs |> List.map snd) runtime permanent)
+                                let mutable referencesValid = true
+                                if selectorsMatch then
+                                    for fieldName, pairs in groups do
+                                        let values = pairs |> List.map snd
+                                        match fieldName with
+                                        | "services" -> services <- Set.union services (Set.ofList values)
+                                        | "icmp-blocks" -> icmpTypes <- Set.union icmpTypes (Set.ofList values)
+                                        | "rich rules" ->
+                                            for rule in values do
+                                                match richRuleReferences rule with
+                                                | Some(ruleServices, ruleIcmpTypes, ruleIpsets) ->
+                                                    services <- Set.union services ruleServices
+                                                    icmpTypes <- Set.union icmpTypes ruleIcmpTypes
+                                                    activeIpSets <- Set.union activeIpSets ruleIpsets
+                                                | None -> referencesValid <- false
+                                        | _ -> ()
+                                if otherFieldsMatch && selectorsMatch && referencesValid then
+                                    allowanceObserved <- true
+                                otherFieldsMatch && selectorsMatch && referencesValid
+                    let interfacesMatch =
+                        if isExcluded || kind <> "zone" then true
+                        else
+                            match normalizedInterfaces environment false name, normalizedInterfaces environment true name with
+                            | Some liveValues, Some permanentValues ->
+                                let live = Set.ofList liveValues
+                                let disk = Set.ofList permanentValues
+                                Set.isSubset disk live
+                                && (Set.difference live disk
+                                    |> Set.forall (fun interfaceName -> networkManagerAssignsZone environment interfaceName name))
+                            | _ -> false
+                    if not fieldsMatch || not interfacesMatch then
+                        refuse ("Reload would change unpersisted live selectors in firewalld " + kind + " " + name + ".")
+                    if not isExcluded && not (recordReferences runtime) then
+                        refuse ("Cannot classify rich-rule references in firewalld " + kind + " " + name + ".")
+                | _ -> refuse ("Cannot completely inspect runtime and permanent firewalld " + kind + " " + name + ".")
+
+            for name in runtimeZones do
+                if failure.IsNone && excludedTarget <> Some("zone", name) then compareZonePolicy "zone" name
+            for name in runtimePolicies do
+                if failure.IsNone && excludedTarget <> Some("policy", name) then compareZonePolicy "policy" name
+            match excludedTarget with
+            | Some(kind, name) when kind = "zone" || kind = "policy" ->
+                let runtimeNames, permanentNames =
+                    if kind = "zone" then runtimeZones, permanentZones
+                    else runtimePolicies, permanentPolicies
+                let collect present permanent =
+                    if not present then true
+                    else
+                        match inspectRuntimeWith environment permanent kind name with
+                        | Some snapshot when snapshot.UnknownFields.IsEmpty -> recordReferences snapshot
+                        | _ -> false
+                if not (collect (List.contains name runtimeNames) false
+                        && collect (List.contains name permanentNames) true) then
+                    refuse "Cannot inspect selector references on the excluded target."
+            | _ -> ()
+
+
+            let inspectExcludedDefinition kind name : Result<RuntimeSnapshot option * RuntimeSnapshot option, string> =
+                let livePresent = List.contains name excludedRuntimeNames
+                let diskPresent = List.contains name excludedPermanentNames
+                let inspect permanent present =
+                    if not present then Ok None
+                    else
+                        match inspectRuntimeWith environment permanent kind name with
+                        | Some snapshot when snapshot.UnknownFields.IsEmpty -> Ok(Some snapshot)
+                        | _ -> Error("Cannot inspect excluded firewalld " + kind + " " + name + ".")
+                if not livePresent && not diskPresent then
+                    Error("Excluded firewalld " + kind + " " + name + " is absent from both inventories.")
+                else
+                    match inspect false livePresent, inspect true diskPresent with
+                    | Ok runtime, Ok permanent -> Ok(runtime, permanent)
+                    | Error reason, _
+                    | _, Error reason -> Error reason
+
+            let mutable pendingServices = services
+            let mutable checkedServices = Set.empty<string>
+            let mutable pendingHelpers = Set.empty<string>
+            let addServiceDependencies (snapshot: RuntimeSnapshot) =
+                let includes = Map.tryFind "includes" snapshot.NativeFields |> Option.defaultValue [] |> words |> Set.ofList
+                let helpers = Map.tryFind "helpers" snapshot.NativeFields |> Option.defaultValue [] |> words |> Set.ofList
+                let modules =
+                    Map.tryFind "modules" snapshot.NativeFields
+                    |> Option.defaultValue []
+                    |> normalizeFieldValues "service" "modules"
+                    |> Set.ofList
+                pendingServices <- Set.union pendingServices includes
+                pendingHelpers <- Set.union pendingHelpers (Set.union helpers modules)
+            while not pendingServices.IsEmpty && failure.IsNone do
+                let name = Set.minElement pendingServices
+                pendingServices <- Set.remove name pendingServices
+                if not (Set.contains name checkedServices) then
+                    checkedServices <- Set.add name checkedServices
+                    if excludedTarget = Some("service", name) then
+                        match inspectExcludedDefinition "service" name with
+                        | Error reason -> refuse reason
+                        | Ok(runtime, permanent) ->
+                            if permanent.IsNone && Set.contains name services then
+                                refuse "Reload would leave an active firewalld service reference unresolved."
+                            [ runtime; permanent ]
+                            |> List.choose id
+                            |> List.iter addServiceDependencies
+                    else
+                        match inspectRuntimeWith environment false "service" name, inspectRuntimeWith environment true "service" name with
+                        | Some runtime, Some permanent
+                            when runtime.UnknownFields.IsEmpty && permanent.UnknownFields.IsEmpty
+                                 && normalizedObjectFields "service" runtime = normalizedObjectFields "service" permanent ->
+                            addServiceDependencies runtime
+                        | _ -> refuse ("Reload would change or cannot inspect active firewalld service " + name + ".")
+
+            let mutable checkedHelpers = Set.empty<string>
+            while not pendingHelpers.IsEmpty && failure.IsNone do
+                let name = Set.minElement pendingHelpers
+                pendingHelpers <- Set.remove name pendingHelpers
+                if not (Set.contains name checkedHelpers) then
+                    checkedHelpers <- Set.add name checkedHelpers
+                    if excludedTarget = Some("helper", name) then
+                        match inspectExcludedDefinition "helper" name with
+                        | Ok(_, permanent) when permanent.IsNone ->
+                            refuse "Reload would leave an active firewalld helper reference unresolved."
+                        | Ok _ -> ()
+                        | Error reason -> refuse reason
+                    else
+                        match inspectRuntimeWith environment false "helper" name, inspectRuntimeWith environment true "helper" name with
+                        | Some runtime, Some permanent
+                            when runtime.UnknownFields.IsEmpty && permanent.UnknownFields.IsEmpty
+                                 && normalizedObjectFields "helper" runtime = normalizedObjectFields "helper" permanent -> ()
+                        | _ -> refuse ("Reload would change or cannot inspect active firewalld helper " + name + ".")
+
+            for name in icmpTypes do
+                if failure.IsNone then
+                    if excludedTarget = Some("icmptype", name) then
+                        match inspectExcludedDefinition "icmptype" name with
+                        | Ok(_, permanent) when permanent.IsNone ->
+                            refuse "Reload would leave an active firewalld ICMP reference unresolved."
+                        | Ok _ -> ()
+                        | Error reason -> refuse reason
+                    else
+                        match inspectRuntimeWith environment false "icmptype" name, inspectRuntimeWith environment true "icmptype" name with
+                        | Some runtime, Some permanent
+                            when runtime.UnknownFields.IsEmpty && permanent.UnknownFields.IsEmpty
+                                 && normalizedObjectFields "icmptype" runtime = normalizedObjectFields "icmptype" permanent -> ()
+                        | _ -> refuse ("Reload would change or cannot inspect active firewalld ICMP type " + name + ".")
+
+            let knownIpSets = Set.ofList runtimeIpSets
+            let referencedIpSets =
+                match excludedTarget with
+                | Some("ipset", name) -> Set.remove name activeIpSets
+                | _ -> activeIpSets
+            if not (Set.isSubset referencedIpSets knownIpSets) then
+                refuse "An active firewalld selector references an uninspectable ipset."
+            for name in runtimeIpSets do
+                if failure.IsNone && excludedTarget <> Some("ipset", name) then
+                    match inspectRuntimeWith environment false "ipset" name, inspectRuntimeWith environment true "ipset" name with
+                    | Some runtime, Some permanent
+                        when runtime.UnknownFields.IsEmpty
+                             && permanent.UnknownFields.IsEmpty
+                             && runtime.IpSetType = permanent.IpSetType
+                             && runtime.IpSetOptions = permanent.IpSetOptions
+                             && Set.ofList runtime.IpSetEntries = Set.ofList permanent.IpSetEntries -> ()
+                    | _ -> refuse ("Reload would change or cannot inspect live firewalld ipset " + name + ".")
+
+            match excludedTarget with
+            | Some("ipset", name)
+                when Set.contains name activeIpSets && not (List.contains name permanentIpSets) ->
+                refuse "Reload would leave an active firewalld ipset selector unresolved."
+            | _ -> ()
+            if not excludedTargetObserved then
+                refuse "The excluded target was not present in either firewalld inventory."
+
+            if not allowanceObserved then
+                refuse "The requested missing selector was not the only proven live decrease."
+            match failure with
+            | Some reason -> Error reason
+            | None -> Ok ()
+        with error -> Error("Unable to prove firewalld reload safety: " + error.Message)
+
+    /// Requires strict host-wide runtime/permanent equivalence before daemon activation.
+    let validateReload (environment: HostEnvironment) : Result<unit, string> =
+        validateReloadCore environment None None
+
+    /// Allows only the exact listed permanent-to-runtime selector decreases on one
+    /// zone or policy; all unrelated host state remains subject to strict proof.
+    let validateReloadAllowingMissingSelectors
+        (environment: HostEnvironment)
+        (kind: string)
+        (name: string)
+        (selectors: (string * string) list)
+        : Result<unit, string> =
+        let supportedFields =
+            [ "services"; "ports"; "source-ports"; "protocols"; "icmp-blocks"; "rich rules"; "forward-ports" ]
+        let valid =
+            List.contains kind [ "zone"; "policy" ]
+            && not (String.IsNullOrWhiteSpace name)
+            && not selectors.IsEmpty
+            && selectors.Length <= 4096
+            && (selectors |> List.forall (fun (field, value) ->
+                List.contains field supportedFields && not (String.IsNullOrWhiteSpace value)))
+            && (selectors |> List.distinct).Length = selectors.Length
+        if not valid then
+            Error "The reload exception must identify a bounded, unique set of zone or policy selectors."
+        else
+            validateReloadCore environment (Some(kind, name, selectors)) None
+
+    /// Single-entry convenience form of the bounded selector allowlist.
+    let validateReloadAllowingMissingSelector
+        (environment: HostEnvironment)
+        (kind: string)
+        (name: string)
+        (field: string)
+        (value: string)
+        : Result<unit, string> =
+        validateReloadAllowingMissingSelectors environment kind name [ field, value ]
+
+    /// Proves host-wide reload safety while excluding only the exact target object;
+    /// callers must separately verify its runtime state with observeExactly.
+    let validateReloadExcludingTargetObject
+        (environment: HostEnvironment)
+        (kind: string)
+        (name: string)
+        : Result<unit, string> =
+        if not (List.contains kind [ "zone"; "policy"; "service"; "ipset"; "icmptype"; "helper" ])
+           || String.IsNullOrWhiteSpace name then
+            Error "The reload exclusion must identify one firewalld object."
+        else
+            validateReloadCore environment None (Some(kind, name))

@@ -39,7 +39,7 @@ module FirewalldBackend =
         transactionNonce |> Option.iter (fun nonce -> payload["transactionNonce"] <- JsonValue.Create nonce)
         let request = payload.ToJsonString()
         if fresh then
-            SshTransport.runHelperFreshConnection connection "firewalld" "firewalld transaction confirmation" request cancellationToken
+            SshTransport.runHelperFreshConnection connection "firewalld" ("firewalld " + operation) request cancellationToken
         else
             SshTransport.runHelper connection "firewalld" "firewalld" request cancellationToken
 
@@ -77,7 +77,7 @@ module FirewalldBackend =
         let properties = propertyNames root
         let legacy = set [ "exists"; "actual"; "inSync" ]
         let current = set [ "exists"; "actual"; "inSync"; "permanentInSync"; "runtimeObserved"; "runtimeInSync" ]
-        let optional = set [ "permanentActual"; "runtimeActual"; "activationReceipt"; "runtimeLimit"; "transactionNonce" ]
+        let optional = set [ "permanentActual"; "runtimeActual"; "activationReceipt"; "runtimeLimit"; "ownershipConflict"; "transactionNonce" ]
         if properties = legacy then
             let exists = readBool root "exists"
             let actual = root.GetProperty("actual").GetString()
@@ -98,7 +98,8 @@ module FirewalldBackend =
             let runtimeObserved = readBool root "runtimeObserved"
             let runtimeInSync = readBool root "runtimeInSync"
             let activationReceipt = optionalBool root "activationReceipt" = Some true
-            if isNull actual || (not runtimeObserved && runtimeInSync)
+            let ownershipConflict = optionalBool root "ownershipConflict" = Some true
+            if isNull actual || (ownershipConflict && permanentInSync) || (not runtimeObserved && runtimeInSync)
                || (inSync && (not permanentInSync || not (if runtimeObserved then runtimeInSync else activationReceipt))) then
                 invalidOp "Inconsistent firewalld helper snapshot."
             { Exists = exists
@@ -115,7 +116,7 @@ module FirewalldBackend =
         })
     let apply connection ownerId configuration (ct: CancellationToken) =
         withHostGate connection ct (fun () -> task {
-            let! output = invoke false "apply" connection ownerId configuration None ct
+            let! output = invoke true "apply" connection ownerId configuration None ct
             use document = JsonDocument.Parse output
             let root = document.RootElement
             if propertyNames root <> set [ "unchanged" ] || not (readBool root "unchanged") then
@@ -127,15 +128,19 @@ module FirewalldBackend =
                    || (not staged.RuntimeObserved && not activationReceipt) then
                     invalidOp "Firewalld mutation did not converge before fresh-connection confirmation."
                 do! confirm connection ownerId configuration nonce ct
-            let! confirmed = invoke false "read" connection ownerId configuration None ct
-            let snapshot = parseSnapshot confirmed
-            if not snapshot.InSync then invalidOp "Firewalld apply did not leave the owned resource in sync."
-            return snapshot
+                // The fresh confirmation validated the same staged policy. Avoid another
+                // fallible SSH read after the remote transaction has committed.
+                return { staged with InSync = true }
+            else
+                let! confirmed = invoke false "read" connection ownerId configuration None ct
+                let snapshot = parseSnapshot confirmed
+                if not snapshot.InSync then invalidOp "Firewalld apply did not leave the owned resource in sync."
+                return snapshot
         })
 
     let delete connection ownerId configuration (ct: CancellationToken) =
         withHostGate connection ct (fun () -> task {
-            let! output = invoke false "delete" connection ownerId configuration None ct
+            let! output = invoke true "delete" connection ownerId configuration None ct
             use document = JsonDocument.Parse output
             let root = document.RootElement
             if root.ValueKind <> JsonValueKind.Object then invalidOp "Invalid firewalld delete response."

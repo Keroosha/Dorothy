@@ -22,12 +22,17 @@
     <Compile Include="AptTests.fs" />
     <Compile Include="UfwBackendTests.fs" />
     <Compile Include="FirewalldCommandFixture.fs" />
+    <Compile Include="FirewalldSettingsTests.fs" />
     <Compile Include="FirewalldTests.fs" />
     <Compile Include="FirewalldGuardTests.fs" />
+    <Compile Include="FirewalldBindingTransferTests.fs" />
+    <Compile Include="FirewalldCatalogueConsumer.fs" />
     <Compile Include="FirewalldCatalogueTests.fs" />
     <Compile Include="FirewalldRuntimeTests.fs" />
+    <Compile Include="FirewalldRecoveryProofTests.fs" />
     <Compile Include="FirewalldLifecycleTests.fs" />
     <Compile Include="FirewalldDeploymentTests.fs" />
+    <Compile Include="FirewalldDockerGateTests.fs" />
     <Compile Include="TraefikBackendTests.fs" />
     <Compile Include="CloudflareTests.fs" />
     <Compile Include="CloudflareCompositionTests.fs" />

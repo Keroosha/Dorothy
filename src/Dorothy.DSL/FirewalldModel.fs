@@ -41,6 +41,11 @@ module FirewalldModel =
           Interfaces = []; Services = []; Ports = []; Protocols = []; Masquerade = false
           Forward = false; Ingress = []; Egress = []; Priority = -1; StrictForwardPorts = None
           Attributes = Map.empty; Elements = []; SettingValue = None }
+    let helperNameForModule (moduleName: string) =
+        if moduleName.StartsWith("nf_conntrack_", StringComparison.Ordinal) then
+            moduleName.Substring("nf_conntrack_".Length).Replace('_', '-')
+        else
+            moduleName
 
     let token label maxLength (value: string) =
         if String.IsNullOrEmpty value || value.Length > maxLength
@@ -92,6 +97,31 @@ module FirewalldModel =
             label
             (label + " must be a safe firewalld identifier.")
         value
+
+    /// References and read-only inventory entries need not satisfy Dorothy's
+    /// narrower owned-resource convention. Native IO_Object checks *each*
+    /// character, including the first, against its kind's alnum alphabet.
+    /// The .xml path component is still a single filename; split zones are separate.
+    let nativeReference kind label (value: string) =
+        let allowed, maxLength =
+            match kind with
+            | "zone" -> "_-", 17
+            | "policy" -> "_-", 18
+            | "service" | "icmptype" -> "_-", Int32.MaxValue
+            | "helper" -> "-.", Int32.MaxValue
+            | "ipset" -> "_-:.", 32
+            | _ -> fail label "Unknown firewalld definition kind."
+        require (not (String.IsNullOrEmpty value) && System.Text.Encoding.UTF8.GetByteCount(value) <= 251) label "Invalid native definition filename."
+        let mutable count = 0
+        for scalar in value.EnumerateRunes() do
+            count <- count + 1
+            require (System.Text.Rune.IsLetter(scalar) || System.Text.Rune.IsNumber(scalar)
+                     || (scalar.IsAscii && allowed.IndexOf(char scalar.Value) >= 0)) label "Invalid native definition name."
+        require (count <= maxLength) label "Native definition name exceeds the target limit."
+        value
+
+    let private normalizedReferences kind values =
+        values |> List.map (nativeReference kind kind) |> List.distinct |> List.sort
 
     let private checkObjectName kind name =
         match kind with
@@ -259,10 +289,10 @@ module FirewalldModel =
         require node.Children.IsEmpty label (label + " cannot contain child elements.")
         node.Text |> Option.iter (safeXmlString label >> ignore)
 
-    let private checkServiceName label value = nativeName label [ '_'; '-' ] 128 value |> ignore
-    let private checkIpSetName label value = nativeName label [ '_'; '-'; ':'; '.' ] 32 value |> ignore
-    let private checkHelperName label value = nativeName label [ '-'; '.' ] 128 value |> ignore
-    let private checkIcmpName label value = nativeName label [ '_'; '-' ] 128 value |> ignore
+    let private checkServiceName label value = nativeReference "service" label value |> ignore
+    let private checkIpSetName label value = nativeReference "ipset" label value |> ignore
+    let private checkHelperName label value = nativeReference "helper" label value |> ignore
+    let private checkIcmpName label value = nativeReference "icmptype" label value |> ignore
 
     let private parseBoolean label (value: string) =
         match value.ToLowerInvariant() with
@@ -321,10 +351,10 @@ module FirewalldModel =
         checkPortAndTransport label node.Attributes
         let toPort, toAddress = attr "to-port" node.Attributes, attr "to-addr" node.Attributes
         require (toPort.IsSome || toAddress.IsSome) label "Forward-port requires to-port or to-addr."
+        require family.IsSome label "An explicit rule family is required for every rich forward-port."
         toPort |> Option.iter (checkNativePort label)
         toAddress
         |> Option.iter (fun value ->
-            require family.IsSome label "An explicit rule family is required for a forward-port."
             checkAddress family label value
             require (not (value.Contains('/'))) label "Forward-port destination must be a single address.")
         checkEmptyNode label node
@@ -494,7 +524,7 @@ module FirewalldModel =
         | "ingress-zone" | "egress-zone" when kind = "policy" ->
             checkNativeAttrs node.Name [ "name" ] [ "name" ] node.Attributes
             let name = requiredAttr node.Name "name" node.Attributes
-            if name <> "HOST" && name <> "ANY" then token "zone" 17 name |> ignore
+            nativeReference "zone" node.Name name |> ignore
             checkEmptyNode node.Name node
         | _ -> fail "elements" ("Unsupported " + kind + " element '" + node.Name + "'.")
 
@@ -564,7 +594,10 @@ module FirewalldModel =
             | "mac" -> require (isMac item && item <> "00:00:00:00:00:00") "entry" "Invalid ipset MAC address."
             | "port" -> checkIpSetPort family item
             | "mark" -> parseUnsigned "entry" 4294967295UL item |> ignore
-            | "iface" -> checkInterface "entry" item |> ignore
+            | "iface" ->
+                checkInterface "entry" item |> ignore
+                if typeName = "hash:net,iface" then
+                    require (item.Length <= 15) "entry" "Interface names in hash:net,iface entries cannot exceed 15 characters."
             | _ -> fail "entry" "Unsupported ipset field."
 
     let rec private guardElement (node: Element) =
@@ -650,10 +683,7 @@ module FirewalldModel =
                     checkNativeAttrs "module" [ "name" ] [ "name" ] node.Attributes
                     let value = requiredAttr "module" "name" node.Attributes
                     nativeName "module" [ '_'; '-' ] 128 value |> ignore
-                    let moduleForUse =
-                        if value.StartsWith("nf_conntrack_", StringComparison.Ordinal) then
-                            value.Replace("nf_conntrack_", "").Replace("_", "-")
-                        else value
+                    let moduleForUse = helperNameForModule value
                     require (moduleForUse.Length >= 2) "module" "Module name is too short."
                     require (not ((!seenNames).Contains ("module:" + value))) "module" "Duplicate service module."
                     seenNames := (!seenNames).Add("module:" + value)
@@ -794,13 +824,15 @@ module FirewalldModel =
         safeXmlString key value |> ignore
         require (value <> "" && not (value.Contains('=')) && (value |> Seq.forall (Char.IsControl >> not))) key (key + " requires a nonempty line-safe value.")
         match key with
-        | "DefaultZone" ->
-            token key 17 value |> ignore
-            require (not (value.Contains('.'))) key "Zone names cannot contain dots."
+        | "DefaultZone" -> nativeReference "zone" key value |> ignore
         | "MinimalMark" -> parseInt key value |> ignore
         | "CleanupOnExit" | "CleanupModulesOnExit" | "IndividualCalls" | "FlushAllOnReload" | "RFC3964_IPv4"
         | "NftablesCounters" | "NftablesTableOwner" | "AllowZoneDrifting" | "Lockdown" -> parseBoolean key value |> ignore
-        | "IPv6_rpfilter" -> require (List.contains (value.ToLowerInvariant()) [ "no"; "strict"; "loose"; "strict-forward"; "loose-forward" ]) key "Invalid IPv6_rpfilter value."
+        | "IPv6_rpfilter" ->
+            require
+                (List.contains (value.ToLowerInvariant()) [ "yes"; "true"; "no"; "false"; "strict"; "loose"; "strict-forward"; "loose-forward" ])
+                key
+                "Invalid IPv6_rpfilter value."
         | "LogDenied" -> require (List.contains value [ "all"; "unicast"; "broadcast"; "multicast"; "off" ]) key "Invalid LogDenied value."
         | "AutomaticHelpers" -> require (List.contains (value.ToLowerInvariant()) [ "yes"; "no"; "system" ]) key "Invalid AutomaticHelpers value."
         | "FirewallBackend" -> require (List.contains (value.ToLowerInvariant()) [ "nftables"; "iptables" ]) key "Invalid FirewallBackend value."
@@ -959,14 +991,9 @@ module FirewalldModel =
                 require (List.contains c.Target targets) "target" "Invalid firewalld target."
                 let normalized label length values = values |> List.map (token label length) |> List.distinct |> List.sort
                 let interfaces = c.Interfaces |> List.map (checkInterface "interface") |> List.distinct |> List.sort
-                let services, protocols = normalized "service" 128 c.Services, normalized "protocol" 128 c.Protocols
+                let services, protocols = normalizedReferences "service" c.Services, normalized "protocol" 128 c.Protocols
                 protocols |> List.iter (checkProtocol "protocol")
-                let zones values =
-                    values
-                    |> List.map (fun value -> if value = "ANY" || value = "HOST" then value else token "zone" 17 value)
-                    |> List.distinct
-                    |> List.sort
-                let ingress, egress = zones c.Ingress, zones c.Egress
+                let ingress, egress = normalizedReferences "zone" c.Ingress, normalizedReferences "zone" c.Egress
                 let nativeIngress = c.Elements |> List.filter (fun e -> e.Name = "ingress-zone") |> List.map (fun e -> Map.tryFind "name" e.Attributes |> Option.defaultValue "")
                 let nativeEgress = c.Elements |> List.filter (fun e -> e.Name = "egress-zone") |> List.map (fun e -> Map.tryFind "name" e.Attributes |> Option.defaultValue "")
                 if c.Kind = "zone" then
@@ -988,7 +1015,6 @@ module FirewalldModel =
                     let effectiveIngress = if nativeIngress.IsEmpty then ingress else nativeIngress
                     let effectiveEgress = if nativeEgress.IsEmpty then egress else nativeEgress
                     let policyZones (values: string list) =
-                        require (not values.IsEmpty) "policy" "Policy requires ingress and egress zones."
                         require (values.Length <= 1 || not (List.contains "ANY" values || List.contains "HOST" values)) "policy" "ANY and HOST cannot be combined with other zones."
                     policyZones effectiveIngress
                     policyZones effectiveEgress
@@ -1016,7 +1042,7 @@ module FirewalldModel =
                             if element.Name = "forward-port" then [ element ]
                             elif element.Name = "rule" then element.Children |> List.filter (fun child -> child.Name = "forward-port")
                             else [])
-                    let addressRequired = not (List.contains "HOST" egress)
+                    let addressRequired = not egress.IsEmpty && not (List.contains "HOST" egress)
                     for forwardPort in forwardPorts do
                         require (not addressRequired || Map.containsKey "to-addr" forwardPort.Attributes) "forward-port" "Policy forward-ports need to-addr unless egress is HOST."
             else
@@ -1046,11 +1072,11 @@ module FirewalldModel =
                 if c.Kind = "zone" || c.Kind = "policy" then
                     let normalizedList label length values = values |> List.map (token label length) |> List.distinct |> List.sort
                     { c with Interfaces = c.Interfaces |> List.map (checkInterface "interface") |> List.distinct |> List.sort
-                             Services = normalizedList "service" 128 c.Services
+                             Services = normalizedReferences "service" c.Services
                              Ports = c.Ports |> List.map port |> List.distinct |> List.sort
                              Protocols = normalizedList "protocol" 128 c.Protocols
-                             Ingress = c.Ingress |> List.map (fun value -> if value = "ANY" || value = "HOST" then value else token "zone" 17 value) |> List.distinct |> List.sort
-                             Egress = c.Egress |> List.map (fun value -> if value = "ANY" || value = "HOST" then value else token "zone" 17 value) |> List.distinct |> List.sort }
+                             Ingress = normalizedReferences "zone" c.Ingress
+                             Egress = normalizedReferences "zone" c.Egress }
                 elif c.Kind = "service" then
                     { c with Ports = c.Ports |> List.map port |> List.distinct |> List.sort
                              Protocols = c.Protocols |> List.map (token "protocol" 128) |> List.distinct |> List.sort }
@@ -1079,6 +1105,9 @@ module FirewalldModel =
             | "service" -> attr "name" node.Attributes |> Option.iter (add "service")
             | "include" -> attr "service" node.Attributes |> Option.iter (add "service")
             | "helper" when c.Kind = "service" -> attr "name" node.Attributes |> Option.iter (add "helper")
+            | "module" when c.Kind = "service" ->
+                attr "name" node.Attributes
+                |> Option.iter (helperNameForModule >> add "helper")
             | "icmp-block" | "icmp-type" -> attr "name" node.Attributes |> Option.iter (add "icmptype")
             | "source" | "destination" -> attr "ipset" node.Attributes |> Option.iter (add "ipset")
             | "ingress-zone" | "egress-zone" ->

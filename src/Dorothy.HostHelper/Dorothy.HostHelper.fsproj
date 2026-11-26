@@ -14,12 +14,16 @@
     <Compile Include="Common.fs" />
     <Compile Include="Fail2BanCliData.fs" />
     <Compile Include="../Dorothy.DSL/FirewalldModel.fs" Link="FirewalldModel.fs" />
+    <Compile Include="../Dorothy.DSL/FirewalldGateModel.fs" Link="FirewalldGateModel.fs" />
     <Compile Include="../Dorothy.DSL/TraefikPathModel.fs" Link="TraefikPathModel.fs" />
     <Compile Include="FieldRuntime.fs" />
     <Compile Include="FirewalldRuntime.fs" />
     <Compile Include="FirewalldLifecycle.fs" />
+    <Compile Include="FirewalldRecoveryProof.fs" />
     <Compile Include="FirewalldReferences.fs" />
+    <Compile Include="FirewalldBindingTransfer.fs" />
     <Compile Include="Firewalld.fs" />
+    <Compile Include="FirewalldDockerGate.fs" />
     <Compile Include="Apt.fs" />
     <Compile Include="Ufw.fs" />
     <Compile Include="Traefik.fs" />

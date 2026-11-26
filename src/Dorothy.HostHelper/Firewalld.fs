@@ -1,11 +1,13 @@
 namespace Dorothy.HostHelper
 
 open System
+open System.Globalization
 open System.IO
 open System.Net
 open System.Text
 open System.Text.Json
 open System.Text.Json.Nodes
+open System.Security.Cryptography
 open System.Xml
 open System.Xml.Linq
 
@@ -55,12 +57,86 @@ module Firewalld =
 
     type private MatchResult = Match | NoMatch | Unknown
     type private Packet =
-        { Source: IPAddress; SourcePort: int
-          Destination: IPAddress; DestinationPort: int }
+        { Source: IPAddress; SourcePort: int option
+          Destination: IPAddress; DestinationPort: int option }
     type private RuleResult = NotApplicable | RuleAllows | RuleBlocks | RuleUnknown
+    type private SshNetworkContext =
+        { IngressInterfaces: string list option
+          Layer2Interfaces: Set<string> option }
+    type private ZoneCandidate = { Name: string; NdpMayBeNeeded: bool }
+    type private NdpPolicyDecision = NdpUndecided | NdpAllowed | NdpBlocked
+    let private unknownSshNetwork = { IngressInterfaces = None; Layer2Interfaces = None }
+    type private SshGuardSnapshots =
+        { CandidateZones: Map<string, string>
+          CandidatePolicies: Map<string, string>
+          RuntimeZones: Map<string, string>
+          RuntimePolicies: Map<string, string> }
+
+    let private observeSshNetwork (environment: HostEnvironment) (context: SshContext) =
+        try
+            let result = environment.Run "ip" [ "-j"; "link"; "show" ] None
+            if result.ExitCode <> 0 then unknownSshNetwork
+            else
+                use document = JsonDocument.Parse result.Stdout
+                if document.RootElement.ValueKind <> JsonValueKind.Array then unknownSshNetwork
+                else
+                    let mutable complete = true
+                    let peerIsLoopback = IPAddress.IsLoopback(IPAddress.Parse context.Peer)
+                    let offHostEgress = not peerIsLoopback && context.Interface <> "lo"
+                    let interfaces, layer2 =
+                        document.RootElement.EnumerateArray()
+                        |> Seq.fold (fun (interfaces, layer2) link ->
+                            let interfaceName = link.GetProperty("ifname").GetString()
+                            FirewalldModel.token "SSH interface" 15 interfaceName |> ignore
+                            let mutable linkType = Unchecked.defaultof<JsonElement>
+                            let hasLinkType =
+                                link.TryGetProperty("link_type", &linkType)
+                                && linkType.ValueKind = JsonValueKind.String
+                            let mutable operstate = Unchecked.defaultof<JsonElement>
+                            let isDown =
+                                link.TryGetProperty("operstate", &operstate)
+                                && operstate.ValueKind = JsonValueKind.String
+                                && operstate.GetString() = "DOWN"
+                            let mutable flags = Unchecked.defaultof<JsonElement>
+                            let hasLoopbackFlag =
+                                link.TryGetProperty("flags", &flags)
+                                && flags.ValueKind = JsonValueKind.Array
+                                && (flags.EnumerateArray() |> Seq.exists (fun flag -> flag.GetString() = "LOOPBACK"))
+                            let isLoopback =
+                                interfaceName = "lo" || hasLoopbackFlag
+                                || (hasLinkType && linkType.GetString() = "loopback")
+                            if isDown || (offHostEgress && isLoopback) then interfaces, layer2
+                            else
+                                if not hasLinkType then complete <- false
+                                if hasLinkType && linkType.GetString() = "ether" then
+                                    Set.add interfaceName interfaces, Set.add interfaceName layer2
+                                else Set.add interfaceName interfaces, layer2)
+                            (Set.empty, Set.empty)
+                    let routeInterfacePresent = Set.contains context.Interface interfaces
+                    { IngressInterfaces = Some(Set.toList interfaces)
+                      Layer2Interfaces = if complete && routeInterfacePresent then Some layer2 else None }
+        with _ -> unknownSshNetwork
+
+    let private isLayer2Interface network interfaceName =
+        match network.Layer2Interfaces with
+        | Some interfaces -> Set.contains interfaceName interfaces
+        | None -> true
 
     let private asAddress (value: string) : IPAddress option =
         match IPAddress.TryParse value with true, parsed -> Some parsed | _ -> None
+
+    let private contiguousMaskPrefix (mask: IPAddress) =
+        let mutable prefix = 0
+        let mutable sawZero = false
+        let mutable valid = true
+        for octet in mask.GetAddressBytes() do
+            for bit in 0 .. 7 do
+                let setBit = (octet &&& byte (1 <<< (7 - bit))) <> 0uy
+                if setBit then
+                    if sawZero then valid <- false
+                    prefix <- prefix + 1
+                else sawZero <- true
+        if valid then Some prefix else None
 
     let private cidrMatches (selector: string) (address: IPAddress) =
         let parts = selector.Split('/')
@@ -77,6 +153,11 @@ module Firewalld =
                         else
                             match Int32.TryParse parts[1] with
                             | true, value when value >= 0 && value <= networkBytes.Length * 8 -> value
+                            | _ when network.AddressFamily = System.Net.Sockets.AddressFamily.InterNetwork && parts[1].Contains('.') ->
+                                match asAddress parts[1] with
+                                | Some mask when mask.AddressFamily = System.Net.Sockets.AddressFamily.InterNetwork ->
+                                    contiguousMaskPrefix mask |> Option.defaultValue -1
+                                | _ -> -1
                             | _ -> -1
                     if prefix < 0 then Unknown
                     else
@@ -121,7 +202,7 @@ module Firewalld =
     let private attributesAreAllowed (allowed: Set<string>) (element: XElement) =
         element.Attributes() |> Seq.forall (fun value -> Set.contains value.Name.LocalName allowed)
 
-    let private portRangeMatches (range: string) (value: int) =
+    let private portRangeMatches (range: string) (value: int option) =
         let pieces = range.Split('-')
         let parse (text: string) =
             match Int32.TryParse text with
@@ -129,8 +210,9 @@ module Firewalld =
             | _ -> None
         if pieces.Length < 1 || pieces.Length > 2 then Unknown
         else
-            match parse pieces[0], parse pieces[pieces.Length - 1] with
-            | Some first, Some last when last >= first -> if value >= first && value <= last then Match else NoMatch
+            match parse pieces[0], parse pieces[pieces.Length - 1], value with
+            | Some first, Some last, Some actual when last >= first -> if actual >= first && actual <= last then Match else NoMatch
+            | Some first, Some last, None when last >= first -> Unknown
             | _ -> Unknown
     let private tcpProtocol (value: string) =
         match value with
@@ -147,7 +229,7 @@ module Firewalld =
         | "udp" | "sctp" | "dccp" -> NoMatch
         | _ -> Unknown
 
-    let private ipSetMatches (ipsetXml: string -> string option) (name: string) (address: IPAddress) (port: int) =
+    let private ipSetMatches (ipsetXml: string -> string option) (name: string) (address: IPAddress) (port: int option) =
         match ipsetXml name with
         | None -> Unknown
         | Some xml ->
@@ -265,7 +347,7 @@ module Firewalld =
 
     let rec private serviceMatches (serviceXml: string -> string option) ipsetXml packet (seen: Set<string>) name =
         if Set.contains name seen then fail "Cyclic firewalld service include."
-        FirewalldModel.token "service" 128 name |> ignore
+        FirewalldModel.nativeReference "service" "service" name |> ignore
         let service = serviceXml name |> Option.defaultWith (fun () -> fail ("Required firewalld service is missing: " + name))
         let root = parseXml "service" service
         if not (attributesAreAllowed (set [ "version" ]) root) then Unknown
@@ -291,32 +373,39 @@ module Firewalld =
                                 else cidrMatches value packet.Destination)
                             |> anyMatches
                 | _ -> Unknown
-            if destinationResult = NoMatch then NoMatch
-            elif destinationResult = Unknown then Unknown
-            else
-                let selectors =
-                    root.Elements()
-                    |> Seq.choose (fun element ->
-                        match element.Name.LocalName with
-                        | "port" -> Some(portElementMatches element packet.DestinationPort)
-                        | "source-port" -> Some(portElementMatches element packet.SourcePort)
-                        | "protocol" when attributesAreAllowed (set [ "value" ]) element ->
-                            attr "value" element
-                            |> Option.map (fun value -> match tcpProtocol value with Match -> Unknown | result -> result)
-                            |> Option.orElse (Some Unknown)
-                        | "protocol" -> Some Unknown
-                        | "include" when attributesAreAllowed (set [ "service" ]) element ->
-                            Some(serviceMatches serviceXml ipsetXml packet (Set.add name seen) (required "service" element))
-                        | "module" | "helper" | "short" | "description" | "destination" -> None
-                        | _ -> Some Unknown)
-                    |> Seq.toList
-                if selectors.IsEmpty then Unknown
-                else
-                    let result = anyMatches selectors
-                    if result = Match
-                       && (List.contains Unknown selectors
-                           || (root.Elements() |> Seq.exists (fun element -> element.Name = xn "module" || element.Name = xn "helper"))) then Unknown
-                    else result
+            let ownSelectors =
+                root.Elements()
+                |> Seq.choose (fun element ->
+                    match element.Name.LocalName with
+                    | "port" when attributesAreAllowed (set [ "protocol"; "port" ]) element && attr "port" element = Some "" ->
+                        Some(attr "protocol" element |> Option.map tcpProtocol |> Option.defaultValue Unknown)
+                    | "port" -> Some(portElementMatches element packet.DestinationPort)
+                    | "source-port" -> Some(portElementMatches element packet.SourcePort)
+                    | "protocol" when attributesAreAllowed (set [ "value" ]) element ->
+                        attr "value" element |> Option.map tcpProtocol |> Option.defaultValue Unknown |> Some
+                    | "protocol" -> Some Unknown
+                    | "include" | "module" | "helper" | "short" | "description" | "destination" -> None
+                    | _ -> Some Unknown)
+                |> Seq.toList
+            let ownResult =
+                match destinationResult with
+                | NoMatch -> NoMatch
+                | Unknown -> Unknown
+                | Match when ownSelectors.IsEmpty -> NoMatch
+                | Match ->
+                    let result = anyMatches ownSelectors
+                    if result = Match && List.contains Unknown ownSelectors then Unknown else result
+            let includedResults =
+                root.Elements(xn "include")
+                |> Seq.map (fun element ->
+                    if not (attributesAreAllowed (set [ "service" ]) element) then Unknown
+                    else serviceMatches serviceXml ipsetXml packet (Set.add name seen) (required "service" element))
+                |> Seq.toList
+            let result = anyMatches (ownResult :: includedResults)
+            if result = Match
+               && (List.contains Unknown ownSelectors
+                   || (root.Elements() |> Seq.exists (fun element -> element.Name = xn "module" || element.Name = xn "helper"))) then Unknown
+            else result
 
     let private selectorMatches serviceXml ipsetXml packet (element: XElement) =
         match element.Name.LocalName with
@@ -345,8 +434,12 @@ module Firewalld =
             | Unknown -> Unknown
             | Match ->
                 match attr "to-port" element, attr "to-addr" element with
-                | Some value, _ when portRangeMatches value 1 = Unknown -> Unknown
-                | _, Some value when asAddress value |> Option.isNone -> Unknown
+                | Some value, _ when portRangeMatches value (Some 1) = Unknown -> Unknown
+                | _, Some value ->
+                    match asAddress value with
+                    | None -> Unknown
+                    | Some address when address.AddressFamily <> packet.Destination.AddressFamily -> NoMatch
+                    | Some _ -> Match
                 | _ -> Match
 
     let private familyMatches family (packet: Packet) =
@@ -380,19 +473,23 @@ module Firewalld =
                 let selectors = selectorChildren |> List.map (selectorMatches serviceXml ipsetXml packet) |> allMatches
                 match selectors with
                 | NoMatch -> NotApplicable
-                | Unknown -> RuleUnknown
+                | Unknown ->
+                    if children |> List.exists (fun element ->
+                        List.contains element.Name.LocalName [ "drop"; "reject"; "forward-port" ]) then RuleUnknown
+                    else NotApplicable
                 | Match ->
                     let known =
-                        set [ "source"; "destination"; "service"; "port"; "source-port"; "protocol"; "icmp-type"
-                              "limit"; "log"; "nflog"; "audit"; "accept"; "drop"; "reject"; "mark"; "forward-port"; "masquerade" ]
+                        set [ "source"; "destination"; "service"; "port"; "source-port"; "protocol"; "icmp-type"; "icmp-block"
+                              "tcp-mss-clamp"; "limit"; "log"; "nflog"; "audit"; "accept"; "drop"; "reject"; "mark"; "forward-port"; "masquerade" ]
                     let allowedAttributes = function
                         | "source" -> set [ "address"; "ipset"; "mac"; "invert" ]
                         | "destination" -> set [ "address"; "ipset"; "invert" ]
                         | "service" -> set [ "name" ]
                         | "port" | "source-port" -> set [ "port"; "protocol" ]
                         | "protocol" -> set [ "value" ]
-                        | "icmp-type" -> set [ "name" ]
+                        | "icmp-type" | "icmp-block" -> set [ "name" ]
                         | "forward-port" -> set [ "port"; "protocol"; "to-port"; "to-addr" ]
+                        | "tcp-mss-clamp" -> set [ "value" ]
                         | "limit" -> set [ "value"; "burst" ]
                         | "log" -> set [ "prefix"; "level" ]
                         | "nflog" -> set [ "group"; "prefix"; "queue-size" ]
@@ -420,7 +517,6 @@ module Firewalld =
                         |> List.forall (fun child -> attributesAreAllowed (allowedAttributes child.Name.LocalName) child)
                     if children |> List.exists (fun element -> not (known.Contains element.Name.LocalName))
                        || nestedUnknown || not limitsValid || not attributesValid then RuleUnknown
-                    elif children |> List.exists (fun element -> element.Name = xn "masquerade") then RuleUnknown
                     else
                         let forwards =
                             if isInbound then children |> List.filter (fun element -> element.Name = xn "forward-port")
@@ -429,11 +525,52 @@ module Firewalld =
                         | Match -> RuleBlocks
                         | Unknown -> RuleUnknown
                         | NoMatch when children |> List.exists (fun element -> element.Name = xn "drop" || element.Name = xn "reject") -> RuleBlocks
-                        | NoMatch when children |> List.exists (fun element -> element.Name = xn "mark") -> RuleUnknown
                         | NoMatch when children |> List.exists (fun element -> element.Name = xn "accept") ->
-                            if not limits.IsEmpty then RuleUnknown else RuleAllows
+                            if not limits.IsEmpty then NotApplicable else RuleAllows
                         | _ -> NotApplicable
 
+    let private richRulePreRoutingResult serviceXml ipsetXml packet (rule: XElement) =
+        let children = rule.Elements() |> Seq.toList
+        let hasPreRoutingAction =
+            children |> List.exists (fun element -> element.Name = xn "forward-port" || element.Name = xn "mark")
+        if not hasPreRoutingAction then NotApplicable
+        else
+            match familyMatches (attr "family" rule) packet with
+            | NoMatch -> NotApplicable
+            | Unknown -> RuleUnknown
+            | Match when not (attributesAreAllowed (set [ "family"; "priority" ]) rule) -> RuleUnknown
+            | Match ->
+                let priorityValid =
+                    match attr "priority" rule with
+                    | None -> true
+                    | Some value ->
+                        match Int32.TryParse value with
+                        | true, priority -> priority >= -32768 && priority <= 32767
+                        | _ -> false
+                if not priorityValid then RuleUnknown
+                else
+                    let selectors =
+                        children
+                        |> List.filter (fun element ->
+                            List.contains element.Name.LocalName [ "source"; "destination"; "service"; "port"; "source-port"; "protocol"; "icmp-type" ])
+                        |> List.map (selectorMatches serviceXml ipsetXml packet)
+                        |> allMatches
+                    match selectors with
+                    | NoMatch -> NotApplicable
+                    | Unknown -> RuleUnknown
+                    | Match ->
+                        if children |> List.exists (fun element ->
+                            (element.Name = xn "mark" && not (attributesAreAllowed (set [ "set" ]) element))
+                            || (element.Name = xn "forward-port" && not (attributesAreAllowed (set [ "port"; "protocol"; "to-port"; "to-addr" ]) element))) then
+                            RuleUnknown
+                        else
+                            let forwards =
+                                children |> List.filter (fun element -> element.Name = xn "forward-port")
+                            match forwards |> List.map (forwardPortMatches packet) |> anyMatches with
+                            | Match -> RuleBlocks
+                            | Unknown -> RuleUnknown
+                            | NoMatch when children |> List.exists (fun element -> element.Name = xn "mark") -> RuleUnknown
+                            | _ -> NotApplicable
     let private interfaceMatches (configured: string) (actual: string) =
         if configured = "+" then true
         elif configured.EndsWith("+", StringComparison.Ordinal) then
@@ -441,19 +578,11 @@ module Firewalld =
         elif configured.Contains '+' then fail "Cannot resolve a non-suffix-plus firewalld interface selector."
         else configured = actual
 
-    let private zoneSourceMatches (ipsetXml: string -> string option) (address: IPAddress) (port: int) (zone: XElement) =
+    let private zoneSourceMatches (ipsetXml: string -> string option) (address: IPAddress) (zone: XElement) =
         zone.Elements(xn "source")
-        |> Seq.map (fun source -> addressSelectorMatches ipsetXml address port source)
+        |> Seq.map (fun source -> addressSelectorMatches ipsetXml address None source)
         |> Seq.toList
-
-    let private zonesBoundToSource ipsetXml address port (zones: Map<string, XElement>) =
-        zones
-        |> Map.toList
-        |> List.choose (fun (name, zone) ->
-            let results = zoneSourceMatches ipsetXml address port zone
-            if List.contains Unknown results then
-                fail "Cannot prove whether a firewalld source-bound zone matches the SSH peer."
-            if List.contains Match results then Some name else None)
+        |> anyMatches
 
     let private zonesBoundToInterface interfaceName (zones: Map<string, XElement>) =
         zones
@@ -465,14 +594,116 @@ module Firewalld =
                        fail "A firewalld interface binding has unknown attributes."
                    interfaceMatches (required "name" element) interfaceName) then Some name else None)
 
-    let private resolveZone (label: string) (defaultZone: string) (explicit: string list) (sourceBound: string list) =
-        if explicit.Length > 1 || sourceBound.Length > 1 then
-            fail ("SSH " + label + " matches multiple firewalld zones.")
-        match explicit, sourceBound with
-        | [ first ], [ second ] when first <> second -> fail ("SSH " + label + " interface/source zone assignment is ambiguous.")
-        | [ first ], _ -> first
-        | _, [ first ] -> first
-        | _ -> defaultZone
+    let private zonePriority priorityName (zone: XElement) =
+        match attr priorityName zone with
+        | None -> 0
+        | Some value ->
+            match Int32.TryParse value with
+            | true, priority when priority >= -32768 && priority <= 32767 -> priority
+            | _ -> fail "A firewalld zone has an invalid classification priority."
+
+    let private selectZoneCandidates priorityName names (zones: Map<string, XElement>) ndpMayBeNeeded =
+        let matching =
+            names
+            |> List.distinct
+            |> List.choose (fun name -> Map.tryFind name zones |> Option.map (fun zone -> name, zone))
+        match matching with
+        | [] -> []
+        | _ ->
+            let selectedPriority = matching |> List.map (fun (_, zone) -> zonePriority priorityName zone) |> List.min
+            matching
+            |> List.choose (fun (name, zone) ->
+                if zonePriority priorityName zone = selectedPriority then Some { Name = name; NdpMayBeNeeded = ndpMayBeNeeded }
+                else None)
+
+    let private mergeZoneCandidates candidates =
+        candidates
+        |> List.fold (fun merged candidate ->
+            match Map.tryFind candidate.Name merged with
+            | Some previous ->
+                Map.add candidate.Name { previous with NdpMayBeNeeded = previous.NdpMayBeNeeded || candidate.NdpMayBeNeeded } merged
+            | None -> Map.add candidate.Name candidate merged) Map.empty
+        |> Map.toList
+        |> List.map snd
+
+    let private interfaceCandidatePaths network defaultZone priorityName (zones: Map<string, XElement>) =
+        let candidatesFor iface =
+            let ndpPossible = isLayer2Interface network iface
+            let bound = zonesBoundToInterface iface zones
+            match selectZoneCandidates priorityName bound zones ndpPossible with
+            | [] -> [ { Name = defaultZone; NdpMayBeNeeded = ndpPossible } ]
+            | selected -> selected
+        match network.IngressInterfaces with
+        | Some interfaces ->
+            let paths = interfaces |> List.distinct |> List.map candidatesFor
+            if paths.IsEmpty then [ [ { Name = defaultZone; NdpMayBeNeeded = true } ] ] else paths
+        | None ->
+            let configured =
+                zones
+                |> Map.toList
+                |> List.collect (fun (_, zone) ->
+                    zone.Elements(xn "interface")
+                    |> Seq.map (required "name")
+                    |> Seq.toList)
+            let representatives =
+                configured
+                |> List.collect (fun selector ->
+                    if selector = "+" then [ "x" ]
+                    elif selector.EndsWith("+", StringComparison.Ordinal) then
+                        let prefix = selector.Substring(0, selector.Length - 1)
+                        [ prefix + "x"; prefix + "0" ] |> List.filter (fun value -> value.Length <= 15)
+                    else [ selector ])
+                |> List.distinct
+            let paths = representatives |> List.map candidatesFor
+            if List.contains "+" configured then paths
+            else paths @ [ [ { Name = defaultZone; NdpMayBeNeeded = true } ] ]
+
+    let private interfaceCandidates network defaultZone priorityName zones =
+        interfaceCandidatePaths network defaultZone priorityName zones
+        |> List.collect id
+        |> mergeZoneCandidates
+
+    let private classifyZoneCandidates priorityName (zones: Map<string, XElement>) sourceStatuses interfaceCandidates =
+        let definite = sourceStatuses |> List.choose (fun (name, result) -> if result = Match then Some name else None)
+        let uncertain = sourceStatuses |> List.choose (fun (name, result) -> if result = Unknown then Some name else None)
+        let sourceNdpMayBeNeeded = interfaceCandidates |> List.exists (fun candidate -> candidate.NdpMayBeNeeded)
+        let known =
+            (definite |> List.map (fun name -> name, 0, sourceNdpMayBeNeeded))
+            @ (interfaceCandidates |> List.map (fun candidate -> candidate.Name, 1, candidate.NdpMayBeNeeded))
+        let score (name, rank, _) = zonePriority priorityName zones[name], rank
+        match known with
+        | [] -> []
+        | _ ->
+            let best = known |> List.map score |> List.min
+            let winners =
+                known
+                |> List.choose (fun (name, rank, ndp) ->
+                    if score (name, rank, ndp) = best then Some { Name = name; NdpMayBeNeeded = ndp }
+                    else None)
+            let possibleSourceWinners =
+                uncertain
+                |> List.choose (fun name ->
+                    let candidateScore = zonePriority priorityName zones[name], 0
+                    if candidateScore <= best then Some { Name = name; NdpMayBeNeeded = sourceNdpMayBeNeeded }
+                    else None)
+            (winners @ possibleSourceWinners) |> mergeZoneCandidates
+
+    let private zoneSourceStatuses ipsetXml address (zones: Map<string, XElement>) =
+        zones
+        |> Map.toList
+        |> List.map (fun (name, zone) -> name, zoneSourceMatches ipsetXml address zone)
+
+    let private ingressZoneCandidates network defaultZone ipsetXml peer (zones: Map<string, XElement>) =
+        let sourceStatuses = zoneSourceStatuses ipsetXml peer zones
+        interfaceCandidatePaths network defaultZone "ingress-priority" zones
+        |> List.collect (classifyZoneCandidates "ingress-priority" zones sourceStatuses)
+        |> mergeZoneCandidates
+
+    let private egressZoneCandidates network defaultZone ipsetXml peer interfaceName (zones: Map<string, XElement>) =
+        let sourceStatuses = zoneSourceStatuses ipsetXml peer zones
+        interfaceCandidatePaths { network with IngressInterfaces = Some [ interfaceName ] } defaultZone "egress-priority" zones
+        |> List.collect (classifyZoneCandidates "egress-priority" zones sourceStatuses)
+        |> mergeZoneCandidates
 
     let private directAllows serviceXml ipsetXml packet (root: XElement) =
         root.Elements()
@@ -483,21 +714,70 @@ module Firewalld =
         |> Seq.toList
         |> anyMatches
 
-    let private zoneDecision isInbound serviceXml ipsetXml packet (zone: XElement) =
+    let private neighborSolicitationNames = set [ "neighbor-solicitation"; "neighbour-solicitation"; "nd-neighbor-solicit"; "nd-neighbor-solicitation" ]
+    let private neighborAdvertisementNames = set [ "neighbor-advertisement"; "neighbour-advertisement"; "nd-neighbor-advert"; "nd-neighbor-advertisement" ]
+    let private isNeighborDiscoveryType name =
+        Set.contains name neighborSolicitationNames || Set.contains name neighborAdvertisementNames
+
+    let private richRuleBlocksNeighborDiscovery packet ndpMayBeNeeded (rule: XElement) =
+        if not ndpMayBeNeeded
+           || packet.Source.AddressFamily <> System.Net.Sockets.AddressFamily.InterNetworkV6 then false
+        else
+            let children = rule.Elements() |> Seq.toList
+            let namedIcmp =
+                children
+                |> List.choose (fun child ->
+                    if child.Name = xn "icmp-type" || child.Name = xn "icmp-block" then attr "name" child
+                    else None)
+            let blocks =
+                children
+                |> List.exists (fun child ->
+                    List.contains child.Name.LocalName [ "icmp-block"; "drop"; "reject"; "mark"; "forward-port" ])
+            if not blocks || not (List.exists isNeighborDiscoveryType namedIcmp) then false
+            else
+                match familyMatches (attr "family" rule) packet with
+                | NoMatch -> false
+                | _ -> true
+
+    let private zoneBlocksNeighborDiscovery packet ndpMayBeNeeded (zone: XElement) =
+        if not ndpMayBeNeeded
+           || packet.Source.AddressFamily <> System.Net.Sockets.AddressFamily.InterNetworkV6 then false
+        else
+            let blocks =
+                zone.Elements(xn "icmp-block")
+                |> Seq.map (fun element ->
+                    if not (attributesAreAllowed (set [ "name" ]) element) then
+                        fail "A zone ICMP block has unknown attributes."
+                    required "name" element)
+                |> Set.ofSeq
+            let inversion =
+                match zone.Elements(xn "icmp-block-inversion") |> Seq.toList with
+                | [] -> false
+                | [ element ] ->
+                    if not (attributesAreAllowed Set.empty element) then fail "ICMP block inversion has unknown attributes."
+                    true
+                | _ -> fail "A zone has duplicate ICMP block inversion elements."
+            let explicitlyBlocked = blocks |> Set.exists isNeighborDiscoveryType
+            let inversionBlocksNdp =
+                inversion
+                && not
+                    (Set.exists (fun name -> Set.contains name blocks) neighborSolicitationNames
+                     && Set.exists (fun name -> Set.contains name blocks) neighborAdvertisementNames)
+            explicitlyBlocked || inversionBlocksNdp
+
+    let private zoneDecision isInbound ndpMayBeNeeded serviceXml ipsetXml packet (zone: XElement) =
         if not (attributesAreAllowed (set [ "version"; "target"; "ingress-priority"; "egress-priority" ]) zone) then
             fail "A zone has an unknown attribute that may affect the SSH path."
-        for priorityName in [ "ingress-priority"; "egress-priority" ] do
-            match attr priorityName zone with
-            | None -> ()
-            | Some value ->
-                match Int32.TryParse value with
-                | true, 0 -> ()
-                | _ -> fail "A non-default zone priority may alter the SSH path."
+        zonePriority "ingress-priority" zone |> ignore
+        zonePriority "egress-priority" zone |> ignore
         let known =
             set [ "short"; "description"; "interface"; "source"; "service"; "port"; "source-port"; "protocol"
                   "rule"; "forward-port"; "icmp-block"; "icmp-block-inversion"; "masquerade"; "forward" ]
         if zone.Elements() |> Seq.exists (fun element -> not (known.Contains element.Name.LocalName)) then
             fail "An unknown zone element may affect the SSH management path."
+        if zoneBlocksNeighborDiscovery packet ndpMayBeNeeded zone
+           || (zone.Elements(xn "rule") |> Seq.exists (richRuleBlocksNeighborDiscovery packet ndpMayBeNeeded)) then
+            fail "A firewalld zone may block IPv6 neighbor discovery needed by the SSH path."
         let rules = zone.Elements(xn "rule") |> Seq.map (richRuleResult serviceXml ipsetXml packet isInbound) |> Seq.toList
         if List.contains RuleBlocks rules then fail "A matching firewalld zone rule blocks or redirects the SSH connection."
         if List.contains RuleUnknown rules then fail "Cannot prove that a firewalld zone rule leaves the SSH connection unchanged."
@@ -512,8 +792,10 @@ module Firewalld =
         let target = attr "target" zone |> Option.defaultValue "default"
         if not (List.contains target [ "default"; "ACCEPT"; "DROP"; "REJECT"; "%%REJECT%%" ]) then
             fail "A zone has an unknown target."
-        target = "ACCEPT" || allowedDirectly || ruleAllows,
-        zone.Elements(xn "masquerade") |> Seq.isEmpty |> not
+        let explicitAllowed = allowedDirectly || ruleAllows
+        target = "ACCEPT" || explicitAllowed,
+        zone.Elements(xn "masquerade") |> Seq.isEmpty |> not,
+        explicitAllowed
 
     let private policyMatches (expected: string) (policy: XElement) (side: string) =
         policy.Elements(xn side)
@@ -523,26 +805,144 @@ module Firewalld =
             let name = required "name" element
             name = expected || (expected <> "HOST" && name = "ANY"))
 
-    let private policyDecision isInbound serviceXml ipsetXml packet sourceZone destinationZone policies =
-        let priorityOf (policy: XElement) =
-            match attr "priority" policy with
-            | Some value ->
-                match Int32.TryParse value with
-                | true, priority when priority <> 0 && priority >= -32768 && priority <= 32767 -> priority
-                | _ -> fail "A policy has an invalid priority."
-            | None -> -1
+    let private policyBlocksNeighborDiscovery packet ndpMayBeNeeded (policy: XElement) =
+        if not ndpMayBeNeeded
+           || packet.Source.AddressFamily <> System.Net.Sockets.AddressFamily.InterNetworkV6 then false
+        else
+            let directBlocks =
+                policy.Elements(xn "icmp-block")
+                |> Seq.map (fun element ->
+                    if not (attributesAreAllowed (set [ "name" ]) element) then
+                        fail "A policy ICMP block has unknown attributes."
+                    required "name" element)
+                |> Seq.exists isNeighborDiscoveryType
+            directBlocks
+            || (policy.Elements(xn "rule") |> Seq.exists (richRuleBlocksNeighborDiscovery packet ndpMayBeNeeded))
+
+    let private policyPriority (policy: XElement) =
+        match attr "priority" policy with
+        | Some value ->
+            match Int32.TryParse value with
+            | true, priority when priority <> 0 && priority >= -32768 && priority <= 32767 -> priority
+            | _ -> fail "A policy has an invalid priority."
+        | None -> -1
+
+    let private policyDecision zoneExplicitlyAllows serviceXml ipsetXml packet sourceZone policies =
         let relevant =
             policies
             |> Map.toList
             |> List.choose (fun (name, xml) ->
                 let policy = parseXml "policy" xml
-                if policyMatches sourceZone policy "ingress-zone" && policyMatches destinationZone policy "egress-zone" then Some(name, policy)
+                if policyMatches sourceZone policy "ingress-zone" && policyMatches "HOST" policy "egress-zone" then
+                    Some(name, policy, policyPriority policy)
                 else None)
-            |> List.choose (fun (name, policy) ->
-                let priority = priorityOf policy
-                if isInbound && priority > 0 then None else Some(name, policy, priority))
+            |> List.sortBy (fun (_, _, priority) -> priority)
         let mutable allows = false
         for _, policy, priority in relevant do
+            let alreadyAcceptedByZone = zoneExplicitlyAllows && priority > 0
+            if not alreadyAcceptedByZone then
+                if not (attributesAreAllowed (set [ "version"; "target"; "priority" ]) policy) then
+                    fail "A policy has an unknown attribute that may affect SSH."
+                let known =
+                    set [ "short"; "description"; "ingress-zone"; "egress-zone"; "service"; "port"; "source-port"; "protocol"
+                          "rule"; "forward-port"; "masquerade"; "icmp-block"; "icmp-block-inversion"; "priority" ]
+                if policy.Elements() |> Seq.exists (fun element -> not (known.Contains element.Name.LocalName)) then
+                    fail "An unknown policy element may affect the SSH management path."
+                let rules = policy.Elements(xn "rule") |> Seq.map (richRuleResult serviceXml ipsetXml packet true) |> Seq.toList
+                if List.contains RuleBlocks rules then fail "A matching host policy blocks or redirects the SSH connection."
+                if List.contains RuleUnknown rules then fail "Cannot prove that a host policy leaves the SSH connection unchanged."
+                let forwards = policy.Elements(xn "forward-port") |> Seq.map (forwardPortMatches packet) |> Seq.toList
+                if List.contains Match forwards then fail "A host policy forward-port can redirect the SSH connection."
+                if List.contains Unknown forwards then fail "Cannot prove that a host policy forward-port is disjoint from SSH."
+                let direct = directAllows serviceXml ipsetXml packet policy = Match
+                let ruleAllows = List.contains RuleAllows rules
+                let target = attr "target" policy |> Option.defaultValue "CONTINUE"
+                let policyAllows = target = "ACCEPT" || direct || ruleAllows
+                if target = "DROP" || target = "REJECT" then
+                    if not direct && not ruleAllows then fail "A matching host policy denies the SSH connection."
+                elif target <> "ACCEPT" && target <> "CONTINUE" then fail "A host policy has an unknown target."
+                if policyAllows then allows <- true
+        allows
+
+    let private richRuleAllowsNeighborDiscovery packet ndpMayBeNeeded (rule: XElement) =
+        if not ndpMayBeNeeded
+           || packet.Source.AddressFamily <> System.Net.Sockets.AddressFamily.InterNetworkV6 then false
+        else
+            let children = rule.Elements() |> Seq.toList
+            let namedIcmp =
+                children
+                |> List.exists (fun child ->
+                    (child.Name = xn "icmp-type" || child.Name = xn "icmp-block")
+                    && (attr "name" child |> Option.exists isNeighborDiscoveryType))
+            let onlyIcmpSelector =
+                children
+                |> List.forall (fun child -> child.Name = xn "icmp-type" || child.Name = xn "accept")
+            let limited = children |> List.exists (fun child -> child.Descendants(xn "limit") |> Seq.isEmpty |> not)
+            let accepts = children |> List.exists (fun child -> child.Name = xn "accept")
+            namedIcmp && onlyIcmpSelector && accepts && not limited
+            && familyMatches (attr "family" rule) packet = Match
+
+    let private policyNdpDecision packet ndpMayBeNeeded ingressZone egressZone policies =
+        if not ndpMayBeNeeded || packet.Source.AddressFamily <> System.Net.Sockets.AddressFamily.InterNetworkV6 then
+            NdpUndecided
+        else
+            let relevant =
+                policies
+                |> Map.toList
+                |> List.choose (fun (_, xml) ->
+                    let policy = parseXml "policy" xml
+                    if policyMatches ingressZone policy "ingress-zone" && policyMatches egressZone policy "egress-zone" then
+                        Some(policy, policyPriority policy)
+                    else None)
+                |> List.sortBy snd
+            let mutable decision = NdpUndecided
+            for policy, _ in relevant do
+                if decision = NdpUndecided then
+                    if not (attributesAreAllowed (set [ "version"; "target"; "priority" ]) policy) then
+                        fail "A policy has an unknown attribute that may affect IPv6 neighbor discovery."
+                    if policyBlocksNeighborDiscovery packet ndpMayBeNeeded policy then
+                        decision <- NdpBlocked
+                    else
+                        let target = attr "target" policy |> Option.defaultValue "CONTINUE"
+                        let allows =
+                            target = "ACCEPT"
+                            || (policy.Elements(xn "rule")
+                                |> Seq.exists (richRuleAllowsNeighborDiscovery packet ndpMayBeNeeded))
+                        if allows then decision <- NdpAllowed
+                        elif target = "DROP" || target = "REJECT" then decision <- NdpBlocked
+                        elif target <> "CONTINUE" then
+                            fail "A host policy has an unknown IPv6 neighbor-discovery target."
+            decision
+
+
+    let private policyHasPreroutingEgress packet ipsetXml (zones: Map<string, XElement>) (policy: XElement) =
+        let ingressIsAny = policyMatches "ANY" policy "ingress-zone"
+        policy.Elements(xn "egress-zone")
+        |> Seq.exists (fun element ->
+            if not (attributesAreAllowed (set [ "name" ]) element) then
+                fail "A policy egress selector has unknown attributes."
+            let name = required "name" element
+            if name = "ANY" then true
+            elif name = "HOST" then ingressIsAny
+            else
+                let zone =
+                    zones |> Map.tryFind name |> Option.defaultWith (fun () -> fail ("Policy egress zone is missing: " + name))
+                if zone.Elements(xn "interface") |> Seq.isEmpty |> not then false
+                elif zone.Elements(xn "source") |> Seq.isEmpty then true
+                else zoneSourceMatches ipsetXml packet.Destination zone <> NoMatch)
+
+    let private policyPreRoutingDecision serviceXml ipsetXml packet sourceZone zones policies =
+        let relevant =
+            policies
+            |> Map.toList
+            |> List.choose (fun (name, xml) ->
+                let policy = parseXml "policy" xml
+                if policyMatches sourceZone policy "ingress-zone"
+                   && policyHasPreroutingEgress packet ipsetXml zones policy then
+                    Some(name, policy, policyPriority policy)
+                else None)
+            |> List.sortBy (fun (_, _, priority) -> priority)
+        for _, policy, _ in relevant do
             if not (attributesAreAllowed (set [ "version"; "target"; "priority" ]) policy) then
                 fail "A policy has an unknown attribute that may affect SSH."
             let known =
@@ -550,57 +950,55 @@ module Firewalld =
                       "rule"; "forward-port"; "masquerade"; "icmp-block"; "icmp-block-inversion"; "priority" ]
             if policy.Elements() |> Seq.exists (fun element -> not (known.Contains element.Name.LocalName)) then
                 fail "An unknown policy element may affect the SSH management path."
-            let rules = policy.Elements(xn "rule") |> Seq.map (richRuleResult serviceXml ipsetXml packet isInbound) |> Seq.toList
-            if List.contains RuleBlocks rules then fail "A matching host policy blocks or redirects the SSH connection."
-            if List.contains RuleUnknown rules then fail "Cannot prove that a host policy leaves the SSH connection unchanged."
-            let forwards =
-                if isInbound then policy.Elements(xn "forward-port") |> Seq.map (forwardPortMatches packet) |> Seq.toList
-                else []
+            let forwards = policy.Elements(xn "forward-port") |> Seq.map (forwardPortMatches packet) |> Seq.toList
             if List.contains Match forwards then fail "A host policy forward-port can redirect the SSH connection."
             if List.contains Unknown forwards then fail "Cannot prove that a host policy forward-port is disjoint from SSH."
-            let direct = directAllows serviceXml ipsetXml packet policy = Match
-            let ruleAllows = List.contains RuleAllows rules
-            let target = attr "target" policy |> Option.defaultValue "CONTINUE"
-            let policyAllows = target = "ACCEPT" || direct || ruleAllows
-            if target = "DROP" || target = "REJECT" then
-                if not direct && not ruleAllows then fail "A matching host policy denies the SSH connection."
-            elif target <> "ACCEPT" && target <> "CONTINUE" then fail "A host policy has an unknown target."
-            if policyAllows && (not isInbound || priority < 0) then allows <- true
-            if not isInbound && (policy.Elements(xn "masquerade") |> Seq.isEmpty |> not) then
-                fail "A host policy may masquerade the SSH reply."
-        allows
-
-
-    let private validateSshState context defaultZone zones policies ipsetXml serviceXml =
+            let rules = policy.Elements(xn "rule") |> Seq.map (richRulePreRoutingResult serviceXml ipsetXml packet) |> Seq.toList
+            if List.contains RuleBlocks rules then fail "A matching policy DNAT can redirect the SSH connection."
+            if List.contains RuleUnknown rules then fail "Cannot prove that a policy PREROUTING mark or DNAT leaves SSH unchanged."
+    let private validateSshState network context defaultZone zones policies ipsetXml serviceXml =
         let peer, local = IPAddress.Parse context.Peer, IPAddress.Parse context.Local
         let inbound =
-            { Source = peer; SourcePort = context.PeerPort
-              Destination = local; DestinationPort = context.Port }
+            { Source = peer; SourcePort = None
+              Destination = local; DestinationPort = Some context.Port }
         let outbound =
-            { Source = local; SourcePort = context.Port
-              Destination = peer; DestinationPort = context.PeerPort }
+            { Source = local; SourcePort = Some context.Port
+              Destination = peer; DestinationPort = None }
         let parsedZones = zones |> Map.map (fun _ xml -> parseXml "zone" xml)
-        let sourceZones = zonesBoundToSource ipsetXml inbound.Source inbound.SourcePort parsedZones
-        let ingressZone = resolveZone "ingress" defaultZone (zonesBoundToInterface context.Interface parsedZones) sourceZones
-        let replySourceZones = zonesBoundToSource ipsetXml outbound.Destination outbound.DestinationPort parsedZones
-        let egressZone = resolveZone "reply" defaultZone (zonesBoundToInterface context.Interface parsedZones) replySourceZones
-        let ingress =
-            parsedZones |> Map.tryFind ingressZone |> Option.defaultWith (fun () -> fail ("SSH ingress zone is missing: " + ingressZone))
-        parsedZones |> Map.tryFind egressZone |> Option.defaultWith (fun () -> fail ("SSH reply zone is missing: " + egressZone)) |> ignore
-        let inboundAllowed, _ = zoneDecision true serviceXml ipsetXml inbound ingress
-        let inboundPolicyAllowed = policyDecision true serviceXml ipsetXml inbound ingressZone "HOST" policies
-        if not inboundAllowed && not inboundPolicyAllowed then
-            fail ("Final zone " + ingressZone + " and its host policies do not allow current SSH port " + string context.Port + "/tcp; refusing mutation.")
-        policyDecision false serviceXml ipsetXml outbound "HOST" egressZone policies |> ignore
-        ingressZone, egressZone
+        let ingressCandidates = ingressZoneCandidates network defaultZone ipsetXml inbound.Source parsedZones
+        let egressCandidates = egressZoneCandidates network defaultZone ipsetXml outbound.Destination context.Interface parsedZones
+        for candidate in ingressCandidates do
+            let ingress =
+                parsedZones |> Map.tryFind candidate.Name |> Option.defaultWith (fun () -> fail ("SSH ingress zone is missing: " + candidate.Name))
+            let ndpPolicy = policyNdpDecision inbound candidate.NdpMayBeNeeded candidate.Name "HOST" policies
+            if ndpPolicy = NdpBlocked then
+                fail "A host policy may block IPv6 neighbor discovery needed by the SSH path."
+            let ndpMayBeNeeded = candidate.NdpMayBeNeeded && ndpPolicy <> NdpAllowed
+            let inboundAllowed, _, zoneExplicitlyAllows =
+                zoneDecision true ndpMayBeNeeded serviceXml ipsetXml inbound ingress
+            let inboundPolicyAllowed =
+                policyDecision zoneExplicitlyAllows serviceXml ipsetXml inbound candidate.Name policies
+            policyPreRoutingDecision serviceXml ipsetXml inbound candidate.Name parsedZones policies
+            if not inboundAllowed && not inboundPolicyAllowed then
+                fail ("Final zone " + candidate.Name + " and its host policies do not allow current SSH port " + string context.Port + "/tcp; refusing mutation.")
+        for candidate in egressCandidates do
+            let egress =
+                parsedZones |> Map.tryFind candidate.Name |> Option.defaultWith (fun () -> fail ("SSH reply zone is missing: " + candidate.Name))
+            let ndpPolicy = policyNdpDecision outbound candidate.NdpMayBeNeeded "HOST" candidate.Name policies
+            if ndpPolicy = NdpBlocked then
+                fail "A host egress policy may block IPv6 neighbor discovery needed by the SSH path."
+            if zoneBlocksNeighborDiscovery outbound (candidate.NdpMayBeNeeded && ndpPolicy <> NdpAllowed) egress then
+                fail "A firewalld reply zone may block IPv6 neighbor discovery needed by the SSH path."
+        ingressCandidates, egressCandidates
 
     let validateSshGuardWithDefinitions context defaultZone zones policies ipsets services =
-        validateSshState context defaultZone zones policies (fun name -> Map.tryFind name ipsets) (fun name -> Map.tryFind name services)
+        validateSshState unknownSshNetwork context defaultZone zones policies (fun name -> Map.tryFind name ipsets) (fun name -> Map.tryFind name services)
         |> ignore
 
     /// Pure guard over final permanent definitions. Unrelated source bindings and host policies are ignored only when disjoint.
     let validateSshGuard context defaultZone zones policies serviceXml =
-        validateSshState context defaultZone zones policies (fun _ -> None) serviceXml |> ignore
+        validateSshState unknownSshNetwork context defaultZone zones policies (fun _ -> None) serviceXml |> ignore
+
 
     let rec private runtimeElementToXml (element: FirewalldModel.Element) : XElement =
         let result = XElement(xn element.Name)
@@ -610,7 +1008,7 @@ module Firewalld =
         result
 
     let private richRuleGroups =
-        set [ "source"; "destination"; "service"; "port"; "source-port"; "protocol"; "icmp-type"
+        set [ "source"; "destination"; "service"; "port"; "source-port"; "protocol"; "icmp-type"; "icmp-block"; "tcp-mss-clamp"
               "limit"; "log"; "nflog"; "audit"; "accept"; "drop"; "reject"; "mark"; "forward-port"; "masquerade" ]
 
     let private tokenizeRichRule (text: string) =
@@ -725,7 +1123,7 @@ module Firewalld =
             |> Option.defaultWith (fun () -> fail ("Cannot enumerate runtime firewalld " + kind + " objects."))
         names
         |> List.map (fun name ->
-            FirewalldModel.token ("runtime " + kind) (if kind = "zone" then 17 else 128) name |> ignore
+            FirewalldModel.nativeReference kind ("runtime " + kind) name |> ignore
             let snapshot =
                 FirewalldRuntime.inspectRuntime environment kind name
                 |> Option.defaultWith (fun () -> fail ("Cannot inspect runtime firewalld " + kind + ": " + name))
@@ -747,6 +1145,92 @@ module Firewalld =
             Some(root.ToString(SaveOptions.DisableFormatting))
         | _ -> None
 
+    let private tryIpSetShape xml =
+        try
+            let root = parseXml "ipset" xml
+            let setType = attr "type" root |> Option.defaultValue ""
+            let optionNodes = root.Elements(xn "option") |> Seq.toList
+            let options =
+                optionNodes
+                |> List.choose (fun option ->
+                    match attr "name" option, attr "value" option with
+                    | Some name, Some value when attributesAreAllowed (set [ "name"; "value" ]) option && option.IsEmpty ->
+                        Some(name, value)
+                    | _ -> None)
+            let entries =
+                root.Elements(xn "entry")
+                |> Seq.map (fun entry -> entry.Value.Trim())
+                |> Seq.toList
+            if setType = "" || options.Length <> optionNodes.Length
+               || (options |> List.countBy fst |> List.exists (fun (_, count) -> count > 1)) then None
+            else Some(setType, Set.ofList options, entries)
+        with _ -> None
+
+    let private mergeRuntimeIpSetEntries candidate runtime =
+        match candidate, runtime with
+        | None, None -> None
+        | Some permanent, None -> Some permanent
+        | None, Some live -> Some live
+        | Some permanent, Some live ->
+            match tryIpSetShape permanent, tryIpSetShape live with
+            | Some(permanentType, permanentOptions, _), Some(liveType, liveOptions, liveEntries)
+                when permanentType = liveType && permanentOptions = liveOptions ->
+                let root = parseXml "ipset" permanent
+                let permanentEntries =
+                    root.Elements(xn "entry")
+                    |> Seq.map (fun entry -> entry.Value.Trim())
+                    |> Set.ofSeq
+                for entry in liveEntries do
+                    if not (Set.contains entry permanentEntries) then root.Add(XElement(xn "entry", entry))
+                Some(root.ToString(SaveOptions.DisableFormatting))
+            | _ -> None
+
+    let private runtimeServiceXml (environment: HostEnvironment) name =
+        match FirewalldRuntime.inspectRuntime environment "service" name with
+        | Some snapshot when snapshot.UnknownFields.IsEmpty ->
+            try
+                let values key =
+                    snapshot.NativeFields[key] |> Seq.collect (fun text -> text.Split([| ' '; '\t' |], StringSplitOptions.RemoveEmptyEntries))
+                let root = XElement(xn "service")
+                for field, tag in [ "ports", "port"; "source-ports", "source-port" ] do
+                    for value in values field do
+                        let port = FirewalldModel.port value
+                        let separator = port.IndexOf('/')
+                        root.Add(XElement(xn tag, XAttribute(xn "port", port.Substring(0, separator)), XAttribute(xn "protocol", port.Substring(separator + 1))))
+                for field, tag, key in [ "protocols", "protocol", "value"; "includes", "include", "service"
+                                         "modules", "module", "name"; "helpers", "helper", "name" ] do
+                    for value in values field do root.Add(XElement(xn tag, XAttribute(xn key, value)))
+                let destination = XElement(xn "destination")
+                for value in values "destination" do
+                    let separator = value.IndexOf(':')
+                    if separator < 1 then fail "Malformed runtime service destination."
+                    let family = value.Substring(0, separator)
+                    if (family <> "ipv4" && family <> "ipv6") || not (isNull (destination.Attribute(xn family))) then
+                        fail "Unknown or duplicate runtime service destination."
+                    destination.SetAttributeValue(xn family, value.Substring(separator + 1))
+                if destination.HasAttributes then root.Add destination
+                Some(root.ToString(SaveOptions.DisableFormatting))
+            with _ -> None
+        | _ -> None
+
+    let private referencedIpSets zones policies =
+        let collect kind objects =
+            objects
+            |> Map.toList
+            |> List.collect (fun (_, xml) ->
+                (parseXml kind xml).DescendantsAndSelf()
+                |> Seq.choose (attr "ipset")
+                |> Seq.toList)
+            |> Set.ofList
+        Set.union (collect "zone" zones) (collect "policy" policies)
+
+    let private runtimeIpSetNames (environment: HostEnvironment) =
+        let result = environment.Run "firewall-cmd" [ "--get-ipsets" ] None
+        if result.ExitCode <> 0 then fail "Cannot enumerate runtime firewalld ipsets for the retained-entry guard."
+        result.Stdout.Split([| ' '; '\t'; '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
+        |> Array.map (FirewalldModel.nativeReference "ipset" "runtime ipset")
+        |> Set.ofArray
+
     let private checkRuntimeFilters kind names (snapshots: Map<string, FirewalldRuntime.RuntimeSnapshot>) =
         for name in names do
             let snapshot = snapshots |> Map.tryFind name |> Option.defaultWith (fun () -> fail ("Runtime firewalld " + kind + " is missing: " + name))
@@ -763,6 +1247,7 @@ module Firewalld =
 
     let private validateRuntimeBinding
         (environment: HostEnvironment)
+        network
         context
         runtimeDefaultZone
         finalDefaultZone
@@ -773,48 +1258,91 @@ module Firewalld =
         ipsets
         services
         =
-        validateSshState context finalDefaultZone zones policies (fun name -> Map.tryFind name ipsets) (fun name -> Map.tryFind name services)
+        validateSshState network context finalDefaultZone zones policies (fun name -> Map.tryFind name ipsets) (fun name -> Map.tryFind name services)
         |> ignore
-        if runtimeInterfaceBound then
-            if not (Map.containsKey runtimeZone zones) then
-                fail "SSH runtime zone is absent from final permanent configuration; reconcile the runtime binding before applying."
-            let runtimeBound =
-                zones |> Map.map (fun name xml ->
-                    let root = parseXml "zone" xml
-                    root.Elements(xn "interface")
-                    |> Seq.filter (fun element -> interfaceMatches (required "name" element) context.Interface)
-                    |> Seq.toArray |> Array.iter (fun element -> element.Remove())
-                    if name = runtimeZone then
-                        root.Add(XElement(xn "interface", XAttribute(xn "name", context.Interface)))
-                    root.ToString(SaveOptions.DisableFormatting))
-            validateSshState context finalDefaultZone runtimeBound policies (fun name -> Map.tryFind name ipsets) (fun name -> Map.tryFind name services)
+        let runtimeBound =
+            if not runtimeInterfaceBound then None
+            else
+                if not (Map.containsKey runtimeZone zones) then
+                    fail "SSH runtime zone is absent from final permanent configuration; reconcile the runtime binding before applying."
+                let bound =
+                    zones |> Map.map (fun name xml ->
+                        let root = parseXml "zone" xml
+                        root.Elements(xn "interface")
+                        |> Seq.filter (fun element -> interfaceMatches (required "name" element) context.Interface)
+                        |> Seq.toArray |> Array.iter (fun element -> element.Remove())
+                        if name = runtimeZone then
+                            root.Add(XElement(xn "interface", XAttribute(xn "name", context.Interface)))
+                        root.ToString(SaveOptions.DisableFormatting))
+                validateSshState network context finalDefaultZone bound policies (fun name -> Map.tryFind name ipsets) (fun name -> Map.tryFind name services)
+                |> ignore
+                Some bound
+        // 2.3.1 decides retention using the PRE-reload in-memory value.
+        // A file edit is not evidence of that value. Prove both the clean
+        // candidate (above) and the candidate combined with surviving members.
+        let referenced = referencedIpSets zones policies
+        if not referenced.IsEmpty then
+            let runtimeNames = runtimeIpSetNames environment
+            let retainedResolver name =
+                let candidate = Map.tryFind name ipsets
+                if Set.contains name runtimeNames then
+                    match runtimeIpSetXml environment name with
+                    | Some live -> mergeRuntimeIpSetEntries candidate (Some live)
+                    | None -> None
+                else candidate
+            validateSshState network context finalDefaultZone zones policies retainedResolver (fun name -> Map.tryFind name services)
             |> ignore
+            runtimeBound
+            |> Option.iter (fun bound ->
+                validateSshState network context finalDefaultZone bound policies retainedResolver (fun name -> Map.tryFind name services)
+                |> ignore)
 
         let zoneSnapshots = runtimeSnapshots environment "zone"
         let policySnapshots = runtimeSnapshots environment "policy"
         let runtimeZones = zoneSnapshots |> Map.map (fun _ snapshot -> runtimeSnapshotXml snapshot)
         let runtimePolicies = policySnapshots |> Map.map (fun _ snapshot -> runtimeSnapshotXml snapshot)
-        let runtimeServices = fun name -> Map.tryFind name services
-        let runtimeIngressZone, egressZone =
-            validateSshState context runtimeDefaultZone runtimeZones runtimePolicies (runtimeIpSetXml environment) runtimeServices
+        let runtimeIngressCandidates, runtimeEgressCandidates =
+            validateSshState network context runtimeDefaultZone runtimeZones runtimePolicies (runtimeIpSetXml environment) (runtimeServiceXml environment)
         let runtimeParsedZones = runtimeZones |> Map.map (fun _ xml -> parseXml "zone" xml)
         let interfaceZones = zonesBoundToInterface context.Interface runtimeParsedZones
-        match runtimeInterfaceBound, interfaceZones with
+        let selectedInterfaceZones =
+            selectZoneCandidates "egress-priority" interfaceZones runtimeParsedZones (isLayer2Interface network context.Interface)
+            |> List.map (fun candidate -> candidate.Name)
+        match runtimeInterfaceBound, selectedInterfaceZones with
         | false, [] -> ()
         | true, [ name ] when name = runtimeZone -> ()
         | false, _ -> fail "Runtime interface selectors disagree with firewall-cmd's unbound observation."
         | true, _ -> fail "Runtime interface selectors disagree with firewall-cmd's zone observation."
-        let selectedZones = [ runtimeIngressZone; egressZone ] |> List.distinct
+        let selectedZones =
+            (runtimeIngressCandidates @ runtimeEgressCandidates)
+            |> List.map (fun candidate -> candidate.Name)
+            |> List.distinct
         checkRuntimeFilters "zone" selectedZones zoneSnapshots
+        let ingressNames = runtimeIngressCandidates |> List.map (fun candidate -> candidate.Name)
+        let egressNames = runtimeEgressCandidates |> List.map (fun candidate -> candidate.Name)
         let relevantPolicies =
             policySnapshots
             |> Map.toList
             |> List.choose (fun (name, snapshot) ->
                 let policy = parseXml "policy" (runtimeSnapshotXml snapshot)
-                if (policyMatches runtimeIngressZone policy "ingress-zone" && policyMatches "HOST" policy "egress-zone")
-                   || (policyMatches "HOST" policy "ingress-zone" && policyMatches egressZone policy "egress-zone") then Some name
-                else None)
+                let inboundHost =
+                    ingressNames
+                    |> List.exists (fun ingress ->
+                        policyMatches ingress policy "ingress-zone" && policyMatches "HOST" policy "egress-zone")
+                let inboundAny =
+                    ingressNames
+                    |> List.exists (fun ingress ->
+                        policyMatches ingress policy "ingress-zone" && policyMatches "ANY" policy "egress-zone")
+                let outbound =
+                    egressNames
+                    |> List.exists (fun egress ->
+                        policyMatches "HOST" policy "ingress-zone" && policyMatches egress policy "egress-zone")
+                if inboundHost || inboundAny || outbound then Some name else None)
         checkRuntimeFilters "policy" relevantPolicies policySnapshots
+        { CandidateZones = zones
+          CandidatePolicies = policies
+          RuntimeZones = runtimeZones
+          RuntimePolicies = runtimePolicies }
 
     let private diagnostic (text: string) =
         if isNull text then ""
@@ -860,7 +1388,7 @@ module Firewalld =
         if unbound then defaultZone, false
         else
             let name = checkedCommandResult "firewall-cmd" arguments result
-            FirewalldModel.token "runtime zone" 17 name, true
+            FirewalldModel.nativeReference "zone" "runtime zone" name, true
 
     let private firewall environment arguments = command environment "firewall-cmd" arguments
 
@@ -901,19 +1429,6 @@ module Firewalld =
         | Some xml -> Some xml
         | None -> readFile environment (objectPath "/usr/lib/firewalld" kind name)
 
-    let private inventory environment kind =
-        [ "/usr/lib/firewalld"; "/etc/firewalld" ]
-        |> List.fold (fun result prefix ->
-            let directory = path environment (prefix + "/" + category kind)
-            if not (Directory.Exists directory) then result
-            else
-                regularPath environment (prefix + "/" + category kind) |> ignore
-                Directory.EnumerateFiles(directory, "*.xml")
-                |> Seq.fold (fun state file ->
-                    let name = Path.GetFileNameWithoutExtension file
-                    FirewalldModel.token kind (if kind = "zone" then 17 else 128) name |> ignore
-                    let logical = objectPath prefix kind name
-                    match readFile environment logical with Some xml -> Map.add name xml state | None -> state) result) Map.empty
     let ensureNoSplitZones (environment: HostEnvironment) =
         for prefix in [ "/usr/lib/firewalld"; "/etc/firewalld" ] do
             let logical = prefix + "/zones"
@@ -954,11 +1469,30 @@ module Firewalld =
                 let journal = JsonNode.Parse(text).AsObject()
                 let keys = journal |> Seq.map (fun pair -> pair.Key) |> Set.ofSeq
                 let required = set [ "version"; "ownerId"; "baseline"; "managed"; "pending" ]
-                let allowed = Set.union required (set [ "baselineMode"; "managedMode"; "deleteOnConfirm" ])
+                let settingsFields = set [ "settingsScopeVersion"; "settingsActivation" ]
+                let allowed =
+                    Set.union required
+                        (set [ "baselineMode"; "managedMode"; "deleteOnConfirm" ] |> Set.union settingsFields)
                 if not (Set.isSubset required keys) || not (Set.isSubset keys allowed)
                    || journal["version"].GetValue<int>() <> 1
                    || getString journal "ownerId" <> owner then
                     fail "Firewalld object is owned by another resource or its journal is invalid."
+                if c.Kind = "settings" then
+                    if journal.ContainsKey "settingsScopeVersion"
+                       && journal["settingsScopeVersion"].GetValue<int>() <> 1 then
+                        fail "Unsupported firewalld settings journal scope version."
+                    if journal.ContainsKey "settingsActivation" then
+                        match journal["settingsActivation"] with
+                        | :? JsonObject as proof ->
+                            let proofKeys = proof |> Seq.map (fun pair -> pair.Key) |> Set.ofSeq
+                            let legacyKeys = set [ "version"; "key"; "value"; "source" ]
+                            let currentKeys = set [ "version"; "key"; "value"; "source"; "generation" ]
+                            if (proofKeys <> legacyKeys && proofKeys <> currentKeys)
+                               || proof["version"].GetValue<int>() <> 1 then
+                                fail "Invalid firewalld settings activation receipt."
+                        | _ -> fail "Invalid firewalld settings activation receipt."
+                elif settingsFields |> Seq.exists journal.ContainsKey then
+                    fail "Settings ownership metadata is attached to a non-settings firewalld journal."
                 optionalString journal "baseline" |> ignore
                 optionalString journal "managed" |> ignore
                 Some journal
@@ -1011,44 +1545,11 @@ module Firewalld =
           Helpers: Map<string, string>
           DefaultZone: string }
 
-    let private definitionFolder kind =
-        match kind with
-        | "zone" -> "zones"
-        | "policy" -> "policies"
-        | "service" -> "services"
-        | "ipset" -> "ipsets"
-        | "icmptype" -> "icmptypes"
-        | "helper" -> "helpers"
-        | _ -> fail ("Unsupported firewalld definition kind: " + kind)
-
-    let private definitionPath prefix kind name =
-        prefix + "/" + definitionFolder kind + "/" + name + ".xml"
-
-    let private validateDefinitionName kind (name: string) =
-        let maxLength, allowed, disallowDots =
-            match kind with
-            | "zone" -> 17, set [ '_'; '-'; '.' ], true
-            | "policy" -> 18, set [ '_'; '-'; '.' ], true
-            | "service" | "icmptype" -> 128, set [ '_'; '-' ], false
-            | "ipset" -> 32, set [ '_'; '-'; ':'; '.' ], false
-            | "helper" -> 128, set [ '-'; '.' ], false
-            | _ -> fail ("Unsupported firewalld definition kind: " + kind)
-        if String.IsNullOrEmpty name || name.Length > maxLength
-           || not (Char.IsAsciiLetterOrDigit name[0])
-           || not (name |> Seq.forall (fun character -> Char.IsAsciiLetterOrDigit character || Set.contains character allowed))
-           || (disallowDots && name.Contains '.') then
-            fail ("Invalid firewalld " + kind + " name.")
-        name
-
-    let private readDefinition environment prefix kind name =
-        validateDefinitionName kind name |> ignore
-        readFile environment (definitionPath prefix kind name)
-
     let private definitionInventory environment kind =
         if kind = "zone" then ensureNoSplitZones environment
         [ "/usr/lib/firewalld"; "/etc/firewalld" ]
         |> List.fold (fun result prefix ->
-            let logicalDirectory = prefix + "/" + definitionFolder kind
+            let logicalDirectory = prefix + "/" + category kind
             let directory = path environment logicalDirectory
             if not (Directory.Exists directory) then result
             else
@@ -1056,13 +1557,13 @@ module Firewalld =
                 Directory.EnumerateFiles(directory, "*.xml")
                 |> Seq.fold (fun state file ->
                     let name = Path.GetFileNameWithoutExtension file
-                    validateDefinitionName kind name |> ignore
-                    match readDefinition environment prefix kind name with
+                    FirewalldModel.nativeReference kind "inventory object" name |> ignore
+                    match readFile environment (objectPath prefix kind name) with
                     | Some xml -> Map.add name xml state
                     | None -> state) result)
             Map.empty
 
-    let private configuredDefaultZone etcContents vendorContents =
+    let private configuredDefaultZone etcContents =
         let parse (text: string option) =
             match text with
             | None -> None
@@ -1082,15 +1583,15 @@ module Firewalld =
                             else None)
                 match values with
                 | [||] -> None
-                | [| value |] -> Some(FirewalldModel.token "default zone" 17 value)
+                | [| value |] -> Some(FirewalldModel.nativeReference "zone" "default zone" value)
                 | _ -> fail "Duplicate DefaultZone settings in firewalld.conf."
-        parse etcContents |> Option.orElse (parse vendorContents) |> Option.defaultValue "public"
+        parse etcContents |> Option.defaultValue "public"
 
     let private updateDefinition environment kind name proposed values =
         match proposed with
         | Some xml -> Map.add name xml values
         | None ->
-            match readDefinition environment "/usr/lib/firewalld" kind name with
+            match readFile environment (objectPath "/usr/lib/firewalld" kind name) with
             | Some vendor -> Map.add name vendor values
             | None -> Map.remove name values
 
@@ -1108,14 +1609,13 @@ module Firewalld =
         let icmpTypes = if c.Kind = "icmptype" then updateDefinition environment c.Kind c.Name proposed icmpTypes else icmpTypes
         let helpers = if c.Kind = "helper" then updateDefinition environment c.Kind c.Name proposed helpers else helpers
         let etcConfig = readFile environment "/etc/firewalld/firewalld.conf"
-        let vendorConfig = readFile environment "/usr/lib/firewalld/firewalld.conf"
         let settingsKey = if c.Kind = "settings" then FirewalldModel.settingKey c else ""
         let candidateConfig =
             if c.Kind = "settings" && settingsKey = "DefaultZone" then proposed
             else etcConfig
         { Zones = zones; Policies = policies; Services = services; IpSets = ipsets
           IcmpTypes = icmpTypes; Helpers = helpers
-          DefaultZone = configuredDefaultZone candidateConfig vendorConfig }
+          DefaultZone = configuredDefaultZone candidateConfig }
 
     let guardMutation (environment: HostEnvironment) (c: FirewalldModel.Configuration) (proposed: string option) =
         let connection = Environment.GetEnvironmentVariable "SSH_CONNECTION"
@@ -1125,7 +1625,8 @@ module Firewalld =
             match IPAddress.TryParse fields[index] with true, _ -> () | _ -> fail "Invalid SSH_CONNECTION address."
         let route = command environment "ip" [ "-j"; "route"; "get"; fields[0]; "from"; fields[2] ]
         let context = parseSshContext connection route
-        let runtimeDefaultZone = firewall environment [ "--get-default-zone" ] |> FirewalldModel.token "runtime default zone" 17
+        let network = observeSshNetwork environment context
+        let runtimeDefaultZone = firewall environment [ "--get-default-zone" ] |> FirewalldModel.nativeReference "zone" "runtime default zone"
         let inventory = finalInventory environment c proposed
         let definitions =
             Map.ofList [ "zone", inventory.Zones; "policy", inventory.Policies; "service", inventory.Services
@@ -1133,7 +1634,17 @@ module Firewalld =
         try FirewalldReferences.validate parseXml c.Kind c.Name inventory.DefaultZone definitions
         with :? InvalidOperationException as error -> fail error.Message
         let runtimeZone, runtimeInterfaceBound = runtimeZoneOfInterface environment runtimeDefaultZone context.Interface
-        validateRuntimeBinding environment context runtimeDefaultZone inventory.DefaultZone runtimeZone runtimeInterfaceBound inventory.Zones inventory.Policies inventory.IpSets inventory.Services
+        let snapshots =
+            validateRuntimeBinding
+                environment network
+                context runtimeDefaultZone inventory.DefaultZone runtimeZone runtimeInterfaceBound
+                inventory.Zones inventory.Policies inventory.IpSets inventory.Services
+        if c.Kind = "zone" || c.Kind = "policy" then
+            match FirewalldBindingTransfer.validate c (effective environment c.Kind c.Name)
+                      snapshots.CandidateZones snapshots.CandidatePolicies inventory.DefaultZone runtimeDefaultZone
+                      snapshots.RuntimeZones snapshots.RuntimePolicies with
+            | Ok () -> ()
+            | Error reason -> fail reason
 
     /// APT may start firewalld from its maintainer script, before any zone resource runs.
     /// Validate that first-start permanent configuration without writing an unowned zone.
@@ -1145,6 +1656,7 @@ module Firewalld =
             match IPAddress.TryParse fields[index] with true, _ -> () | _ -> fail "Invalid SSH_CONNECTION address."
         let route = command environment "ip" [ "-j"; "route"; "get"; fields[0]; "from"; fields[2] ]
         let context = parseSshContext connection route
+        let etcConfig = readFile environment "/etc/firewalld/firewalld.conf"
         let inventory =
             { Zones = definitionInventory environment "zone"
               Policies = definitionInventory environment "policy"
@@ -1152,10 +1664,7 @@ module Firewalld =
               IpSets = definitionInventory environment "ipset"
               IcmpTypes = definitionInventory environment "icmptype"
               Helpers = definitionInventory environment "helper"
-              DefaultZone =
-                configuredDefaultZone
-                    (readFile environment "/etc/firewalld/firewalld.conf")
-                    (readFile environment "/usr/lib/firewalld/firewalld.conf") }
+              DefaultZone = configuredDefaultZone etcConfig }
         // Debian 13's package default permits SSH on 22, not the provider's configured port.
         let stockSsh = "<service><port port=\"22\" protocol=\"tcp\"/></service>"
         let services =
@@ -1176,7 +1685,8 @@ module Firewalld =
 
     let private snapshot environment (c: FirewalldModel.Configuration) journal =
         let actual = effective environment c.Kind c.Name
-        let overrideFile = readFile environment (objectPath "/etc/firewalld" c.Kind c.Name)
+        let logical = objectPath "/etc/firewalld" c.Kind c.Name
+        let overrideFile = readFile environment logical
         let objectPending =
             journal
             |> Option.exists (fun (value: JsonObject) -> not (isNull value["pending"]))
@@ -1189,7 +1699,31 @@ module Firewalld =
                     optionalString transaction "managedAfter"
                 | _ -> optionalString value "managed"
             | None -> None
-        let owned = managed = overrideFile && journal.IsSome
+        let managedMode =
+            journal
+            |> Option.bind (fun value ->
+                match value["pending"] with
+                | :? JsonObject as transaction when transaction.ContainsKey "managedAfter" && transaction.ContainsKey "afterMode" ->
+                    Some(transaction["afterMode"].GetValue<int>())
+                | _ when value.ContainsKey "managedMode" && not (isNull value["managedMode"]) ->
+                    Some(value["managedMode"].GetValue<int>())
+                | _ when (c.Kind = "zone" || c.Kind = "policy") && FirewalldLifecycle.preMetadataJournal value -> Some 0o644
+                | _ -> None)
+        let metadataMatches =
+            match managedMode, overrideFile with
+            | Some expectedMode, None -> expectedMode = 0o644
+            | Some expectedMode, Some _ ->
+                try
+                    let physical = regularPath environment logical
+                    let owner = environment.Run "stat" [ "-c"; "%u:%g"; "--"; physical ] None
+                    owner.ExitCode = 0
+                    && owner.Stdout.Trim() = "0:0"
+                    && int (File.GetUnixFileMode physical) = expectedMode
+                with _ -> false
+            | None, _ -> false
+        let ownershipConflict =
+            journal.IsSome && (managed <> overrideFile || not metadataMatches)
+        let owned = journal.IsSome && managed = overrideFile && metadataMatches
         let matches =
             actual |> Option.exists (fun xml -> canonicalXml c.Kind xml = canonicalXml c.Kind (render c))
         let splitZonesSafe =
@@ -1204,6 +1738,7 @@ module Firewalld =
         let result = JsonObject()
         result["exists"] <- JsonValue.Create actual.IsSome
         result["actual"] <- JsonValue.Create(defaultArg actual "")
+        result["ownershipConflict"] <- JsonValue.Create ownershipConflict
         result["permanentInSync"] <- JsonValue.Create permanentInSync
         result["runtimeObserved"] <- JsonValue.Create runtimeObserved
         result["runtimeInSync"] <- JsonValue.Create runtimeInSync
@@ -1221,16 +1756,68 @@ module Firewalld =
             firewall environment [ "--reload" ] |> ignore
         | _ -> command environment "/usr/bin/systemctl" [ "restart"; "firewalld.service" ] |> ignore
 
+    let private objectReadState (scope: JsonObject option) (contents: string option) =
+        if scope.IsSome then fail "Firewalld object transaction cannot use a scoped file state."
+        contents
+
+    let private objectWriteState
+        (environment: HostEnvironment)
+        (c: FirewalldModel.Configuration)
+        (logical: string)
+        (scope: JsonObject option)
+        (expectedCurrent: string option)
+        (target: string option)
+        (mode: int)
+        =
+        if scope.IsSome then fail "Firewalld object transaction cannot use a scoped file state."
+        let current = readFile environment logical
+        if current <> expectedCurrent then
+            fail "Firewalld object configuration changed before its transaction write."
+        writeOverride environment c target mode
+
+    let private requireReloadProof (environment: HostEnvironment) =
+        match FirewalldRuntime.validateReload environment with
+        | Ok () -> ()
+        | Error reason -> fail ("Cannot prove a daemon-wide firewalld activation and rollback safe: " + reason)
+
+    let private requireRestoredObjectRuntime
+        (environment: HostEnvironment)
+        (c: FirewalldModel.Configuration)
+        =
+        match FirewalldRuntime.validateReload environment with
+        | Error reason -> fail ("Firewalld runtime did not restore its permanent baseline: " + reason)
+        | Ok () ->
+            let disk = FirewalldRuntime.snapshotFromXml c.Kind c.Name (effective environment c.Kind c.Name)
+            match disk, FirewalldRuntime.queryPermanent environment c.Kind c.Name, FirewalldRuntime.queryRuntime environment c.Kind c.Name with
+            | Ok None, Ok None, Ok None -> ()
+            | Ok(Some expected), Ok(Some permanent), Ok(Some live)
+                when FirewalldRecoveryProof.snapshotsEqual expected permanent
+                  && FirewalldRecoveryProof.snapshotsEqual expected live -> ()
+            | Error reason, _, _ -> fail ("Unable to prove restored firewalld XML: " + reason)
+            | _, Error reason, _ -> fail ("Unable to prove restored permanent firewalld object: " + reason)
+            | _, _, Error reason -> fail ("Unable to prove restored runtime firewalld object: " + reason)
+            | _ -> fail "The deleted firewalld object is not absent or loaded at its restored baseline."
+
+    let private restoreObjectRuntime
+        (environment: HostEnvironment)
+        (c: FirewalldModel.Configuration)
+        (transaction: FirewalldLifecycle.PendingTransaction)
+        (phase: FirewalldLifecycle.RecoveryPhase)
+        =
+        let effectiveCurrent = effective environment c.Kind c.Name
+        FirewalldRecoveryProof.restoreRuntime environment c effectiveCurrent transaction.RollbackProof phase
+
     let private recover environment (c: FirewalldModel.Configuration) (journal: JsonObject) =
         let logical = objectPath "/etc/firewalld" c.Kind c.Name
-        let write contents mode = writeOverride environment c contents mode
-        let validate proposed = guardMutation environment c proposed
+        let readState scope contents = objectReadState scope contents
+        let writeState scope expectedCurrent target mode =
+            objectWriteState environment c logical scope expectedCurrent target mode
         try
-            FirewalldLifecycle.recover environment c journal logical write validate (fun () -> activateRecovered environment c)
+            FirewalldLifecycle.recover environment c journal logical readState writeState (restoreObjectRuntime environment c)
         with :? InvalidOperationException as error ->
             fail error.Message
 
-    let private transact environment (c: FirewalldModel.Configuration) (journal: JsonObject) releaseOnRollback desired afterMode =
+    let private transact environment (c: FirewalldModel.Configuration) (journal: JsonObject) releaseOnRollback deleteOnConfirm desired afterMode =
         if releaseOnRollback then
             match effective environment c.Kind c.Name with
             | Some baseline when not (FieldRuntime.safeAdoption c baseline) ->
@@ -1242,44 +1829,71 @@ module Firewalld =
         if releaseOnRollback && before.IsSome && not (List.contains beforeMode [ 0o600; 0o640; 0o644 ]) then
             fail "An adopted firewalld object override must be root-owned and non-executable mode 0600, 0640, or 0644."
         let managedBefore = optionalString journal "managed"
-        let write contents mode = writeOverride environment c contents mode
-        let validate proposed = guardMutation environment c proposed
-        let activate () =
-            firewall environment [ "--check-config" ] |> ignore
+        let readState scope contents = objectReadState scope contents
+        let writeState scope expectedCurrent target mode =
+            objectWriteState environment c logical scope expectedCurrent target mode
+        let validate (scope: JsonObject option) proposed =
+            if scope.IsSome then fail "Firewalld object transaction cannot use a scoped file state."
+            guardMutation environment c proposed
+        // Lifecycle validates the candidate immediately before arming. Guard a
+        // different disk rollback preimage as well, before any mutation.
+        if before <> desired then validate None before
+        let runtimeMatches () =
+            let observation = FirewalldRuntime.observe environment c
+            observation.Observed && observation.InSync
+        let rollbackProof, activate =
             if before <> desired then
-                firewall environment [ "--reload" ] |> ignore
+                requireReloadProof environment
+                let effectiveBefore = effective environment c.Kind c.Name
+                let effectiveAfter =
+                    desired |> Option.orElseWith (fun () -> readFile environment (objectPath "/usr/lib/firewalld" c.Kind c.Name))
+                FirewalldRecoveryProof.reloadProof environment c effectiveBefore effectiveAfter,
+                (fun () ->
+                    firewall environment [ "--check-config" ] |> ignore
+                    firewall environment [ "--reload" ] |> ignore)
+            elif runtimeMatches () then
+                FirewalldRecoveryProof.unchangedProof c,
+                (fun () -> firewall environment [ "--check-config" ] |> ignore)
             else
-                let observation = FirewalldRuntime.observe environment c
-                if not observation.Observed || not observation.InSync then
-                    firewall environment [ "--reload" ] |> ignore
+                let live =
+                    FirewalldRuntime.inspectRuntime environment c.Kind c.Name
+                    |> Option.defaultWith (fun () -> fail "Unable to observe the loaded firewalld object before proving a runtime repair.")
+                let proof = FirewalldRecoveryProof.runtimeRepairProof environment c live
+                proof,
+                (fun () ->
+                    firewall environment [ "--check-config" ] |> ignore
+                    FirewalldRecoveryProof.activateRuntimeRepair environment c proof)
         try
             FirewalldLifecycle.transact
-                environment c journal releaseOnRollback logical before beforeMode desired afterMode
-                managedBefore desired write validate activate
+                environment c journal releaseOnRollback deleteOnConfirm logical None before beforeMode desired afterMode
+                managedBefore desired (Some rollbackProof) readState writeState validate activate (restoreObjectRuntime environment c)
         with :? InvalidOperationException as error ->
             fail error.Message
 
     let private strictConfigPath = "/etc/firewalld/firewalld.conf"
-    let private vendorStrictConfigPath = "/usr/lib/firewalld/firewalld.conf"
     let private settingsUtf8 = UTF8Encoding(false, true)
 
     type private SettingEntry =
         { Start: int
           ContentEnd: int
           End: int
-          Value: string }
+          Value: string
+          Line: string }
 
     type private SettingsOrigin =
         { EtcExisted: bool
-          VendorContents: string option
-          VendorMode: int }
+          LegacyVendorSeedHash: string option }
 
     type private SettingsBaseline =
         { Exists: bool
-          Contents: string option
           Value: string option
+          Line: string option
           Mode: int
           Origin: SettingsOrigin }
+
+    type private SettingsKeyState =
+        { Value: string option
+          Line: string option }
 
     let private readSettingsFile environment logical =
         let physical = path environment logical
@@ -1316,7 +1930,7 @@ module Firewalld =
                         fail ("Invalid " + key + " setting in firewalld.conf.")
                     let value = line.Substring(separator + 1).Trim()
                     if value = "" then fail ("Invalid " + key + " value in firewalld.conf.")
-                    result.Add { Start = start; ContentEnd = contentEnd; End = finish; Value = value }
+                    result.Add { Start = start; ContentEnd = contentEnd; End = finish; Value = value; Line = text.Substring(start, contentEnd - start) }
             start <- finish
         if result.Count > 1 then fail ("Duplicate " + key + " settings in firewalld.conf.")
         result |> Seq.toList
@@ -1334,24 +1948,64 @@ module Firewalld =
         elif text.Contains('\r') then "\r"
         else "\n"
 
-    let private setSettingValue (text: string) (key: string) (value: string option) =
+    let private settingLine (text: string) (key: string) =
+        match settingEntries text key with
+        | [] -> None
+        | [ entry ] -> Some entry.Line
+        | _ -> fail ("Duplicate " + key + " settings in firewalld.conf.")
+
+    let private setSettingLine (text: string) (key: string) (line: string option) =
         match settingEntries text key with
         | [ entry ] ->
-            match value with
-            | Some item ->
-                text.Substring(0, entry.Start) + key + "=" + item + text.Substring(entry.ContentEnd)
-            | None ->
-                text.Remove(entry.Start, entry.End - entry.Start)
+            match line with
+            | Some replacement -> text.Substring(0, entry.Start) + replacement + text.Substring(entry.ContentEnd)
+            | None -> text.Remove(entry.Start, entry.End - entry.Start)
         | [] ->
-            match value with
+            match line with
             | None -> text
-            | Some item ->
+            | Some replacement ->
                 let newline = newlineOf text
                 let separator =
                     if text = "" || text.EndsWith("\n", StringComparison.Ordinal) || text.EndsWith("\r", StringComparison.Ordinal) then ""
                     else newline
-                text + separator + key + "=" + item + newline
+                text + separator + replacement + newline
         | _ -> fail ("Duplicate " + key + " settings in firewalld.conf.")
+
+    let private setSettingValue (text: string) (key: string) (value: string option) =
+        setSettingLine text key (value |> Option.map (fun item -> key + "=" + item))
+    let private settingsContentHash (contents: string) =
+        SHA256.HashData(settingsUtf8.GetBytes contents) |> Convert.ToHexString
+    let private settingsKeyState key (contents: string option) =
+        match contents with
+        | None -> { Value = None; Line = None }
+        | Some text ->
+            { Value = settingValue text key
+              Line = settingLine text key }
+
+    let private encodeSettingsKeyState (state: SettingsKeyState) =
+        let node = JsonObject()
+        node["version"] <- JsonValue.Create 1
+        setOptional node "value" state.Value
+        setOptional node "line" state.Line
+        node.ToJsonString()
+
+    let private parseSettingsKeyState key (text: string) =
+        let state =
+            try JsonNode.Parse(text).AsObject()
+            with _ -> fail "Invalid key-scoped firewalld settings state."
+        let keys = state |> Seq.map (fun pair -> pair.Key) |> Set.ofSeq
+        if keys <> set [ "version"; "value"; "line" ] || state["version"].GetValue<int>() <> 1 then
+            fail "Invalid key-scoped firewalld settings state."
+        let value, line = optionalString state "value", optionalString state "line"
+        match line, value with
+        | None, None -> { Value = None; Line = None }
+        | Some raw, Some expected when settingValue raw key = Some expected && settingLine raw key = Some raw ->
+            { Value = value; Line = line }
+        | _ -> fail "Key-scoped firewalld settings state does not match its key line."
+
+    let private settingsKeyStateToken key contents =
+        settingsKeyState key contents |> encodeSettingsKeyState
+
 
     let private settingsFileModeAt environment logical contents =
         match contents with
@@ -1424,12 +2078,70 @@ module Firewalld =
 
     let private settingDefault key = Map.tryFind key settingDefaults
 
-    let private effectiveSettingValue key etcContents vendorContents =
-        let fileValue =
-            match etcContents with
-            | Some contents -> settingValue contents key
-            | None -> vendorContents |> Option.bind (fun contents -> settingValue contents key)
+    let private effectiveSettingValue key etcContents =
+        let fileValue = etcContents |> Option.bind (fun contents -> settingValue contents key)
         fileValue |> Option.orElseWith (fun () -> settingDefault key)
+
+    let private systemdProperty (environment: HostEnvironment) property =
+        try
+            Some(command environment "/usr/bin/systemctl" [ "show"; "--timestamp=unix"; "--property=" + property; "--value"; "firewalld.service" ])
+        with _ -> None
+
+    let private systemdTimestamp (value: string) =
+        if not (value.StartsWith('@')) then None
+        else
+            match Int64.TryParse(value.AsSpan(1), NumberStyles.None, CultureInfo.InvariantCulture) with
+            | true, seconds when seconds > 0L -> Some seconds
+            | _ -> None
+
+
+    let private firewalldDaemonIdentity (environment: HostEnvironment) =
+        // Readiness follows configuration parsing. Only a file that predates
+        // process creation can be attributed to that startup.
+        match systemdProperty environment "InvocationID", systemdProperty environment "ExecMainStartTimestamp" with
+        | Some invocation, Some entered when not (String.IsNullOrWhiteSpace invocation || invocation = "n/a") ->
+            systemdTimestamp entered |> Option.map (fun start -> invocation, start)
+        | _ -> None
+
+    let private trustedPathPredates (environment: HostEnvironment) logical (started: int64) =
+        try
+            let physical = regularPath environment logical
+            if not (File.Exists physical || Directory.Exists physical) then false
+            else
+                let owner = command environment "stat" [ "-c"; "%u:%g"; "--"; physical ]
+                let mode = command environment "stat" [ "-c"; "%a"; "--"; physical ] |> fun value -> Convert.ToInt32(value, 8)
+                let changed = command environment "stat" [ "-c"; "%Z"; "--"; physical ] |> Int64.Parse
+                owner = "0:0"
+                && (mode &&& 0o022) = 0
+                && changed < started
+        with _ -> false
+
+    let private settingsStartupLoadedValue
+        (environment: HostEnvironment)
+        key
+        (etcContents: string option)
+        =
+        match firewalldDaemonIdentity environment with
+        | None -> None
+        | Some(generation, started) ->
+            let etcPath = if etcContents.IsSome then strictConfigPath else "/etc/firewalld"
+            if not (trustedPathPredates environment etcPath started) then None
+            else
+                let explicitValue = etcContents |> Option.bind (fun contents -> settingValue contents key)
+                let value =
+                    match explicitValue with
+                    | Some item -> Some item
+                    | None ->
+                        let version =
+                            try command environment "firewall-cmd" [ "--version" ]
+                            with _ -> ""
+                        if version.StartsWith("2.3.1", StringComparison.Ordinal) then settingDefault key
+                        else None
+                let stableGeneration =
+                    firewalldDaemonIdentity environment
+                    |> Option.exists (fun (currentGeneration, _) -> currentGeneration = generation)
+                if stableGeneration then value |> Option.map (fun item -> item, generation)
+                else None
 
     let private normalizedBoolean (value: string) =
         match value.ToLowerInvariant() with
@@ -1490,17 +2202,16 @@ module Firewalld =
             else equal first second
         | _ -> false
 
-    let private encodeSettingsBaseline key (contents: string option) (mode: int) (origin: SettingsOrigin) =
+    let private encodeSettingsBaseline key (exists: bool) (state: SettingsKeyState) (mode: int) (origin: SettingsOrigin) =
         let baseline = JsonObject()
-        baseline["version"] <- JsonValue.Create 3
+        baseline["version"] <- JsonValue.Create 4
         baseline["key"] <- JsonValue.Create(key: string)
-        baseline["etcExists"] <- JsonValue.Create(contents.IsSome)
-        setOptional baseline "etcContents" contents
-        setOptional baseline "etcValue" (contents |> Option.bind (fun text -> settingValue text key))
+        baseline["etcExists"] <- JsonValue.Create exists
+        setOptional baseline "etcValue" state.Value
+        setOptional baseline "etcLine" state.Line
         baseline["etcMode"] <- JsonValue.Create mode
         baseline["originEtcExists"] <- JsonValue.Create origin.EtcExisted
-        setOptional baseline "originVendorContents" origin.VendorContents
-        baseline["originVendorMode"] <- JsonValue.Create origin.VendorMode
+        origin.LegacyVendorSeedHash |> Option.iter (fun hash -> setOptional baseline "legacyVendorSeedHash" (Some hash))
         baseline.ToJsonString()
 
     let private parseSettingsBaseline key (text: string) =
@@ -1508,65 +2219,94 @@ module Firewalld =
             try JsonNode.Parse(text).AsObject()
             with _ -> fail "Invalid firewalld settings ownership baseline."
         let keys = baseline |> Seq.map (fun pair -> pair.Key) |> Set.ofSeq
-        let currentVersion = set [ "version"; "key"; "etcExists"; "etcContents"; "etcValue"; "etcMode"; "originEtcExists"; "originVendorContents"; "originVendorMode" ]
-        let previousVersion = set [ "version"; "key"; "etcExists"; "etcContents"; "etcValue"; "etcMode" ]
+        let keyScoped = set [ "version"; "key"; "etcExists"; "etcValue"; "etcLine"; "etcMode"; "originEtcExists" ]
+        let keyScopedWithLegacy = Set.add "legacyVendorSeedHash" keyScoped
+        let version3 = set [ "version"; "key"; "etcExists"; "etcContents"; "etcValue"; "etcMode"; "originEtcExists"; "originVendorContents"; "originVendorMode" ]
+        let version2 = set [ "version"; "key"; "etcExists"; "etcContents"; "etcValue"; "etcMode" ]
         let legacyCompact = set [ "etcExists"; "etcStrictValue"; "etcMode" ]
         let legacyContents = set [ "etcExists"; "etcContents"; "vendorContents"; "etcMode" ]
+        let validateLine value line =
+            match line, value with
+            | None, None -> ()
+            | Some raw, Some expected when settingValue raw key = Some expected && settingLine raw key = Some raw -> ()
+            | _ -> fail "Invalid firewalld settings baseline key line."
+        let legacySeed vendor =
+            vendor
+            |> Option.map (fun contents -> settingsContentHash (setSettingLine contents key None))
         let result =
-            if keys = currentVersion then
+            if keys = keyScoped || keys = keyScopedWithLegacy then
+                if baseline["version"].GetValue<int>() <> 4 || getString baseline "key" <> key then
+                    fail "Firewalld settings ownership baseline does not match its key."
+                let exists = baseline["etcExists"].GetValue<bool>()
+                let value, line = optionalString baseline "etcValue", optionalString baseline "etcLine"
+                validateLine value line
+                if not exists && value.IsSome then fail "Invalid absent-file firewalld settings baseline."
+                let legacyVendorSeedHash =
+                    if keys = keyScopedWithLegacy then optionalString baseline "legacyVendorSeedHash"
+                    else None
+                { Exists = exists
+                  Value = value
+                  Line = line
+                  Mode = baseline["etcMode"].GetValue<int>()
+                  Origin =
+                    { EtcExisted = baseline["originEtcExists"].GetValue<bool>()
+                      LegacyVendorSeedHash = legacyVendorSeedHash } }
+            elif keys = version3 then
                 if baseline["version"].GetValue<int>() <> 3 || getString baseline "key" <> key then
                     fail "Firewalld settings ownership baseline does not match its key."
                 let exists = baseline["etcExists"].GetValue<bool>()
                 let contents = optionalString baseline "etcContents"
                 let value = optionalString baseline "etcValue"
-                let vendorMode = baseline["originVendorMode"].GetValue<int>()
-                if exists <> contents.IsSome
-                   || (contents |> Option.bind (fun item -> settingValue item key)) <> value
-                   || vendorMode < 0 || vendorMode > 0o7777 then
+                let line = contents |> Option.bind (fun item -> settingLine item key)
+                if exists <> contents.IsSome || (contents |> Option.bind (fun item -> settingValue item key)) <> value then
                     fail "Invalid firewalld settings ownership baseline."
+                validateLine value line
+                let originEtcExists = baseline["originEtcExists"].GetValue<bool>()
+                let legacyVendorSeedHash =
+                    if originEtcExists then None else legacySeed (optionalString baseline "originVendorContents")
                 { Exists = exists
-                  Contents = contents
                   Value = value
+                  Line = line
                   Mode = baseline["etcMode"].GetValue<int>()
-                  Origin =
-                    { EtcExisted = baseline["originEtcExists"].GetValue<bool>()
-                      VendorContents = optionalString baseline "originVendorContents"
-                      VendorMode = vendorMode } }
-            elif keys = previousVersion then
+                  Origin = { EtcExisted = originEtcExists; LegacyVendorSeedHash = legacyVendorSeedHash } }
+            elif keys = version2 then
                 if baseline["version"].GetValue<int>() <> 2 || getString baseline "key" <> key then
                     fail "Firewalld settings ownership baseline does not match its key."
                 let exists = baseline["etcExists"].GetValue<bool>()
                 let contents = optionalString baseline "etcContents"
                 let value = optionalString baseline "etcValue"
-                if exists <> contents.IsSome
-                   || (contents |> Option.bind (fun item -> settingValue item key)) <> value then
+                let line = contents |> Option.bind (fun item -> settingLine item key)
+                if exists <> contents.IsSome || (contents |> Option.bind (fun item -> settingValue item key)) <> value then
                     fail "Invalid firewalld settings ownership baseline."
+                validateLine value line
                 { Exists = exists
-                  Contents = contents
                   Value = value
+                  Line = line
                   Mode = baseline["etcMode"].GetValue<int>()
-                  Origin = { EtcExisted = exists; VendorContents = None; VendorMode = 0o600 } }
+                  Origin = { EtcExisted = exists; LegacyVendorSeedHash = None } }
             elif key = "StrictForwardPorts" && keys = legacyCompact then
                 let exists = baseline["etcExists"].GetValue<bool>()
+                let value = optionalString baseline "etcStrictValue"
+                let line = value |> Option.map (fun item -> key + "=" + item)
                 { Exists = exists
-                  Contents = None
-                  Value = optionalString baseline "etcStrictValue"
+                  Value = value
+                  Line = line
                   Mode = baseline["etcMode"].GetValue<int>()
-                  Origin = { EtcExisted = exists; VendorContents = None; VendorMode = 0o600 } }
+                  Origin = { EtcExisted = exists; LegacyVendorSeedHash = None } }
             elif key = "StrictForwardPorts" && keys = legacyContents then
                 let exists = baseline["etcExists"].GetValue<bool>()
                 let contents = optionalString baseline "etcContents"
+                let value = contents |> Option.bind (fun item -> settingValue item key)
+                let line = contents |> Option.bind (fun item -> settingLine item key)
+                let legacyVendorSeedHash =
+                    if exists then None else legacySeed (optionalString baseline "vendorContents")
                 { Exists = exists
-                  Contents = contents
-                  Value = contents |> Option.bind (fun value -> settingValue value key)
+                  Value = value
+                  Line = line
                   Mode = baseline["etcMode"].GetValue<int>()
-                  Origin =
-                    { EtcExisted = exists
-                      VendorContents = optionalString baseline "vendorContents"
-                      VendorMode = 0o600 } }
+                  Origin = { EtcExisted = exists; LegacyVendorSeedHash = legacyVendorSeedHash } }
             else fail "Invalid firewalld settings ownership baseline."
-        if result.Mode < 0 || result.Mode > 0o7777
-           || result.Origin.VendorMode < 0 || result.Origin.VendorMode > 0o7777 then
+        if result.Mode < 0 || result.Mode > 0o7777 then
             fail "Invalid firewalld settings baseline mode."
         result
 
@@ -1582,12 +2322,7 @@ module Firewalld =
             |> Seq.sort
             |> Seq.toList
 
-    let private settingsOriginFromJournal
-        (environment: HostEnvironment)
-        (fileName: string)
-        (fallbackVendorContents: string option)
-        (fallbackVendorMode: int)
-        =
+    let private settingsOriginFromJournal (environment: HostEnvironment) (fileName: string) =
         let logical = journalDirectory + "/" + fileName
         rootOnly environment logical "600"
         let journalText =
@@ -1600,66 +2335,50 @@ module Firewalld =
         let etcExisted =
             if hasOriginMetadata then baseline["originEtcExists"].GetValue<bool>()
             else baseline["etcExists"].GetValue<bool>()
-        let vendorContents =
+        let legacyVendorContents =
             if baseline.ContainsKey "originVendorContents" then optionalString baseline "originVendorContents"
             elif baseline.ContainsKey "vendorContents" then optionalString baseline "vendorContents"
-            else fallbackVendorContents
-        let vendorMode =
-            if baseline.ContainsKey "originVendorMode" then baseline["originVendorMode"].GetValue<int>()
-            else fallbackVendorMode
-        if vendorMode < 0 || vendorMode > 0o7777 then fail "Invalid firewalld settings vendor baseline mode."
-        { EtcExisted = etcExisted; VendorContents = vendorContents; VendorMode = vendorMode }, hasOriginMetadata
+            else None
+        let legacyKey =
+            if baseline.ContainsKey "key" then getString baseline "key"
+            elif fileName = "settings-strict-forward-ports.json" then "StrictForwardPorts"
+            else ""
+        let legacyVendorSeedHash =
+            if baseline.ContainsKey "legacyVendorSeedHash" then optionalString baseline "legacyVendorSeedHash"
+            elif etcExisted || String.IsNullOrEmpty legacyKey then None
+            else
+                legacyVendorContents
+                |> Option.map (fun contents -> settingsContentHash (setSettingLine contents legacyKey None))
+        { EtcExisted = etcExisted
+          LegacyVendorSeedHash = legacyVendorSeedHash }, hasOriginMetadata
 
     let private settingsOriginForNewOwner
         (environment: HostEnvironment)
         (c: FirewalldModel.Configuration)
         (etcContents: string option)
-        (vendorContents: string option)
-        (vendorMode: int)
         =
         match settingsJournalFiles environment c with
-        | [] -> { EtcExisted = etcContents.IsSome; VendorContents = vendorContents; VendorMode = vendorMode }
+        | [] -> { EtcExisted = etcContents.IsSome; LegacyVendorSeedHash = None }
         | files ->
-            let origins =
-                files
-                |> List.map (fun file -> settingsOriginFromJournal environment file vendorContents vendorMode)
+            let origins = files |> List.map (settingsOriginFromJournal environment)
             let existedValues = origins |> List.map (fun (origin, _) -> origin.EtcExisted) |> List.distinct
             if existedValues.Length <> 1 then fail "Firewalld settings journals disagree about the original override."
             let persisted = origins |> List.choose (fun (origin, hasMetadata) -> if hasMetadata then Some origin else None)
-            let origin =
-                match persisted with
-                | first :: remaining ->
-                    if remaining |> List.exists ((<>) first) then fail "Firewalld settings journals disagree about the vendor baseline."
-                    first
-                | [] ->
-                    origins
-                    |> List.tryFind (fun (value, _) -> value.VendorContents.IsSome)
-                    |> Option.map fst
-                    |> Option.defaultValue (fst (List.head origins))
-            origin
+            match persisted with
+            | first :: remaining ->
+                if remaining |> List.exists ((<>) first) then fail "Firewalld settings journals disagree about the original override provenance."
+                first
+            | [] -> fst (List.head origins)
 
-    let private managedSettingValue key (contents: string option) =
-        contents |> Option.bind (fun text -> settingValue text key)
+    let private managedSettingState key keyScoped (contents: string option) =
+        contents
+        |> Option.map (fun text ->
+            if keyScoped then parseSettingsKeyState key text
+            else settingsKeyState key (Some text))
+        |> Option.defaultValue { Value = None; Line = None }
 
     let private deprecatedSetting key = Set.contains key deprecatedSettings
 
-    let private guardCurrentConfiguration (environment: HostEnvironment) =
-        let connection = Environment.GetEnvironmentVariable "SSH_CONNECTION"
-        let fields = if isNull connection then [||] else connection.Split([| ' '; '\t' |], StringSplitOptions.RemoveEmptyEntries)
-        if fields.Length <> 4 then fail "SSH_CONNECTION is required before any firewalld mutation."
-        for index in [ 0; 2 ] do
-            match IPAddress.TryParse fields[index] with true, _ -> () | _ -> fail "Invalid SSH_CONNECTION address."
-        let route = command environment "ip" [ "-j"; "route"; "get"; fields[0]; "from"; fields[2] ]
-        let context = parseSshContext connection route
-        let runtimeDefaultZone = firewall environment [ "--get-default-zone" ] |> FirewalldModel.token "runtime default zone" 17
-        let zones, policies = definitionInventory environment "zone", definitionInventory environment "policy"
-        let services, ipsets = definitionInventory environment "service", definitionInventory environment "ipset"
-        let runtimeZone, runtimeInterfaceBound = runtimeZoneOfInterface environment runtimeDefaultZone context.Interface
-        let defaultZone =
-            configuredDefaultZone
-                (readFile environment "/etc/firewalld/firewalld.conf")
-                (readFile environment "/usr/lib/firewalld/firewalld.conf")
-        validateRuntimeBinding environment context runtimeDefaultZone defaultZone runtimeZone runtimeInterfaceBound zones policies ipsets services
 
     type private NftRuntimeState =
         { Chains: Set<string>
@@ -1940,46 +2659,111 @@ module Firewalld =
             | _ -> false
         | _ -> false
 
-    let private iptablesStrictValue (rules: string) =
-        let lines = rules.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
-        let chainRules chain =
-            let prefix = "-A " + chain + " "
-            lines |> Array.filter (fun line -> line.StartsWith(prefix, StringComparison.Ordinal))
-        let dnatRules chain =
-            chainRules chain |> Array.filter (fun line -> line.Contains("DNAT", StringComparison.Ordinal))
-        let dnatPortAccept (line: string) =
-            if not (line.Contains("--ctstate DNAT", StringComparison.Ordinal)
-                    && line.Contains("--ctdir ORIGINAL", StringComparison.Ordinal)
-                    && line.Contains("-j ACCEPT", StringComparison.Ordinal)) then false
-            else
-                let fields = line.Split(' ', StringSplitOptions.RemoveEmptyEntries)
-                match fields |> Array.tryFindIndex ((=) "--ctorigdstport") with
-                | Some index when index + 1 < fields.Length -> iptablesPort fields[index + 1]
+    let private iptablesFields (line: string) =
+        line.Split(' ', StringSplitOptions.RemoveEmptyEntries)
+
+    let private iptablesStateSet (fields: string array) =
+        let selector =
+            [| "--ctstate"; "--state" |]
+            |> Array.choose (fun flag -> fields |> Array.tryFindIndex ((=) flag) |> Option.map (fun index -> flag, index))
+        match selector with
+        | [| (flag, index) |] when index + 1 < fields.Length ->
+            let moduleName =
+                fields
+                |> Array.pairwise
+                |> Array.tryFind (fun (name, value) -> name = "-m" && (value = "conntrack" || value = "state"))
+                |> Option.map snd
+            let moduleMatches =
+                match flag, moduleName with
+                | "--ctstate", Some "conntrack" -> true
+                | "--state", Some "state" -> true
                 | _ -> false
+            if moduleMatches then Some(fields[index + 1].Split(',') |> Set.ofArray) else None
+        | _ -> None
+
+    let private iptablesTarget (fields: string array) =
+        match
+            [| "-j"; "--jump" |]
+            |> Array.choose (fun flag -> fields |> Array.tryFindIndex ((=) flag) |> Option.map id)
+        with
+        | [| index |] when index + 1 < fields.Length -> Some fields[index + 1]
+        | _ -> None
+
+    let private iptablesRuleFields chain (rules: string) =
+        let prefix = "-A " + chain + " "
+        rules.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries)
+        |> Array.filter (fun line -> line.StartsWith(prefix, StringComparison.Ordinal))
+        |> Array.map iptablesFields
+
+    let private iptablesDnatMatch (fields: string array) =
+        iptablesStateSet fields |> Option.exists (Set.contains "DNAT")
+
+    let private iptablesAcceptMayMatchDnat (fields: string array) =
+        iptablesTarget fields = Some "ACCEPT"
+        && (iptablesStateSet fields |> Option.forall (Set.contains "DNAT"))
+
+    let private iptablesPortAccept (fields: string array) =
+        match iptablesStateSet fields, iptablesTarget fields with
+        | Some states, Some "ACCEPT" when states = Set.singleton "DNAT" ->
+            fields
+            |> Array.tryFindIndex ((=) "--ctdir")
+            |> Option.exists (fun index ->
+                index + 1 < fields.Length
+                && fields[index + 1] = "ORIGINAL"
+                && (fields
+                    |> Array.tryFindIndex ((=) "--ctorigdstport")
+                    |> Option.exists (fun portIndex -> portIndex + 1 < fields.Length && iptablesPort fields[portIndex + 1])))
+        | _ -> false
+
+    let private iptablesTerminalReject (fields: string array) =
+        fields.Length >= 4
+        && fields[0] = "-A"
+        && (fields[2] = "-j" || fields[2] = "--jump")
+        && fields[3] = "REJECT"
+
+    let private iptablesGenericDnatAccept (fields: string array) =
+        let genericStates = Set.ofList [ "RELATED"; "ESTABLISHED"; "DNAT" ]
+        iptablesStateSet fields = Some genericStates && iptablesTarget fields = Some "ACCEPT"
+
+    let private iptablesHasEarlierAcceptBypass (rules: string) chain index =
+        iptablesRuleFields chain rules
+        |> Array.take index
+        |> Array.exists iptablesAcceptMayMatchDnat
+
+    let private iptablesStrictValue (rules: string) =
+        let chainRules chain = iptablesRuleFields chain rules
+        let dnatRules chain = chainRules chain |> Array.filter iptablesDnatMatch
         let strictRules =
             dnatChains
             |> List.forall (fun chain ->
                 let dnatChain = chain + "_dnat"
                 let chainLines = chainRules dnatChain
                 let baseDnat = dnatRules chain
+                let jumpIndex =
+                    chainRules chain
+                    |> Array.tryFindIndex (fun fields ->
+                        iptablesStateSet fields = Some(Set.singleton "DNAT")
+                        && iptablesTarget fields = Some dnatChain)
                 iptablesHasChain rules dnatChain
                 && chainLines.Length > 0
-                && chainLines[chainLines.Length - 1].StartsWith("-A " + dnatChain + " -j REJECT", StringComparison.Ordinal)
-                && (chainLines |> Array.take (chainLines.Length - 1) |> Array.forall dnatPortAccept)
+                && iptablesTerminalReject chainLines[chainLines.Length - 1]
+                && (chainLines |> Array.take (chainLines.Length - 1) |> Array.forall iptablesPortAccept)
                 && baseDnat.Length = 1
-                && baseDnat[0].Contains("--ctstate DNAT", StringComparison.Ordinal)
-                && baseDnat[0].Contains("-j " + dnatChain, StringComparison.Ordinal))
+                && jumpIndex.IsSome
+                && not (iptablesHasEarlierAcceptBypass rules chain (Option.get jumpIndex)))
         if strictRules then Some "yes"
         else
             let genericRules =
                 dnatChains
                 |> List.forall (fun chain ->
                     let dnatChain = chain + "_dnat"
+                    let chainLines = chainRules chain
                     let baseDnat = dnatRules chain
+                    let acceptIndex = chainLines |> Array.tryFindIndex iptablesGenericDnatAccept
                     not (iptablesHasChain rules dnatChain)
                     && baseDnat.Length = 1
-                    && baseDnat[0].Contains("--ctstate RELATED,ESTABLISHED,DNAT", StringComparison.Ordinal)
-                    && baseDnat[0].Contains("-j ACCEPT", StringComparison.Ordinal))
+                    && acceptIndex.IsSome
+                    && not (iptablesHasEarlierAcceptBypass rules chain (Option.get acceptIndex)))
             if genericRules then Some "no" else None
 
 
@@ -2029,6 +2813,15 @@ module Firewalld =
             runtimeFirewall environment
             |> Option.bind (fun runtime -> runtime.Nft |> Option.bind nftCountersValue)
         | _ -> None
+    let strictForwardPortsLoaded (environment: HostEnvironment) =
+        runtimeSettingValue environment "StrictForwardPorts" = Some "yes"
+    let strictForwardPortsConfigured (environment: HostEnvironment) =
+        try
+            effectiveSettingValue "StrictForwardPorts" (readSettingsFile environment strictConfigPath)
+            |> Option.exists (fun value -> normalizedBoolean value = Some "yes")
+        with _ -> false
+
+
 
     let private settingRuntimeObservable key = Set.contains key observableSettings
 
@@ -2041,8 +2834,7 @@ module Firewalld =
     let private validateSettingsCandidate (environment: HostEnvironment) (c: FirewalldModel.Configuration) key proposed =
         proposed |> Option.iter (fun contents -> settingValue contents key |> ignore)
         if nftablesSettings.Contains key then
-            let vendorContents = readSettingsFile environment vendorStrictConfigPath
-            match effectiveSettingValue "FirewallBackend" proposed vendorContents with
+            match effectiveSettingValue "FirewallBackend" proposed with
             | Some backend when String.Equals(backend, "iptables", StringComparison.OrdinalIgnoreCase) ->
                 fail (key + " cannot be confirmed with FirewallBackend=iptables.")
             | _ -> ()
@@ -2057,36 +2849,230 @@ module Firewalld =
         firewall environment [ "--state" ] |> ignore
         if settingRuntimeObservable key then
             let etcContents = readSettingsFile environment strictConfigPath
-            let vendorContents = readSettingsFile environment vendorStrictConfigPath
-            let expected = effectiveSettingValue key etcContents vendorContents
+            let expected = effectiveSettingValue key etcContents
             match expected, runtimeSettingValue environment key with
             | Some expectedValue, Some actualValue when settingValuesEqual key (Some expectedValue) (Some actualValue) -> ()
             | Some _, Some _ -> fail ("firewalld did not load the requested " + key + " effect.")
             | _ -> fail ("Unable to observe the loaded " + key + " effect after activation.")
+
+    let private settingsScope key (removeEmptyFile: bool) legacyVendorSeedHash =
+        let scope = JsonObject()
+        scope["version"] <- JsonValue.Create 1
+        scope["kind"] <- JsonValue.Create "setting"
+        scope["key"] <- JsonValue.Create(key: string)
+        scope["removeEmptyFile"] <- JsonValue.Create removeEmptyFile
+        legacyVendorSeedHash
+        |> Option.iter (fun hash -> scope["legacySeedHash"] <- JsonValue.Create(hash: string))
+        Some scope
+
+    let private settingsScopeDetails (scope: JsonObject option) =
+        let value = scope |> Option.defaultWith (fun () -> fail "Firewalld settings transaction has no key scope.")
+        let keys = value |> Seq.map (fun pair -> pair.Key) |> Set.ofSeq
+        let required = set [ "version"; "kind"; "key"; "removeEmptyFile" ]
+        if (keys <> required && keys <> Set.add "legacySeedHash" required)
+           || value["version"].GetValue<int>() <> 1
+           || getString value "kind" <> "setting" then
+            fail "Invalid key-scoped firewalld settings transaction."
+        let key = getString value "key"
+        let removeEmptyFile = value["removeEmptyFile"].GetValue<bool>()
+        let legacyVendorSeedHash =
+            if value.ContainsKey "legacySeedHash" then optionalString value "legacySeedHash"
+            else None
+        key, removeEmptyFile, legacyVendorSeedHash
+
+    let private readSettingsState (_environment: HostEnvironment) scope contents =
+        let key, _, _ = settingsScopeDetails scope
+        let state = settingsKeyState key contents
+        if state.Value.IsNone then None else Some(encodeSettingsKeyState state)
+
+    let private validateSettingsState
+        (environment: HostEnvironment)
+        (c: FirewalldModel.Configuration)
+        scope
+        candidate
+        =
+        let key, removeEmptyFile, legacyVendorSeedHash = settingsScopeDetails scope
+        if c.Kind <> "settings" || FirewalldModel.settingKey c <> key then
+            fail "Firewalld settings transaction scope does not match its resource."
+        let state =
+            candidate
+            |> Option.map (parseSettingsKeyState key)
+            |> Option.defaultValue { Value = None; Line = None }
+        let current = readSettingsFile environment strictConfigPath
+        let merged = setSettingLine (defaultArg current "") key state.Line
+        let legacySeedMatches =
+            legacyVendorSeedHash
+            |> Option.exists (fun hash -> settingsContentHash merged = hash)
+        let proposed =
+            if current.IsNone && state.Value.IsNone then None
+            elif removeEmptyFile && state.Value.IsNone && (merged = "" || legacySeedMatches) then None
+            else Some merged
+        // The same permanent selectors can classify SSH differently under the
+        // old and new DefaultZone. Both must be safe before arming recovery.
+        if key = "DefaultZone" && effectiveSettingValue key current <> effectiveSettingValue key proposed then
+            validateSettingsCandidate environment c key current
+        validateSettingsCandidate environment c key proposed
+
+    let private writeSettingsState
+        (environment: HostEnvironment)
+        (c: FirewalldModel.Configuration)
+        scope
+        expected
+        target
+        mode
+        =
+        let key, removeEmptyFile, legacyVendorSeedHash = settingsScopeDetails scope
+        if c.Kind <> "settings" || FirewalldModel.settingKey c <> key then
+            fail "Firewalld settings transaction scope does not match its resource."
+        let current = readSettingsFile environment strictConfigPath
+        settingsFileMode environment current |> ignore
+        if readSettingsState environment scope current <> expected then
+            fail "The owned firewalld setting changed during key-scoped write; refusing to overwrite it."
+        let state =
+            target
+            |> Option.map (parseSettingsKeyState key)
+            |> Option.defaultValue { Value = None; Line = None }
+        let merged = setSettingLine (defaultArg current "") key state.Line
+        let legacySeedMatches =
+            legacyVendorSeedHash
+            |> Option.exists (fun hash -> settingsContentHash merged = hash)
+        let proposed =
+            if current.IsNone && state.Value.IsNone then None
+            elif removeEmptyFile && state.Value.IsNone && (merged = "" || legacySeedMatches) then None
+            else Some merged
+        writeSettingsFile environment proposed mode
+    let private settingsRollbackProof key loadedValue source =
+        let proof = JsonObject()
+        proof["version"] <- JsonValue.Create 1
+        proof["key"] <- JsonValue.Create(key: string)
+        proof["loadedValue"] <- JsonValue.Create(loadedValue: string)
+        proof["source"] <- JsonValue.Create(source: string)
+        proof
+
+    let private settingsActivationValue (environment: HostEnvironment) key (journal: JsonObject option) =
+        let currentGeneration = firewalldDaemonIdentity environment |> Option.map fst
+        journal
+        |> Option.bind (fun value ->
+            match value["settingsActivation"], currentGeneration with
+            | :? JsonObject as proof, Some generation
+                when proof.ContainsKey "generation"
+                     && proof["version"].GetValue<int>() = 1
+                     && getString proof "key" = key
+                     && getString proof "generation" = generation ->
+                if firewalldDaemonIdentity environment |> Option.exists (fun (current, _) -> current = generation) then
+                    optionalString proof "value"
+                else None
+            | _ -> None)
+
+    let private recordSettingsActivation
+        (environment: HostEnvironment)
+        c key value source
+        (journal: JsonObject)
+        =
+        match firewalldDaemonIdentity environment |> Option.map fst with
+        | Some generation ->
+            let receipt = JsonObject()
+            receipt["version"] <- JsonValue.Create 1
+            receipt["key"] <- JsonValue.Create(key: string)
+            receipt["value"] <- JsonValue.Create(value: string)
+            receipt["source"] <- JsonValue.Create(source: string)
+            receipt["generation"] <- JsonValue.Create(generation: string)
+            journal["settingsActivation"] <- receipt
+            saveJournal environment c journal
+        | None when settingRuntimeObservable key -> ()
+        | None -> fail "Cannot record activation without a verifiable firewalld daemon generation."
+
+    let private settingsLoadedEvidence environment key journal etcContents =
+        match settingsActivationValue environment key journal with
+        | Some value -> Some(value, "completed-activation-receipt")
+        | None ->
+            settingsStartupLoadedValue environment key etcContents
+            |> Option.map (fun (value, _) -> value, "verified-daemon-start")
+
+
+    let private restoreSettingsRuntime
+        (environment: HostEnvironment)
+        (transaction: FirewalldLifecycle.PendingTransaction)
+        (phase: FirewalldLifecycle.RecoveryPhase)
+        =
+        if transaction.ActivationStarted && phase <> FirewalldLifecycle.BootBeforeFirewalld then
+            let proof =
+                transaction.RollbackProof
+                |> Option.defaultWith (fun () -> fail "Settings recovery has no durable loaded-state proof.")
+            let keys = proof |> Seq.map (fun pair -> pair.Key) |> Set.ofSeq
+            if keys <> set [ "version"; "key"; "loadedValue"; "source" ] || proof["version"].GetValue<int>() <> 1 then
+                fail "Invalid key-scoped firewalld settings rollback proof."
+            let key = getString proof "key"
+            let loadedValue = getString proof "loadedValue"
+            if transaction.Configuration.Kind <> "settings" || key <> FirewalldModel.settingKey transaction.Configuration then
+                fail "Firewalld settings rollback proof does not match its resource."
+            let current = readSettingsFile environment strictConfigPath
+            let permanent = effectiveSettingValue key current
+            if not (settingValuesEqual key permanent (Some loadedValue)) then
+                fail ("Cannot restore loaded " + key + " without replacing its proven permanent preimage.")
+            match phase with
+            | FirewalldLifecycle.ActiveDaemon ->
+                requireReloadProof environment
+                activateSettings environment key
+            | FirewalldLifecycle.BootAfterFirewalld ->
+                if not (daemonActive environment) then fail "firewalld is not active at post-boot settings recovery."
+                let loaded =
+                    if settingRuntimeObservable key then runtimeSettingValue environment key
+                    else settingsStartupLoadedValue environment key current |> Option.map fst
+                match loaded with
+                | Some actual when settingValuesEqual key (Some actual) (Some loadedValue) -> ()
+                | Some _ -> fail ("The post-boot loaded " + key + " effect does not match the rollback proof.")
+                | None -> fail ("Unable to verify the post-boot loaded " + key + " effect.")
+            | FirewalldLifecycle.BootBeforeFirewalld -> ()
+
+    let private restoreSettingsRuntimeWithJournal
+        (environment: HostEnvironment)
+        (transaction: FirewalldLifecycle.PendingTransaction)
+        (phase: FirewalldLifecycle.RecoveryPhase)
+        (journal: JsonObject option)
+        =
+        restoreSettingsRuntime environment transaction phase
+        if phase <> FirewalldLifecycle.BootBeforeFirewalld && transaction.ActivationStarted then
+            let proof = transaction.RollbackProof |> Option.get
+            let key = getString proof "key"
+            let loadedValue = getString proof "loadedValue"
+            match journal with
+            | Some value -> recordSettingsActivation environment transaction.Configuration key loadedValue "rollback-activation" value
+            | None when transaction.ReleaseOnRollback -> ()
+            | None -> fail "Firewalld settings owner journal disappeared during rollback."
+
     let private validateSettingsConfirmation (environment: HostEnvironment) key (journal: JsonObject) =
         let pending =
             match journal["pending"] with
             | :? JsonObject as value -> value
             | _ -> fail "No firewalld settings transaction awaits confirmation."
+        let scope =
+            match pending["scope"] with
+            | :? JsonObject as value -> Some value
+            | _ -> fail "Firewalld settings confirmation has no key scope."
+        let scopedKey, _, _ = settingsScopeDetails scope
+        if scopedKey <> key then fail "Firewalld settings confirmation scope does not match its key."
         let after = optionalString pending "after"
         let current = readSettingsFile environment strictConfigPath
-        if current <> after then fail "firewalld.conf changed before settings confirmation."
+        if readSettingsState environment scope current <> after then
+            fail "The owned firewalld setting changed before confirmation."
         if not (daemonActive environment) then fail "firewalld is not active at settings confirmation."
-        let vendorContents = readSettingsFile environment vendorStrictConfigPath
-        let expected = effectiveSettingValue key current vendorContents
+        let expected = effectiveSettingValue key current
         if settingRuntimeObservable key then
             match expected, runtimeSettingValue environment key with
             | Some expectedValue, Some actualValue when settingValuesEqual key (Some expectedValue) (Some actualValue) -> ()
             | Some _, Some _ -> fail ("Loaded " + key + " effect changed before fresh-connection confirmation.")
             | _ -> fail ("Unable to observe the loaded " + key + " effect at confirmation.")
-
+        elif not (settingsActivationValue environment key (Some journal) |> Option.exists (fun value -> settingValuesEqual key (Some value) expected)) then
+            fail ("No completed activation receipt proves the loaded " + key + " effect at confirmation.")
 
     let private settingsSnapshot (environment: HostEnvironment) (owner: string) (c: FirewalldModel.Configuration) key desired =
         let etcContents = readSettingsFile environment strictConfigPath
-        let vendorContents = readSettingsFile environment vendorStrictConfigPath
-        let effective = etcContents |> Option.orElse vendorContents
-        let permanentValue = effectiveSettingValue key etcContents vendorContents
+        let effective = etcContents
+        let permanentValue = effectiveSettingValue key etcContents
         let runtimeValue = runtimeSettingValue environment key
+        let currentState = settingsKeyState key etcContents
+        let currentMode = settingsFileMode environment etcContents
         let journal = loadJournal environment c owner
         let pendingNode =
             journal
@@ -2095,19 +3081,49 @@ module Firewalld =
                 | :? JsonObject as pending -> Some pending
                 | _ -> None)
         let pending = pendingNode.IsSome || pendingFor environment c
+        let keyScoped =
+            (journal
+             |> Option.exists (fun value ->
+                 value.ContainsKey "settingsScopeVersion"
+                 && value["settingsScopeVersion"].GetValue<int>() = 1))
+            || (pendingNode
+                |> Option.exists (fun value -> value["scope"] :? JsonObject))
         let managedContents =
             match pendingNode with
             | Some value when value.ContainsKey "managedAfter" -> optionalString value "managedAfter"
             | _ -> journal |> Option.bind (fun value -> optionalString value "managed")
-        let managedValue = managedSettingValue key managedContents
+        let managedState = managedSettingState key keyScoped managedContents
         let managedMatches =
-            journal.IsSome
-            && settingValuesEqual key (etcContents |> Option.bind (fun text -> settingValue text key)) managedValue
+            journal.IsSome && settingValuesEqual key currentState.Value managedState.Value
+        let expectedMode =
+            match pendingNode with
+            | Some value when value.ContainsKey "afterMode" -> Some(value["afterMode"].GetValue<int>())
+            | _ ->
+                journal
+                |> Option.bind (fun value ->
+                    if value.ContainsKey "managedMode" && not (isNull value["managedMode"]) then
+                        Some(value["managedMode"].GetValue<int>())
+                    elif key = "StrictForwardPorts" && FirewalldLifecycle.preMetadataJournal value then
+                        optionalString value "baseline" |> Option.map (fun text -> (parseSettingsBaseline key text).Mode)
+                    else None)
+        let modeMatches =
+            if journal.IsNone then false
+            elif managedState.Value.IsNone then true
+            else
+                match expectedMode, etcContents with
+                | Some _, None -> false
+                | Some expected, Some _ -> expected = currentMode
+                | _ -> false
         let active = daemonActive environment
-        let permanentInSync = managedMatches && settingValuesEqual key permanentValue (Some desired)
+        let permanentInSync =
+            managedMatches && modeMatches && settingValuesEqual key permanentValue (Some desired)
         let runtimeInSync = runtimeValue |> Option.exists (fun actual -> settingValuesEqual key (Some actual) (Some desired))
         let runtimeObserved = runtimeValue.IsSome
-        let activationReceipt = managedMatches && active
+        let loadedEvidence = settingsLoadedEvidence environment key journal etcContents
+        let activationReceipt =
+            managedMatches
+            && modeMatches
+            && (loadedEvidence |> Option.exists (fun (actual, _) -> settingValuesEqual key (Some actual) (Some desired)))
         let inSync =
             not pending
             && permanentInSync
@@ -2135,7 +3151,11 @@ module Firewalld =
                 | _ -> "native runtime effect observed"
             elif deprecatedSetting key then "deprecated or ignored by firewalld 2.3.1"
             elif settingRuntimeObservable key then "native runtime getter unavailable; not confirmed"
-            else "successful activation receipt only; packet behavior is not observed"
+            else
+                match loadedEvidence with
+                | Some(_, "verified-daemon-start") -> "trusted pre-start system configuration/default and current daemon generation; packet behavior not probed"
+                | Some _ -> "activation receipt verified for current firewalld generation; packet behavior not probed"
+                | None -> "no loaded-value getter or verified activation proof; packet behavior unknown"
         result["runtimeLimit"] <- JsonValue.Create runtimeLimit
         result :> JsonNode
 
@@ -2156,9 +3176,12 @@ module Firewalld =
                 |> Option.defaultWith (fun () -> fail "StrictForwardPorts setting value is required.")
             else
                 c.SettingValue |> Option.defaultWith (fun () -> fail (key + " setting value is required."))
-        let write = writeSettingsFile environment
-        let validate = validateSettingsCandidate environment c key
-        let activate = fun () -> activateSettings environment key
+        let readState = readSettingsState environment
+        let writeState = writeSettingsState environment c
+        let validateState = validateSettingsState environment c
+        let mutable activeJournal: JsonObject option = None
+        let restoreRuntime transaction recoveryPhase =
+            restoreSettingsRuntimeWithJournal environment transaction recoveryPhase activeJournal
         let lockFile = path environment lockPath
         if operation = "read" then
             use _lock =
@@ -2170,7 +3193,7 @@ module Firewalld =
             let journal = loadJournal environment c owner |> Option.defaultWith (fun () -> fail "No owned firewalld settings transaction awaits confirmation.")
             let nonce = transactionNonce |> Option.defaultWith (fun () -> fail "Firewalld confirmation requires transactionNonce.")
             validateSettingsConfirmation environment key journal
-            FirewalldLifecycle.confirm environment c journal nonce
+            FirewalldLifecycle.confirm environment c journal nonce readState
             JsonObject() :> JsonNode
         elif operation = "apply" || operation = "delete" then
             use _lock = HostFiles.lockFile lockFile
@@ -2181,110 +3204,215 @@ module Firewalld =
                 unchanged :> JsonNode
             else
                 firewall environment [ "--state" ] |> ignore
+                activeJournal <- existingJournal
                 existingJournal
-                |> Option.iter (fun journal -> FirewalldLifecycle.recover environment c journal strictConfigPath write validate activate)
+                |> Option.iter (fun journal ->
+                    FirewalldLifecycle.recover environment c journal strictConfigPath readState writeState restoreRuntime)
                 let recoveredJournal =
                     if existingJournal.IsSome then loadJournal environment c owner
                     else None
-                let current = readSettingsFile environment strictConfigPath
-                let currentMode = settingsFileMode environment current
-                let vendorContents = readSettingsFile environment vendorStrictConfigPath
-                let vendorMode = settingsFileModeAt environment vendorStrictConfigPath vendorContents
-                let isNewOwner = recoveredJournal.IsNone
-                let journal =
-                    recoveredJournal
-                    |> Option.defaultWith (fun () ->
-                        let origin = settingsOriginForNewOwner environment c current vendorContents vendorMode
-                        newJournal owner (Some(encodeSettingsBaseline key current currentMode origin)))
-                if operation = "delete" && existingJournal.IsSome && isNewOwner then
+                activeJournal <- recoveredJournal
+                if operation = "delete" && recoveredJournal.IsNone then
                     let unchanged = JsonObject()
                     unchanged["unchanged"] <- JsonValue.Create true
                     unchanged :> JsonNode
                 else
-                    let currentValue = current |> Option.bind (fun text -> settingValue text key)
-                    let managedContents = optionalString journal "managed"
-                    let managedValue = managedSettingValue key managedContents
-                    if not isNewOwner && not (settingValuesEqual key currentValue managedValue) then
-                        fail ("Owned " + key + " setting changed independently; refusing to overwrite firewalld.conf.")
-                    let baselineText = optionalString journal "baseline" |> Option.defaultWith (fun () -> fail "Missing firewalld settings ownership baseline.")
+                    let current = readSettingsFile environment strictConfigPath
+                    let currentMode = settingsFileMode environment current
+                    let isNewOwner = recoveredJournal.IsNone
+                    let journal =
+                        match recoveredJournal with
+                        | Some value -> value
+                        | None ->
+                            let baselineState = settingsKeyState key current
+                            let origin = settingsOriginForNewOwner environment c current
+                            let baselineText =
+                                encodeSettingsBaseline key current.IsSome baselineState currentMode origin
+                            let value = newJournal owner (Some baselineText)
+                            value["settingsScopeVersion"] <- JsonValue.Create 1
+                            setOptional value "managed" (Some(encodeSettingsKeyState baselineState))
+                            value
+                    activeJournal <- Some journal
+                    let baselineText =
+                        optionalString journal "baseline"
+                        |> Option.defaultWith (fun () -> fail "Missing firewalld settings ownership baseline.")
                     let baseline = parseSettingsBaseline key baselineText
+                    let keyScoped =
+                        journal.ContainsKey "settingsScopeVersion"
+                        && journal["settingsScopeVersion"].GetValue<int>() = 1
+                    let storedManaged = optionalString journal "managed"
+                    let managedState = managedSettingState key keyScoped storedManaged
+                    let baselineNode = JsonNode.Parse(baselineText).AsObject()
+                    let baselineVersion =
+                        if baselineNode.ContainsKey "version" then baselineNode["version"].GetValue<int>()
+                        else 0
+                    let mutable journalChanged = false
+                    if not keyScoped || baselineVersion <> 4 then
+                        let compact =
+                            encodeSettingsBaseline key baseline.Exists
+                                { Value = baseline.Value; Line = baseline.Line }
+                                baseline.Mode baseline.Origin
+                        setOptional journal "baseline" (Some compact)
+                        setOptional journal "managed" (Some(encodeSettingsKeyState managedState))
+                        journal["settingsScopeVersion"] <- JsonValue.Create 1
+                        if journal.ContainsKey "deleteOnConfirm" then journal.Remove "deleteOnConfirm" |> ignore
+                        journalChanged <- true
+                    if current.IsSome && managedState.Value.IsNone then
+                        if not (journal.ContainsKey "managedMode")
+                           || isNull journal["managedMode"]
+                           || journal["managedMode"].GetValue<int>() <> currentMode then
+                            journal["managedMode"] <- JsonValue.Create currentMode
+                            journalChanged <- true
+                    elif current.IsSome then
+                        if journal.ContainsKey "managedMode" && not (isNull journal["managedMode"]) then
+                            if journal["managedMode"].GetValue<int>() <> currentMode then
+                                fail "Owned firewalld.conf mode changed independently; refusing to mutate it."
+                        elif baseline.Mode = currentMode then
+                            journal["managedMode"] <- JsonValue.Create currentMode
+                            journalChanged <- true
+                        else
+                            fail "Firewalld settings ownership mode is unknown; refusing to mutate firewalld.conf."
+                    let managedContents = optionalString journal "managed"
+                    let managedState = managedSettingState key true managedContents
+                    let currentState = settingsKeyState key current
+                    let managedMatches = settingValuesEqual key currentState.Value managedState.Value
+                    let effectiveNow = effectiveSettingValue key current
+                    let runtimeValue = runtimeSettingValue environment key
+                    let priorEvidence = settingsLoadedEvidence environment key (Some journal) current
+                    let priorReceipt = priorEvidence |> Option.map fst
+                    let otherOwnersRemain = not (settingsJournalFiles environment c).IsEmpty
+                    let removeEmptyFile = not baseline.Origin.EtcExisted && not otherOwnersRemain
+                    let scope = settingsScope key removeEmptyFile baseline.Origin.LegacyVendorSeedHash
                     if operation = "apply" then
-                        let effectiveNow = effectiveSettingValue key current vendorContents
                         let candidate =
                             if settingValuesEqual key effectiveNow (Some desired) then current
-                            else
-                                let source = current |> Option.defaultValue (defaultArg vendorContents "")
-                                Some(setSettingValue source key (Some desired))
-                        let fileChanged = candidate <> current
+                            else Some(setSettingValue (defaultArg current "") key (Some desired))
+                        let candidateState = settingsKeyState key candidate
+                        let currentProjected = readState scope current
+                        let candidateProjected = readState scope candidate
+                        let effectiveAfter = effectiveSettingValue key candidate
                         let runtimeMatches =
-                            runtimeSettingValue environment key
+                            runtimeValue
                             |> Option.exists (fun actual -> settingValuesEqual key (Some actual) (Some desired))
-                        let needsActivation = fileChanged || (settingRuntimeObservable key && not runtimeMatches)
-                        let needsTransaction = needsActivation || isNewOwner
-                        if needsTransaction then
-                            let afterMode =
-                                match candidate, current, vendorContents with
-                                | Some _, Some _, _ -> currentMode
-                                | Some _, None, Some _ -> vendorMode
-                                | Some _, None, None -> 0o600
-                                | None, _, _ -> currentMode
-                            let activation = if needsActivation then activate else fun () -> ()
-                            let nonce =
-                                FirewalldLifecycle.transact
-                                    environment c journal isNewOwner strictConfigPath
-                                    current currentMode candidate afterMode managedContents candidate
-                                    write validate activation
-                            let result = settingsSnapshot environment owner c key desired |> fun value -> value.AsObject()
-                            result["transactionNonce"] <- JsonValue.Create nonce
-                            result :> JsonNode
-                        else
-                            // No file, ownership or daemon mutation; there is no transaction to confirm.
+                        let receiptMatches =
+                            priorReceipt
+                            |> Option.exists (fun actual -> settingValuesEqual key (Some actual) (Some desired))
+                        let needsTransaction =
+                            isNewOwner
+                            || journalChanged
+                            || currentProjected <> candidateProjected
+                            || not managedMatches
+                            || (settingRuntimeObservable key && not runtimeMatches)
+                            || (not (settingRuntimeObservable key) && not receiptMatches)
+                        if not needsTransaction then
                             let unchanged = JsonObject()
                             unchanged["unchanged"] <- JsonValue.Create true
                             unchanged :> JsonNode
-                    else
-                        let otherOwnersRemain = not (settingsJournalFiles environment c).IsEmpty
-                        let transactDelete after afterMode managedAfter =
-                            journal["deleteOnConfirm"] <- JsonValue.Create true
-                            let changed = after <> current || (after.IsSome && afterMode <> currentMode)
-                            let activation = if changed then activate else fun () -> ()
+                        else
+                            let loadedValue, proofSource =
+                                if settingRuntimeObservable key then
+                                    match runtimeValue, effectiveNow with
+                                    | Some actual, Some permanent when settingValuesEqual key (Some actual) (Some permanent) ->
+                                        actual, "observed-runtime"
+                                    | Some _, Some _ ->
+                                        fail ("Cannot safely mutate " + key + " while its loaded value differs from the permanent preimage.")
+                                    | None, _ ->
+                                        fail ("Cannot observe the previous loaded " + key + " value for a safe transaction.")
+                                    | _, None ->
+                                        fail ("Cannot establish the previous effective " + key + " value for a safe transaction.")
+                                else
+                                    match priorEvidence with
+                                    | Some(value, source) when settingValuesEqual key (Some value) effectiveNow -> value, source
+                                    | _ ->
+                                        fail ("Cannot safely change unobservable " + key + " without a current-generation activation receipt or trusted pre-start configuration.")
+                            let attribution =
+                                if settingValuesEqual key currentState.Value managedState.Value then "managed"
+                                elif settingValuesEqual key currentState.Value baseline.Value then "baseline"
+                                else "owned-key-drift"
+                            let rollbackProof =
+                                settingsRollbackProof key loadedValue (proofSource + ":" + attribution)
+                            let afterMode =
+                                match candidate, current with
+                                | Some _, Some _ -> currentMode
+                                | Some _, None when journal.ContainsKey "managedMode" && not (isNull journal["managedMode"]) ->
+                                    journal["managedMode"].GetValue<int>()
+                                | Some _, None -> 0o600
+                                | None, _ -> currentMode
+                            requireReloadProof environment
                             let nonce =
                                 FirewalldLifecycle.transact
-                                    environment c journal false strictConfigPath
-                                    current currentMode after afterMode managedContents managedAfter
-                                    write validate activation
-                            let result = JsonObject()
+                                    environment c journal isNewOwner false strictConfigPath scope
+                                    currentProjected currentMode candidateProjected afterMode
+                                    managedContents (Some(encodeSettingsKeyState candidateState))
+                                    (Some rollbackProof) readState writeState validateState
+                                    (fun () -> activateSettings environment key) restoreRuntime
+                            let activatedValue =
+                                effectiveAfter
+                                |> Option.defaultWith (fun () -> fail ("Unable to establish activated " + key + " value."))
+                            recordSettingsActivation environment c key activatedValue "completed-activation" journal
+                            let result = settingsSnapshot environment owner c key desired |> fun value -> value.AsObject()
                             result["transactionNonce"] <- JsonValue.Create nonce
                             result :> JsonNode
-                        let restoredBeforeCleanup =
-                            if baseline.Value = managedValue then current
+                    else
+                        let restoredText = setSettingLine (defaultArg current "") key baseline.Line
+                        let restored =
+                            if current.IsNone && baseline.Line.IsNone then None
+                            elif removeEmptyFile && restoredText = "" then None
+                            else Some restoredText
+                        let restoredState = settingsKeyState key restored
+                        let beforeProjected = readState scope current
+                        let afterProjected = readState scope restored
+                        let effectiveAfter = effectiveSettingValue key restored
+                        let loadedValue, proofSource =
+                            if settingRuntimeObservable key then
+                                match runtimeValue, effectiveNow with
+                                | Some actual, Some permanent when settingValuesEqual key (Some actual) (Some permanent) ->
+                                    actual, "observed-runtime"
+                                | Some _, Some _ ->
+                                    fail ("Cannot safely delete " + key + " while its loaded value differs from the permanent preimage.")
+                                | None, _ ->
+                                    fail ("Cannot observe the previous loaded " + key + " value for safe Delete.")
+                                | _, None ->
+                                    fail ("Cannot establish the previous effective " + key + " value for safe Delete.")
                             else
-                                let restoredText = setSettingValue (defaultArg current "") key baseline.Value
-                                if baseline.Exists then Some restoredText
-                                elif restoredText = "" then None
-                                else Some restoredText
-                        let removeOverride =
-                            not baseline.Origin.EtcExisted
-                            && not otherOwnersRemain
-                            && (current = managedContents
-                                || restoredBeforeCleanup = baseline.Origin.VendorContents
-                                || restoredBeforeCleanup = vendorContents)
-                        let restored = if removeOverride then None else restoredBeforeCleanup
-                        let restoredMode =
+                                match priorEvidence with
+                                | Some(value, source) when settingValuesEqual key (Some value) effectiveNow -> value, source
+                                | _ ->
+                                    fail ("Cannot safely Delete unobservable " + key + " without a current-generation activation receipt or trusted pre-start configuration.")
+                        let attribution =
+                            if settingValuesEqual key currentState.Value managedState.Value then "managed"
+                            elif settingValuesEqual key currentState.Value baseline.Value then "baseline"
+                            else "owned-key-drift"
+                        let rollbackProof =
+                            settingsRollbackProof key loadedValue (proofSource + ":" + attribution)
+                        let afterMode =
                             match restored, current with
                             | Some _, Some _ -> currentMode
                             | Some _, None when baseline.Exists -> baseline.Mode
-                            | Some _, None when vendorContents.IsSome -> vendorMode
                             | Some _, None -> 0o600
                             | None, _ -> currentMode
-                        transactDelete restored restoredMode restored
+                        requireReloadProof environment
+                        let nonce =
+                            FirewalldLifecycle.transact
+                                environment c journal false true strictConfigPath scope
+                                beforeProjected currentMode afterProjected afterMode
+                                managedContents (Some(encodeSettingsKeyState restoredState))
+                                (Some rollbackProof) readState writeState validateState
+                                (fun () -> activateSettings environment key) restoreRuntime
+                        let activatedValue =
+                            effectiveAfter
+                            |> Option.defaultWith (fun () -> fail ("Unable to establish restored " + key + " value."))
+                        recordSettingsActivation environment c key activatedValue "completed-activation" journal
+                        let result = JsonObject()
+                        result["transactionNonce"] <- JsonValue.Create nonce
+                        result :> JsonNode
         else fail "Unsupported firewalld operation."
-    let private recoverPendingCore (environment: HostEnvironment) (bootRecovery: bool) =
+    let private recoverPendingCore (environment: HostEnvironment) (phase: FirewalldLifecycle.RecoveryPhase) =
         try
-            FirewalldLifecycle.recoverPending environment (fun transaction journal ->
+            let recover (transaction: FirewalldLifecycle.PendingTransaction) ownerJournal =
                 let c = transaction.Configuration
                 let journal =
-                    match journal with
+                    match ownerJournal with
                     | Some value -> value
                     | None when transaction.ReleaseOnRollback || (transaction.Status = "confirmed" && transaction.DeleteOnConfirm) ->
                         let value = JsonObject()
@@ -2292,19 +3420,32 @@ module Firewalld =
                         value
                     | None -> fail "Firewalld recovery owner journal is missing."
                 let logical = if c.Kind = "settings" then strictConfigPath else objectPath "/etc/firewalld" c.Kind c.Name
-                let write contents mode =
-                    if c.Kind = "settings" then writeStrictConfig environment contents mode
-                    else writeOverride environment c contents mode
-                let validate proposed = guardMutation environment c proposed
-                let activate () =
-                    if not bootRecovery then activateRecovered environment c
-                FirewalldLifecycle.recoverPendingTransaction environment c journal logical write activate)
+                let readState scope contents =
+                    if c.Kind = "settings" then readSettingsState environment scope contents
+                    else objectReadState scope contents
+                let writeState scope expectedCurrent target mode =
+                    if c.Kind = "settings" then writeSettingsState environment c scope expectedCurrent target mode
+                    else objectWriteState environment c logical scope expectedCurrent target mode
+                let restoreRuntime transaction recoveryPhase =
+                    if c.Kind = "settings" then restoreSettingsRuntimeWithJournal environment transaction recoveryPhase ownerJournal
+                    else restoreObjectRuntime environment c transaction recoveryPhase
+                FirewalldLifecycle.recoverPendingTransaction
+                    environment c journal logical phase readState writeState restoreRuntime
+            match phase with
+            | FirewalldLifecycle.ActiveDaemon -> FirewalldLifecycle.recoverPending environment recover
+            | FirewalldLifecycle.BootBeforeFirewalld -> FirewalldLifecycle.recoverPendingBoot environment recover
+            | FirewalldLifecycle.BootAfterFirewalld -> FirewalldLifecycle.recoverPendingPostBoot environment recover
         with :? InvalidOperationException as error ->
             fail error.Message
 
-    let recoverPending (environment: HostEnvironment) = recoverPendingCore environment false
+    let recoverPending (environment: HostEnvironment) =
+        recoverPendingCore environment FirewalldLifecycle.ActiveDaemon
 
-    let recoverPendingBoot (environment: HostEnvironment) = recoverPendingCore environment true
+    let recoverPendingBoot (environment: HostEnvironment) =
+        recoverPendingCore environment FirewalldLifecycle.BootBeforeFirewalld
+
+    let recoverPendingPostBoot (environment: HostEnvironment) =
+        recoverPendingCore environment FirewalldLifecycle.BootAfterFirewalld
     let handle (environment: HostEnvironment) (request: JsonElement) : JsonNode =
         let operation = request.GetProperty("operation").GetString()
         let keys = request.EnumerateObject() |> Seq.map (fun property -> property.Name) |> Set.ofSeq
@@ -2351,19 +3492,26 @@ module Firewalld =
             elif operation = "confirm" then
                 use _lock = HostFiles.lockFile lockFile
                 let journal = loadJournal environment c owner |> Option.defaultWith (fun () -> fail "No owned firewalld object awaits confirmation.")
-                let deleting =
-                    match journal["deleteOnConfirm"] with
-                    | null -> false
-                    | value -> value.GetValue<bool>()
-                if deleting then firewall environment [ "--state" ] |> ignore
+                let nonce = transactionNonce |> Option.defaultWith (fun () -> fail "Firewalld confirmation requires transactionNonce.")
+                let transaction =
+                    FirewalldLifecycle.pending environment
+                    |> Option.defaultWith (fun () -> fail "No global firewalld transaction awaits confirmation.")
+                if transaction.OwnerId <> owner || transaction.Nonce <> nonce
+                   || FirewalldModel.toJson transaction.Configuration <> FirewalldModel.toJson c then
+                    fail "Firewalld confirmation does not match the authenticated pending transaction."
+                let deleting = transaction.DeleteOnConfirm
+                if deleting then
+                    firewall environment [ "--state" ] |> ignore
+                    requireRestoredObjectRuntime environment c
                 else
                     let observed = snapshot environment c (Some journal)
                     if not (observed["permanentInSync"].GetValue<bool>())
                        || not (observed["runtimeObserved"].GetValue<bool>())
                        || not (observed["runtimeInSync"].GetValue<bool>()) then
                         fail "Firewalld object did not converge before fresh-connection confirmation."
+                let readState scope contents = objectReadState scope contents
                 try
-                    FirewalldLifecycle.confirm environment c journal (transactionNonce |> Option.get)
+                    FirewalldLifecycle.confirm environment c journal nonce readState
                 with :? InvalidOperationException as error ->
                     fail error.Message
                 JsonObject() :> JsonNode
@@ -2392,7 +3540,7 @@ module Firewalld =
                             |> Option.defaultWith (fun () -> newJournal owner (readFile environment logical))
                         if operation = "apply" then
                             let desiredMode = objectFileMode environment logical
-                            let nonce = transact environment c journal currentJournal.IsNone (Some(render c)) desiredMode
+                            let nonce = transact environment c journal currentJournal.IsNone false (Some(render c)) desiredMode
                             let result = snapshot environment c (Some journal)
                             if not (result["permanentInSync"].GetValue<bool>())
                                || not (result["runtimeObserved"].GetValue<bool>())
@@ -2412,8 +3560,7 @@ module Firewalld =
                                     journal["baselineMode"].GetValue<int>()
                                 elif baseline.IsNone then int mode644
                                 else fail "Legacy firewalld journal lacks the original override mode; refusing Delete."
-                            journal["deleteOnConfirm"] <- JsonValue.Create true
-                            let nonce = transact environment c journal false baseline baselineMode
+                            let nonce = transact environment c journal false true baseline baselineMode
                             let result = JsonObject()
                             result["transactionNonce"] <- JsonValue.Create nonce
                             result :> JsonNode

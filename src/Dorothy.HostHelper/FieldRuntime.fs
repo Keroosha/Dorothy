@@ -22,6 +22,72 @@ module FieldRuntime =
             raise (XmlException("Unexpected firewalld XML root."))
         document.Root
 
+    let private xmlAttributes (node: XElement) =
+        node.Attributes()
+        |> Seq.map (fun attribute ->
+            if attribute.Name.Namespace <> XNamespace.None then
+                invalidOp "Namespaced firewalld XML attributes cannot be projected."
+            attribute.Name.LocalName, attribute.Value)
+        |> Map.ofSeq
+
+    let rec private xmlElement (node: XElement) : FirewalldModel.Element =
+        if node.Name.Namespace <> XNamespace.None then
+            invalidOp "Namespaced firewalld XML elements cannot be projected."
+        let texts =
+            node.Nodes()
+            |> Seq.choose (function
+                | :? XText as text -> Some text.Value
+                | _ -> None)
+            |> Seq.toArray
+        let text =
+            if texts.Length = 0
+               || (node.HasElements && (texts |> Array.forall String.IsNullOrWhiteSpace)) then None
+            else Some(String.concat "" texts)
+        { Name = node.Name.LocalName
+          Attributes = xmlAttributes node
+          Text = text
+          Children = node.Elements() |> Seq.map xmlElement |> Seq.toList }
+
+    /// Parses an effective native XML object into the validated wire model without
+    /// normalizing away any root attributes or child elements.
+    let parseConfiguration (kind: string) (name: string) (text: string) : Result<FirewalldModel.Configuration, string> =
+        try
+            if kind = "settings" then invalidArg "kind" "Global settings are not XML objects."
+            let root = parseRoot kind text
+            let rootTexts =
+                root.Nodes()
+                |> Seq.choose (function
+                    | :? XText as value -> Some value.Value
+                    | _ -> None)
+                |> Seq.toArray
+            if rootTexts |> Array.exists (String.IsNullOrWhiteSpace >> not) then
+                invalidArg "text" "Firewalld object roots cannot contain text."
+            let attributes = xmlAttributes root
+            let empty = FirewalldModel.empty kind name
+            let target =
+                if kind = "zone" || kind = "policy" then
+                    Map.tryFind "target" attributes |> Option.defaultValue empty.Target
+                else empty.Target
+            let priority =
+                if kind = "policy" then
+                    Map.tryFind "priority" attributes
+                    |> Option.map (fun value -> Int32.Parse(value, Globalization.CultureInfo.InvariantCulture))
+                    |> Option.defaultValue empty.Priority
+                else empty.Priority
+            let attributes =
+                if kind = "zone" || kind = "policy" then Map.remove "target" attributes
+                else attributes
+            let attributes = if kind = "policy" then Map.remove "priority" attributes else attributes
+            let configuration =
+                { empty with
+                    Target = target
+                    Priority = priority
+                    Attributes = attributes
+                    Elements = root.Elements() |> Seq.map xmlElement |> Seq.toList }
+            FirewalldModel.validate configuration |> ignore
+            Ok configuration
+        with error -> Error error.Message
+
     let rec private modelElement (element: FirewalldModel.Element) =
         let result = XElement(xn element.Name)
         for KeyValue(name, value) in element.Attributes do
@@ -151,52 +217,51 @@ module FieldRuntime =
             for _, child in children do childArray.Add child
             result.Add childArray
             result
-        (canonical root).ToJsonString()
+        canonical root
 
     /// Canonical comparison ignores XML formatting and unordered native element order,
     /// but retains every declared attribute and text value. The zone/policy rule
     /// sequence is normalized as firewalld's native priority/rule set, not XML order.
     let canonicalXml kind text =
-        parseRoot kind text |> canonicalNode
+        (parseRoot kind text |> canonicalNode).ToJsonString()
 
-    let private legacyChildAttributes kind (name: XName) =
-        match kind, name with
-        | "zone", name when name = xn "interface" -> Some [ "name" ]
-        | "zone", name when name = xn "service" -> Some [ "name" ]
-        | "zone", name when name = xn "port" -> Some [ "port"; "protocol" ]
-        | "zone", name when name = xn "protocol" -> Some [ "value" ]
-        | "zone", name when name = xn "masquerade" -> Some []
-        | "zone", name when name = xn "forward" -> Some []
-        | "policy", name when name = xn "ingress-zone" -> Some [ "name" ]
-        | "policy", name when name = xn "egress-zone" -> Some [ "name" ]
-        | "policy", name when name = xn "masquerade" -> Some []
-        | _ -> None
+    let private jsonArray (node: JsonNode) =
+        match node with
+        | :? JsonArray as values -> values
+        | _ -> invalidOp "Canonical XML has an invalid array."
 
-    let private completeLegacyChild kind (node: XElement) =
-        match legacyChildAttributes kind node.Name with
-        | None -> false
-        | Some expectedAttributes ->
-            let actualAttributes = node.Attributes() |> Seq.map (fun attribute -> attribute.Name.ToString()) |> Seq.sort |> Seq.toList
-            let expectedAttributes = expectedAttributes |> List.map (fun name -> (xn name).ToString()) |> List.sort
-            let noContent =
-                not node.HasElements
-                && (node.Nodes()
-                    |> Seq.forall (function
-                        | :? XText as text -> String.IsNullOrWhiteSpace text.Value
-                        | _ -> false))
-            actualAttributes = expectedAttributes && noContent
+    let private jsonString (node: JsonNode) =
+        match node with
+        | :? JsonValue as value -> value.GetValue<string>()
+        | _ -> invalidOp "Canonical XML has an invalid string."
 
-    let private preserveNonLegacy (kind: string) (root: XElement) =
-        for child in root.Elements() |> Seq.toArray do
-            if completeLegacyChild kind child then child.Remove()
-        for attribute in root.Attributes() |> Seq.toArray do
-            if ((kind = "zone" || kind = "policy") && attribute.Name = xn "target")
-               || (kind = "policy" && attribute.Name = xn "priority") then
-                attribute.Remove()
-        root
+    let private canonicalFeaturesPreserved (baseline: JsonArray) (desired: JsonArray) =
+        let attributes (root: JsonArray) =
+            jsonArray root[1]
+            |> Seq.map (fun pair ->
+                let pair = jsonArray pair
+                jsonString pair[0], jsonString pair[1])
+            |> Map.ofSeq
+        let baselineAttributes = attributes baseline
+        let desiredAttributes = attributes desired
+        let attributesPreserved =
+            baselineAttributes
+            |> Map.forall (fun name value -> Map.tryFind name desiredAttributes = Some value)
+        let baselineText = jsonArray baseline[2]
+        let desiredText = jsonArray desired[2]
+        let textPreserved =
+            baselineText.Count = 0
+            || baselineText.ToJsonString() = desiredText.ToJsonString()
+        let childSet (root: JsonArray) =
+            jsonArray root[3]
+            |> Seq.map (fun child -> child.ToJsonString())
+            |> Set.ofSeq
+        attributesPreserved
+        && textPreserved
+        && Set.isSubset (childSet baseline) (childSet desired)
 
-    /// Existing definitions may be replaced only if every feature outside the
-    /// legacy replacement contract is explicitly carried through unchanged.
+    /// First adoption may add declared features, but it must carry every native
+    /// feature already present in the baseline forward without changing it.
     let safeAdoption (configuration: FirewalldModel.Configuration) (baselineXml: string) : bool =
         try
             let c = FirewalldModel.validate configuration
@@ -204,7 +269,15 @@ module FieldRuntime =
             else
                 let baseline = parseRoot c.Kind baselineXml
                 let desired = parseRoot c.Kind (render c)
-                let baselineFeatures = canonicalNode (preserveNonLegacy c.Kind baseline)
-                let desiredFeatures = canonicalNode (preserveNonLegacy c.Kind desired)
-                baselineFeatures = desiredFeatures
+                let effectiveAttr key fallback (root: XElement) =
+                    match root.Attribute(xn key) with null -> fallback | attribute -> attribute.Value
+                // Omitting target/priority still has native packet semantics. An
+                // implicit default is not permission to replace it during acquisition.
+                let defaults =
+                    match c.Kind with
+                    | "zone" -> [ "target", "default"; "ingress-priority", "0"; "egress-priority", "0" ]
+                    | "policy" -> [ "target", "CONTINUE"; "priority", "-1" ]
+                    | _ -> []
+                (defaults |> List.forall (fun (key, fallback) -> effectiveAttr key fallback baseline = effectiveAttr key fallback desired))
+                && canonicalFeaturesPreserved (canonicalNode baseline) (canonicalNode desired)
         with _ -> false

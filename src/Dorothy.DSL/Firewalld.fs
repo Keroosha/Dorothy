@@ -46,6 +46,8 @@ type FirewalldPart =
     | Ingress of string list
     | Egress of string list
     | Priority of int
+    | ZoneIngressPriority of int
+    | ZoneEgressPriority of int
     | Sources of FirewalldSelector list
     | RichRules of FirewalldModel.Element list
     | ForwardPort of FirewalldForwardPort
@@ -83,7 +85,8 @@ type FirewalldRichRulePart =
     | RichLog of string option * string option
     | RichNfLog of string option * string option * int option
     | RichAudit
-    | RichLimit of int * FirewalldLimitUnit
+    | RichLimit of int * FirewalldLimitUnit * int option
+    | RichTcpMssClamp of int option
     | RichAccept
     | RichReject of string option
     | RichDrop
@@ -195,11 +198,19 @@ type FirewalldObjectBuilder internal (kind: string, name: string) =
             | Ingress value -> once "ingress"; configuration <- { configuration with Ingress = value }
             | Egress value -> once "egress"; configuration <- { configuration with Egress = value }
             | Priority value -> once "priority"; configuration <- { configuration with Priority = value }
+            | ZoneIngressPriority value ->
+                once "ingressPriority"
+                addAttribute "ingress-priority" (string value)
+            | ZoneEgressPriority value ->
+                once "egressPriority"
+                addAttribute "egress-priority" (string value)
             | Sources values ->
                 once "sources"
                 addElements (values |> List.map FirewalldFormatting.selectorElement)
             | RichRules values ->
-                seen.Add "richRules" |> ignore
+                once "richRules"
+                if values |> List.exists (fun element -> isNull (box element) || element.Name <> "rule") then
+                    invalidArg "richRules" "Each richRules value must be a complete rich rule element."
                 addElements values
             | Short value ->
                 once "short"
@@ -262,11 +273,11 @@ type FirewalldObjectBuilder internal (kind: string, name: string) =
             match kind with
             | "zone" ->
                 set [ "target"; "interfaces"; "services"; "ports"; "protocols"; "masquerade"; "forward"
-                      "sources"; "richRules"; "forwardPorts"; "icmpBlocks"; "icmpBlockInversion"
+                      "sources"; "sourcePorts"; "ingressPriority"; "egressPriority"; "richRules"; "forwardPorts"; "icmpBlocks"; "icmpBlockInversion"
                       "short"; "description"; "version" ]
             | "policy" ->
                 set [ "target"; "ingress"; "egress"; "priority"; "masquerade"; "services"; "ports"
-                      "protocols"; "richRules"; "forwardPorts"; "icmpBlocks"; "short"; "description"; "version" ]
+                      "protocols"; "sourcePorts"; "richRules"; "forwardPorts"; "icmpBlocks"; "short"; "description"; "version" ]
             | "service" ->
                 set [ "short"; "description"; "version"; "ports"; "protocols"; "sourcePorts"; "includes"
                       "helpers"; "modules"; "destination" ]
@@ -324,14 +335,17 @@ type FirewalldRichRuleBuilder internal () =
             if actionSeen then invalidArg "richRule" "A rich rule may declare only one terminal action."
             actionSeen <- true
             if supportsLimit then addLimitableChild node else addChild node
-        let limitNode rate unit =
+        let limitNode rate unit burst =
             let suffix =
                 match unit with
                 | FirewalldLimitUnit.Second -> "s"
                 | FirewalldLimitUnit.Minute -> "m"
                 | FirewalldLimitUnit.Hour -> "h"
                 | FirewalldLimitUnit.Day -> "d"
-            FirewalldFormatting.node "limit" [ "value", string rate + "/" + suffix ] None []
+            let attributes =
+                [ "value", string rate + "/" + suffix ]
+                @ (burst |> Option.map (fun value -> [ "burst", string value ]) |> Option.defaultValue [])
+            FirewalldFormatting.node "limit" attributes None []
         for part in parts do
             match part with
             | RichFamily value -> once "family" family; family <- Some value
@@ -359,12 +373,15 @@ type FirewalldRichRuleBuilder internal () =
                     @ (queueSize |> Option.map (fun value -> [ "queue-size", string value ]) |> Option.defaultValue [])
                 addLimitableChild (FirewalldFormatting.node "nflog" attributes None [])
             | RichAudit -> addLimitableChild (FirewalldFormatting.node "audit" [] None [])
-            | RichLimit(rate, unit) ->
+            | RichTcpMssClamp value ->
+                let attributes = value |> Option.map (fun size -> [ "value", string size ]) |> Option.defaultValue []
+                addChild (FirewalldFormatting.node "tcp-mss-clamp" attributes None [])
+            | RichLimit(rate, unit, burst) ->
                 match limitIndex with
                 | Some index ->
                     match children[index] with
                     | Some parent when parent.Children.IsEmpty ->
-                        children[index] <- Some { parent with Children = [ limitNode rate unit ] }
+                        children[index] <- Some { parent with Children = [ limitNode rate unit burst ] }
                         limitIndex <- None
                     | _ -> invalidArg "richRule" "Limit must follow a log, audit, or terminal action and may only be declared once."
                 | None -> invalidArg "richRule" "Limit must follow a log, audit, or terminal action."
@@ -461,6 +478,20 @@ module internal FirewalldGraph =
         |> List.iter (snd >> visit)
         ordered |> Seq.toList
 
+    /// Native policy constraints that can be determined from this declaration.
+    /// Do not assume a backend or an interface list for externally supplied zones.
+    let validatePolicyTopology (objects: FirewalldObjectSpec list) =
+        let boundZones = objects |> List.choose (fun p -> if p.Kind = "zone" && not p.Value.Interfaces.IsEmpty then Some p.Name else None) |> Set.ofList
+        let iptables = objects |> List.exists (fun p -> p.Kind = "settings" && p.Name = "FirewallBackend" && p.Value.SettingValue = Some "iptables")
+        for obj in objects do
+            if obj.Kind = "policy" then
+                let policy = obj.Value
+                let contains name = policy.Elements |> List.exists (fun e -> e.Name = name || (e.Name = "rule" && (e.Children |> List.exists (fun child -> child.Name = name))))
+                if iptables && (policy.Masquerade || contains "masquerade") && (policy.Ingress |> List.exists boundZones.Contains) then
+                    invalidArg "masquerade" "The iptables backend cannot masquerade a policy with interface-bound ingress zones."
+                if (contains "forward-port" || contains "mark") && (policy.Egress |> List.exists boundZones.Contains) then
+                    invalidArg "egressZones" "A policy forward-port or mark cannot use an interface-bound egress zone."
+
     let validateUniqueBindings (objects: FirewalldObjectSpec list) =
         let zonePolicyNames = HashSet<string>(StringComparer.Ordinal)
         let interfaceBindings = ResizeArray<string * string>()
@@ -522,6 +553,7 @@ module internal FirewalldGraph =
             && candidate.Target = "DROP"
             && candidate.Priority < 0
             && List.contains "docker" candidate.Egress
+            && not candidate.Ingress.IsEmpty && not (List.contains "HOST" candidate.Ingress)
             && candidate.Services.IsEmpty
             && candidate.Ports.IsEmpty
             && candidate.Protocols.IsEmpty
@@ -542,56 +574,13 @@ module internal FirewalldGraph =
 module internal FirewalldGuardUnit =
     let name (hostName: string) = hostName + "-docker-firewall-guard.service"
 
-    let private systemdShell (command: string) =
-        "ExecStart=:/bin/sh -ec \"" + command.Replace("\"", "\\\"") + "\""
-
-    let private infoCheck (policy: FirewalldObjectSpec) =
-        let exactLine (value: string) =
-            "/usr/bin/printf '%%s' \"$info\" | /usr/bin/grep -Fqx '  " + value + "'"
-        let checks =
-            [ exactLine "target: DROP"
-              exactLine ("priority: " + string policy.Value.Priority)
-              exactLine ("ingress-zones: " + String.concat " " policy.Value.Ingress)
-              exactLine ("egress-zones: " + String.concat " " policy.Value.Egress)
-              exactLine "masquerade: no" ]
-        "info=$(/usr/bin/firewall-cmd --info-policy="
-        + policy.Name
-        + ") || exit 1; "
-        + String.concat "; " checks
-        |> systemdShell
-
-    let private emptyListCheck (policy: FirewalldObjectSpec) (option: string) =
-        "value=$(/usr/bin/firewall-cmd --policy="
-        + policy.Name
-        + " "
-        + option
-        + ") || exit 1; test -z \"$value\""
-        |> systemdShell
-
-    let configuration (guardPolicies: FirewalldObjectSpec list) =
-        if guardPolicies.IsEmpty then invalidArg "guardPolicies" "Docker readiness requires at least one safe guard policy."
-        let unitLines =
-            [ "[Unit]"
-              "Description=Dorothy strict Firewalld readiness gate for Docker"
-              "Requires=firewalld.service"
-              "After=firewalld.service"
-              "Before=docker.service"
-              ""
-              "[Service]"
-              "Type=oneshot"
-              "ExecStart=/usr/bin/firewall-cmd --state"
-              "ExecStart=/usr/bin/grep -Fqx StrictForwardPorts=yes /etc/firewalld/firewalld.conf" ]
-            @ [ for policy in guardPolicies do
-                    yield infoCheck policy
-                    for option in [ "--list-services"; "--list-ports"; "--list-protocols"; "--list-source-ports"
-                                    "--list-forward-ports"; "--list-rich-rules" ] do
-                        yield emptyListCheck policy option ]
-            @ [ "RemainAfterExit=yes"
-                ""
-                "[Install]"
-                "RequiredBy=docker.service"
-                "" ]
-        String.concat "\n" unitLines
+    let specification (unitName: string) (policies: FirewalldObjectSpec list) =
+        let spec = System.Text.Json.Nodes.JsonObject()
+        spec["name"] <- System.Text.Json.Nodes.JsonValue.Create unitName
+        spec["managed"] <- System.Text.Json.Nodes.JsonValue.Create true
+        spec["configuration"] <- System.Text.Json.Nodes.JsonValue.Create ""
+        spec["dockerFence"] <- policies |> List.map (fun p -> FirewalldGateModel.ofPolicy p.Value) |> FirewalldGateModel.encode
+        spec.ToJsonString()
 
 type FirewalldBuilder internal () =
     member _.Yield(value: FirewalldObjectSpec) = [ FirewalldDeclaration.Object value ]
@@ -622,6 +611,7 @@ type FirewalldBuilder internal () =
             && FirewalldModel.settingKey value.Value = "StrictForwardPorts") then
             invalidArg "firewalld" "StrictForwardPorts has a legacy resource identity and cannot have a second settings owner."
         FirewalldGraph.validateUniqueBindings values
+        FirewalldGraph.validatePolicyTopology values
         FirewalldSpec(FirewalldGraph.orderObjects values, List.tryHead settings)
 
 /// Open this module for the firewalld vocabulary; names do not shadow other host DSLs globally.
@@ -631,7 +621,6 @@ module Firewalld =
     let strictForwardPorts enabled = FirewalldDeclaration.StrictForwardPorts enabled
     let zone name = FirewalldObjectBuilder("zone", name)
     let policy name = FirewalldObjectBuilder("policy", name)
-    let service name = FirewalldObjectBuilder("service", name)
     let ipset name = FirewalldObjectBuilder("ipset", name)
     let icmpType name = FirewalldObjectBuilder("icmptype", name)
     let helper name = FirewalldObjectBuilder("helper", name)
@@ -689,7 +678,6 @@ module Firewalld =
     let icmpBlockInversion = IcmpBlockInversion
     let richRules values = RichRules values
     let short value = Short value
-    let description value = Description value
     let version value = Version value
     let includes values = Includes values
     let helpers values = Helpers values
@@ -721,12 +709,24 @@ module Firewalld =
         { OriginalPort = original
           DestinationAddress = destinationAddress
           DestinationPort = destinationPort }
-    let log level prefix = RichLog(level, prefix)
-    let nflog group prefix queueSize = RichNfLog(group, prefix, queueSize)
-    let audit = RichAudit
-    let limit rate unit = RichLimit(rate, unit)
-    let accept = RichAccept
-    let reject = RichReject None
-    let rejectWith rejectType = RichReject(Some rejectType)
-    let drop = RichDrop
-    let mark value = RichMark value
+    module Defined =
+        let service name = FirewalldObjectBuilder("service", name)
+        let description value = Description value
+
+    module Zone =
+        let ingressPriority value = ZoneIngressPriority value
+        let egressPriority value = ZoneEgressPriority value
+
+    module RichRule =
+        let log level prefix = RichLog(level, prefix)
+        let nflog group prefix queueSize = RichNfLog(group, prefix, queueSize)
+        let audit = RichAudit
+        let limit rate unit = RichLimit(rate, unit, None)
+        let limitBurst rate unit burst = RichLimit(rate, unit, Some burst)
+        let accept = RichAccept
+        let reject = RichReject None
+        let rejectWith rejectType = RichReject(Some rejectType)
+        let drop = RichDrop
+        let mark value = RichMark value
+        let tcpMssClamp = RichTcpMssClamp None
+        let tcpMssClampValue value = RichTcpMssClamp(Some value)

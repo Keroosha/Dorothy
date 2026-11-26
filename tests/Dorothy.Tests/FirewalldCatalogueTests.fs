@@ -85,3 +85,59 @@ type FirewalldCatalogueTests() =
         Assert.That(firewall.StrictForwardPorts, Is.EqualTo(Some true))
         for key, value in [ "StrictForwardPorts", "yes"; "ReloadPolicy", "unicast"; "DefaultZone", "../zones"; "LogDenied", "all\nDefaultZone=trusted" ] do
             Assert.Throws<ArgumentException>(fun () -> Dorothy.DSL.Firewalld.setting key value |> ignore) |> ignore
+
+    [<Test>]
+    member _.ExportsPublicFirewalldNativeCatalogue() =
+        use temporary = new TemporaryDirectory("dorothy-firewalld-native-catalogue-")
+        let outputDirectory =
+            match Environment.GetEnvironmentVariable "DOROTHY_FIREWALLD_CATALOGUE_DIR" with
+            | null | "" -> temporary.Path
+            | value -> System.IO.Path.GetFullPath value
+        FirewalldPublicCatalogueConsumer.export (Dorothy.HostHelper.FirewalldModel.parse >> Dorothy.HostHelper.FieldRuntime.render) outputDirectory
+        for directory in [ "zones"; "policies"; "services"; "helpers"; "ipsets"; "icmptypes" ] do
+            Assert.That(System.IO.Directory.Exists(System.IO.Path.Combine(outputDirectory, directory)), Is.True, directory)
+        for path in
+            [ "zones/catalogue-edge.xml"; "policies/catalogue-policy.xml"; "services/catalogue-service.xml"
+              "helpers/ftp.xml"; "ipsets/catalogue-net-iface.xml"; "icmptypes/catalogue-echo.xml" ] do
+            Assert.That(System.IO.File.Exists(System.IO.Path.Combine(outputDirectory, path)), Is.True, path)
+        let daemonConfig = System.IO.File.ReadAllLines(System.IO.Path.Combine(outputDirectory, "firewalld.conf"))
+        Assert.That(daemonConfig, Has.Length.EqualTo 18)
+        Assert.That(daemonConfig, Does.Contain "StrictForwardPorts=yes")
+
+    [<Test>]
+    member _.``Service modules reference the canonical helper and prevent its removal``() =
+        let moduleConsumer =
+            { Model.empty "service" "consumer" with
+                Elements = [ leaf "module" [ "name", "nf_conntrack_ftp" ] ] }
+        Assert.That(Model.helperNameForModule "nf_conntrack_ftp", Is.EqualTo "ftp")
+        Assert.That(Model.references moduleConsumer, Is.EquivalentTo [ "helper", "ftp" ])
+        let inventories: Map<string, Map<string, string>> =
+            Map.ofList
+                [ "zone", Map.ofList [ "public", "<zone/>" ]
+                  "policy", Map.empty
+                  "service", Map.ofList [ "consumer", "<service><module name=\"nf_conntrack_ftp\"/></service>" ]
+                  "helper", Map.ofList [ "ftp", "<helper module=\"nf_conntrack_ftp\"/>" ]
+                  "ipset", Map.empty
+                  "icmptype", Map.empty ]
+        let parse = Dorothy.HostHelper.Firewalld.parseXml
+        Dorothy.HostHelper.FirewalldReferences.validate parse "service" "consumer" "public" inventories
+        let withoutHelper = Map.add "helper" Map.empty inventories
+        Assert.Throws<InvalidOperationException>(fun () ->
+            Dorothy.HostHelper.FirewalldReferences.validate parse "helper" "ftp" "public" withoutHelper) |> ignore
+
+    [<Test>]
+    member _.``Native catalogue accepts IPv6 rpfilter aliases and enforces ipset interface length``() =
+        for value in [ "yes"; "true"; "no"; "false" ] do
+            Dorothy.DSL.Firewalld.setting "IPv6_rpfilter" value |> ignore
+        Assert.DoesNotThrow(fun () ->
+            Dorothy.DSL.Firewalld.ipset "iface-valid" {
+                Dorothy.DSL.Firewalld.ipsetType "hash:net,iface"
+                Dorothy.DSL.Firewalld.entries [ "192.0.2.0/24,abcdefghijklmno" ]
+            }
+            |> ignore)
+        Assert.Throws<ArgumentException>(fun () ->
+            Dorothy.DSL.Firewalld.ipset "iface-too-long" {
+                Dorothy.DSL.Firewalld.ipsetType "hash:net,iface"
+                Dorothy.DSL.Firewalld.entries [ "192.0.2.0/24,abcdefghijklmnop" ]
+            }
+            |> ignore) |> ignore

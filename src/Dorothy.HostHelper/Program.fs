@@ -8,14 +8,23 @@ open System.Text.Json.Nodes
 
 module Program =
     let private usage () =
-        Console.Error.WriteLine("Usage: keroosha-iac-helper apt|ufw|firewalld|firewalld-recover|firewalld-recover-boot|traefik|docker|docker-job|swapfile|sshd|fail2ban|users|sudo|content|service|--version")
+        Console.Error.WriteLine("Usage: keroosha-iac-helper apt|ufw|firewalld|firewalld-recover|firewalld-recover-boot|firewalld-recover-postboot|firewalld-docker-gate NAME PRIORITY INGRESS EGRESS|traefik|docker|docker-job|sshd|fail2ban|users|sudo|content|service|swapfile|--version")
         64
+
+    // A disconnected provider must not leave an external command holding the
+    // transaction lock indefinitely. Independent recovery will retry once the
+    // lock is released; unsuccessful commands never attest a successful reload.
+    let private firewalldEnvironment =
+        let host = HostEnvironment.system
+        { host with
+            Run = fun executable arguments input ->
+                host.Run "/usr/bin/timeout" ("--kill-after=5s" :: "75s" :: executable :: arguments) input }
 
     let private dispatch (command: string) (request: JsonElement) =
         match command with
         | "apt" -> Apt.handle HostEnvironment.system request
         | "ufw" -> Ufw.handle HostEnvironment.system request
-        | "firewalld" -> Firewalld.handle HostEnvironment.system request
+        | "firewalld" -> Firewalld.handle firewalldEnvironment request
         | "traefik" -> Traefik.handle HostEnvironment.system request
         | "docker" -> DockerEngine.handle HostEnvironment.system request
         | "docker-job" -> DockerJob.handle HostEnvironment.system request
@@ -83,10 +92,27 @@ module Program =
 
     [<EntryPoint>]
     let main (arguments: string array) =
-        if arguments.Length = 1 && arguments[0] = "firewalld-recover-boot" then
+        if arguments.Length = 5 && arguments[0] = "firewalld-docker-gate" then
+            try
+                let fence = FirewalldGateModel.parseArguments arguments[1] arguments[2] arguments[3] arguments[4]
+                FirewalldDockerGate.verify firewalldEnvironment [ fence ]
+                0
+            with error ->
+                reportFailure error
+                1
+        elif arguments.Length = 1 && arguments[0] = "firewalld-recover-postboot" then
             try
                 verifyGlobalization ()
-                Firewalld.recoverPendingBoot HostEnvironment.system
+                Firewalld.recoverPendingPostBoot firewalldEnvironment
+                Console.Out.WriteLine("{}")
+                0
+            with error ->
+                reportFailure error
+                1
+        elif arguments.Length = 1 && arguments[0] = "firewalld-recover-boot" then
+            try
+                verifyGlobalization ()
+                Firewalld.recoverPendingBoot firewalldEnvironment
                 Console.Out.WriteLine("{}")
                 0
             with error ->
@@ -95,7 +121,7 @@ module Program =
         elif arguments.Length = 1 && arguments[0] = "firewalld-recover" then
             try
                 verifyGlobalization ()
-                Firewalld.recoverPending HostEnvironment.system
+                Firewalld.recoverPending firewalldEnvironment
                 Console.Out.WriteLine("{}")
                 0
             with error ->

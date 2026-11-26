@@ -24,7 +24,15 @@ module Services =
         if not ([ "read"; "apply"; "delete" ] |> List.contains operation) then fail "Unsupported service operation."
         let name = unitName (text request "name")
         let managed = request.GetProperty("managed").GetBoolean()
-        let configuration = text request "configuration"
+        let suppliedConfiguration = text request "configuration"
+        let fences, configuration =
+            match request.TryGetProperty "dockerFence" with
+            | true, value ->
+                if not managed || suppliedConfiguration <> "" || not (name.EndsWith("-docker-firewall-guard.service", StringComparison.Ordinal)) then
+                    fail "Invalid typed Docker firewall gate."
+                let fences = FirewalldGateModel.decode (JsonNode.Parse(value.GetRawText()))
+                Some fences, FirewalldDockerGate.renderUnit Environment.ProcessPath fences
+            | _ -> None, suppliedConfiguration
         if not managed && configuration <> "" then fail "Package units cannot have a managed configuration."
         let path = HostEnvironment.path environment ("/etc/systemd/system/" + name)
         if managed then Content.ensureSafePath path
@@ -48,6 +56,9 @@ module Services =
         let active state = Map.tryFind "ActiveState" state = Some "active"
         let enabled state = Map.tryFind "UnitFileState" state = Some "enabled"
         if operation = "apply" then
+            // Check the new gate now. Restarting an already active RequiredBy unit to
+            // perform the check also stops its dependent Docker service and workloads.
+            fences |> Option.iter (FirewalldDockerGate.verify environment)
             let fileChanged = managed && (not (File.Exists path) || File.ReadAllText path <> configuration || int (File.GetUnixFileMode path) <> 0o644)
             if fileChanged then
                 Directory.CreateDirectory(Path.GetDirectoryName path) |> ignore
@@ -56,20 +67,30 @@ module Services =
             if fileChanged then run [ "reenable"; "--"; name ]
             elif not (enabled initial) then run [ "enable"; "--"; name ]
             let restart = request.GetProperty("restart").GetBoolean()
-            if active initial && (fileChanged || restart) then run [ "restart"; "--"; name ]
+            if active initial && fences.IsNone && (fileChanged || restart) then run [ "restart"; "--"; name ]
             elif not (active initial) then run [ "start"; "--"; name ]
         elif operation = "delete" then
             if loaded initial then
-                run [ "stop"; "--"; name ]
+                if fences.IsNone then run [ "stop"; "--"; name ]
                 run [ "disable"; "--"; name ]
+                if fences.IsSome then
+                    // Detach docker.service's Requires edge before stopping the gate.
+                    run [ "daemon-reload" ]
+                    run [ "stop"; "--"; name ]
             if managed && File.Exists path then
                 File.Delete path
                 run [ "daemon-reload" ]
         let state = if operation = "read" then initial else observed ()
         let fileMatches = not managed || (File.Exists path && File.ReadAllText path = configuration && int (File.GetUnixFileMode path) = 0o644)
+        let gateMatches =
+            match fences with
+            | Some values when operation = "read" && fileMatches && active state && enabled state ->
+                try FirewalldDockerGate.verify environment values; true
+                with :? Firewalld.BackendError -> false
+            | _ -> true
         let result = JsonObject()
         result["exists"] <- JsonValue.Create(loaded state && (not managed || File.Exists path))
-        result["inSync"] <- JsonValue.Create(fileMatches && active state && enabled state)
+        result["inSync"] <- JsonValue.Create(fileMatches && gateMatches && active state && enabled state)
         result["active"] <- JsonValue.Create(active state)
         result["enabled"] <- JsonValue.Create(enabled state)
         result :> JsonNode

@@ -93,7 +93,7 @@ type FirewalldRuntimeTests() =
         Assert.That(FieldRuntime.canonicalXml "zone" first, Is.Not.EqualTo(FieldRuntime.canonicalXml "zone" changedText))
 
     [<Test>]
-    member _.``Safe adoption requires nonlegacy metadata and filtering rules unchanged``() =
+    member _.``Safe adoption preserves baseline features and allows explicit additions``() =
         let config =
             { FirewalldModel.empty "zone" "public" with
                 Target = "DROP"
@@ -101,6 +101,14 @@ type FirewalldRuntimeTests() =
                 Elements = [ element "description" [] (Some "preserved") [] ] }
         let baseline = "<zone target=\"DROP\"><service name=\"ssh\"/><description>preserved</description></zone>"
         Assert.That(FieldRuntime.safeAdoption config baseline, Is.True)
+        let legacyBaseline =
+            "<zone target=\"DROP\"><service name=\"ssh\"/><port port=\"9090\" protocol=\"tcp\"/><description>preserved</description></zone>"
+        let explicitSuperset = { config with Ports = [ "9090/tcp"; "9443/tcp" ] }
+        Assert.That(FieldRuntime.safeAdoption explicitSuperset legacyBaseline, Is.True)
+        Assert.That(FieldRuntime.safeAdoption config legacyBaseline, Is.False)
+        Assert.That(FieldRuntime.safeAdoption { explicitSuperset with Target = "default" } legacyBaseline, Is.False)
+        Assert.That(FieldRuntime.safeAdoption { explicitSuperset with Target = "ACCEPT" } "<zone><service name=\"ssh\"/></zone>", Is.False)
+
         Assert.That(FieldRuntime.safeAdoption config (baseline.Replace("preserved", "different", StringComparison.Ordinal)), Is.False)
         let opaqueService = baseline.Replace("<service name=\"ssh\"/>", "<service name=\"ssh\" future=\"on\"/>", StringComparison.Ordinal)
         Assert.That(FieldRuntime.safeAdoption config opaqueService, Is.False)
@@ -111,6 +119,218 @@ type FirewalldRuntimeTests() =
         let richBaseline = baseline.Replace("</zone>", "<rule><source address=\"192.0.2.0/24\"/><drop/></rule></zone>", StringComparison.Ordinal)
         Assert.That(FieldRuntime.safeAdoption config richBaseline, Is.False)
 
+
+    [<Test>]
+    member _.``Live restrictive rich additions and authoritative NetworkManager interfaces do not drift``() =
+        let config = { FirewalldModel.empty "zone" "quiet" with Services = [ "ssh" ] }
+        let ban = "rule family=\"ipv4\" source address=\"192.0.2.7\" reject limit value=\"10/m\""
+        let accept = "rule family=\"ipv4\" source address=\"192.0.2.8\" accept"
+        let mutable richRules = [ ban ]
+        let run executable arguments _ =
+            match executable, arguments with
+            | "firewall-cmd", [ "--zone=quiet"; "--list-all" ] ->
+                commandResult(zoneOutput "ssh" "" [] richRules)
+            | "firewall-cmd", [ "--zone=quiet"; "--list-interfaces" ] -> commandResult "eth0"
+            | "nmcli", [ "-g"; "GENERAL.CON-UUID"; "device"; "show"; "eth0" ] -> commandResult "c9442404-b0ac-40fe-9bd0-ddbcb382196f"
+            | "nmcli", [ "-g"; "connection.zone"; "connection"; "show"; "uuid"; "c9442404-b0ac-40fe-9bd0-ddbcb382196f" ] -> commandResult "quiet"
+            | _ -> failwith ("Unexpected fixture command: " + executable + " " + String.concat " " arguments)
+        let environment, root = makeEnvironment run
+        try
+            Directory.CreateDirectory root |> ignore
+            let banObservation = FirewalldRuntime.observe environment config
+            Assert.That(banObservation.Observed, Is.True)
+            Assert.That(banObservation.InSync, Is.True)
+            richRules <- [ accept ]
+            let acceptObservation = FirewalldRuntime.observe environment config
+            Assert.That(acceptObservation.Observed, Is.True)
+            Assert.That(acceptObservation.InSync, Is.False)
+            Assert.That(FirewalldRuntime.isRestrictiveRichRule ban, Is.True)
+            Assert.That(
+                FirewalldRuntime.isRestrictiveRichRule "rule family=\"ipv4\" source address=\"drop\" accept",
+                Is.False)
+        finally
+            if Directory.Exists root then Directory.Delete(root, true)
+
+    [<Test>]
+    member _.``Overlapping port and source-port ranges normalize but adjacent ranges remain distinct``() =
+        Assert.That(
+            FirewalldRuntime.normalizeFieldValues "zone" "ports" [ "8005-8015/tcp 8000-8010/tcp" ],
+            Is.EquivalentTo [ "8000-8015/tcp" ])
+        Assert.That(
+            FirewalldRuntime.normalizeFieldValues "policy" "source-ports" [ "2000-2010/udp"; "2005-2015/udp" ],
+            Is.EquivalentTo [ "2000-2015/udp" ])
+        Assert.That(
+            FirewalldRuntime.normalizeFieldValues "zone" "ports" [ "8000-8010/tcp"; "8011-8015/tcp" ],
+            Is.EquivalentTo [ "8000-8010/tcp"; "8011-8015/tcp" ])
+
+    [<Test>]
+    member _.``Rich selector ordering limits and default MSS value match firewalld native rendering``() =
+        let source = element "source" [ "address", "192.0.2.0/24" ] None []
+        let destination = element "destination" [ "address", "198.51.100.0/24" ] None []
+        let mssClamp = element "tcp-mss-clamp" [] None []
+        let rule = element "rule" [ "family", "ipv4" ] None [ destination; source; mssClamp ]
+        let limitedSource = element "source" [ "address", "203.0.113.0/24" ] None []
+        let logLimit = element "limit" [ "value", "10/minute"; "burst", "20" ] None []
+        let log = element "log" [ "prefix", "limited" ] None [ logLimit ]
+        let actionLimit = element "limit" [ "value", "5/second" ] None []
+        let drop = element "drop" [] None [ actionLimit ]
+        let limitedRule = element "rule" [ "family", "ipv4" ] None [ limitedSource; log; drop ]
+        let config = { FirewalldModel.empty "zone" "quiet" with Elements = [ rule; limitedRule ] }
+        let nativeRule =
+            "rule family=\"ipv4\" source address=\"192.0.2.0/24\" destination address=\"198.51.100.0/24\" tcp-mss-clamp value=\"pmtu\""
+        let nativeLimitedRule =
+            "rule family=\"ipv4\" source address=\"203.0.113.0/24\" log prefix=\"limited\" limit value=\"10/m\" burst=20 drop limit value=\"5/s\""
+        Assert.That(
+            FirewalldRuntime.expectedRichRuleStrings config,
+            Is.EqualTo(Some [ nativeRule; nativeLimitedRule ]))
+        let run executable arguments _ =
+            match executable, arguments with
+            | "firewall-cmd", [ "--zone=quiet"; "--list-all" ] ->
+                commandResult(zoneOutput "" "" [] [ nativeRule; nativeLimitedRule ])
+            | "firewall-cmd", [ "--zone=quiet"; "--list-interfaces" ] -> commandResult ""
+            | _ -> failwith ("Unexpected fixture command: " + executable + " " + String.concat " " arguments)
+        let environment, root = makeEnvironment run
+        try
+            Directory.CreateDirectory root |> ignore
+            let observation = FirewalldRuntime.observe environment config
+            Assert.That(observation.Observed, Is.True)
+            Assert.That(observation.InSync, Is.True)
+            let projected =
+                match FirewalldRuntime.snapshotFromXml "zone" "quiet" (Some(FieldRuntime.render config)) with
+                | Ok(Some snapshot) -> snapshot
+                | result -> failwith ("Unable to project effective XML: " + string result)
+            let exactProjection = FirewalldRuntime.observeSnapshotExactly environment projected
+            Assert.That(exactProjection.Observed, Is.True)
+            Assert.That(exactProjection.InSync, Is.True)
+        finally
+            if Directory.Exists root then Directory.Delete(root, true)
+
+    [<Test>]
+    member _.``Service modules and ICMP family defaults use native spellings``() =
+        let service =
+            { FirewalldModel.empty "service" "ftp-control" with
+                Elements = [ element "module" [ "name", "nf_conntrack_ftp" ] None [] ] }
+        let disabledIcmp =
+            { FirewalldModel.empty "icmptype" "no-family" with
+                Elements = [ element "destination" [ "ipv4", "no"; "ipv6", "no" ] None [] ] }
+        let defaultIcmp = FirewalldModel.empty "icmptype" "all-families"
+        let run executable arguments _ =
+            match executable, arguments with
+            | "firewall-cmd", [ "--info-service=ftp-control" ] ->
+                commandResult "ftp-control\n  ports:\n  protocols:\n  source-ports:\n  modules: ftp\n  destination:\n  includes:\n  helpers:\n"
+            | "firewall-cmd", [ "--info-icmptype=no-family" ] ->
+                commandResult "no-family\n  destination: ipv4 ipv6\n"
+            | "firewall-cmd", [ "--info-icmptype=all-families" ] ->
+                commandResult "all-families\n  destination: ipv4 ipv6\n"
+            | _ -> failwith ("Unexpected fixture command: " + executable + " " + String.concat " " arguments)
+        let environment, root = makeEnvironment run
+        try
+            Directory.CreateDirectory root |> ignore
+            Assert.That(FirewalldRuntime.inSync environment service, Is.True)
+            Assert.That(FirewalldRuntime.inSync environment disabledIcmp, Is.True)
+            Assert.That(FirewalldRuntime.inSync environment defaultIcmp, Is.True)
+        finally
+            if Directory.Exists root then Directory.Delete(root, true)
+
+
+    [<Test>]
+    member _.``Reload preflight refuses foreign runtime differences across unrelated objects and ipsets``() =
+        let mutable zoneRules = []
+        let mutable policyRules = []
+        let mutable policyPorts = "22/tcp"
+        let mutable zoneServices = "ssh"
+        let mutable zonePorts = "80/tcp"
+        let mutable serviceDestination = ""
+        let mutable includedServicePorts = ""
+        let mutable ipsetEntries = "192.0.2.7"
+        let serviceOutput name ports destination includes =
+            name + "\n  ports: " + ports + "\n  protocols:\n  source-ports:\n  modules:\n  destination: " + destination + "\n  includes: " + includes + "\n  helpers:\n"
+        let zoneWithPorts services ports rules =
+            (zoneOutput services "" [] rules).Replace("  ports: \n", "  ports: " + ports + "\n", StringComparison.Ordinal)
+        let ipsetOutput entries =
+            "blocked\n  type: hash:net\n  options: family=inet hashsize=1024\n  entries: " + entries + "\n"
+        let run executable arguments _ =
+            match executable, arguments with
+            | "firewall-cmd", [ "--get-zones" ]
+            | "firewall-cmd", [ "--permanent"; "--get-zones" ] -> commandResult "public"
+            | "firewall-cmd", [ "--get-policies" ]
+            | "firewall-cmd", [ "--permanent"; "--get-policies" ] -> commandResult "edge"
+            | "firewall-cmd", [ "--get-ipsets" ]
+            | "firewall-cmd", [ "--permanent"; "--get-ipsets" ] -> commandResult "blocked"
+            | "firewall-cmd", [ "--zone=public"; "--list-all" ] ->
+                commandResult(zoneWithPorts zoneServices zonePorts zoneRules)
+            | "firewall-cmd", [ "--permanent"; "--zone=public"; "--list-all" ] ->
+                commandResult(zoneWithPorts "ssh" "80/tcp" [])
+            | "firewall-cmd", [ "--zone=public"; "--list-interfaces" ]
+            | "firewall-cmd", [ "--permanent"; "--zone=public"; "--list-interfaces" ] -> commandResult ""
+            | "firewall-cmd", [ "--policy=edge"; "--list-all" ] ->
+                commandResult(policyOutput "docker" "" policyPorts "" policyRules)
+            | "firewall-cmd", [ "--permanent"; "--policy=edge"; "--list-all" ] ->
+                commandResult(policyOutput "docker" "" "22/tcp" "" [])
+            | "firewall-cmd", [ "--info-service=ssh" ] -> commandResult(serviceOutput "ssh" "" serviceDestination "ssh-aux")
+            | "firewall-cmd", [ "--permanent"; "--info-service=ssh" ] -> commandResult(serviceOutput "ssh" "" "" "ssh-aux")
+            | "firewall-cmd", [ "--info-service=ssh-aux" ] -> commandResult(serviceOutput "ssh-aux" includedServicePorts "" "")
+            | "firewall-cmd", [ "--permanent"; "--info-service=ssh-aux" ] -> commandResult(serviceOutput "ssh-aux" "" "" "")
+            | "firewall-cmd", [ "--info-ipset=blocked" ] -> commandResult(ipsetOutput ipsetEntries)
+            | "firewall-cmd", [ "--permanent"; "--info-ipset=blocked" ] -> commandResult(ipsetOutput "192.0.2.7")
+            | _ -> failwith ("Unexpected fixture command: " + executable + " " + String.concat " " arguments)
+        let environment, root = makeEnvironment run
+        let expectRefusal () =
+            match FirewalldRuntime.validateReload environment with
+            | Error _ -> ()
+            | Ok () -> Assert.Fail("Reload preflight accepted an unpersisted runtime change.")
+        let expectTargetedRefusal kind name field value =
+            match FirewalldRuntime.validateReloadAllowingMissingSelector environment kind name field value with
+            | Error _ -> ()
+            | Ok () -> Assert.Fail("Targeted reload preflight accepted another host difference.")
+        try
+            Directory.CreateDirectory root |> ignore
+            Assert.That(FirewalldRuntime.validateReload environment, Is.EqualTo(Ok () : Result<unit, string>))
+            zoneServices <- ""
+            zonePorts <- ""
+            expectRefusal ()
+            Assert.That(
+                FirewalldRuntime.validateReloadAllowingMissingSelectors
+                    environment "zone" "public" [ "services", "ssh"; "ports", "80/tcp" ],
+                Is.EqualTo(Ok () : Result<unit, string>))
+            policyPorts <- "8080/tcp"
+            expectTargetedRefusal "zone" "public" "services" "ssh"
+            policyPorts <- "22/tcp"
+            zoneServices <- "ssh"
+            zonePorts <- "80/tcp"
+            policyPorts <- ""
+            expectRefusal ()
+            Assert.That(
+                FirewalldRuntime.validateReloadAllowingMissingSelectors environment "policy" "edge" [ "ports", "22/tcp" ],
+                Is.EqualTo(Ok () : Result<unit, string>))
+            policyPorts <- "22/tcp"
+            serviceDestination <- "ipv4:192.0.2.1"
+            expectRefusal ()
+            serviceDestination <- ""
+            includedServicePorts <- "8443/tcp"
+            expectRefusal ()
+            includedServicePorts <- ""
+            policyPorts <- "8080/tcp"
+            expectRefusal ()
+            policyPorts <- "22/tcp"
+            policyRules <- [ "rule family=\"ipv4\" source address=\"192.0.2.9\" drop" ]
+            expectRefusal ()
+            policyRules <- []
+            zoneRules <- [ "rule family=\"ipv4\" source address=\"192.0.2.8\" reject" ]
+            Assert.That(FirewalldRuntime.validateReloadExcludingTargetObject environment "zone" "public", Is.EqualTo(Ok () : Result<unit, string>))
+            let expectedAfter =
+                { FirewalldModel.empty "zone" "public" with
+                    Services = [ "ssh" ]
+                    Ports = [ "80/tcp" ] }
+            let exactTarget = FirewalldRuntime.observeExactly environment expectedAfter
+            Assert.That(exactTarget.Observed, Is.True)
+            Assert.That(exactTarget.InSync, Is.False)
+            expectRefusal ()
+            zoneRules <- []
+            ipsetEntries <- "192.0.2.7 198.51.100.4"
+            expectRefusal ()
+        finally
+            if Directory.Exists root then Directory.Delete(root, true)
     [<Test>]
     member _.``Read observes quiet zone selectors and runtime drift without claiming other objects``() =
         let config =
@@ -176,6 +396,19 @@ type FirewalldRuntimeTests() =
             Assert.That(snapshot.SourcesRaw, Is.EquivalentTo [ "192.0.2.0/24"; "02:00:00:00:00:01"; "ipset:trusted" ])
             Assert.That(snapshot.Sources |> List.map (fun source -> source.Attributes), Is.EquivalentTo [ Map.ofList [ "address", "192.0.2.0/24" ]; Map.ofList [ "mac", "02:00:00:00:00:01" ]; Map.ofList [ "ipset", "trusted" ] ])
             Assert.That(snapshot.ForwardPorts.Head.Attributes, Is.EqualTo<Map<string,string>>(Map.ofList [ "port", "443"; "protocol", "tcp"; "to-port", "8443"; "to-addr", "192.0.2.9" ]))
+            Assert.That(
+                FirewalldRuntime.canonicalForwardPortValue snapshot.ForwardPorts.Head,
+                Is.EqualTo(Some "port=443:proto=tcp:toport=8443:toaddr=192.0.2.9"))
+            let expectedConfig =
+                { FirewalldModel.empty "zone" "quiet" with
+                    Elements =
+                        [ element "forward-port"
+                              [ "port", "443"; "protocol", "tcp"; "to-port", "8443"; "to-addr", "192.0.2.9" ]
+                              None
+                              [] ] }
+            Assert.That(
+                FirewalldRuntime.expectedForwardPortValues expectedConfig,
+                Is.EqualTo(Some [ "port=443:proto=tcp:toport=8443:toaddr=192.0.2.9" ]))
             Assert.That(snapshot.ForwardPorts.Length, Is.EqualTo 2)
             Assert.That(snapshot.ForwardPorts[1].Attributes, Is.EqualTo<Map<string,string>>(Map.ofList [ "port", "8080"; "protocol", "udp"; "to-addr", "2001:db8::3" ]))
             Assert.That(snapshot.RichRules, Is.EquivalentTo [ rule ])
