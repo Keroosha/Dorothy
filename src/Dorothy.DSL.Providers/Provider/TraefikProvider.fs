@@ -37,6 +37,7 @@ module private TraefikProviderLogic =
       "description": "Manages one owned native Traefik instance on an existing Debian host.",
       "inputProperties": {
         "connection": { "$ref": "#/types/keroosha:debian:SshConnection" },
+        "configuration": { "type": "string", "secret": true, "description": "Structured, validated native Traefik configuration encoded as JSON. Omitted for legacy declarations." },
         "entryPoints": { "type": "object", "additionalProperties": { "type": "integer" } },
         "resolvers": {
           "type": "object",
@@ -56,6 +57,7 @@ module private TraefikProviderLogic =
             "type": "object",
             "properties": {
               "host": { "type": "string" },
+              "entryPoint": { "type": "string" },
               "excludedPathSubtree": { "type": "string" },
               "backend": { "type": "string" },
               "redirect": {
@@ -96,6 +98,7 @@ module private TraefikProviderLogic =
       "requiredInputs": ["connection", "entryPoints", "resolvers", "routers", "certificates"],
       "properties": {
         "connection": { "$ref": "#/types/keroosha:debian:SshConnection" },
+        "configuration": { "type": "string", "secret": true },
         "entryPoints": { "type": "object", "additionalProperties": { "type": "integer" } },
         "resolvers": {
           "type": "object",
@@ -114,6 +117,7 @@ module private TraefikProviderLogic =
             "type": "object",
             "properties": {
               "host": { "type": "string" },
+              "entryPoint": { "type": "string" },
               "excludedPathSubtree": { "type": "string" },
               "backend": { "type": "string" },
               "redirect": {
@@ -149,6 +153,7 @@ module private TraefikProviderLogic =
         "adminPort": { "type": "integer" },
         "inSync": { "type": "boolean" },
         "actualConfigHash": { "type": "string" },
+        "tlsProbeSummary": { "type": "object", "additionalProperties": { "type": "integer" }, "description": "Bounded TLS observation counts; truncated is 0 or 1. Configuration acceptance does not prove a skipped handshake." },
         "certificateFingerprints": { "type": "object", "additionalProperties": { "type": "string" } }
       },
       "required": ["connection", "entryPoints", "resolvers", "routers", "certificates", "adminPort", "inSync", "actualConfigHash", "certificateFingerprints"]
@@ -156,7 +161,7 @@ module private TraefikProviderLogic =
   }
 }"""
 
-    let private declarativeProperties = [ "connection"; "entryPoints"; "resolvers"; "routers"; "certificates"; "adminPort" ]
+    let private declarativeProperties = [ "connection"; "entryPoints"; "resolvers"; "routers"; "certificates"; "adminPort"; "configuration" ]
     let private outputProperties = [ "inSync"; "actualConfigHash"; "certificateFingerprints" ]
     let private knownProperties = Set.ofList declarativeProperties
 
@@ -195,15 +200,11 @@ module private TraefikProviderLogic =
     let private hasUnknownInputs (values: ImmutableDictionary<string, PropertyValue>) =
         values.Values |> Seq.exists containsUnknown
 
-    let private markCertificatesSecret (values: Dictionary<string, PropertyValue>) =
-        match values.TryGetValue("certificates") with
-        | true, value when value.IsSecret -> ()
-        | true, value ->
-            match tryGetMap value with
-            | Some contents ->
-                values["certificates"] <- PropertyValue(contents, IsSecret = true, Dependencies = value.Dependencies)
-            | None -> ()
-        | false, _ -> ()
+    let private protectInputs (values: Dictionary<string, PropertyValue>) =
+        for name in [ "certificates"; "configuration" ] do
+            match values.TryGetValue(name) with
+            | true, value when not value.IsSecret -> values[name] <- value.WithSecret(true)
+            | _ -> ()
 
     let private mapWithMetadata (source: PropertyValue) (values: ImmutableDictionary<string, PropertyValue>) =
         PropertyValue(values, IsSecret = source.IsSecret, Dependencies = source.Dependencies)
@@ -710,10 +711,27 @@ module private TraefikProviderLogic =
                 int number
         if entryPoints.Values |> Seq.exists ((=) adminPort) then
             invalidOp "The loopback Traefik adminPort must not overlap a public entryPoint."
+        for router in routers.Values do
+            match router.Target with
+            | TraefikRouterTarget.Backend url -> TraefikSettings.guardAdminDestination adminPort url
+            | _ -> ()
+        let configuration =
+            match values.TryGetValue("configuration") with
+            | false, _ -> None
+            | true, source ->
+                let root =
+                    match tryGetString source with
+                    | Some text -> TraefikSettings.parse text
+                    | None -> invalidOp "Traefik configuration must be a structured JSON string."
+                TraefikSettings.validate
+                    (entryPoints |> Seq.map (fun field -> field.Key, field.Value) |> Map.ofSeq)
+                    adminPort (Set.ofSeq resolvers.Keys) (Set.ofSeq certificates.Keys) (Set.ofSeq routers.Keys) root
+                Some root
         { EntryPoints = entryPoints
           Resolvers = resolvers
           Routers = routers
           Certificates = certificates
+          Configuration = configuration
           AdminPort = adminPort }
 
     let private validateTls (config: TraefikConfig) =
@@ -743,7 +761,7 @@ module private TraefikProviderLogic =
         | false, _ -> normalized["adminPort"] <- PropertyValue(19080.0)
         | true, value when value.IsNull -> normalized["adminPort"] <- numberWithMetadata value 19080.0
         | _ -> ()
-        markCertificatesSecret normalized
+        protectInputs normalized
         if not hasUnknown then normalizeKnownDefaults normalized
         { Values = normalized
           HasUnknowns = hasUnknown
@@ -805,17 +823,22 @@ module private TraefikProviderLogic =
 
     let private outputValues (inputs: Dictionary<string, PropertyValue>) (snapshot: TraefikSnapshot) =
         let outputs = Dictionary<string, PropertyValue>(inputs, StringComparer.Ordinal)
-        markCertificatesSecret outputs
+        protectInputs outputs
         outputs["inSync"] <- PropertyValue(snapshot.InSync)
         outputs["actualConfigHash"] <- PropertyValue(snapshot.ActualConfigHash)
         outputs["certificateFingerprints"] <- stringMapValue snapshot.CertificateFingerprints
+        if inputs.ContainsKey("configuration") then
+            let counts = ImmutableDictionary.CreateBuilder<string, PropertyValue>(StringComparer.Ordinal)
+            for field in snapshot.TlsProbeSummary do counts.Add(field.Key, PropertyValue(float field.Value))
+            outputs["tlsProbeSummary"] <- PropertyValue(counts.ToImmutable())
         outputs
 
     let private previewValues (inputs: NormalizedInputs) =
         let outputs = Dictionary<string, PropertyValue>(inputs.Values, StringComparer.Ordinal)
-        markCertificatesSecret outputs
+        protectInputs outputs
         for property in outputProperties do
             outputs[property] <- PropertyValue.Computed
+        if inputs.Values.ContainsKey("configuration") then outputs["tlsProbeSummary"] <- PropertyValue.Computed
         outputs
 
     let private requestTimeout (timeout: TimeSpan) =
@@ -923,9 +946,17 @@ module private TraefikProviderLogic =
                     replaces.Add("connection.address")
                 | _ -> ()
 
-                for property in [ "connection"; "entryPoints"; "resolvers"; "routers"; "certificates"; "adminPort" ] do
+                let compareConfiguration (oldValue: PropertyValue) (newValue: PropertyValue) =
+                    // External SDKs need not use the F# DSL's canonical key order.
+                    if not (oldValue.Equals(newValue)) then
+                        match tryGetString oldValue, tryGetString newValue with
+                        | Some previous, Some desired when System.Text.Json.Nodes.JsonNode.DeepEquals(TraefikSettings.parse previous, TraefikSettings.parse desired) -> ()
+                        | _ -> add "configuration" "configuration" PropertyDiffKind.Update true
+
+                for property in declarativeProperties do
                     if property <> "connection" then
                         match oldNormalized.Values.TryGetValue(property), newNormalized.Values.TryGetValue(property) with
+                        | (true, oldValue), (true, newValue) when property = "configuration" -> compareConfiguration oldValue newValue
                         | (true, oldValue), (true, newValue) -> compareValue property property oldValue newValue
                         | (true, _), (false, _) -> add property property PropertyDiffKind.Delete true
                         | (false, _), (true, _) -> add property property PropertyDiffKind.Add true
@@ -987,7 +1018,9 @@ module private TraefikProviderLogic =
                 try
                     parseConnection normalized.Values["connection"] |> ignore
                     parseConfig normalized.Values |> validateTls
-                with _ ->
+                with
+                | :? TraefikSettings.InvalidConfiguration as error -> addFailure normalized.Failures "configuration" error.Message
+                | _ ->
                     addFailure normalized.Failures "" "Traefik configuration or TLS certificate material is invalid."
             checkResponse normalized.Values normalized.Failures
 

@@ -14,11 +14,13 @@ type TraefikConfig =
       Resolvers: ImmutableDictionary<string, TraefikResolver>
       Routers: ImmutableDictionary<string, TraefikRouter>
       Certificates: ImmutableDictionary<string, NormalizedCertificate>
+      Configuration: Nodes.JsonObject option
       AdminPort: int }
 
 type TraefikSnapshot =
     { InSync: bool
       ActualConfigHash: string
+      TlsProbeSummary: ImmutableDictionary<string, int>
       CertificateFingerprints: ImmutableDictionary<string, string> }
 
 module TraefikBackend =
@@ -80,6 +82,11 @@ module TraefikBackend =
             json.WriteEndObject())
 
         writer.WriteNumber("adminPort", desired.AdminPort)
+        match desired.Configuration with
+        | Some configuration ->
+            writer.WritePropertyName("configuration")
+            configuration.WriteTo(writer)
+        | None -> ()
         writer.WriteEndObject()
         writer.Flush()
         Encoding.UTF8.GetString(stream.GetBuffer(), 0, int stream.Length)
@@ -117,7 +124,7 @@ module TraefikBackend =
             invalidOp "Remote Traefik response must be an object."
 
         let properties = root.EnumerateObject() |> Seq.toArray
-        let expected = Set.ofList [ "inSync"; "actualConfigHash"; "certificateFingerprints" ]
+        let expected = Set.ofList [ "inSync"; "actualConfigHash"; "certificateFingerprints"; "tlsObservations" ]
         let names = properties |> Array.map (fun property -> property.Name) |> Set.ofArray
         if names <> expected || properties.Length <> expected.Count then
             invalidOp "Remote Traefik response has an invalid shape."
@@ -145,8 +152,18 @@ module TraefikBackend =
                 invalidOp "Remote Traefik response contains an invalid certificate fingerprint."
             fingerprints <- fingerprints.Add(property.Name, fingerprint)
 
+        let report = root.GetProperty("tlsObservations")
+        if report.ValueKind <> JsonValueKind.Object then invalidOp "Invalid Traefik TLS observation report."
+        let summary = ImmutableDictionary.CreateBuilder<string, int>(StringComparer.Ordinal)
+        for name in [ "nativeProbesAttempted"; "unprobedCount"; "opaqueRouterCount" ] do
+            let value = report.GetProperty(name).GetInt32()
+            if value < 0 then invalidOp "Invalid Traefik TLS observation count."
+            summary.Add(name, value)
+        summary.Add("truncated", if report.GetProperty("truncated").GetBoolean() then 1 else 0)
+
         { InSync = inSyncElement.GetBoolean()
           ActualConfigHash = hash
+          TlsProbeSummary = summary.ToImmutable()
           CertificateFingerprints = fingerprints }
 
     let private parseDeleteResponse (output: string) =

@@ -6,17 +6,25 @@ Target: [Traefik 3.7.16](https://github.com/traefik/traefik/tree/v3.7.16/pkg/con
 
 Keep `keroosha:debian:Traefik`, its parent, name, resource ID, legacy inputs, ACME storage names and redirect/backend generation. Existing declarations need no checkpoint rewrite. New declarations contribute structured fields to an optional `configuration` input; omit this input for a legacy-only resource. Common operations build native objects; an object or field declared twice is an error, not a last-write-wins merge. Maps are unordered; arrays (for example middleware chains) preserve order. Secret/dependent Pulumi values stay secret/dependent. Validate known inputs offline; never collapse preview unknowns to defaults.
 
+The new input is a secret JSON string in Pulumi state and an object on the private helper stdin protocol. Neither object names nor values appear in native-configuration diffs. Keep the existing resource token and provider identity; distribute the provider together with its matching Native AOT helper. An old plugin is not a fallback for new inputs. To check a migration, preview a copy of the old checkpoint with refresh disabled before pointing a stack at the new plugin.
+
+For a structured configuration, `tlsProbeSummary` contains aggregate counts, not names, keys or certificates: `nativeProbesAttempted`, `opaqueRouterCount`, `unprobedCount`, and `truncated` (0 or 1). Treat a nonzero unprobed count or truncation flag as an observation limit, not a successful handshake. Transport TLS and mutual authentication still need positive and negative client tests.
+
+The [F# consumer catalogue](../../../tests/Dorothy.Tests/TraefikCatalogueTests.fs) composes `traefikConfiguration` with the legacy `traefik` builder. For example, `httpRule (hostRule [ "shop.test" ] &&& pathPrefixRule "/items")` selects the path; `httpRouterService (httpServiceRef "catalog")` selects the named service. Rule arguments are quoted literals. Use the native rule form when supplying Traefik's actual rule language. TLS trust anchors can be public PEM without the CA signing key.
+
 Example intended native shapes (JSON paths relative to `configuration`):
 
 | Path | Example value | Binding |
 |---|---|---|
 | `static.entryPoints.front` | `{"address":"127.0.0.1:8443/tcp"}` | Add a listener, not a firewall opening |
-| `dynamic.http.routers.catalog` | `{"rule":"Host(`shop.test`) && PathPrefix(`/items`)","entryPoints":["front"],"service":"catalog"}` | Resolve within the HTTP graph |
+| `dynamic.http.routers.catalog` | ``{"rule":"Host(`shop.test`) && PathPrefix(`/items`)","entryPoints":["front"],"service":"catalog"}`` | Resolve within the HTTP graph |
 | `dynamic.tcp.services.echo` | `{"loadBalancer":{"servers":[{"address":"127.0.0.1:9000"}],"proxyProtocol":{"version":2}}}` | PROXY to the upstream is independent of trusted inbound peers |
 
 ## Coverage matrix and acceptance gates
 
 All rows start **planned**. Runtime is the pinned binary; a file hash, fixture, schema or preview alone cannot discharge a runtime gate.
+
+External inventories: [static file catalogue](https://github.com/traefik/traefik/blob/v3.7.16/docs/content/reference/static-configuration/file.yaml) (SHA-256 `5be139deacf4995103542a1a8b3cb4e6973f820b488ff75c926077559a57db5b`), [dynamic file catalogue](https://github.com/traefik/traefik/blob/v3.7.16/docs/content/reference/dynamic-configuration/file.yaml) (`c6160ab3f549f8d3c7389e6d6aabc52e7f9ad9ee13a2d27626209b5bc032c404`). These generated examples enumerate shapes; their placeholder values and simultaneous mutually exclusive alternatives do not form a runnable configuration.
 
 | Native capability (source) | DSL / wire | Helper and Read | Independent acceptance |
 |---|---|---|---|

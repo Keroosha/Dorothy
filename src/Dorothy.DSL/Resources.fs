@@ -517,6 +517,9 @@ type TraefikArgs() =
     [<Input("adminPort")>]
     member val AdminPort: Input<int> = Unchecked.defaultof<_> with get, set
 
+    [<Input("configuration")>]
+    member val Configuration: Input<string> = Unchecked.defaultof<_> with get, set
+
 /// Native output DTO for one resolver.
 [<OutputType>]
 type TraefikResolverOutput [<OutputConstructor>] (email: string, httpChallengeEntryPoint: string, caServer: string) =
@@ -992,6 +995,9 @@ type TraefikInstance(name: string, args: TraefikArgs, options: CustomResourceOpt
     [<DefaultValue>]
     val mutable private certificateFingerprints: Output<ImmutableDictionary<string, string>>
 
+    [<DefaultValue>]
+    val mutable private tlsProbeSummary: Output<ImmutableDictionary<string, int>>
+
     new(name: string, args: TraefikArgs) = TraefikInstance(name, args, ProviderContract.resourceOptions ())
 
     [<Output("entryPoints")>]
@@ -1033,6 +1039,12 @@ type TraefikInstance(name: string, args: TraefikArgs, options: CustomResourceOpt
     member this.CertificateFingerprints
         with get () = this.certificateFingerprints
         and private set value = this.certificateFingerprints <- value
+
+    /// Bounded TLS observation counts; only provided when using structured configuration.
+    [<Output("tlsProbeSummary")>]
+    member this.TlsProbeSummary
+        with get () = this.tlsProbeSummary
+        and private set value = this.tlsProbeSummary <- value
 
 module private TraefikResourceMappings =
     let private mapImmutableOutput
@@ -1866,6 +1878,10 @@ module Host =
                 InputMap<TraefikCertificateArgs>.op_Implicit(TraefikResourceMappings.certificates resolved.Certificates)
 
             args.AdminPort <- Input<int>.op_Implicit resolved.AdminPort
+
+            resolved.Configuration
+            |> Option.iter (fun configuration ->
+                args.Configuration <- Input<string>.op_Implicit configuration)
 
             let dependencies =
                 [ mainApt :> Resource ]

@@ -38,6 +38,7 @@ type TraefikResolvedSpec =
       Resolvers: Output<ImmutableDictionary<string, TraefikResolver>>
       Routers: Output<ImmutableDictionary<string, TraefikRouter>>
       Certificates: Output<ImmutableDictionary<string, NormalizedCertificate>>
+      Configuration: Output<string> option
       AdminPort: int }
 
 type EntryPointDefinition =
@@ -116,12 +117,12 @@ type RouterDefinition =
       ExcludedPathSubtree: string option
       Target: RouterTargetInput
       Tls: TraefikTlsMode }
-[<RequireQualifiedAccess>]
 type TraefikDeclaration =
     | EntryPoint of EntryPointDefinition
     | Router of RouterDefinition
     | Resolver of TraefikAcmeResolverSpec
     | Certificate of TraefikCertificateSpec
+    | Configuration of TraefikConfigurationSpec
     | AdminPort of int
 
 [<Sealed>]
@@ -412,7 +413,8 @@ type TraefikSpec internal (
     resolvers: TraefikAcmeResolverSpec list,
     routers: RouterDefinition list,
     certificates: TraefikCertificateSpec list,
-    adminPort: int
+    adminPort: int,
+    configuration: TraefikConfigurationSpec option
 ) =
     member _.Resolve(cancellationToken: CancellationToken) =
         let entryPointNames = entryPoints |> Seq.map (fun item -> item.Name) |> Set.ofSeq
@@ -576,6 +578,7 @@ type TraefikSpec internal (
           Resolvers = resolversOutput
           Routers = routersOutput
           Certificates = certificatesOutput
+          Configuration = configuration |> Option.map TraefikConfiguration.resolve
           AdminPort = adminPort }
 [<RequireQualifiedAccess>]
 module TraefikSpec =
@@ -591,11 +594,13 @@ type TraefikBuilder() =
     member _.Yield(router: RouterDefinition) = [ TraefikDeclaration.Router router ]
     member _.Yield(resolver: TraefikAcmeResolverSpec) = [ TraefikDeclaration.Resolver resolver ]
     member _.Yield(certificate: TraefikCertificateSpec) = [ TraefikDeclaration.Certificate certificate ]
+    member _.Yield(configuration: TraefikConfigurationSpec) = [ TraefikDeclaration.Configuration configuration ]
     member _.YieldFrom(declarations: seq<TraefikDeclaration>) = Seq.toList declarations
     member _.YieldFrom(entryPoints: seq<EntryPointDefinition>) = entryPoints |> Seq.map TraefikDeclaration.EntryPoint |> Seq.toList
     member _.YieldFrom(routers: seq<RouterDefinition>) = routers |> Seq.map TraefikDeclaration.Router |> Seq.toList
     member _.YieldFrom(resolvers: seq<TraefikAcmeResolverSpec>) = resolvers |> Seq.map TraefikDeclaration.Resolver |> Seq.toList
     member _.YieldFrom(certificates: seq<TraefikCertificateSpec>) = certificates |> Seq.map TraefikDeclaration.Certificate |> Seq.toList
+    member _.YieldFrom(configurations: seq<TraefikConfigurationSpec>) = configurations |> Seq.map TraefikDeclaration.Configuration |> Seq.toList
     member _.Yield(part: TraefikRootPart) = [ TraefikDeclaration.AdminPort(match part with TraefikRootPart.AdminPort port -> port) ]
     member _.Zero() = []
     member _.Combine(left: TraefikDeclaration list, right: TraefikDeclaration list) = left @ right
@@ -607,6 +612,7 @@ type TraefikBuilder() =
         let routers = declarations |> List.choose (function TraefikDeclaration.Router value -> Some value | _ -> None)
         let resolvers = declarations |> List.choose (function TraefikDeclaration.Resolver value -> Some value | _ -> None)
         let certificates = declarations |> List.choose (function TraefikDeclaration.Certificate value -> Some value | _ -> None)
+        let configurations = declarations |> List.choose (function TraefikDeclaration.Configuration value -> Some value | _ -> None)
         let adminPorts = declarations |> List.choose (function TraefikDeclaration.AdminPort value -> Some value | _ -> None)
 
         for entryPoint in entryPoints do
@@ -631,7 +637,15 @@ type TraefikBuilder() =
         validateUnique "resolver" (resolvers |> Seq.map (fun item -> item.Name))
         validateUnique "certificate" (certificates |> Seq.map (fun certificate -> certificate.Name))
 
-        if entryPoints.IsEmpty then invalidArg "traefik" "At least one entry point is required."
+        let configuration =
+            match configurations with
+            | [] -> None
+            | [ value ] -> Some value
+            | _ -> invalidArg "traefik" "Structured Traefik configuration may be declared only once."
+
+        if entryPoints.IsEmpty
+           && not (configuration |> Option.exists (fun value -> value.HasStaticEntryPoints)) then
+            invalidArg "traefik" "At least one entry point is required."
         if adminPorts.Length > 1 then invalidArg "traefik" "Admin port may be declared only once."
 
         let listenPorts = entryPoints |> List.map (fun entryPoint -> entryPoint.Listen)
@@ -641,7 +655,7 @@ type TraefikBuilder() =
         if adminPort < 1 || adminPort > 65535 || (entryPoints |> List.exists (fun entryPoint -> entryPoint.Listen = adminPort)) then
             invalidArg "traefik" "The loopback admin port must be between 1 and 65535 and differ from entry-point listen ports."
 
-        TraefikSpec(entryPoints, resolvers, routers, certificates, adminPort)
+        TraefikSpec(entryPoints, resolvers, routers, certificates, adminPort, configuration)
 
 
 

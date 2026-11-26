@@ -15,6 +15,10 @@
     <Compile Include="Fail2BanCliData.fs" />
     <Compile Include="../Dorothy.DSL/FirewalldModel.fs" Link="FirewalldModel.fs" />
     <Compile Include="../Dorothy.DSL/TraefikPathModel.fs" Link="TraefikPathModel.fs" />
+    <Compile Include="../Dorothy.DSL/TraefikStatic.fs" Link="TraefikStatic.fs" />
+    <Compile Include="../Dorothy.DSL/TraefikTlsSettings.fs" Link="TraefikTlsSettings.fs" />
+    <Compile Include="../Dorothy.DSL/TraefikDynamic.fs" Link="TraefikDynamic.fs" />
+    <Compile Include="../Dorothy.DSL/TraefikSettings.fs" Link="TraefikSettings.fs" />
     <Compile Include="Firewalld.fs" />
     <Compile Include="Apt.fs" />
     <Compile Include="Ufw.fs" />
