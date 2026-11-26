@@ -47,7 +47,7 @@ module private TraefikProviderLogic =
               "httpChallengeEntryPoint": { "type": "string" },
               "caServer": { "type": "string", "default": "https://acme-v02.api.letsencrypt.org/directory" }
             },
-            "required": ["email", "httpChallengeEntryPoint"]
+            "required": ["httpChallengeEntryPoint"]
           }
         },
         "routers": {
@@ -369,7 +369,7 @@ module private TraefikProviderLogic =
         | true, value when value.IsComputed -> invalidOp "A Traefik string property is unknown."
         | true, value ->
             match tryGetString value with
-            | Some text when not (String.IsNullOrWhiteSpace(text)) -> text
+            | Some text when text = defaultValue || not (String.IsNullOrWhiteSpace(text)) -> text
             | _ -> invalidOp "A Traefik string property is invalid."
 
 
