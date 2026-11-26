@@ -145,6 +145,7 @@ module Traefik =
           EntryPoint: string
           Backend: string option
           Redirect: Redirect option
+          ExcludedPathSubtree: string option
           Tls: RouterTls }
 
     type private Request =
@@ -430,9 +431,17 @@ module Traefik =
                     requireObject "router" value |> ignore
                     let fields = objectNames value
                     if not (Set.isSubset (set [ "host"; "entryPoint"; "tls" ]) fields)
-                       || not (Set.isEmpty (Set.difference fields (set [ "host"; "entryPoint"; "backend"; "redirect"; "tls" ]))) then
+                       || not (Set.isEmpty (Set.difference fields (set [ "host"; "entryPoint"; "backend"; "redirect"; "excludedPathSubtree"; "tls" ]))) then
                         fail "router configuration is invalid"
                     let host = requiredProperty value "host" "router host must be a DNS name or IP address" |> stringValue "router host must be a DNS name or IP address" |> validateDnsName
+                    let excludedPathSubtree =
+                        match tryProperty value "excludedPathSubtree" with
+                        | None -> None
+                        | Some subtree ->
+                            let subtree = stringValue "router excludedPathSubtree must be a canonical subtree" subtree
+                            if not (TraefikPathModel.isCanonicalSubtree subtree) then
+                                fail "router excludedPathSubtree must be a canonical subtree"
+                            Some subtree
                     let entryPoint = requiredProperty value "entryPoint" "router entryPoint contains an unsafe name" |> stringValue "router entryPoint contains an unsafe name"
                     validateName "router entryPoint" [] entryPoint |> ignore
                     if not (entryPoints.ContainsKey(entryPoint)) then fail "router entryPoint is not declared"
@@ -464,7 +473,7 @@ module Traefik =
                             let origin = requiredProperty redirect "origin" "router redirect origin is invalid" |> stringValue "router redirect origin is invalid"
                             None, Some { Origin = validateRedirectOrigin origin }
                         | _ -> fail "router must specify exactly one of backend or redirect"
-                    { Host = host; EntryPoint = entryPoint; Backend = backend; Redirect = redirect; Tls = { Kind = kind; Name = tlsName } }) (requiredProperty request "routers" "request is missing routers")
+                    { Host = host; EntryPoint = entryPoint; Backend = backend; Redirect = redirect; ExcludedPathSubtree = excludedPathSubtree; Tls = { Kind = kind; Name = tlsName } }) (requiredProperty request "routers" "request is missing routers")
 
             { Operation = operation
               OwnerId = ownerId
@@ -580,7 +589,15 @@ module Traefik =
         let middlewares = JsonObject()
         for KeyValue(name, router) in normalized.Routers do
             let dynamicRouter = JsonObject()
-            dynamicRouter["rule"] <- JsonValue.Create("Host(`" + hostRuleValue router.Host + "`)") 
+            let hostRule = "Host(`" + hostRuleValue router.Host + "`)"
+            let rule =
+                match router.ExcludedPathSubtree with
+                | None -> hostRule
+                | Some subtree ->
+                    // Traefik preserves reserved escapes, including encoded slashes, in its routing path.
+                    let pathPattern = subtree.Replace("/", "(/|%2[fF])+", StringComparison.Ordinal)
+                    hostRule + " && !PathRegexp(`^" + pathPattern + "($|/|%2[fF])`)"
+            dynamicRouter["rule"] <- JsonValue.Create(rule)
             let entryPoints = JsonArray()
             entryPoints.Add(JsonValue.Create(router.EntryPoint))
             dynamicRouter["entryPoints"] <- entryPoints

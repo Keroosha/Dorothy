@@ -56,7 +56,7 @@ module private TraefikProviderLogic =
             "type": "object",
             "properties": {
               "host": { "type": "string" },
-              "entryPoint": { "type": "string" },
+              "excludedPathSubtree": { "type": "string" },
               "backend": { "type": "string" },
               "redirect": {
                 "type": "object",
@@ -114,7 +114,7 @@ module private TraefikProviderLogic =
             "type": "object",
             "properties": {
               "host": { "type": "string" },
-              "entryPoint": { "type": "string" },
+              "excludedPathSubtree": { "type": "string" },
               "backend": { "type": "string" },
               "redirect": {
                 "type": "object",
@@ -606,6 +606,7 @@ module private TraefikProviderLogic =
                    && field.Key <> "entryPoint"
                    && field.Key <> "backend"
                    && field.Key <> "redirect"
+                   && field.Key <> "excludedPathSubtree"
                    && field.Key <> "tls" then
                     invalidOp "A Traefik router contains an unsupported property."
             let host = requiredString "host" fields
@@ -617,6 +618,16 @@ module private TraefikProviderLogic =
                 match fields.TryGetValue("backend") with
                 | true, value when not value.IsNull -> Some value
                 | _ -> None
+            let excludedPathSubtree =
+                match fields.TryGetValue("excludedPathSubtree") with
+                | false, _ -> None
+                | true, value when value.IsNull -> None
+                | true, value when value.IsComputed ->
+                    invalidOp "A Traefik router excluded path subtree is unknown."
+                | true, value ->
+                    match tryGetString value with
+                    | Some path when TraefikPathModel.isCanonicalSubtree path -> Some path
+                    | _ -> invalidOp "A Traefik router excluded path subtree is invalid."
             let redirect =
                 match fields.TryGetValue("redirect") with
                 | true, value when not value.IsNull -> Some value
@@ -645,6 +656,7 @@ module private TraefikProviderLogic =
                 { Host = host
                   EntryPoint = entryPoint
                   Target = target
+                  ExcludedPathSubtree = excludedPathSubtree
                   Tls = tls }
             )
         builder.ToImmutable()

@@ -472,6 +472,8 @@ type TraefikRouterArgs() =
 
     [<Input("backend")>]
     member val Backend: Input<string> = Unchecked.defaultof<_> with get, set
+    [<Input("excludedPathSubtree")>]
+    member val ExcludedPathSubtree: Input<string> = Unchecked.defaultof<_> with get, set
 
     [<Input("redirect")>]
     member val Redirect: Input<TraefikRouterRedirectArgs> = Unchecked.defaultof<_> with get, set
@@ -542,12 +544,14 @@ type TraefikRouterOutput
         host: string,
         entryPoint: string,
         backend: string,
+        excludedPathSubtree: string,
         redirect: TraefikRouterRedirectOutput,
         tls: TraefikRouterTlsOutput
     ) =
     member _.Host = host
     member _.EntryPoint = entryPoint
     member _.Backend = backend
+    member _.ExcludedPathSubtree = excludedPathSubtree
     member _.Redirect = redirect
     member _.Tls = tls
 
@@ -1067,6 +1071,10 @@ module private TraefikResourceMappings =
             redirect.Kind <- Input<string>.op_Implicit "permanentToOrigin"
             redirect.Origin <- Input<string>.op_Implicit origin
             args.Redirect <- Input<TraefikRouterRedirectArgs>.op_Implicit redirect
+        value.ExcludedPathSubtree
+        |> Option.iter (fun excludedPathSubtree ->
+            args.ExcludedPathSubtree <- Input<string>.op_Implicit excludedPathSubtree
+        )
 
         args.Tls <- Input<TraefikRouterTlsArgs>.op_Implicit tls
         args
