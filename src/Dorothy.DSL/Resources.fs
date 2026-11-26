@@ -1431,14 +1431,36 @@ module Host =
                 let version = host.Packages |> Map.tryFind "firewalld" |> Option.defaultValue None
                 Some(createAptPackageSet (host.Name + "-firewalld-package") (Map.ofList [ "firewalld", version ]) [] false)
             else None
+        let firewalldSettingsResource =
+            match host.Firewalld |> Option.bind _.StrictForwardPorts, firewalldPackage with
+            | Some enabled, Some packageSet ->
+                let configuration =
+                    { FirewalldModel.empty "settings" "strict-forward-ports" with StrictForwardPorts = Some enabled }
+                    |> FirewalldModel.toJson
+                let args = FirewalldArgs()
+                args.Connection <- Input<AptConnectionArgs>.op_Implicit connection
+                args.Configuration <- Input<string>.op_Implicit configuration
+                Some(
+                    FirewalldResource(
+                        "keroosha:debian:FirewalldSettings",
+                        host.Name + "-firewalld-strict-forward-ports",
+                        args,
+                        ProviderContract.resourceOptionsWithDependencies [ packageSet :> Resource ]
+                    )
+                )
+            | Some _, None -> invalidOp "A firewalld global setting requires its APT package prerequisite."
+            | None, _ -> None
+
 
         // Keep explicitly declared docker.io in its original main APT owner. Ordering
         // the whole owner after firewalld avoids both first-start races and package removal.
         let mainDependencies =
             if host.Docker.IsSome then
-                firewalldPackage |> Option.map (fun resource -> resource :> Resource) |> Option.toList
+                (firewalldPackage |> Option.map (fun resource -> resource :> Resource) |> Option.toList)
+                @ (firewalldSettingsResource |> Option.map (fun resource -> resource :> Resource) |> Option.toList)
             else []
         let mainApt = createAptPackageSet host.Name mainPackages mainDependencies false
+
 
         let fail2banPackages =
             if host.Fail2Ban.IsSome then
@@ -1463,10 +1485,10 @@ module Host =
 
         let dockerPackage =
             if host.Docker.IsSome && not (Map.containsKey "docker.io" host.Packages) then
-                // firewalld must be running before Docker's first startup registers its zone.
                 let dependencies =
                     [ mainApt :> Resource ]
                     @ (firewalldPackage |> Option.map (fun resource -> resource :> Resource) |> Option.toList)
+                    @ (firewalldSettingsResource |> Option.map (fun resource -> resource :> Resource) |> Option.toList)
                 Some(createAptPackageSet (host.Name + "-docker-package") (Map.ofList [ "docker.io", None ]) dependencies true)
             else
                 None
@@ -1494,6 +1516,8 @@ module Host =
                 else Some(createAptPackageSet (host.Name + "-content-zstd") (Map.ofList [ "zstd", None ]) [ mainApt :> Resource ] true)
             else None
         let contentResources = Dictionary<HostContentItem, HostContentResource>()
+        let hostContentDirectories = Dictionary<HostContentDirectory, Resource>()
+
         for item in contentItems do
             let specification, payload = HostContentInputs.resolve item
             let args = HostContentArgs()
@@ -1503,6 +1527,8 @@ module Host =
             let dependencies = contentPrerequisites @ (zstdPackage |> Option.map (fun value -> value :> Resource) |> Option.toList)
             let resource = HostContentResource(host.Name + "-content-" + item.Name, args, ProviderContract.resourceOptionsWithDependencies dependencies)
             contentResources.Add(item, resource)
+            item.Directory |> Option.iter (fun directory -> hostContentDirectories.Add(directory, resource :> Resource))
+
         for service in host.Services do
             let args = HostServiceArgs()
             args.Connection <- Input<AptConnectionArgs>.op_Implicit connection
@@ -1587,32 +1613,32 @@ module Host =
 
 
 
-        let dockerEngine, dockerContainers =
+        let dockerEngine =
             match host.Docker with
-            | Some specification ->
+            | Some _ ->
                 let packageSet = defaultArg dockerPackage mainApt
                 let args = DockerEngineArgs()
                 args.Connection <- Input<AptConnectionArgs>.op_Implicit connection
-
-                let engine =
+                Some(
                     DockerEngine(
                         host.Name,
                         args,
                         ProviderContract.resourceOptionsWithDependencies
                             ([ packageSet :> Resource ]
                              @ (firewalldPackage |> Option.map (fun resource -> resource :> Resource) |> Option.toList))
-                    )
+                    ) :> CustomResource
+                )
+            | None -> None
 
-                let completeJob name (container: Pulumi.Docker.Container) timeout (secretEnvironmentKeys: Output<ImmutableArray<string>>) =
-                    let args = DockerJobArgs()
-                    args.Connection <- Input<AptConnectionArgs>.op_Implicit connection
-                    args.ContainerId <- Input<string>.op_Implicit container.Id
-                    args.TimeoutSeconds <- Input<int>.op_Implicit (DockerValidation.waitHealthySeconds timeout)
-                    args.SecretEnvironmentKeys <- InputList<string>.op_Implicit secretEnvironmentKeys
-                    let options = ProviderContract.resourceOptionsWithDependencies [ container :> Resource ]
-                    DockerJob(name, args, options) :> Resource
-                Some(engine :> Resource), DockerDeployment.deploy host engine specification completeJob
-            | None -> None, []
+        let completeJob name (container: Pulumi.Docker.Container) timeout (secretEnvironmentKeys: Output<ImmutableArray<string>>) =
+            let args = DockerJobArgs()
+            args.Connection <- Input<AptConnectionArgs>.op_Implicit connection
+            args.ContainerId <- Input<string>.op_Implicit container.Id
+            args.TimeoutSeconds <- Input<int>.op_Implicit (DockerValidation.waitHealthySeconds timeout)
+            args.SecretEnvironmentKeys <- InputList<string>.op_Implicit secretEnvironmentKeys
+            let options = ProviderContract.resourceOptionsWithDependencies [ container :> Resource ]
+            DockerJob(name, args, options) :> Resource
+
 
         let firewallPackage =
             if host.Ufw.IsSome || Map.containsKey "ufw" host.Packages then
@@ -1662,6 +1688,7 @@ module Host =
             | Some _, None -> invalidOp "A UFW declaration must have its APT prerequisite resource."
 
 
+        let firewalldResources = Dictionary<FirewalldObjectSpec, Resource>()
         match host.Firewalld, firewalldPackage with
         | Some firewall, Some packageSet ->
             let zones = Collections.Generic.Dictionary<string, Resource>(StringComparer.Ordinal)
@@ -1673,10 +1700,14 @@ module Host =
                 FirewalldResource(token, host.Name + "-firewalld-" + specification.Kind + "-" + specification.Name,
                                   args, ProviderContract.resourceOptionsWithDependencies dependencies) :> Resource
             // Zones are serialized so an interface transfer cannot race another managed zone.
-            let mutable prior = packageSet :> Resource
+            let mutable prior =
+                firewalldSettingsResource
+                |> Option.map (fun resource -> resource :> Resource)
+                |> Option.defaultValue (packageSet :> Resource)
             for specification in firewall.Objects |> List.filter (fun value -> value.Kind = "zone") do
                 let resource = create specification [ prior ]
                 zones.Add(specification.Name, resource)
+                firewalldResources.Add(specification, resource)
                 prior <- resource
             for specification in firewall.Objects |> List.filter (fun value -> value.Kind = "policy") do
                 let referenced = specification.Value.Ingress @ specification.Value.Egress
@@ -1685,10 +1716,84 @@ module Host =
                     |> List.choose (fun name -> match zones.TryGetValue name with true, resource -> Some resource | _ -> None)
                 let referencesUnmanagedZone =
                     referenced |> List.exists (fun name -> name <> "ANY" && name <> "HOST" && not (zones.ContainsKey name))
-                let ownerDependencies = if referencesUnmanagedZone then Option.toList dockerEngine else []
-                // Missing unmanaged references still fail explicitly on hosts without Docker.
-                create specification (prior :: dependencies @ ownerDependencies) |> ignore
+                let ownerDependencies =
+                    if referencesUnmanagedZone then dockerEngine |> Option.map (fun engine -> [ engine :> Resource ]) |> Option.defaultValue []
+                    else []
+                let resource = create specification (prior :: dependencies @ ownerDependencies)
+                firewalldResources.Add(specification, resource)
         | _, None | None, _ -> ()
+        let dockerFirewallGuard =
+            match host.Firewalld |> Option.bind _.StrictForwardPorts, dockerEngine with
+            | Some true, Some engine ->
+                let guardPolicies =
+                    host.Firewalld.Value.Objects
+                    |> List.filter (fun specification ->
+                        specification.Kind = "policy"
+                        && specification.Value.Target = "DROP"
+                        && List.contains "docker" specification.Value.Egress)
+                if guardPolicies.IsEmpty then None
+                else
+                    let unitName = host.Name + "-docker-firewall-guard.service"
+                    let unitLines =
+                        [ "[Unit]"
+                          "Description=Dorothy strict Firewalld readiness gate for Docker"
+                          "Requires=firewalld.service"
+                          "After=firewalld.service"
+                          "Before=docker.service"
+                          ""
+                          "[Service]"
+                          "Type=oneshot"
+                          "ExecStart=/usr/bin/firewall-cmd --state"
+                          "ExecStart=/usr/bin/grep -Fqx StrictForwardPorts=yes /etc/firewalld/firewalld.conf" ]
+                        @ (guardPolicies
+                           |> List.collect (fun policy ->
+                               let infoCheck setting =
+                                   "ExecStart=/bin/sh -ec \"/usr/bin/firewall-cmd --info-policy="
+                                   + policy.Name
+                                   + " | /usr/bin/grep -Fxq '  "
+                                   + setting
+                                   + "'\""
+                               [ infoCheck "target: DROP"
+                                 infoCheck ("priority: " + string policy.Value.Priority)
+                                 "ExecStart=/usr/bin/firewall-cmd --policy=" + policy.Name + " --query-egress-zone=docker" ]
+                               @ (policy.Value.Ingress
+                                  |> List.map (fun zone ->
+                                      "ExecStart=/usr/bin/firewall-cmd --policy=" + policy.Name + " --query-ingress-zone=" + zone))))
+                        @ [ "RemainAfterExit=yes"
+                            ""
+                            "[Install]"
+                            "RequiredBy=docker.service"
+                            "" ]
+                    let configuration = String.concat "\n" unitLines
+                    let specification = HostServiceSpec(unitName, true, configuration, [], true)
+                    let args = HostServiceArgs()
+                    args.Connection <- Input<AptConnectionArgs>.op_Implicit connection
+                    args.Specification <- Input<string>.op_Implicit(HostContentInputs.service specification)
+                    args.Triggers <-
+                        Input<string>.op_Implicit(
+                            System.Text.Json.JsonSerializer.Serialize(
+                                guardPolicies |> List.map _.Configuration |> List.toArray))
+                    args.RestartOnChange <- Input<bool>.op_Implicit true
+                    let dependencies =
+                        [ engine :> Resource ]
+                        @ (firewalldSettingsResource |> Option.map (fun value -> value :> Resource) |> Option.toList)
+                        @ (guardPolicies |> List.map (fun policy -> firewalldResources[policy]))
+                    let resource =
+                        HostServiceResource(
+                            host.Name + "-docker-firewall-guard",
+                            args,
+                            ProviderContract.resourceOptionsWithDependencies dependencies)
+                    Some(resource :> Resource)
+            | _ -> None
+
+        let dockerContainers =
+            match host.Docker, dockerEngine with
+            | Some specification, Some engine ->
+                DockerDeployment.deploy
+                    host engine specification hostContentDirectories firewalldResources
+                    (dockerFirewallGuard |> Option.toList) completeJob
+            | Some _, None -> invalidOp "A Docker declaration must have its engine prerequisite resource."
+            | None, _ -> []
 
         let sshdConfigResource =
             match host.Sshd |> Option.bind (fun specification -> specification.Config) with

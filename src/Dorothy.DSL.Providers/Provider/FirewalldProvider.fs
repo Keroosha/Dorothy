@@ -10,11 +10,16 @@ open Pulumi.Experimental
 open Pulumi.Experimental.Provider
 
 module private FirewalldProviderLogic =
-    let tokens = [ "keroosha:debian:FirewalldZone"; "keroosha:debian:FirewalldPolicy" ]
+    let zoneToken = "keroosha:debian:FirewalldZone"
+    let policyToken = "keroosha:debian:FirewalldPolicy"
+    let settingsToken = "keroosha:debian:FirewalldSettings"
+    let tokens = [ zoneToken; policyToken; settingsToken ]
     let kind token =
-        if token = tokens[0] then "zone"
-        elif token = tokens[1] then "policy"
+        if token = zoneToken then "zone"
+        elif token = policyToken then "policy"
+        elif token = settingsToken then "settings"
         else invalidOp "Unexpected firewalld resource token."
+
 
     let schema =
         let resource = """{"inputProperties":{"connection":{"$ref":"#/types/keroosha:debian:SshConnection"},"configuration":{"type":"string"}},"requiredInputs":["connection","configuration"],"properties":{"connection":{"$ref":"#/types/keroosha:debian:SshConnection"},"configuration":{"type":"string"},"exists":{"type":"boolean"},"actual":{"type":"string"},"inSync":{"type":"boolean"}},"required":["connection","configuration","exists","actual","inSync"]}"""
@@ -230,6 +235,7 @@ module private FirewalldProviderLogic =
         outputs normalized None
 
     let owner (urn: Pulumi.Urn) (connection: SshConnection) = urn.ToString() + "::" + connection.Address
+    let generationOwner (urn: Pulumi.Urn) (connection: SshConnection) = owner urn connection + "::" + Guid.NewGuid().ToString("N")
 
     let run timeout ct action =
         task {
@@ -274,14 +280,17 @@ module private FirewalldProviderLogic =
             response.Diffs <- diffs
             response.Replaces <- replaces
             response.DetailedDiff <- details
-            response.DeleteBeforeReplace <- replaces.Count > 0
+            // Replacement Create must run while the old guard still owns the object.
+            // A same-object replacement is rejected by the helper's existing journal owner check.
+            response.DeleteBeforeReplace <- false
         response
 
-/// One provider implementation for independently owned zone and policy resources.
+/// One provider implementation for independently owned zones, policies, and global settings.
 [<Sealed>]
 type FirewalldProvider() =
     inherit Pulumi.Experimental.Provider.Provider()
     static member ZoneToken = "keroosha:debian:FirewalldZone"
+    static member SettingsToken = FirewalldProviderLogic.settingsToken
     static member PolicyToken = "keroosha:debian:FirewalldPolicy"
     static member Handles token = List.contains token FirewalldProviderLogic.tokens
     static member Schema = FirewalldProviderLogic.schema
@@ -314,7 +323,7 @@ type FirewalldProvider() =
         else
             FirewalldProviderLogic.run request.Timeout ct (fun token -> task {
                 let values, connection, configuration = FirewalldProviderLogic.parse request.Type request.Inputs
-                let owner = FirewalldProviderLogic.owner request.Urn connection
+                let owner = FirewalldProviderLogic.generationOwner request.Urn connection
                 let! snapshot = FirewalldBackend.apply connection owner configuration token
                 let response = CreateResponse()
                 response.Id <- owner

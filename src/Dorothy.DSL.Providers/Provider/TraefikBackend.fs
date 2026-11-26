@@ -46,7 +46,7 @@ module TraefikBackend =
 
         writeInputMap writer "resolvers" desired.Resolvers (fun json resolver ->
             json.WriteStartObject()
-            json.WriteString("email", resolver.Email)
+            if not (String.IsNullOrEmpty resolver.Email) then json.WriteString("email", resolver.Email)
             json.WriteString("httpChallengeEntryPoint", resolver.HttpChallengeEntryPoint)
             json.WriteString("caServer", resolver.CaServer)
             json.WriteEndObject())

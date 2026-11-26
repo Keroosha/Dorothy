@@ -455,12 +455,13 @@ module private TraefikProviderLogic =
         connection
 
     let private validateEmail (email: string) =
-        email.Length <= 254
-        && not (email |> Seq.exists Char.IsControl)
-        && (try
-                let address = System.Net.Mail.MailAddress(email)
-                String.Equals(address.Address, email, StringComparison.Ordinal)
-            with _ -> false)
+        email = ""
+        || (email.Length <= 254
+            && not (email |> Seq.exists Char.IsControl)
+            && (try
+                    let address = System.Net.Mail.MailAddress(email)
+                    String.Equals(address.Address, email, StringComparison.Ordinal)
+                with _ -> false))
 
     let private validateCaUri (value: string) =
         let mutable uri = Unchecked.defaultof<Uri>
@@ -501,7 +502,7 @@ module private TraefikProviderLogic =
             for field in fields do
                 if field.Key <> "email" && field.Key <> "httpChallengeEntryPoint" && field.Key <> "caServer" then
                     invalidOp "A Traefik resolver contains an unsupported property."
-            let email = requiredString "email" fields
+            let email = optionalString "email" "" fields
             if not (validateEmail email) then invalidOp "A Traefik resolver email address is invalid."
             let httpChallengeEntryPoint = requiredString "httpChallengeEntryPoint" fields
             if not (entryPoints.ContainsKey(httpChallengeEntryPoint)) then
