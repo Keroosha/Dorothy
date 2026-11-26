@@ -1453,9 +1453,10 @@ module Host =
             | None -> declared
 
         let firewalldPackage =
-            if host.Firewalld.IsSome || Map.containsKey "firewalld" host.Packages then
-                let version = host.Packages |> Map.tryFind "firewalld" |> Option.defaultValue None
-                Some(createAptPackageSet (host.Name + "-firewalld-package") (Map.ofList [ "firewalld", version ]) [] false)
+            let declared = Map.tryFind "firewalld" host.Packages
+            if host.Firewalld.IsSome || declared.IsSome then
+                // Owning firewall configuration does not grant authority to uninstall the daemon.
+                Some(createAptPackageSet (host.Name + "-firewalld-package") (Map.ofList [ "firewalld", Option.flatten declared ]) [] declared.IsNone)
             else None
         let firewalldSettingsResource =
             match host.Firewalld |> Option.bind _.StrictForwardPorts, firewalldPackage with

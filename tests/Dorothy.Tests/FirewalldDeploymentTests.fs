@@ -41,7 +41,10 @@ type FirewalldDeploymentTests() =
                 Address "192.0.2.2"
                 User "root"
                 debian {
-                    if explicitVersion then apt { packageVersion "docker.io" "26.1.5+dfsg1-9" }
+                    if explicitVersion then apt {
+                        packageVersion "docker.io" "26.1.5+dfsg1-9"
+                        packageVersion "firewalld" "2.3.1-1+deb13u1"
+                    }
                     docker { }
                     firewalld {
                         zone "external" { services [ "ssh" ]; interfaces [ "eth0" ] }
@@ -58,6 +61,7 @@ type FirewalldDeploymentTests() =
         let name (resource: Resource) = OutputUtilities.GetValueAsync(resource.Urn).Result.Split("::") |> Array.last
         let captured = FirewalldDeploymentFixture.captured |> Seq.filter (fun a -> not (a.Resource :? Stack)) |> Seq.toArray
         let byName = captured |> Array.map (fun a -> name a.Resource, a) |> Map.ofArray
+        Assert.That(byName["ordered-firewalld-package"].Options.RetainOnDelete, Is.EqualTo(Nullable(not explicitVersion)))
         let dependencies key =
             let output: Output<ImmutableArray<Resource>> = InputList<Resource>.op_Implicit byName[key].Options.DependsOn
             OutputUtilities.GetValueAsync(output).Result |> Seq.map name |> Set.ofSeq
