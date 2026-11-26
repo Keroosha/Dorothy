@@ -93,7 +93,7 @@ module FieldRuntime =
 
         root.ToString(SaveOptions.DisableFormatting) + "\n"
 
-    let private directText (node: XElement) =
+    let private directText isRoot (node: XElement) =
         let texts =
             node.Nodes()
             |> Seq.choose (function
@@ -101,7 +101,7 @@ module FieldRuntime =
                 | _ -> None)
             |> Seq.toArray
         if texts.Length = 0 then None
-        elif node.HasElements && (texts |> Array.forall String.IsNullOrWhiteSpace) then None
+        elif (isRoot || node.HasElements) && (texts |> Array.forall String.IsNullOrWhiteSpace) then None
         else Some(String.concat "" texts)
  
 
@@ -125,7 +125,7 @@ module FieldRuntime =
             result.Add attributeArray
 
             let textArray = JsonArray()
-            directText node |> Option.iter (fun value -> textArray.Add(JsonValue.Create value))
+            directText (node = root) node |> Option.iter (fun value -> textArray.Add(JsonValue.Create value))
             result.Add textArray
 
             // firewalld 2.3.1 stores rich rules as a set. Priority is part of each

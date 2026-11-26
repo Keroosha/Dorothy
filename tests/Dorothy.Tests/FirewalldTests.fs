@@ -579,7 +579,7 @@ type FirewalldTests() =
     member this.``Delete restores the adopted override including its original binding``() =
         this.WithHost(fun env root calls ->
             let file = Path.Combine(root, "etc/firewalld/zones/external.xml")
-            let baseline = "<zone target=\"DROP\"><interface name=\"eth0\"/><port port=\"22\" protocol=\"tcp\"/><port port=\"9090\" protocol=\"tcp\"/></zone>"
+            let baseline = "<zone target=\"DROP\">\n  <interface name=\"eth0\"/>\n  <port port=\"22\" protocol=\"tcp\"/>\n  <port port=\"9090\" protocol=\"tcp\"/>\n</zone>\n"
             File.WriteAllText(file, baseline)
             this.Invoke env "apply" zoneConfiguration |> ignore
             this.Invoke env "delete" zoneConfiguration |> ignore
