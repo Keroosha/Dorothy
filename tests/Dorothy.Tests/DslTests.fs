@@ -507,6 +507,30 @@ module private TraefikRedirectProviderTestValues =
 
 [<TestFixture>]
 type TraefikRedirectProviderTests() =
+    [<TestCase("", true)>]
+    [<TestCase(" ", false)>]
+    [<TestCase("not-an-address", false)>]
+    member _.``Provider Check accepts an omitted ACME contact but rejects malformed email``(email: string, accepted: bool) =
+        let map = TraefikRedirectProviderTestValues.map
+        let text = TraefikRedirectProviderTestValues.string
+        let number = TraefikRedirectProviderTestValues.number
+        let baseInput = TraefikRedirectProviderTestValues.traefikBackendInput "http://127.0.0.1:8080" 19080
+        let baseRouters = TraefikRedirectProviderTestValues.mapContents baseInput["routers"]
+        let router =
+            (TraefikRedirectProviderTestValues.mapContents baseRouters["example"])
+                .SetItem("tls", map [ "kind", text "acme"; "name", text "le" ])
+        let routers = baseRouters.SetItem("example", PropertyValue(router))
+        let inputs =
+            baseInput
+                .SetItem("entryPoints", map [ "web", number 80; "websecure", number 443 ])
+                .SetItem("resolvers", map [ "le", map [ "email", text email; "httpChallengeEntryPoint", text "web" ] ])
+                .SetItem("routers", PropertyValue(routers))
+        let response = TraefikRedirectProviderTestValues.check (DorothyProvider()) inputs
+        if accepted then
+            Assert.That(response.Failures, Is.Empty)
+        else
+            Assert.That(response.Failures, Is.Not.Empty)
+
     [<Test>]
     member _.``Provider Check canonicalizes redirect origins and requires one target``() =
         // Arrange
