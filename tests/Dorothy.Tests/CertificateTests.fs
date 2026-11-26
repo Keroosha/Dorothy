@@ -16,7 +16,8 @@ type CertificateTests() =
         { Name = name
           CertificatePem = fixture.ChainPem
           PrivateKeyPem = fixture.PrivateKeyPem
-          Fingerprint = fixture.Fingerprint }
+          Fingerprint = fixture.Fingerprint
+          Usage = "server" }
 
     [<Test>]
     member _.``PEM validation accepts an actual leaf intermediate root chain``() =
@@ -68,6 +69,59 @@ type CertificateTests() =
         Assert.Throws<InvalidOperationException>(expiredAction) |> ignore
         Assert.Throws<InvalidOperationException>(futureAction) |> ignore
         Assert.Throws<InvalidOperationException>(usageAction) |> ignore
+
+    [<Test>]
+    member _.``Client identities accept clientAuth while server identities retain serverAuth``() =
+        let now = DateTimeOffset.UtcNow
+        let clientAuth = createCertificateFixture "upstream client" [ "upstream-client.example.test" ] (now.AddDays(-1.0)) (now.AddDays(30.0)) [ "1.3.6.1.5.5.7.3.2" ]
+        let serverAuth = createValidCertificateFixture "server" [ "server.example.test" ]
+
+        let pemClient =
+            CertificateMaterial.normalizeClientPem
+                "client"
+                clientAuth.ChainPem
+                clientAuth.PrivateKeyPem
+                None
+        let pfxClient =
+            CertificateMaterial.normalizeClientPkcs12
+                "client-pfx"
+                clientAuth.PfxBytes
+                (Some clientAuth.PfxPassword)
+        let pemServer =
+            CertificateMaterial.normalizePem
+                "server"
+                serverAuth.ChainPem
+                serverAuth.PrivateKeyPem
+                None
+        let serverRejectsClient =
+            TestDelegate(fun () ->
+                CertificateMaterial.normalizePem
+                    "client-as-server"
+                    clientAuth.ChainPem
+                    clientAuth.PrivateKeyPem
+                    None
+                |> ignore)
+        let clientRejectsServer =
+            TestDelegate(fun () ->
+                CertificateMaterial.normalizeClientPem
+                    "server-as-client"
+                    serverAuth.ChainPem
+                    serverAuth.PrivateKeyPem
+                    None
+                |> ignore)
+        let clientCannotCoverAnInboundRouter =
+            TestDelegate(fun () ->
+                TraefikCertificateValidation.validateRouterCertificateCoverage
+                    [ "router", "upstream-client.example.test", "client" ]
+                    [ pemClient ])
+
+        Assert.That(pemClient.Usage, Is.EqualTo("client"))
+        Assert.That(pfxClient.Usage, Is.EqualTo("client"))
+        Assert.That(pemServer.Usage, Is.EqualTo("server"))
+        TraefikCertificateValidation.validateNormalizedCertificates [ pemClient; pemServer ]
+        Assert.Throws<InvalidOperationException>(serverRejectsClient) |> ignore
+        Assert.Throws<InvalidOperationException>(clientRejectsServer) |> ignore
+        Assert.Throws<InvalidOperationException>(clientCannotCoverAnInboundRouter) |> ignore
 
     [<Test>]
     member _.``Certificate validation rejects malformed chains and overlapping certificate domains``() =

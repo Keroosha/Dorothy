@@ -494,6 +494,9 @@ type TraefikCertificateArgs() =
     [<Input("fingerprint", true)>]
     member val Fingerprint: Input<string> = Unchecked.defaultof<_> with get, set
 
+    [<Input("usage")>]
+    member val Usage: Input<string> = Unchecked.defaultof<_> with get, set
+
 
 /// Native Pulumi arguments for keroosha:debian:Traefik.
 type TraefikArgs() =
@@ -560,11 +563,12 @@ type TraefikRouterOutput
 
 /// Native output DTO for one normalized certificate; the map key carries its name.
 [<OutputType>]
-type TraefikCertificateOutput [<OutputConstructor>] (certificatePem: string, privateKeyPem: string, fingerprint: string)
+type TraefikCertificateOutput [<OutputConstructor>] (certificatePem: string, privateKeyPem: string, fingerprint: string, usage: string)
     =
     member _.CertificatePem = certificatePem
     member _.PrivateKeyPem = privateKeyPem
     member _.Fingerprint = fingerprint
+    member _.Usage = usage
 
 
 
@@ -1096,6 +1100,8 @@ module private TraefikResourceMappings =
         args.CertificatePem <- Input<string>.op_Implicit value.CertificatePem
         args.PrivateKeyPem <- Input<string>.op_Implicit value.PrivateKeyPem
         args.Fingerprint <- Input<string>.op_Implicit value.Fingerprint
+        // Omission is the historical wire representation for an inbound server identity.
+        if value.Usage <> "server" then args.Usage <- Input<string>.op_Implicit value.Usage
         args
 
     let resolvers values = mapImmutableOutput values resolver

@@ -37,7 +37,7 @@ module LegacyProgram =
                         host "example.org"
                         entryPoint "websecure"
                         backend backendUrl
-                        tls (Provided certificate)
+                        tls (TraefikTlsMode.Provided certificate)
                     }
                     adminPort 19080
                 }

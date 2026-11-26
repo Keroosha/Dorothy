@@ -22,7 +22,8 @@ fail() {
     exit 1
 }
 
-[[ $# == 2 ]] || usage
+[[ $# == 2 || ($# == 3 && $3 == legacy-many) ]] || usage
+profile=${3:-structured}
 mode=$1
 case "$mode" in
     prepare|inject|assert-drift|assert-positive|restore) ;;
@@ -40,7 +41,7 @@ root=$(realpath -e -- "$2")
 [[ -f "$root/.owner" && ! -L "$root/.owner" && "$(<"$root/.owner")" == "$ROOT_MARKER" ]] \
     || fail 'guest fixture ownership marker is missing'
 
-readonly FIXTURE=$root/sni-drift
+if [[ "$profile" == legacy-many ]]; then readonly FIXTURE=$root/legacy-many-drift; else readonly FIXTURE=$root/sni-drift; fi
 readonly STATE=$FIXTURE/state.json
 readonly EXPECTED_CERT=$FIXTURE/desired.crt
 readonly EXPECTED_KEY=$FIXTURE/desired.key
@@ -111,16 +112,14 @@ find_pair() {
     safe_file "$DYNAMIC_CONFIG" || fail 'owned dynamic configuration is missing or unsafe'
     [[ -d "$CERT_DIR" && ! -L "$CERT_DIR" && "$(realpath -e -- "$CERT_DIR")" == "$CERT_DIR" ]] \
         || fail 'managed certificate directory is missing or unsafe'
-    jq -e --arg host "$HOST" '
+    jq -e --arg host "$HOST" --arg profile "$profile" '
         (.http.routers["sni-proof"] // null) as $router
         | ($router != null)
-          and ($router.rule == ("Host(\"" + $host + "\")"))
+          and ($router.rule == (if $profile == "legacy-many" then "Host(`" + $host + "`)" else "Host(\"" + $host + "\")" end))
           and ($router.entryPoints == ["sni-proof"])
           and (($router.tls | type) == "object")
           and (($router.tls | has("certResolver")) | not)
-          and ([.http.routers | to_entries[]?
-                | select((.value.rule // "") | contains("Host(\"" + $host + "\")"))
-                | .key] == ["sni-proof"])
+          and ([.http.routers | to_entries[]? | select(.value.rule == $router.rule) | .key] == ["sni-proof"])
     ' "$DYNAMIC_CONFIG" >/dev/null 2>&1 \
         || fail 'dynamic configuration does not contain the dedicated provided-certificate router'
     entries=$(jq -er '

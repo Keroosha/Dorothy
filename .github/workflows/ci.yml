@@ -31,6 +31,10 @@ jobs:
           sudo apt-get install --yes sudo zstd
       - name: Build DSL
         run: dotnet build src/Dorothy.DSL/Dorothy.DSL.fsproj --configuration Release
+      - name: Compile Traefik guest consumers (no deployment)
+        run: |
+          dotnet build tests/Traefik.Acceptance/Traefik.Acceptance.fsproj --configuration Release
+          dotnet build tests/Traefik.Acceptance/review/Traefik.Review.Acceptance.fsproj --configuration Release
       # CLI fixtures resolve their provider and program from Release output paths.
       - name: Run tests
         run: dotnet test tests/Dorothy.Tests --configuration Release
@@ -51,3 +55,7 @@ jobs:
           sudo apt-get install --yes clang zlib1g-dev
       - name: Publish host helper
         run: bash scripts/publish-host-helper.sh linux-x64
+      - name: Execute published Traefik capability probe
+        run: |
+          src/Dorothy.DSL.Providers/Provider/helper/linux-x64/keroosha-iac-helper traefik-capabilities \
+            | jq -e '.protocol == "dorothy-traefik" and .version == 2 and (.capabilities | index("traefik-v2") != null)'

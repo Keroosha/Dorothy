@@ -145,14 +145,14 @@ module TraefikTlsSettings =
         finally
             for certificate in certificates do certificate.Dispose()
 
-    let private validateCaMaterial (legacyCertificates: Set<string>) (node: JsonNode) =
+    let private validateCaMaterial (certificateNames: Set<string>) (node: JsonNode) =
         let value = stringValue node
-        if not (legacyCertificates.Contains(value)) then validatePublicCertificatePem value
+        if not (certificateNames.Contains(value)) then validatePublicCertificatePem value
         value
 
-    let private validateCaArray (legacyCertificates: Set<string>) (node: JsonNode) =
+    let private validateCaArray (certificateNames: Set<string>) (node: JsonNode) =
         arrayValue node
-        |> Seq.map (validateCaMaterial legacyCertificates)
+        |> Seq.map (validateCaMaterial certificateNames)
         |> Seq.toList
         |> validateUniqueStrings
 
@@ -212,14 +212,42 @@ module TraefikTlsSettings =
             let entryPoints = requireObject node
             entryPoints |> Seq.map (fun property -> validateName property.Key) |> Set.ofSeq
 
+    let private decodeEabHmac (encoded: string) =
+        let firstPadding = encoded.IndexOf('=')
+        let contentLength = if firstPadding < 0 then encoded.Length else firstPadding
+        let padding = encoded.Length - contentLength
+        let validCharacters =
+            encoded
+            |> Seq.take contentLength
+            |> Seq.forall (fun character ->
+                (character >= 'A' && character <= 'Z')
+                || (character >= 'a' && character <= 'z')
+                || (character >= '0' && character <= '9')
+                || character = '-'
+                || character = '_')
+        let validPadding =
+            encoded
+            |> Seq.skip contentLength
+            |> Seq.forall ((=) '=')
+        let requiredPadding = (4 - contentLength % 4) % 4
+        if contentLength = 0
+           || padding > 2
+           || not validCharacters
+           || not validPadding
+           || (padding > 0 && padding <> requiredPadding)
+           || contentLength % 4 = 1 then false
+        else
+            try
+                let base64 = encoded.Substring(0, contentLength).Replace('-', '+').Replace('_', '/')
+                Convert.FromBase64String(base64 + String('=', requiredPadding)).Length > 0
+            with _ -> false
+
     let private validateEab (node: JsonNode) =
         let eab = requireObject node
         allowKeys eab (set [ "kid"; "hmacEncoded" ])
         let kid = requiredString eab "kid" |> safeText
         let encoded = requiredString eab "hmacEncoded" |> safeText
-        if kid.Length > 1024 then failure ()
-        try Convert.FromBase64String(encoded) |> ignore
-        with _ -> failure ()
+        if kid.Length > 1024 || not (decodeEabHmac encoded) then failure ()
 
     let private validatePropagation (node: JsonNode) =
         let propagation = requireObject node
@@ -391,11 +419,17 @@ module TraefikTlsSettings =
             "TLS_ECDHE_ECDSA_WITH_AES_128_GCM_SHA256"
             "TLS_ECDHE_RSA_WITH_AES_256_GCM_SHA384"
             "TLS_ECDHE_ECDSA_WITH_AES_256_GCM_SHA384"
+            "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305"
             "TLS_ECDHE_RSA_WITH_CHACHA20_POLY1305_SHA256"
+            "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305"
             "TLS_ECDHE_ECDSA_WITH_CHACHA20_POLY1305_SHA256"
+            "TLS_AES_128_GCM_SHA256"
+            "TLS_AES_256_GCM_SHA384"
+            "TLS_CHACHA20_POLY1305_SHA256"
+            "TLS_FALLBACK_SCSV"
         ]
 
-    let private validateTlsOption (legacyCertificates: Set<string>) (node: JsonNode) =
+    let private validateTlsOption (certificateNames: Set<string>) (node: JsonNode) =
         let option = requireObject node
         allowKeys option (set [
             "minVersion"; "maxVersion"; "cipherSuites"; "curvePreferences"; "clientAuth"
@@ -411,7 +445,8 @@ module TraefikTlsSettings =
         optional option "curvePreferences"
         |> Option.iter (fun values ->
             stringArray values
-            |> List.iter (fun curve -> if not (Set.contains curve (set [ "CurveP256"; "CurveP384"; "CurveP521"; "X25519" ])) then failure ()))
+            |> List.iter (fun curve ->
+                if not (Set.contains curve (set [ "CurveP256"; "CurveP384"; "CurveP521"; "X25519"; "X25519MLKEM768"; "SecP256r1MLKEM768"; "SecP384r1MLKEM1024" ])) then failure ()))
         optional option "alpnProtocols"
         |> Option.iter (fun values ->
             stringArray values
@@ -427,7 +462,7 @@ module TraefikTlsSettings =
             allowKeys auth (set [ "caFiles"; "clientAuthType" ])
             let caFiles =
                 optional auth "caFiles"
-                |> Option.map (validateCaArray legacyCertificates)
+                |> Option.map (validateCaArray certificateNames)
                 |> Option.defaultValue []
             let authType = optionalString auth "clientAuthType"
             match authType with
@@ -437,11 +472,11 @@ module TraefikTlsSettings =
             | Some("VerifyClientCertIfGiven" | "RequireAndVerifyClientCert") when caFiles.IsEmpty -> failure ()
             | _ -> ())
 
-    let private validateTlsStore (legacyResolvers: Set<string>) (resolvers: Set<string>) (legacyCertificates: Set<string>) (node: JsonNode) =
+    let private validateTlsStore (legacyResolvers: Set<string>) (resolvers: Set<string>) (serverCertificates: Set<string>) (node: JsonNode) =
         let store = requireObject node
         allowKeys store (set [ "defaultCertificate"; "defaultGeneratedCert" ])
         let defaultCertificate = optional store "defaultCertificate"
-        defaultCertificate |> Option.iter (certificateReference legacyCertificates >> ignore)
+        defaultCertificate |> Option.iter (certificateReference serverCertificates >> ignore)
         let generated = optional store "defaultGeneratedCert"
         if defaultCertificate.IsSome && generated.IsSome then failure ()
         generated
@@ -456,43 +491,43 @@ module TraefikTlsSettings =
             optional domain "sans"
             |> Option.iter (fun sans -> stringArray sans |> List.iter (validateDomain true)))
 
-    let private tlsCertificateReference (legacyCertificates: Set<string>) (node: JsonNode) =
+    let private tlsCertificateReference (serverCertificates: Set<string>) (node: JsonNode) =
         let item = requireObject node
         allowKeys item (set [ "certificate"; "stores" ])
         let name = requiredString item "certificate" |> validateName
-        if not (legacyCertificates.Contains(name)) then failure ()
+        if not (serverCertificates.Contains(name)) then failure ()
         optional item "stores"
         |> Option.iter (fun stores ->
             stringArray stores
             |> List.iter (fun store -> if store <> "default" then failure ()))
         name
-    let private validateCertificateReference (legacyCertificates: Set<string>) (node: JsonNode) =
+    let private validateCertificateReference (certificateNames: Set<string>) (node: JsonNode) =
         let reference = requireObject node
         allowKeys reference (set [ "certificate" ])
         let name = requiredString reference "certificate" |> validateName
-        if not (legacyCertificates.Contains(name)) then failure ()
+        if not (certificateNames.Contains(name)) then failure ()
 
-    let private validateCertificateReferences (legacyCertificates: Set<string>) (node: JsonNode) =
+    let private validateCertificateReferences (certificateNames: Set<string>) (node: JsonNode) =
         let references = arrayValue node
         let mutable seen = Set.empty
         for reference in references do
             let name = requiredString (requireObject reference) "certificate"
             if seen.Contains(name) then failure ()
-            validateCertificateReference legacyCertificates reference
+            validateCertificateReference certificateNames reference
             seen <- seen.Add(name)
 
-    let private validateForwardAuthTls (legacyCertificates: Set<string>) (node: JsonNode) =
+    let private validateForwardAuthTls (certificateNames: Set<string>) (node: JsonNode) =
         let tls = requireObject node
         allowKeys tls (set [ "caCertificate"; "clientCertificate"; "insecureSkipVerify"; "caOptional" ])
-        optional tls "caCertificate" |> Option.iter (validateCaMaterial legacyCertificates >> ignore)
+        optional tls "caCertificate" |> Option.iter (validateCaMaterial certificateNames >> ignore)
         optionalString tls "clientCertificate"
         |> Option.iter (fun name ->
             validateName name |> ignore
-            if not (legacyCertificates.Contains(name)) then failure ())
+            if not (certificateNames.Contains(name)) then failure ())
         optional tls "insecureSkipVerify" |> Option.iter (fun value -> if boolValue value then failure ())
         optionalBool tls "caOptional"
 
-    let private validateProtectedTransportCertificates (legacyCertificates: Set<string>) (dynamicRoot: JsonObject) =
+    let private validateProtectedTransportCertificates (certificateNames: Set<string>) (dynamicRoot: JsonObject) =
         let validateHttp () =
             match optional dynamicRoot "http" with
             | None -> ()
@@ -502,8 +537,8 @@ module TraefikTlsSettings =
                 | Some transports ->
                     for transport in requireObject transports do
                         let settings = requireObject transport.Value
-                        optional settings "rootCAs" |> Option.iter (validateCaArray legacyCertificates >> ignore)
-                        optional settings "certificates" |> Option.iter (validateCertificateReferences legacyCertificates)
+                        optional settings "rootCAs" |> Option.iter (validateCaArray certificateNames >> ignore)
+                        optional settings "certificates" |> Option.iter (validateCertificateReferences certificateNames)
                 | None -> ()
                 match optional http "middlewares" with
                 | Some middlewares ->
@@ -512,7 +547,7 @@ module TraefikTlsSettings =
                         match optional settings "forwardAuth" with
                         | Some forwardAuth ->
                             match optional (requireObject forwardAuth) "tls" with
-                            | Some tls -> validateForwardAuthTls legacyCertificates tls
+                            | Some tls -> validateForwardAuthTls certificateNames tls
                             | None -> ()
                         | None -> ()
                 | None -> ()
@@ -529,15 +564,15 @@ module TraefikTlsSettings =
                         match optional settings "tls" with
                         | Some tlsNode ->
                             let tls = requireObject tlsNode
-                            optional tls "rootCAs" |> Option.iter (validateCaArray legacyCertificates >> ignore)
-                            optional tls "certificates" |> Option.iter (validateCertificateReferences legacyCertificates)
+                            optional tls "rootCAs" |> Option.iter (validateCaArray certificateNames >> ignore)
+                            optional tls "certificates" |> Option.iter (validateCertificateReferences certificateNames)
                         | None -> ()
                 | None -> ()
 
         validateHttp ()
         validateTcp ()
 
-    let private validateDynamicTls (legacyResolvers: Set<string>) (resolvers: Set<string>) (legacyCertificates: Set<string>) (dynamicRoot: JsonObject) =
+    let private validateDynamicTls (legacyResolvers: Set<string>) (resolvers: Set<string>) (serverCertificates: Set<string>) (certificateNames: Set<string>) (dynamicRoot: JsonObject) =
         let tls =
             match optional dynamicRoot "tls" with
             | None -> JsonObject()
@@ -548,7 +583,7 @@ module TraefikTlsSettings =
             let certificates = arrayValue node
             let mutable seen = Set.empty
             for certificate in certificates do
-                let name = tlsCertificateReference legacyCertificates certificate
+                let name = tlsCertificateReference serverCertificates certificate
                 if seen.Contains(name) then failure ()
                 seen <- seen.Add(name))
 
@@ -558,7 +593,7 @@ module TraefikTlsSettings =
             | Some node -> requireObject node
         for option in options do
             validateName option.Key |> ignore
-            validateTlsOption legacyCertificates option.Value
+            validateTlsOption certificateNames option.Value
 
         let stores =
             match optional tls "stores" with
@@ -566,11 +601,16 @@ module TraefikTlsSettings =
             | Some node -> requireObject node
         for store in stores do
             if store.Key <> "default" then failure ()
-            validateTlsStore legacyResolvers resolvers legacyCertificates store.Value
-
-    /// Validates the TLS, ACME resolver, and protected DNS credential subsets of a config root.
+            validateTlsStore legacyResolvers resolvers serverCertificates store.Value
+    /// Validates TLS/ACME configuration against distinct server and outbound identity inventories.
     /// All diagnostics are fixed and never include user-supplied names or secret values.
-    let validate (entryPoints: Map<string, string>) (legacyResolvers: Set<string>) (legacyCertificates: Set<string>) (configuration: JsonObject) : unit =
+    let validateWithCertificateUsage
+        (entryPoints: Map<string, string>)
+        (legacyResolvers: Set<string>)
+        (serverCertificates: Set<string>)
+        (clientCertificates: Set<string>)
+        (configuration: JsonObject)
+        : unit =
         if isNull configuration then failure ()
         let staticRoot =
             match optional configuration "static" with
@@ -583,8 +623,14 @@ module TraefikTlsSettings =
         let resolverNames, usedProviders = validateResolvers entryPoints legacyResolvers staticRoot
         validateDnsCredentials configuration usedProviders |> ignore
         let allResolvers = Set.union legacyResolvers resolverNames
-        validateDynamicTls legacyResolvers allResolvers legacyCertificates dynamicRoot
-        validateProtectedTransportCertificates legacyCertificates dynamicRoot
+        let allCertificates = Set.union serverCertificates clientCertificates
+        validateDynamicTls legacyResolvers allResolvers serverCertificates allCertificates dynamicRoot
+        validateProtectedTransportCertificates allCertificates dynamicRoot
+
+    /// Validates the TLS, ACME resolver, and protected DNS credential subsets of a config root.
+    /// Certificates in this compatibility entrypoint are treated as server identities.
+    let validate (entryPoints: Map<string, string>) (legacyResolvers: Set<string>) (legacyCertificates: Set<string>) (configuration: JsonObject) : unit =
+        validateWithCertificateUsage entryPoints legacyResolvers legacyCertificates Set.empty configuration
 
     let private hashText (value: string) =
         SHA256.HashData(Encoding.UTF8.GetBytes(value))
@@ -593,10 +639,14 @@ module TraefikTlsSettings =
 
     let private deepCopyObject (value: JsonObject) = value.DeepClone() :?> JsonObject
 
-    let private resolverStoragePath (stateDir: string) (name: string) =
+    let legacyAcmeStoragePath (stateDir: string) (name: string) =
         Path.Combine(stateDir, "acme-" + hashText name + ".json")
 
-    /// Copies static native settings and replaces all ACME storage locations with stable helper-owned paths.
+    /// Isolates each managed ACME account by resolver name and exact directory URL.
+    let acmeStoragePath (stateDir: string) (name: string) (caServer: string) =
+        Path.Combine(stateDir, "acme-" + hashText (name + "\n" + caServer) + ".json")
+
+    /// Copies static native settings and replaces all ACME storage locations with issuer-keyed helper-owned paths.
     let staticSettings (stateDir: string) (staticRoot: JsonObject) : JsonObject =
         if String.IsNullOrWhiteSpace stateDir || not (Path.IsPathRooted stateDir) || isNull staticRoot then failure ()
         let result = deepCopyObject staticRoot
@@ -611,7 +661,8 @@ module TraefikTlsSettings =
                     | Some node ->
                         match node with
                         | :? JsonObject as acme ->
-                            acme["storage"] <- JsonValue.Create(resolverStoragePath stateDir resolver.Key)
+                            let caServer = optionalString acme "caServer" |> Option.defaultValue "https://acme-v02.api.letsencrypt.org/directory"
+                            acme["storage"] <- JsonValue.Create(acmeStoragePath stateDir resolver.Key caServer)
                         | _ -> failure ()
                     | None -> ()
                 | _ -> failure ()

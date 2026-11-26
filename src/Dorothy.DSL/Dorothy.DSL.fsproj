@@ -11,6 +11,7 @@
         <Compile Include="Ufw.fs" />
         <Compile Include="FirewalldModel.fs" />
         <Compile Include="TraefikPathModel.fs" />
+        <Compile Include="TraefikHttpGraphModel.fs" />
         <Compile Include="TraefikStatic.fs" />
         <Compile Include="TraefikTlsSettings.fs" />
         <Compile Include="TraefikDynamic.fs" />

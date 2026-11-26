@@ -108,7 +108,6 @@ module Traefik =
         "https://github.com/traefik/traefik/releases/download/v" + Version + "/traefik_v" + Version + "_linux_" + architecture + ".tar.gz"
     let archiveChecksum architecture = archiveChecksums[architecture]
 
-    let private namePattern = Regex("^[A-Za-z0-9][A-Za-z0-9_.-]{0,62}$", RegexOptions.CultureInvariant)
     let private dnsLabelPattern = Regex("^[a-z0-9](?:[a-z0-9-]{0,61}[a-z0-9])?$", RegexOptions.IgnoreCase ||| RegexOptions.CultureInvariant)
     let private fingerprintPattern = Regex("^[0-9a-f]{64}$", RegexOptions.CultureInvariant)
     let private certificateFilenamePattern = Regex("^[0-9a-f]{64}\\.(?:crt|key)$", RegexOptions.CultureInvariant)
@@ -135,8 +134,8 @@ module Traefik =
     type private Certificate =
         { CertificatePem: string
           PrivateKeyPem: string
-          Fingerprint: string }
-
+          Fingerprint: string
+          Usage: string }
     type private RouterTls =
         { Kind: string
           Name: string }
@@ -160,6 +159,9 @@ module Traefik =
           Routers: Map<string, Router>
           Certificates: Map<string, Certificate>
           Configuration: JsonObject option
+          MergedDynamic: JsonObject option
+          PreviousUdpEntryPoints: Set<string> option
+          ReadProbeSafe: bool
           AdminPort: int }
 
     type private FsEntry =
@@ -184,12 +186,14 @@ module Traefik =
         { Static: byte[] option
           Dynamic: byte[] option
           Credentials: byte[] option
+          CredentialsKnown: bool
           Unit: byte[] option
           ReleaseMarker: byte[] option
           BinaryPresent: bool
           BinarySha256: string option
           WasActive: bool
           WasEnabled: bool
+          RestartRequired: bool
           CertificateFiles: string list }
 
     let pathsFor (environment: HostEnvironment) =
@@ -240,7 +244,7 @@ module Traefik =
 
     let private validateName (field: string) (reserved: string list) (value: string) =
         let reservedNames = reserved |> Seq.map (fun name -> name.ToLowerInvariant()) |> Set.ofSeq
-        if not (namePattern.IsMatch(value)) || reservedNames.Contains(value.ToLowerInvariant()) then
+        if not (TraefikHttpGraphModel.isValidName 63 value) || reservedNames.Contains(value.ToLowerInvariant()) then
             fail (field + " contains an unsafe name")
         value
 
@@ -350,6 +354,33 @@ module Traefik =
         for property in objectProperties field element do
             if not (values.TryAdd(property.Name, parser property.Name property.Value)) then fail "duplicate Traefik declaration"
         values |> Seq.map (fun pair -> pair.Key, pair.Value) |> Map.ofSeq
+    let private parseCertificates (element: JsonElement) =
+        parseStringMap "certificates" (fun name value ->
+            validateName "certificate" [] name |> ignore
+            requireObject "certificate" value |> ignore
+            let fields = objectNames value
+            let requiredFields = set [ "certificatePem"; "privateKeyPem"; "fingerprint" ]
+            let allowedFields = Set.add "usage" requiredFields
+            if not (Set.isSubset requiredFields fields)
+               || not (Set.isEmpty (Set.difference fields allowedFields)) then
+                fail "certificate configuration is invalid"
+            let certificatePem = requiredProperty value "certificatePem" "certificatePem is not valid PEM material" |> stringValue "certificatePem is not valid PEM material"
+            if String.IsNullOrEmpty(certificatePem) || Encoding.UTF8.GetByteCount(certificatePem) > MaximumCertificateBytes || not (certificatePem.Contains("-----BEGIN CERTIFICATE-----", StringComparison.Ordinal)) then
+                fail "certificatePem is not valid PEM material"
+            let privateKeyPem = requiredProperty value "privateKeyPem" "privateKeyPem is not valid PEM material" |> stringValue "privateKeyPem is not valid PEM material"
+            if String.IsNullOrEmpty(privateKeyPem) || Encoding.UTF8.GetByteCount(privateKeyPem) > MaximumCertificateBytes || not (privateKeyPem.Contains("-----BEGIN ", StringComparison.Ordinal)) || not (privateKeyPem.Contains("PRIVATE KEY-----", StringComparison.Ordinal)) then
+                fail "privateKeyPem is not valid PEM material"
+            let fingerprint = requiredProperty value "fingerprint" "certificate fingerprint must be lowercase SHA-256 hex" |> stringValue "certificate fingerprint must be lowercase SHA-256 hex"
+            if not (fingerprintPattern.IsMatch(fingerprint)) then fail "certificate fingerprint must be lowercase SHA-256 hex"
+            let usage =
+                match tryProperty value "usage" with
+                | None -> "server"
+                | Some property -> stringValue "certificate usage is invalid" property
+            if usage <> "server" && usage <> "client" then fail "certificate usage is invalid"
+            { CertificatePem = certificatePem
+              PrivateKeyPem = privateKeyPem
+              Fingerprint = fingerprint
+              Usage = usage }) element
 
     let private validateRequest (request: JsonElement) : Request =
         if request.ValueKind <> JsonValueKind.Object then fail "request must be an object"
@@ -372,12 +403,29 @@ module Traefik =
               Routers = Map.empty
               Certificates = Map.empty
               Configuration = None
+              MergedDynamic = None
+              PreviousUdpEntryPoints = None
+              ReadProbeSafe = false
               AdminPort = DefaultAdminPort }
         else
-            let allowed = set [ "operation"; "ownerId"; "entryPoints"; "resolvers"; "routers"; "certificates"; "adminPort"; "configuration" ]
+            let allowed = set [ "operation"; "ownerId"; "entryPoints"; "resolvers"; "routers"; "certificates"; "adminPort"; "configuration"; "previousUdpEntryPoints" ]
             if not (Set.isEmpty (Set.difference (objectNames request) allowed)) then fail "request contains unsupported fields"
             for field in [ "entryPoints"; "resolvers"; "routers"; "certificates" ] do
                 if tryProperty request field |> Option.isNone then fail ("request is missing " + field)
+
+            let previousUdpEntryPoints =
+                match tryProperty request "previousUdpEntryPoints" with
+                | None -> None
+                | Some value when operation = "apply" && value.ValueKind = JsonValueKind.Array && value.GetArrayLength() <= 256 ->
+                    let mutable names = Set.empty
+                    for item in value.EnumerateArray() do
+                        let name = stringValue "previousUdpEntryPoints must contain safe entrypoint names" item
+                        validateName "previous UDP entrypoint" [] name |> ignore
+                        if Set.contains name names then fail "previousUdpEntryPoints contains duplicates"
+                        names <- Set.add name names
+                    Some names
+                | _ -> fail "previousUdpEntryPoints is invalid"
+            let mutable readProbeSafe = true
 
             let entryPoints =
                 parseStringMap "entryPoints" (fun name value ->
@@ -387,7 +435,9 @@ module Traefik =
                 match tryProperty request "adminPort" with
                 | None -> DefaultAdminPort
                 | Some value -> parseInt32 "adminPort" value
-            if entryPoints |> Map.exists (fun _ port -> port = adminPort) then fail "adminPort must not collide with an entryPoint port"
+            if entryPoints |> Map.exists (fun _ port -> port = adminPort) then
+                if operation = "read" then readProbeSafe <- false
+                else fail "adminPort must not collide with an entryPoint port"
 
             let resolvers =
                 parseStringMap "resolvers" (fun name value ->
@@ -420,19 +470,7 @@ module Traefik =
                     { Email = email; HttpChallengeEntryPoint = challenge; CaServer = caServer }) (requiredProperty request "resolvers" "request is missing resolvers")
 
             let certificates =
-                parseStringMap "certificates" (fun name value ->
-                    validateName "certificate" [] name |> ignore
-                    requireObject "certificate" value |> ignore
-                    if objectNames value <> set [ "certificatePem"; "privateKeyPem"; "fingerprint" ] then fail "certificate configuration is invalid"
-                    let certificatePem = requiredProperty value "certificatePem" "certificatePem is not valid PEM material" |> stringValue "certificatePem is not valid PEM material"
-                    if String.IsNullOrEmpty(certificatePem) || Encoding.UTF8.GetByteCount(certificatePem) > MaximumCertificateBytes || not (certificatePem.Contains("-----BEGIN CERTIFICATE-----", StringComparison.Ordinal)) then
-                        fail "certificatePem is not valid PEM material"
-                    let privateKeyPem = requiredProperty value "privateKeyPem" "privateKeyPem is not valid PEM material" |> stringValue "privateKeyPem is not valid PEM material"
-                    if String.IsNullOrEmpty(privateKeyPem) || Encoding.UTF8.GetByteCount(privateKeyPem) > MaximumCertificateBytes || not (privateKeyPem.Contains("-----BEGIN ", StringComparison.Ordinal)) || not (privateKeyPem.Contains("PRIVATE KEY-----", StringComparison.Ordinal)) then
-                        fail "privateKeyPem is not valid PEM material"
-                    let fingerprint = requiredProperty value "fingerprint" "certificate fingerprint must be lowercase SHA-256 hex" |> stringValue "certificate fingerprint must be lowercase SHA-256 hex"
-                    if not (fingerprintPattern.IsMatch(fingerprint)) then fail "certificate fingerprint must be lowercase SHA-256 hex"
-                    { CertificatePem = certificatePem; PrivateKeyPem = privateKeyPem; Fingerprint = fingerprint }) (requiredProperty request "certificates" "request is missing certificates")
+                parseCertificates (requiredProperty request "certificates" "request is missing certificates")
 
             let routers =
                 parseStringMap "routers" (fun name value ->
@@ -467,14 +505,16 @@ module Traefik =
                     | "provided" ->
                         validateName "TLS certificate" [] tlsName |> ignore
                         if not (certificates.ContainsKey(tlsName)) then fail "router references an undeclared certificate"
-                    | _ -> fail "router TLS kind is invalid"
+                        if certificates[tlsName].Usage <> "server" then fail "router cannot use an outbound-only certificate"
                     let backend, redirect =
                         match tryProperty value "backend", tryProperty value "redirect" with
                         | Some backend, None ->
                             let backend = stringValue "router backend must be an HTTP or HTTPS URL" backend
                             validateNetworkUrl "router backend must be an HTTP or HTTPS URL" 2048 false backend |> ignore
                             try TraefikSettings.guardAdminDestination adminPort backend
-                            with :? InvalidOperationException -> fail "proxy destination must not use the private Traefik administration port"
+                            with :? InvalidOperationException ->
+                                if operation = "read" then readProbeSafe <- false
+                                else fail "proxy destination must not use the private Traefik administration port"
                             Some backend, None
                         | None, Some redirect ->
                             requireObject "router redirect" redirect |> ignore
@@ -486,12 +526,52 @@ module Traefik =
                         | _ -> fail "router must specify exactly one of backend or redirect"
                     { Host = host; EntryPoint = entryPoint; Backend = backend; Redirect = redirect; ExcludedPathSubtree = excludedPathSubtree; Tls = { Kind = kind; Name = tlsName } }) (requiredProperty request "routers" "request is missing routers")
 
+            let serverCertificates =
+                certificates
+                |> Seq.choose (fun (KeyValue(name, certificate)) -> if certificate.Usage = "server" then Some name else None)
+                |> Set.ofSeq
+            let clientCertificates =
+                certificates
+                |> Seq.choose (fun (KeyValue(name, certificate)) -> if certificate.Usage = "client" then Some name else None)
+                |> Set.ofSeq
+            let legacyRoutes =
+                routers
+                |> Seq.map (fun (KeyValue(name, router)) ->
+                    let target: TraefikHttpGraphModel.LegacyTarget =
+                        match router.Backend, router.Redirect with
+                        | Some backend, None -> TraefikHttpGraphModel.LegacyTarget.Backend backend
+                        | None, Some redirect -> TraefikHttpGraphModel.LegacyTarget.Redirect redirect.Origin
+                        | _ -> fail "router must specify exactly one of backend or redirect"
+                    let tls: TraefikHttpGraphModel.LegacyTls =
+                        match router.Tls.Kind with
+                        | "none" -> TraefikHttpGraphModel.LegacyTls.None
+                        | "acme" -> TraefikHttpGraphModel.LegacyTls.Acme router.Tls.Name
+                        | "provided" -> TraefikHttpGraphModel.LegacyTls.Provided
+                        | _ -> fail "router TLS kind is invalid"
+                    let legacyRouter: TraefikHttpGraphModel.LegacyRouter =
+                        { Name = name
+                          Host = router.Host
+                          EntryPoint = router.EntryPoint
+                          ExcludedPathSubtree = router.ExcludedPathSubtree
+                          Target = target
+                          Tls = tls }
+                    legacyRouter)
             let configuration =
                 tryProperty request "configuration"
-                |> Option.map (fun input ->
-                    let root = TraefikSettings.parse (input.GetRawText())
-                    TraefikSettings.validate entryPoints adminPort (Set.ofSeq resolvers.Keys) (Set.ofSeq certificates.Keys) (Set.ofSeq routers.Keys) root
-                    root)
+                |> Option.map (fun input -> TraefikSettings.parse (input.GetRawText()))
+            let configurationRoot = defaultArg configuration (JsonObject())
+            let _, mergedDynamic, safe =
+                try
+                    if operation = "read" then
+                        TraefikSettings.validateForReadWithLegacyRoutes
+                            entryPoints adminPort (Set.ofSeq resolvers.Keys) serverCertificates clientCertificates legacyRoutes configurationRoot
+                    else
+                        let graph, dynamic =
+                            TraefikSettings.validateWithLegacyRoutes
+                                entryPoints adminPort (Set.ofSeq resolvers.Keys) serverCertificates clientCertificates legacyRoutes configurationRoot
+                        graph, dynamic, true
+                with :? TraefikSettings.InvalidConfiguration as invalid -> fail invalid.Message
+            if not safe then readProbeSafe <- false
 
             { Operation = operation
               OwnerId = ownerId
@@ -500,6 +580,9 @@ module Traefik =
               Routers = routers
               Certificates = certificates
               Configuration = configuration
+              MergedDynamic = Some mergedDynamic
+              PreviousUdpEntryPoints = previousUdpEntryPoints
+              ReadProbeSafe = readProbeSafe
               AdminPort = adminPort }
 
     let private jsonWriterOptions =
@@ -533,13 +616,6 @@ module Traefik =
         writer.Flush()
         Encoding.UTF8.GetString(stream.ToArray()) + "\n"
 
-    let private serviceNameForBackend backend = "keroosha-backend-" + sha256Text backend
-    let private redirectMiddlewareName routerName origin = "keroosha-redirect-" + sha256Text (routerName + "\n" + origin)
-    let private redirectRegex = "^https?://[^/?#]+(.*)$"
-
-    let private redirectReplacement (origin: string) =
-        origin.Replace("$", "$$") + "${1}"
-
     let private materialDigest (certificate: Certificate) =
         let certificateBytes = Encoding.UTF8.GetBytes(certificate.CertificatePem)
         let keyBytes = Encoding.UTF8.GetBytes(certificate.PrivateKeyPem)
@@ -548,13 +624,46 @@ module Traefik =
         Buffer.BlockCopy(keyBytes, 0, material, certificateBytes.Length + 1, keyBytes.Length)
         sha256Bytes material
 
-    let private hostRuleValue (host: string) =
-        let mutable address = Unchecked.defaultof<IPAddress>
-        if IPAddress.TryParse(host, &address) && address.AddressFamily = AddressFamily.InterNetworkV6 then
-            "[" + address.ToString().ToLowerInvariant() + "]"
-        else host
+    let private legacyAcmeStoragePath
+        (paths: RuntimePaths)
+        (resolverName: string)
+        (caServer: string)
+        (previousStatic: byte[] option)
+        =
+        let legacyPath = TraefikTlsSettings.legacyAcmeStoragePath paths.StateDir resolverName
+        let issuerPath = TraefikTlsSettings.acmeStoragePath paths.StateDir resolverName caServer
+        let sameLegacyIssuer =
+            match previousStatic with
+            | None -> false
+            | Some bytes ->
+                try
+                    use document = JsonDocument.Parse(ReadOnlyMemory<byte>(bytes))
+                    let root = document.RootElement
+                    let resolver =
+                        tryProperty root "certificatesResolvers"
+                        |> Option.bind (fun values -> tryProperty values resolverName)
+                    let acme = resolver |> Option.bind (fun value -> tryProperty value "acme")
+                    let stringOr name fallback =
+                        acme
+                        |> Option.bind (fun value -> tryProperty value name)
+                        |> Option.bind (fun value ->
+                            if value.ValueKind <> JsonValueKind.String then None
+                            else
+                                match value.GetString() with
+                                | null -> None
+                                | text -> Some text)
+                        |> Option.defaultValue fallback
+                    stringOr "caServer" DefaultCaServer = caServer
+                    && stringOr "storage" "" = legacyPath
+                with _ -> false
+        if sameLegacyIssuer then legacyPath else issuerPath
 
-    let private renderStatic (normalized: Request) (paths: RuntimePaths) (listenHost: string) =
+    let private renderStaticWithPrevious
+        (normalized: Request)
+        (paths: RuntimePaths)
+        (listenHost: string)
+        (previousStatic: byte[] option)
+        =
         let staticConfig = JsonObject()
         let entryPoints = JsonObject()
         for KeyValue(name, port) in normalized.EntryPoints do
@@ -578,11 +687,12 @@ module Traefik =
         for KeyValue(name, resolver) in normalized.Resolvers do
             let acme = JsonObject()
             if not (String.IsNullOrEmpty resolver.Email) then acme["email"] <- JsonValue.Create(resolver.Email)
-            acme["storage"] <- JsonValue.Create(Path.Combine(paths.StateDir, "acme-" + sha256Text name + ".json"))
+            let caServer = defaultArg resolver.CaServer DefaultCaServer
+            acme["storage"] <- JsonValue.Create(legacyAcmeStoragePath paths name caServer previousStatic)
             let challenge = JsonObject()
             challenge["entryPoint"] <- JsonValue.Create(resolver.HttpChallengeEntryPoint)
             acme["httpChallenge"] <- challenge
-            acme["caServer"] <- JsonValue.Create(defaultArg resolver.CaServer DefaultCaServer)
+            acme["caServer"] <- JsonValue.Create(caServer)
             let resolverConfig = JsonObject()
             resolverConfig["acme"] <- acme
             resolvers[name] <- resolverConfig
@@ -591,110 +701,91 @@ module Traefik =
         match normalized.Configuration with
         | Some root ->
             let native = TraefikSettings.section root "static" |> TraefikTlsSettings.staticSettings paths.StateDir
+            match native["certificatesResolvers"] with
+            | :? JsonObject as nativeResolvers ->
+                for KeyValue(name, resolverNode) in nativeResolvers do
+                    match resolverNode with
+                    | :? JsonObject as resolver ->
+                        match resolver["acme"] with
+                        | :? JsonObject as acme ->
+                            let caServer =
+                                match acme["caServer"] with
+                                | :? JsonValue as value when value.GetValueKind() = JsonValueKind.String ->
+                                    match value.GetValue<string>() with
+                                    | null -> DefaultCaServer
+                                    | text -> text
+                                | _ -> DefaultCaServer
+                            acme["storage"] <- JsonValue.Create(legacyAcmeStoragePath paths name caServer previousStatic)
+                        | _ -> ()
+                    | _ -> ()
+            | _ -> ()
+            let hasOtlpLogs (sectionName: string) =
+                let mutable section = null
+                if not (native.TryGetPropertyValue(sectionName, &section)) then
+                    false
+                else
+                    match section with
+                    | :? JsonObject as fields ->
+                        let mutable otlp = null
+                        fields.TryGetPropertyValue("otlp", &otlp) && not (isNull otlp)
+                    | _ -> false
+            let enableOtlpLogs = hasOtlpLogs "log" || hasOtlpLogs "accessLog"
             TraefikSettings.merge 1 staticConfig native
+            if enableOtlpLogs then
+                let experimental = JsonObject()
+                experimental["otlpLogs"] <- JsonValue.Create(true)
+                staticConfig["experimental"] <- experimental
         | None -> ()
         jsonText staticConfig
+
+    let private renderStatic (normalized: Request) (paths: RuntimePaths) (listenHost: string) =
+        renderStaticWithPrevious normalized paths listenHost None
 
     let renderStaticConfig request paths listenHost = renderStatic (validateRequest request) paths listenHost
 
     let private renderDynamic (normalized: Request) (paths: RuntimePaths) =
-        let dynamicConfig = JsonObject()
-        let http = JsonObject()
-        let routers = JsonObject()
-        let admin = JsonObject()
-        admin["rule"] <- JsonValue.Create("PathPrefix(`/api`) || PathPrefix(`/dashboard`)")
-        let adminEntryPoints = JsonArray()
-        adminEntryPoints.Add(JsonValue.Create("keroosha-admin"))
-        admin["entryPoints"] <- adminEntryPoints
-        admin["service"] <- JsonValue.Create("api@internal")
-        admin["priority"] <- JsonValue.Create(1000000)
-        routers["keroosha-admin"] <- admin
-        let services = JsonObject()
-        let middlewares = JsonObject()
-        for KeyValue(name, router) in normalized.Routers do
-            let dynamicRouter = JsonObject()
-            let hostRule = "Host(`" + hostRuleValue router.Host + "`)"
-            let rule =
-                match router.ExcludedPathSubtree with
-                | None -> hostRule
-                | Some subtree ->
-                    // Traefik preserves reserved escapes, including encoded slashes, in its routing path.
-                    let pathPattern = subtree.Replace("/", "(/|%2[fF])+", StringComparison.Ordinal)
-                    hostRule + " && !PathRegexp(`^" + pathPattern + "($|/|%2[fF])`)"
-            dynamicRouter["rule"] <- JsonValue.Create(rule)
-            let entryPoints = JsonArray()
-            entryPoints.Add(JsonValue.Create(router.EntryPoint))
-            dynamicRouter["entryPoints"] <- entryPoints
-            match router.Backend, router.Redirect with
-            | Some backend, None ->
-                let serviceName = serviceNameForBackend backend
-                dynamicRouter["service"] <- JsonValue.Create(serviceName)
-                let loadBalancer = JsonObject()
-                let servers = JsonArray()
-                let server = JsonObject()
-                server["url"] <- JsonValue.Create(backend)
-                servers.Add(server)
-                loadBalancer["servers"] <- servers
-                let service = JsonObject()
-                service["loadBalancer"] <- loadBalancer
-                services[serviceName] <- service
-            | None, Some redirect ->
-                let middlewareName = redirectMiddlewareName name redirect.Origin
-                let redirectRegexConfig = JsonObject()
-                redirectRegexConfig["regex"] <- JsonValue.Create(redirectRegex)
-                redirectRegexConfig["replacement"] <- JsonValue.Create(redirectReplacement redirect.Origin)
-                redirectRegexConfig["permanent"] <- JsonValue.Create(true)
-                let middleware = JsonObject()
-                middleware["redirectRegex"] <- redirectRegexConfig
-                middlewares[middlewareName] <- middleware
-                let routeMiddlewares = JsonArray()
-                routeMiddlewares.Add(JsonValue.Create(middlewareName))
-                dynamicRouter["middlewares"] <- routeMiddlewares
-                dynamicRouter["service"] <- JsonValue.Create("noop@internal")
-            | _ -> fail "router must specify exactly one of backend or redirect"
-            match router.Tls.Kind with
-            | "acme" ->
-                let tls = JsonObject()
-                tls["certResolver"] <- JsonValue.Create(router.Tls.Name)
-                dynamicRouter["tls"] <- tls
-            | "provided" -> dynamicRouter["tls"] <- JsonObject()
-            | _ -> ()
-            routers[name] <- dynamicRouter
-        http["routers"] <- routers
-        if services.Count > 0 then http["services"] <- services
-        if middlewares.Count > 0 then http["middlewares"] <- middlewares
-        dynamicConfig["http"] <- http
-        let tlsRoot = JsonObject()
-        let material = normalized.Certificates |> Map.map (fun _ certificate ->
-            let digest = materialDigest certificate
-            Path.Combine(paths.CertificateDir, digest + ".crt"), Path.Combine(paths.CertificateDir, digest + ".key"))
-        let native =
-            normalized.Configuration |> Option.map (fun root ->
-                TraefikSettings.section root "dynamic" |> TraefikTlsSettings.dynamicSettings material)
+        let mergedDynamic =
+            normalized.MergedDynamic
+            |> Option.defaultWith (fun () -> fail "lowered Traefik dynamic configuration is unavailable")
+        let material =
+            normalized.Certificates
+            |> Map.map (fun _ certificate ->
+                let digest = materialDigest certificate
+                Path.Combine(paths.CertificateDir, digest + ".crt"), Path.Combine(paths.CertificateDir, digest + ".key"))
+        let dynamicConfig = TraefikTlsSettings.dynamicSettings material mergedDynamic
+        let tlsRoot =
+            match dynamicConfig["tls"] with
+            | null -> JsonObject()
+            | :? JsonObject as value -> value
+            | _ -> fail "TLS configuration is invalid"
         let certificates, explicitPaths =
-            match native |> Option.map (fun config -> TraefikSettings.section config "tls") with
-            | Some tls when tls.ContainsKey("certificates") ->
-                let items = tls["certificates"].AsArray()
-                tls.Remove("certificates") |> ignore
-                let paths = items |> Seq.map (fun item -> item["certFile"].GetValue<string>(), item["keyFile"].GetValue<string>()) |> Set.ofSeq
+            if tlsRoot.ContainsKey("certificates") then
+                let items = tlsRoot["certificates"].AsArray()
+                tlsRoot.Remove("certificates") |> ignore
+                let paths =
+                    items
+                    |> Seq.map (fun item -> item["certFile"].GetValue<string>(), item["keyFile"].GetValue<string>())
+                    |> Set.ofSeq
                 if paths.Count <> items.Count || not (Set.isSubset paths (material.Values |> Set.ofSeq)) then
                     fail "TLS store registration must reference distinct managed certificates"
                 items, paths
-            | _ -> JsonArray(), Set.empty
-        for KeyValue(_, ((certFile, keyFile) as pair)) in material do
-            if not (explicitPaths.Contains(pair)) then
+            else
+                JsonArray(), Set.empty
+        for KeyValue(name, ((certFile, keyFile) as pair)) in material do
+            if normalized.Certificates[name].Usage = "server" && not (explicitPaths.Contains(pair)) then
                 let item = JsonObject()
                 item["certFile"] <- JsonValue.Create(certFile)
                 item["keyFile"] <- JsonValue.Create(keyFile)
                 certificates.Add(item)
         tlsRoot["certificates"] <- certificates
         dynamicConfig["tls"] <- tlsRoot
-        match native with
-        | Some native ->
-            TraefikSettings.merge 2 dynamicConfig native
+
+        if normalized.Configuration.IsSome then
+            let http = dynamicConfig["http"] :?> JsonObject
+            let routers = http["routers"] :?> JsonObject
+            let admin = routers["keroosha-admin"] :?> JsonObject
             // Some file-provider settings (e.g. transports) have no public API collection.
-            // A changed rule on this private router acknowledges the *generation*, not that
-            // every object in it works. Read checks accepted objects and status separately.
+            // A changed rule on this private router acknowledges the generation, not acceptance.
             use hash = SHA256.Create()
             use sink = new CryptoStream(Stream.Null, hash, CryptoStreamMode.Write)
             use writer = new Utf8JsonWriter(sink, jsonWriterOptions)
@@ -702,8 +793,11 @@ module Traefik =
             writer.Flush()
             sink.FlushFinalBlock()
             let generation = Convert.ToHexStringLower(hash.Hash)
-            admin["rule"] <- JsonValue.Create("(PathPrefix(`/api`) || PathPrefix(`/dashboard`)) && !Path(`/.dorothy-generation/" + generation + "`)")
-        | None -> ()
+            admin["rule"] <- JsonValue.Create(TraefikHttpGraphModel.generatedAdminRuleWithGeneration generation)
+
+        // validateRequest already validated the merged graph, including trusted generated routes,
+        // before resolving certificate aliases. Native certFile/keyFile are outputs of the
+        // protected-material transform, never admissible operator paths.
         // JSON is valid YAML. Keep literal braces in legacy URL paths from becoming Go templates.
         (jsonText dynamicConfig).Replace("{{", "\\u007b\\u007b", StringComparison.Ordinal)
 
@@ -849,27 +943,46 @@ module Traefik =
             with _ -> None
     // Rawdata can confirm route removal, but cannot observe an already-open peer session
     // using the removed UDP handler. Restart when its last route disappears to clear it.
+    let udpWithdrawalRequiresRestartForAcceptedEntryPoints
+        (previous: Set<string>)
+        (nextDynamic: byte[] option)
+        (targetStatic: byte[] option)
+        : bool =
+        let next = udpGraphEntryPoints nextDynamic
+        let bound = boundUdpEntryPoints targetStatic
+        match next, bound with
+        | Some next, Some bound ->
+            Set.difference previous next
+            |> Set.intersect bound
+            |> Set.isEmpty
+            |> not
+        | None, Some bound -> Set.intersect previous bound |> Set.isEmpty |> not
+        | Some next, None -> not (Set.isEmpty (Set.difference previous next))
+        | None, None -> not (Set.isEmpty previous)
+
     let udpWithdrawalRequiresRestart
         (previousDynamic: byte[] option)
         (nextDynamic: byte[] option)
         (targetStatic: byte[] option)
         : bool =
-        let previous = udpGraphEntryPoints previousDynamic
-        let next = udpGraphEntryPoints nextDynamic
-        let bound = boundUdpEntryPoints targetStatic
-        match previous, next, bound with
-        | None, _, Some entryPoints -> not (Set.isEmpty entryPoints)
-        | None, _, None -> true
-        | Some previous, Some next, Some bound ->
-            Set.difference previous next
-            |> Set.intersect bound
-            |> Set.isEmpty
-            |> not
-        | Some previous, None, Some bound ->
-            Set.intersect previous bound |> Set.isEmpty |> not
-        | Some previous, Some next, None ->
-            not (Set.isEmpty (Set.difference previous next))
-        | Some previous, None, None -> not (Set.isEmpty previous)
+        match udpGraphEntryPoints previousDynamic with
+        | Some previous -> udpWithdrawalRequiresRestartForAcceptedEntryPoints previous nextDynamic targetStatic
+        | None ->
+            match boundUdpEntryPoints targetStatic with
+            | Some entryPoints -> not (Set.isEmpty entryPoints)
+            | None -> true
+
+    /// Disk may have drifted since the checkpoint. Either graph can describe a handler the
+    /// daemon is still serving; if a previous graph is unknown, a bound idle listener is ambiguous.
+    let udpUpdateRequiresRestart accepted previousDynamic nextDynamic targetStatic =
+        match boundUdpEntryPoints targetStatic, udpGraphEntryPoints nextDynamic with
+        | Some bound, Some desired when not bound.IsEmpty ->
+            let disk = udpGraphEntryPoints previousDynamic
+            bound |> Set.exists (fun name ->
+                not (desired.Contains name)
+                && (Option.forall (Set.contains name) accepted || Option.forall (Set.contains name) disk))
+        | Some bound, _ -> not bound.IsEmpty
+        | None, _ -> true
 
 
     let private credentialData (configuration: JsonObject option) : byte[] option =
@@ -1061,12 +1174,36 @@ module Traefik =
         finally nativeClose(descriptor) |> ignore
 
     let private writeAtomic (environment: HostEnvironment) (path: string) (data: byte[]) (mode: int) (groupId: int option) =
-        if not (assertDirectory environment (Path.GetDirectoryName(path)) "Traefik configuration directory") then
+        let parent = Path.GetDirectoryName(path)
+        if not (assertDirectory environment parent "Traefik configuration directory") then
             fail "Traefik configuration directory is unavailable"
-        HostFiles.atomicWrite path data (unixMode mode)
+        assertRegular environment path "Traefik owned file" |> ignore
         let uid = runOk environment "cannot secure Traefik file ownership" "id" [ "-u" ] |> fun result -> Int32.Parse(result.Stdout.Trim(), CultureInfo.InvariantCulture)
         let gid = defaultArg groupId (runOk environment "cannot secure Traefik file ownership" "id" [ "-g" ] |> fun result -> Int32.Parse(result.Stdout.Trim(), CultureInfo.InvariantCulture))
-        chown environment path uid gid
+        let temporaryPath = Path.Combine(parent, ".keroosha-traefik-write-" + Guid.NewGuid().ToString("N"))
+        let mutable temporaryExists = false
+        try
+            let options = FileStreamOptions()
+            options.Mode <- FileMode.CreateNew
+            options.Access <- FileAccess.Write
+            options.Share <- FileShare.None
+            options.BufferSize <- 4096
+            options.Options <- FileOptions.WriteThrough
+            options.UnixCreateMode <- Nullable<UnixFileMode>(unixMode mode)
+            do
+                use output = new FileStream(temporaryPath, options)
+                temporaryExists <- true
+                output.Write(data, 0, data.Length)
+                output.Flush(true)
+            chown environment temporaryPath uid gid
+            setMode environment temporaryPath mode false
+            assertRegular environment path "Traefik owned file" |> ignore
+            File.Move(temporaryPath, path, true)
+            temporaryExists <- false
+            HostFiles.syncDirectory parent
+        finally
+            if temporaryExists then
+                try File.Delete(temporaryPath) with _ -> ()
 
     let private chmod (environment: HostEnvironment) (path: string) (mode: int) =
         setMode environment path mode false
@@ -1784,12 +1921,55 @@ module Traefik =
         let configStatus, stateStatus, installStatus, unitData = checkLayoutCollisions environment paths ownerId
         if unitData.IsSome && configStatus <> "owned" then fail "Traefik service unit has no matching owned configuration"
         configStatus, stateStatus, installStatus, unitData
+    let private cleanupTemporaryFiles (environment: HostEnvironment) (directory: string) (filenamePattern: Regex) : unit =
+        let uid = runOk environment "cannot inspect Traefik temporary file owner" "id" [ "-u" ] |> fun result -> Int32.Parse(result.Stdout.Trim(), CultureInfo.InvariantCulture)
+        let mutable removed = false
+        for filename in entries directory do
+            if filenamePattern.IsMatch(filename) then
+                let path = Path.Combine(directory, filename)
+                match tryStat environment path with
+                | Some item when item.Kind = "regular file" && item.Uid = uid ->
+                    File.Delete(path)
+                    removed <- true
+                | _ -> fail "Traefik temporary file is unsafe"
+        if removed then HostFiles.syncDirectory directory
+
+    let private cleanupOwnedTemporaryFiles (environment: HostEnvironment) (directory: string) (ownerId: string) (filenamePattern: Regex) : unit =
+        if markerStatus environment directory ownerId = "owned" then
+            cleanupTemporaryFiles environment directory filenamePattern
+
+    let private cleanupStaleTraefikTemporaryFiles (environment: HostEnvironment) (paths: RuntimePaths) (ownerId: string) : unit =
+        let atomicTemporaryPattern = Regex("^\\.(?:keroosha-traefik-write|keroosha-iac)-[0-9a-f]{32}$", RegexOptions.CultureInvariant)
+        let binaryTemporaryPattern = Regex("^\\.traefik-install-[0-9a-f]{32}$", RegexOptions.CultureInvariant)
+        for directory in [ paths.ConfigDir; paths.DynamicDir; paths.CertificateDir; paths.InstallDir ] do
+            cleanupOwnedTemporaryFiles environment directory ownerId atomicTemporaryPattern
+        if markerStatus environment paths.InstallDir ownerId = "owned" then
+            let versionDirectory = Path.GetDirectoryName(paths.BinaryPath)
+            if assertDirectory environment versionDirectory "Traefik binary directory" then
+                cleanupTemporaryFiles environment versionDirectory binaryTemporaryPattern
 
     let private ensureGroupedAtomicWrite environment path data mode groupId = writeAtomic environment path data mode (Some groupId)
+
 
     let private certificateIdentity (certificate: Certificate) =
         try
             use cert = X509Certificate2.CreateFromPem(certificate.CertificatePem.AsSpan(), certificate.PrivateKeyPem.AsSpan())
+            let requiredEku =
+                match certificate.Usage with
+                | "server" -> "1.3.6.1.5.5.7.3.1"
+                | "client" -> "1.3.6.1.5.5.7.3.2"
+                | _ -> fail "certificate usage is invalid"
+            let ekuExtensions =
+                cert.Extensions
+                |> Seq.cast<X509Extension>
+                |> Seq.filter (fun extension ->
+                    not (isNull extension.Oid)
+                    && String.Equals(extension.Oid.Value, "2.5.29.37", StringComparison.Ordinal))
+                |> Seq.toArray
+            if ekuExtensions.Length <> 1 then fail "certificate extended key usage is invalid"
+            let eku = X509EnhancedKeyUsageExtension(ekuExtensions[0], ekuExtensions[0].Critical)
+            if not (eku.EnhancedKeyUsages |> Seq.cast<Oid> |> Seq.exists (fun oid -> String.Equals(oid.Value, requiredEku, StringComparison.Ordinal))) then
+                fail "certificate extended key usage does not match its declared use"
             let der = cert.Export(X509ContentType.Cert)
             let fingerprint = sha256Bytes der
             if fingerprint <> certificate.Fingerprint then fail "certificate identity or fingerprint does not match"
@@ -1823,12 +2003,17 @@ module Traefik =
         handler.AllowAutoRedirect <- false
         new HttpClient(handler, true)
 
-    let private readApiEndpoint
+    [<Literal>]
+    let private ApiEntryPointPageSize = 100
+    [<Literal>]
+    let private ApiMaximumEntryPoints = TraefikStatic.MaximumObservedEntryPoints
+
+    let private readApiEndpointResponse
         (adminPort: int)
         (resource: string)
         (expectedKind: JsonValueKind)
         (cancellationToken: CancellationToken)
-        : Task<JsonElement option> =
+        : Task<(JsonElement * int option * int) option> =
         task {
             try
                 use request =
@@ -1845,6 +2030,20 @@ module Traefik =
                      && response.Content.Headers.ContentLength.Value > int64 ApiMaximumBytes then
                     return None
                 else
+                    let mutable nextPageValues = Unchecked.defaultof<System.Collections.Generic.IEnumerable<string>>
+                    let nextPage =
+                        if response.Headers.TryGetValues("X-Next-Page", &nextPageValues) then
+                            match Seq.toArray nextPageValues with
+                            | [| value |] ->
+                                let mutable page = 0
+                                if Int32.TryParse(value, NumberStyles.None, CultureInfo.InvariantCulture, &page)
+                                   && page > 0 then
+                                    Some page
+                                else
+                                    None
+                            | _ -> None
+                        else
+                            None
                     use! stream = response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false)
                     use output = new MemoryStream()
                     let buffer = Array.zeroCreate<byte> 16384
@@ -1860,11 +2059,77 @@ module Traefik =
                     else
                         use document = JsonDocument.Parse(output.GetBuffer().AsMemory(0, count))
                         if document.RootElement.ValueKind = expectedKind then
-                            return Some(document.RootElement.Clone())
+                            return Some(document.RootElement.Clone(), nextPage, count)
                         else
                             return None
             with _ ->
                 return None
+        }
+
+    let private readApiEndpoint
+        (adminPort: int)
+        (resource: string)
+        (expectedKind: JsonValueKind)
+        (cancellationToken: CancellationToken)
+        : Task<JsonElement option> =
+        task {
+            let! response = readApiEndpointResponse adminPort resource expectedKind cancellationToken
+            return response |> Option.map (fun (value, _, _) -> value)
+        }
+
+    let internal readApiEntryPoints (adminPort: int) (cancellationToken: CancellationToken) : Task<JsonElement option> =
+        task {
+            let maximumPages = (ApiMaximumEntryPoints + ApiEntryPointPageSize - 1) / ApiEntryPointPageSize
+            let pages = ResizeArray<JsonElement>()
+            let mutable page = 1
+            let mutable itemCount = 0
+            let mutable totalBytes = 0
+            let mutable finished = false
+            let mutable valid = true
+            while valid && not finished do
+                if page > maximumPages then
+                    valid <- false
+                else
+                    let requestedPage = page
+                    let resource =
+                        "entrypoints?per_page="
+                        + ApiEntryPointPageSize.ToString(CultureInfo.InvariantCulture)
+                        + "&page="
+                        + requestedPage.ToString(CultureInfo.InvariantCulture)
+                    let! response =
+                        readApiEndpointResponse adminPort resource JsonValueKind.Array cancellationToken
+                    match response with
+                    | Some(items, Some nextPage, bytes) when items.ValueKind = JsonValueKind.Array ->
+                        let count = items.GetArrayLength()
+                        if count > ApiMaximumEntryPoints - itemCount || bytes > ApiMaximumBytes - totalBytes then
+                            valid <- false
+                        else
+                            pages.Add(items)
+                            itemCount <- itemCount + count
+                            totalBytes <- totalBytes + bytes
+                            if nextPage = 1 then
+                                finished <- true
+                            elif nextPage = requestedPage + 1 && nextPage <= maximumPages then
+                                page <- nextPage
+                            else
+                                valid <- false
+                    | _ -> valid <- false
+
+            if not valid then
+                return None
+            else
+                use output = new MemoryStream()
+                use writer = new Utf8JsonWriter(output)
+                writer.WriteStartArray()
+                for items in pages do
+                    for item in items.EnumerateArray() do item.WriteTo(writer)
+                writer.WriteEndArray()
+                writer.Flush()
+                if output.Length > int64 ApiMaximumBytes then
+                    return None
+                else
+                    use document = JsonDocument.Parse(output.GetBuffer().AsMemory(0, int output.Length))
+                    return Some(document.RootElement.Clone())
         }
 
     let private readApi (adminPort: int) : Task<ApiConfiguration option> =
@@ -1873,7 +2138,7 @@ module Traefik =
             let! responses =
                 Task.WhenAll(
                     [| readApiEndpoint adminPort "rawdata" JsonValueKind.Object deadline.Token
-                       readApiEndpoint adminPort "entrypoints" JsonValueKind.Array deadline.Token
+                       readApiEntryPoints adminPort deadline.Token
                        readApiEndpoint adminPort "version" JsonValueKind.Object deadline.Token |]
                 ).ConfigureAwait(false)
             match responses with
@@ -1891,7 +2156,7 @@ module Traefik =
             use deadline = new CancellationTokenSource(ConnectTimeoutMilliseconds)
             let! responses =
                 Task.WhenAll(
-                    [| readApiEndpoint adminPort "entrypoints" JsonValueKind.Array deadline.Token
+                    [| readApiEntryPoints adminPort deadline.Token
                        readApiEndpoint adminPort "version" JsonValueKind.Object deadline.Token |]
                 ).ConfigureAwait(false)
             match responses with
@@ -1985,6 +2250,39 @@ module Traefik =
         | None -> Some Map.empty
         | Some resources -> namedResources resources
 
+    type private HttpEntryPointModel =
+        { Middlewares: string array
+          Tls: JsonElement option
+          AsDefault: bool
+          Applies: bool }
+    type private RouterProtocol =
+        | HttpProtocol
+        | TcpProtocol
+        | UdpProtocol
+
+    let private httpRouterFields =
+        set [ "entryPoints"; "middlewares"; "service"; "rule"; "ruleSyntax"; "priority"; "tls"; "observability"; "parentRefs" ]
+
+    let private tcpRouterFields =
+        set [ "entryPoints"; "middlewares"; "service"; "rule"; "ruleSyntax"; "priority"; "tls" ]
+
+    let private udpRouterFields =
+        set [ "entryPoints"; "service" ]
+
+    let private udpRouterFieldsComparedSeparately =
+        set [ "entryPoints"; "service" ]
+    let private defaultTrueBooleanFields =
+        set [ "followRedirects"; "mirrorBody"; "passHostHeader" ]
+
+    let private routerFieldsComparedSeparately =
+        set [ "service"; "middlewares"; "parentRefs"; "tls"; "priority"; "entryPoints" ]
+
+    let private routerApiMetadataFields =
+        set [ "name"; "provider"; "status"; "using" ]
+
+    let private serviceApiMetadataFields =
+        set [ "name"; "provider"; "serverStatus"; "status"; "type"; "usedBy" ]
+
     let private referenceMatches (expected: JsonElement) (actual: JsonElement) : bool =
         match expected.ValueKind, actual.ValueKind with
         | JsonValueKind.String, JsonValueKind.String ->
@@ -2007,19 +2305,170 @@ module Traefik =
                 wanted
                 found
         | _ -> false
+
+    let private parentRefsMatch (expected: JsonElement option) (actual: JsonElement option) : bool =
+        let normalize (values: JsonElement option) =
+            match values with
+            | None -> Some [||]
+            | Some value when value.ValueKind = JsonValueKind.Null -> Some [||]
+            | Some value ->
+                jsonArrayStrings value
+                |> Option.bind (fun names ->
+                    let normalized = names |> Array.map (withoutProviderSuffix "file")
+                    if normalized |> Array.exists String.IsNullOrEmpty then None
+                    else Some(Array.sort normalized))
+        match normalize expected, normalize actual with
+        | Some wanted, Some found -> wanted = found
+        | _ -> false
+
+    let private literalMapPath (path: string list) =
+        match path with
+        | "customRequestHeaders" :: "headers" :: _
+        | "customResponseHeaders" :: "headers" :: _
+        | "headers" :: "healthCheck" :: "loadBalancer" :: _ -> true
+        | _ -> false
+
+    let private durationFieldNames =
+        set [
+            "dialKeepAlive"; "dialTimeout"; "failureWindow"; "flushInterval"; "graceTimeOut"
+            "idleConnTimeout"; "idleTimeout"; "interval"; "keepAliveMaxTime"; "readTimeout"
+            "requestAcceptGraceTimeout"; "responseHeaderTimeout"; "terminationDelay"; "timeout"
+            "unhealthyInterval"; "writeTimeout"
+        ]
+
+    let private durationFieldAt path name =
+        Set.contains name durationFieldNames && not (literalMapPath path)
+
+    let private tryDurationNanoseconds (value: string) : decimal option =
+        if String.IsNullOrEmpty(value) then None
+        elif value = "0" then Some 0M
+        else
+            let mutable index = 0
+            let mutable sign = 1M
+            if value[index] = '-' then
+                sign <- -1M
+                index <- index + 1
+            elif value[index] = '+' then
+                index <- index + 1
+            let mutable total = 0M
+            let mutable valid = index < value.Length
+            while valid && index < value.Length do
+                let numberStart = index
+                let mutable sawDigit = false
+                let mutable sawDecimal = false
+                while index < value.Length
+                      && ((value[index] >= '0' && value[index] <= '9')
+                          || (value[index] = '.' && not sawDecimal)) do
+                    if value[index] = '.' then sawDecimal <- true
+                    else sawDigit <- true
+                    index <- index + 1
+                if not sawDigit || index = value.Length then
+                    valid <- false
+                else
+                    let numberSpan = value.AsSpan(numberStart, index - numberStart)
+                    let mutable number = 0M
+                    if not (Decimal.TryParse(numberSpan, NumberStyles.AllowDecimalPoint, CultureInfo.InvariantCulture, &number)) then
+                        valid <- false
+                    else
+                        let unit, scale =
+                            if value.AsSpan(index).StartsWith("ns".AsSpan(), StringComparison.Ordinal) then "ns", 1M
+                            elif value.AsSpan(index).StartsWith("us".AsSpan(), StringComparison.Ordinal) then "us", 1000M
+                            elif value.AsSpan(index).StartsWith("µs".AsSpan(), StringComparison.Ordinal) then "µs", 1000M
+                            elif value.AsSpan(index).StartsWith("ms".AsSpan(), StringComparison.Ordinal) then "ms", 1000000M
+                            elif value.AsSpan(index).StartsWith("s".AsSpan(), StringComparison.Ordinal) then "s", 1000000000M
+                            elif value.AsSpan(index).StartsWith("m".AsSpan(), StringComparison.Ordinal) then "m", 60000000000M
+                            elif value.AsSpan(index).StartsWith("h".AsSpan(), StringComparison.Ordinal) then "h", 3600000000000M
+                            else "", 0M
+                        if String.IsNullOrEmpty(unit) then valid <- false
+                        else
+                            total <- total + number * scale
+                            index <- index + unit.Length
+            if valid then Some(sign * Decimal.Truncate(total)) else None
+
+    let private jsonStringIs (expected: string) (actual: JsonElement) =
+        actual.ValueKind = JsonValueKind.String && actual.GetString() = expected
+
+    let private defaultHttpResponseForwarding (value: JsonElement) =
+        value.ValueKind = JsonValueKind.Object
+        && objectNames value = set [ "flushInterval" ]
+        && (tryProperty value "flushInterval"
+            |> Option.bind (fun interval ->
+                tryDurationNanoseconds (if interval.ValueKind = JsonValueKind.String then interval.GetString() else null)))
+           = Some 100000000M
+
+    let private defaultValueForMissingExpected (path: string list) (name: string) (actual: JsonElement) =
+        let isInteger expected =
+            let mutable found = 0L
+            actual.ValueKind = JsonValueKind.Number && actual.TryGetInt64(&found) && found = expected
+        match path, name with
+        | "loadBalancer" :: _, "strategy" -> jsonStringIs "wrr" actual
+        | "loadBalancer" :: _, "passHostHeader" -> actual.ValueKind = JsonValueKind.True
+        | "loadBalancer" :: _, "responseForwarding" -> defaultHttpResponseForwarding actual
+        | "responseForwarding" :: "loadBalancer" :: _, "flushInterval" ->
+            tryDurationNanoseconds (if actual.ValueKind = JsonValueKind.String then actual.GetString() else null) = Some 100000000M
+        | "healthCheck" :: "loadBalancer" :: _, "mode" -> jsonStringIs "http" actual
+        | "healthCheck" :: "loadBalancer" :: _, "interval" ->
+            tryDurationNanoseconds (if actual.ValueKind = JsonValueKind.String then actual.GetString() else null) = Some 30000000000M
+        | "healthCheck" :: "loadBalancer" :: _, "timeout" ->
+            tryDurationNanoseconds (if actual.ValueKind = JsonValueKind.String then actual.GetString() else null) = Some 5000000000M
+        | "healthCheck" :: "loadBalancer" :: _, "followRedirects" -> actual.ValueKind = JsonValueKind.True
+        | "cookie" :: "sticky" :: ("loadBalancer" | "weighted") :: _, "path" -> jsonStringIs "/" actual
+        | "passiveHealthCheck" :: "loadBalancer" :: _, "failureWindow" ->
+            tryDurationNanoseconds (if actual.ValueKind = JsonValueKind.String then actual.GetString() else null) = Some 10000000000M
+        | "passiveHealthCheck" :: "loadBalancer" :: _, "maxFailedAttempts" -> isInteger 1L
+        | "mirroring" :: _, "mirrorBody" -> actual.ValueKind = JsonValueKind.True
+        | "mirroring" :: _, "maxBodySize" -> isInteger -1L
+        | "errors" :: "failover" :: _, "maxRequestBodyBytes" -> isInteger -1L
+        | _, _ when actual.ValueKind = JsonValueKind.False ->
+            not (Set.contains name defaultTrueBooleanFields)
+        | _ -> false
+
     let rec private jsonConfigMatches (path: string list) (expected: JsonElement) (actual: JsonElement) : bool =
         match expected.ValueKind, actual.ValueKind with
         | JsonValueKind.Object, JsonValueKind.Object ->
-            expected.EnumerateObject()
-            |> Seq.forall (fun property ->
-                let propertyPath = property.Name :: path
-                match property.Name, tryProperty actual property.Name with
-                | "middlewares", found -> referenceArraysMatch (Some property.Value) found
-                | ("service" | "serversTransport"), Some found -> referenceMatches property.Value found
-                | "name", Some found when (match path with "[]" :: "services" :: _ -> true | _ -> false) ->
-                    referenceMatches property.Value found
-                | _, Some found -> jsonConfigMatches propertyPath property.Value found
-                | _ -> false)
+            let wantedNames = objectNames expected
+            let mapKeysMatch =
+                not (literalMapPath path) || wantedNames = objectNames actual
+            let expectedPropertiesMatch =
+                expected.EnumerateObject()
+                |> Seq.forall (fun property ->
+                    let propertyPath = property.Name :: path
+                    match property.Name, tryProperty actual property.Name with
+                    | "middlewares", found when path = [] || path = [ "chain" ] ->
+                        referenceArraysMatch (Some property.Value) found
+                    | "parentRefs", found when path = [] ->
+                        parentRefsMatch (Some property.Value) found
+                    | ("service" | "serversTransport"), Some found
+                        when (property.Name = "service" && (path = [ "mirroring" ] || path = [ "failover" ]))
+                             || (property.Name = "serversTransport" && path = [ "loadBalancer" ]) ->
+                        referenceMatches property.Value found
+                    | "fallback", Some found when path = [ "failover" ] ->
+                        referenceMatches property.Value found
+                    | "name", Some found
+                        when path = [ "[]"; "services"; "weighted" ]
+                             || path = [ "[]"; "mirrors"; "mirroring" ] ->
+                        referenceMatches property.Value found
+                    | _, Some found when durationFieldAt path property.Name
+                                          && property.Value.ValueKind = JsonValueKind.String
+                                          && found.ValueKind = JsonValueKind.String ->
+                        match tryDurationNanoseconds (property.Value.GetString()), tryDurationNanoseconds (found.GetString()) with
+                        | Some wanted, Some found -> wanted = found
+                        | _ -> false
+                    | _, Some found -> jsonConfigMatches propertyPath property.Value found
+                    | _, None when property.Value.ValueKind = JsonValueKind.False
+                                   && not (Set.contains property.Name defaultTrueBooleanFields) -> true
+                    | _, None when property.Value.ValueKind = JsonValueKind.Null -> true
+                    | _ -> false)
+            let unexpectedPropertiesMatch =
+                actual.EnumerateObject()
+                |> Seq.forall (fun property ->
+                    if Set.contains property.Name wantedNames then true
+                    elif path = []
+                         && Set.contains property.Name serviceApiMetadataFields then
+                        true
+                    else
+                        defaultValueForMissingExpected path property.Name property.Value)
+            mapKeysMatch && expectedPropertiesMatch && unexpectedPropertiesMatch
         | JsonValueKind.Array, JsonValueKind.Array ->
             let wanted = expected.EnumerateArray() |> Seq.toArray
             let found = actual.EnumerateArray() |> Seq.toArray
@@ -2029,7 +2478,12 @@ module Traefik =
                 |> Array.forall id
         | JsonValueKind.String, JsonValueKind.String ->
             match path with
-            | "name" :: "[]" :: "services" :: _ -> referenceMatches expected actual
+            | "name" :: "[]" :: "services" :: "weighted" :: _
+            | "name" :: "[]" :: "mirrors" :: "mirroring" :: _ -> referenceMatches expected actual
+            | name :: parentPath when durationFieldAt parentPath name ->
+                match tryDurationNanoseconds (expected.GetString()), tryDurationNanoseconds (actual.GetString()) with
+                | Some wanted, Some found -> wanted = found
+                | _ -> false
             | _ -> expected.GetString() = actual.GetString()
         | JsonValueKind.Number, JsonValueKind.Number ->
             let mutable wanted = 0M
@@ -2058,57 +2512,241 @@ module Traefik =
             let optionsMatches =
                 match tryProperty wanted "options", tryProperty found "options" with
                 | None, None -> true
-                | None, Some value -> value.ValueKind = JsonValueKind.String && value.GetString() = "default"
-                | Some expectedOptions, None ->
-                    expectedOptions.ValueKind = JsonValueKind.String && expectedOptions.GetString() = "default"
+                | None, Some value -> jsonStringIs "default" value
+                | Some expectedOptions, None -> jsonStringIs "default" expectedOptions
                 | Some expectedOptions, Some actualOptions ->
-                    if expectedOptions.ValueKind = JsonValueKind.String && expectedOptions.GetString() = "default" then
-                        actualOptions.ValueKind = JsonValueKind.String && actualOptions.GetString() = "default"
-                    else
-                        jsonConfigMatches [ "options" ] expectedOptions actualOptions
+                    if jsonStringIs "default" expectedOptions then jsonStringIs "default" actualOptions
+                    else referenceMatches expectedOptions actualOptions
+            let expectedNames = objectNames wanted
             let otherPropertiesMatch =
                 wanted.EnumerateObject()
                 |> Seq.filter (fun property -> property.Name <> "certResolver" && property.Name <> "options")
                 |> Seq.forall (fun property ->
-                    tryProperty found property.Name
-                    |> Option.exists (jsonConfigMatches [ property.Name ] property.Value))
-            resolverMatches && optionsMatches && otherPropertiesMatch
+                    match tryProperty found property.Name with
+                    | Some value -> jsonConfigMatches [ property.Name ] property.Value value
+                    | None ->
+                        property.Value.ValueKind = JsonValueKind.False
+                        && not (Set.contains property.Name defaultTrueBooleanFields))
+            let unexpectedPropertiesMatch =
+                found.EnumerateObject()
+                |> Seq.forall (fun property ->
+                    Set.contains property.Name expectedNames
+                    || (property.Name = "options" && jsonStringIs "default" property.Value)
+                    || (property.Value.ValueKind = JsonValueKind.False
+                        && not (Set.contains property.Name defaultTrueBooleanFields)))
+            resolverMatches && optionsMatches && otherPropertiesMatch && unexpectedPropertiesMatch
         | _ -> false
 
-    let private routerMatches (expected: JsonElement) (actual: JsonElement) : bool =
+    let private skipRuleWhitespace (rule: string) (index: byref<int>) =
+        while index < rule.Length && Char.IsWhiteSpace(rule[index]) do
+            index <- index + 1
+
+    let private isTcpCatchAllRule (rule: string) =
+        let matcher = "HostSNI"
+        let mutable index = 0
+        skipRuleWhitespace rule &index
+        let mutable matcherIndex = 0
+        let mutable matches = true
+        while matches && matcherIndex < matcher.Length do
+            if index >= rule.Length
+               || Char.ToUpperInvariant(rule[index]) <> Char.ToUpperInvariant(matcher[matcherIndex]) then
+                matches <- false
+            else
+                index <- index + 1
+                matcherIndex <- matcherIndex + 1
+        skipRuleWhitespace rule &index
+        if not matches || index >= rule.Length || rule[index] <> '(' then false
+        else
+            index <- index + 1
+            skipRuleWhitespace rule &index
+            if index >= rule.Length || (rule[index] <> '`' && rule[index] <> char 39) then false
+            else
+                let quote = rule[index]
+                index <- index + 1
+                if index >= rule.Length || rule[index] <> '*' then false
+                else
+                    index <- index + 1
+                    if index >= rule.Length || rule[index] <> quote then false
+                    else
+                        index <- index + 1
+                        skipRuleWhitespace rule &index
+                        if index >= rule.Length || rule[index] <> ')' then false
+                        else
+                            index <- index + 1
+                            skipRuleWhitespace rule &index
+                            index = rule.Length
+
+    /// Mirrors the pinned effective priorities used when Traefik builds HTTP/TCP handlers.
+    /// HTTP and TCP priority handling: https://github.com/traefik/traefik/blob/v3.7.16/pkg/server/router/router.go#L243-L250
+    /// TCP HostSNI catchall priority: https://github.com/traefik/traefik/blob/v3.7.16/pkg/muxer/tcp/mux.go
+    /// Effective-zero branches: https://github.com/traefik/traefik/blob/v3.7.16/pkg/server/router/tcp/manager.go#L217-L225
+    let private effectiveRouterPriority (tcp: bool) (router: JsonElement) : int64 option =
+        let rule = tryString router "rule"
+        if String.IsNullOrEmpty(rule) then None
+        else
+            let computed =
+                if tcp && isTcpCatchAllRule rule then -1L
+                else int64 (Encoding.UTF8.GetByteCount(rule))
+            match tryProperty router "priority" with
+            | None -> Some computed
+            | Some value when value.ValueKind = JsonValueKind.Null -> Some computed
+            | Some value when value.ValueKind = JsonValueKind.Number ->
+                let mutable explicitPriority = 0L
+                if value.TryGetInt64(&explicitPriority) then
+                    if explicitPriority = 0L then Some computed else Some explicitPriority
+                else None
+            | _ -> None
+
+    let private entryPointsMatch (expected: JsonElement option) (actual: JsonElement option) =
+        let read (values: JsonElement option) =
+            match values with
+            | None -> Some [||]
+            | Some value when value.ValueKind = JsonValueKind.Null -> Some [||]
+            | Some value -> jsonArrayStrings value |> Option.map Array.sort
+        match read expected, read actual with
+        | Some wanted, Some found -> wanted = found
+        | _ -> false
+
+    let private defaultRouterObservability (value: JsonElement) =
+        value.ValueKind = JsonValueKind.Object
+        && objectNames value = set [ "accessLogs"; "metrics"; "tracing"; "traceVerbosity" ]
+        && (tryProperty value "accessLogs" |> Option.exists (fun flag -> flag.ValueKind = JsonValueKind.True))
+        && (tryProperty value "metrics" |> Option.exists (fun flag -> flag.ValueKind = JsonValueKind.True))
+        && (tryProperty value "tracing" |> Option.exists (fun flag -> flag.ValueKind = JsonValueKind.True))
+        && (tryProperty value "traceVerbosity" |> Option.exists (jsonStringIs "minimal"))
+
+    let private routerMatches (protocol: RouterProtocol) (expected: JsonElement) (actual: JsonElement) : bool =
+        let allowedFields, fieldsComparedSeparately =
+            match protocol with
+            | HttpProtocol -> httpRouterFields, routerFieldsComparedSeparately
+            | TcpProtocol -> tcpRouterFields, routerFieldsComparedSeparately
+            | UdpProtocol -> udpRouterFields, udpRouterFieldsComparedSeparately
+        let expectedFieldsMatch =
+            Set.isEmpty (Set.difference (objectNames expected) allowedFields)
         let expectedService = tryString expected "service"
         let actualService = tryString actual "service"
         let serviceMatches =
-            if String.IsNullOrEmpty(expectedService) then false
+            if String.IsNullOrEmpty(expectedService) then String.IsNullOrEmpty(actualService)
             elif expectedService.EndsWith("@internal", StringComparison.Ordinal) then
                 actualService = expectedService
                 || actualService = expectedService.Substring(0, expectedService.Length - "@internal".Length)
             else
                 actualService = expectedService
         let middlewareMatches =
-            referenceArraysMatch (tryProperty expected "middlewares") (tryProperty actual "middlewares")
-        let tlsMatches = tlsRouterMatches (tryProperty expected "tls") (tryProperty actual "tls")
+            match protocol with
+            | UdpProtocol ->
+                Option.isNone (tryProperty expected "middlewares")
+                && Option.isNone (tryProperty actual "middlewares")
+            | _ ->
+                referenceArraysMatch (tryProperty expected "middlewares") (tryProperty actual "middlewares")
+        let parentMatches =
+            match protocol with
+            | HttpProtocol -> parentRefsMatch (tryProperty expected "parentRefs") (tryProperty actual "parentRefs")
+            | _ -> Option.isNone (tryProperty expected "parentRefs") && Option.isNone (tryProperty actual "parentRefs")
+        let tlsMatches =
+            match protocol with
+            | UdpProtocol -> Option.isNone (tryProperty expected "tls") && Option.isNone (tryProperty actual "tls")
+            | _ -> tlsRouterMatches (tryProperty expected "tls") (tryProperty actual "tls")
+        let priorityMatches =
+            match protocol with
+            | UdpProtocol ->
+                Option.isNone (tryProperty expected "priority")
+                && Option.isNone (tryProperty actual "priority")
+            | HttpProtocol
+            | TcpProtocol ->
+                let expectedPriority = effectiveRouterPriority (protocol = TcpProtocol) expected
+                let actualPriority = effectiveRouterPriority (protocol = TcpProtocol) actual
+                expectedPriority.IsSome && expectedPriority = actualPriority
+        let entryPointsMatches = entryPointsMatch (tryProperty expected "entryPoints") (tryProperty actual "entryPoints")
         let otherPropertiesMatch =
             expected.EnumerateObject()
-            |> Seq.filter (fun property -> property.Name <> "service" && property.Name <> "middlewares" && property.Name <> "tls")
+            |> Seq.filter (fun property -> not (Set.contains property.Name fieldsComparedSeparately))
             |> Seq.forall (fun property ->
                 tryProperty actual property.Name
                 |> Option.exists (jsonConfigMatches [ property.Name ] property.Value))
+        let unexpectedPropertiesMatch =
+            let expectedNames = objectNames expected
+            actual.EnumerateObject()
+            |> Seq.forall (fun property ->
+                if Set.contains property.Name expectedNames
+                   || Set.contains property.Name routerApiMetadataFields then true
+                elif property.Name = "entryPoints" then true
+                elif property.Name = "priority" && protocol <> UdpProtocol then true
+                elif property.Name = "middlewares" && protocol <> UdpProtocol then middlewareMatches
+                elif property.Name = "observability" && protocol = HttpProtocol then
+                    defaultRouterObservability property.Value
+                elif property.Name = "ruleSyntax" && protocol <> UdpProtocol then
+                    jsonStringIs "v3" property.Value
+                else false)
         tryString actual "status" = "enabled"
         && providerIsFile actual
+        && expectedFieldsMatch
         && serviceMatches
         && middlewareMatches
+        && parentMatches
         && tlsMatches
+        && priorityMatches
+        && entryPointsMatches
         && otherPropertiesMatch
+        && unexpectedPropertiesMatch
 
-    let private serviceMatches (expected: JsonElement) (actual: JsonElement) : bool =
+    let private apiUsers (actual: JsonElement) : Map<string, int> option =
+        match tryProperty actual "usedBy" with
+        | None -> Some Map.empty
+        | Some value ->
+            match jsonArrayStrings value with
+            | None -> None
+            | Some names ->
+                let normalized = names |> Array.map (withoutProviderSuffix "file")
+                if normalized |> Array.exists String.IsNullOrEmpty then None
+                else
+                    normalized
+                    |> Array.countBy id
+                    |> Map.ofArray
+                    |> Some
+
+    let private serviceUsers
+        (expectedRouters: Map<string, JsonElement>)
+        (serviceName: string)
+        : Map<string, int> =
+        let mutable users = Map.empty
+        for KeyValue(routerName, router) in expectedRouters do
+            let service = tryString router "service"
+            if not (String.IsNullOrEmpty(service))
+               && withoutProviderSuffix "file" service = serviceName then
+                users <- Map.change routerName (function None -> Some 1 | Some count -> Some(count + 1)) users
+        users
+
+    let private serviceMatches
+        (expectedRouters: Map<string, JsonElement>)
+        (name: string)
+        (expected: JsonElement)
+        (actual: JsonElement)
+        : bool =
+        let expectedKind =
+            expected.EnumerateObject()
+            |> Seq.filter (fun property -> property.Name <> "middlewares")
+            |> Seq.map (fun property -> property.Name.ToLowerInvariant())
+            |> Seq.tryHead
+        let actualType = tryString actual "type"
+        let typeMatches =
+            String.IsNullOrEmpty(actualType)
+            || (expectedKind |> Option.exists (fun kind -> kind = actualType.ToLowerInvariant()))
         tryString actual "status" = "enabled"
         && providerIsFile actual
+        && typeMatches
         && jsonConfigMatches [] expected actual
-
+        && apiUsers actual = Some(serviceUsers expectedRouters name)
     let private defaultHttpLoadBalancerMatches (expected: JsonElement) (actual: JsonElement) : bool =
         match tryProperty expected "loadBalancer", tryProperty actual "loadBalancer" with
-        | None, _ -> true
+        | None, None -> true
+        | None, Some actualBalancer when actualBalancer.ValueKind = JsonValueKind.Object ->
+            let onlyDefaults =
+                actualBalancer.EnumerateObject()
+                |> Seq.forall (fun property ->
+                    defaultValueForMissingExpected [ "loadBalancer" ] property.Name property.Value)
+            onlyDefaults
+        | None, _ -> false
         | Some _, None -> false
         | Some expectedBalancer, Some actualBalancer
             when expectedBalancer.ValueKind = JsonValueKind.Object && actualBalancer.ValueKind = JsonValueKind.Object ->
@@ -2119,62 +2757,46 @@ module Traefik =
                 | Some expectedValue, Some actualValue -> jsonConfigMatches [ name ] expectedValue actualValue
                 | _ -> false
             let strategyMatches =
-                normalizedFieldMatches "strategy" (fun value ->
-                    value.ValueKind = JsonValueKind.String && value.GetString() = "wrr")
+                normalizedFieldMatches "strategy" (jsonStringIs "wrr")
             let passHostHeaderMatches =
                 normalizedFieldMatches "passHostHeader" (fun value -> value.ValueKind = JsonValueKind.True)
             let responseForwardingMatches =
-                normalizedFieldMatches "responseForwarding" (fun value ->
-                    value.ValueKind = JsonValueKind.Object
-                    && objectNames value = set [ "flushInterval" ]
-                    && tryString value "flushInterval" = "100ms")
+                normalizedFieldMatches "responseForwarding" defaultHttpResponseForwarding
             strategyMatches && passHostHeaderMatches && responseForwardingMatches
         | _ -> false
 
-    let private httpServiceMatches (expected: JsonElement) (actual: JsonElement) : bool =
-        serviceMatches expected actual && defaultHttpLoadBalancerMatches expected actual
+    let private httpServiceMatches
+        (expectedRouters: Map<string, JsonElement>)
+        (name: string)
+        (expected: JsonElement)
+        (actual: JsonElement)
+        : bool =
+        serviceMatches expectedRouters name expected actual
+        && defaultHttpLoadBalancerMatches expected actual
 
+    /// Mirrors the pinned PopulateUsedBy relationship index: router-level HTTP middleware occurrences only.
+    /// It does not add chain-child, service-level, or TCP-router middleware users.
+    /// https://github.com/traefik/traefik/blob/v3.7.16/pkg/config/runtime/runtime.go#L128-L194
     let private middlewareUsers
         (expectedRouters: Map<string, JsonElement>)
-        (expectedMiddlewares: Map<string, JsonElement>)
         (middlewareName: string)
-        : Set<string> =
-        let routerUsers =
-            expectedRouters
-            |> Map.toSeq
-            |> Seq.choose (fun (routerName, router) ->
-                match tryProperty router "middlewares" |> Option.bind jsonArrayStrings with
-                | Some names when names |> Array.exists (fun name -> name = middlewareName || name = middlewareName + "@file") ->
-                    Some routerName
-                | _ -> None)
-        let chainUsers =
-            expectedMiddlewares
-            |> Map.toSeq
-            |> Seq.choose (fun (parentName, middleware) ->
-                match tryProperty middleware "chain" with
-                | Some chain ->
-                    match tryProperty chain "middlewares" |> Option.bind jsonArrayStrings with
-                    | Some names when names |> Array.exists (fun name -> name = middlewareName || name = middlewareName + "@file") ->
-                        Some parentName
-                    | _ -> None
-                | None -> None)
-        Set.ofSeq (Seq.append routerUsers chainUsers)
-
-    let private apiUsers (actual: JsonElement) : Set<string> option =
-        match tryProperty actual "usedBy" with
-        | None -> Some Set.empty
-        | Some value ->
-            match jsonArrayStrings value with
-            | None -> None
+        : Map<string, int> =
+        let mutable users = Map.empty
+        for KeyValue(routerName, router) in expectedRouters do
+            match tryProperty router "middlewares" |> Option.bind jsonArrayStrings with
             | Some names ->
-                let normalized = names |> Array.map (withoutProviderSuffix "file")
-                if normalized |> Array.exists String.IsNullOrEmpty then None
-                elif normalized.Length <> (normalized |> Set.ofArray |> Set.count) then None
-                else Some(Set.ofArray normalized)
+                for name in names do
+                    let normalized = withoutProviderSuffix "file" name
+                    if normalized = middlewareName then
+                        users <- Map.change routerName (function None -> Some 1 | Some count -> Some(count + 1)) users
+            | None -> ()
+        users
+
+
 
     let private middlewareMatches
+        (countRouterUsers: bool)
         (expectedRouters: Map<string, JsonElement>)
-        (expectedMiddlewares: Map<string, JsonElement>)
         (name: string)
         (expected: JsonElement)
         (actual: JsonElement)
@@ -2186,7 +2808,7 @@ module Traefik =
                 |> Array.forall (fun property ->
                     tryProperty actual property.Name
                     |> Option.exists (jsonConfigMatches [ property.Name ] property.Value)))
-        let expectedUsers = middlewareUsers expectedRouters expectedMiddlewares name
+        let expectedUsers = if countRouterUsers then middlewareUsers expectedRouters name else Map.empty
         let actualType = tryString actual "type"
         let typeMatches =
             String.IsNullOrEmpty(actualType)
@@ -2212,6 +2834,181 @@ module Traefik =
                 | None -> false)
         | _ -> false
 
+    let private readEntryPointModel (config: JsonElement) : HttpEntryPointModel option =
+        if config.ValueKind <> JsonValueKind.Object then None
+        else
+            let asDefault =
+                match tryProperty config "asDefault" with
+                | None -> Some false
+                | Some value when value.ValueKind = JsonValueKind.True -> Some true
+                | Some value when value.ValueKind = JsonValueKind.False -> Some false
+                | _ -> None
+            let http =
+                match tryProperty config "http" with
+                | None -> Some None
+                | Some value when value.ValueKind = JsonValueKind.Null -> Some None
+                | Some value when value.ValueKind = JsonValueKind.Object -> Some(Some value)
+                | _ -> None
+            match asDefault, http with
+            | Some asDefaultValue, Some httpValue ->
+                let middlewares =
+                    match httpValue |> Option.bind (fun value -> tryProperty value "middlewares") with
+                    | None -> Some [||]
+                    | Some value when value.ValueKind = JsonValueKind.Null -> Some [||]
+                    | Some value -> jsonArrayStrings value
+                let tls =
+                    match httpValue |> Option.bind (fun value -> tryProperty value "tls") with
+                    | None -> Some None
+                    | Some value when value.ValueKind = JsonValueKind.Null -> Some None
+                    | Some value when value.ValueKind = JsonValueKind.Object -> Some(Some value)
+                    | _ -> None
+                match middlewares, tls with
+                | Some middlewareNames, Some tlsValue ->
+                    Some {
+                        Middlewares = middlewareNames
+                        Tls = tlsValue
+                        AsDefault = asDefaultValue
+                        Applies = middlewareNames.Length > 0 || tlsValue.IsSome
+                    }
+                | _ -> None
+            | _ -> None
+
+    let private entryPointModelsFromStatic (root: JsonElement) : Map<string, HttpEntryPointModel> option =
+        match tryProperty root "entryPoints" with
+        | Some values when values.ValueKind = JsonValueKind.Object ->
+            let entries = ResizeArray<string * HttpEntryPointModel>()
+            let mutable valid = true
+            for property in values.EnumerateObject() do
+                match readEntryPointModel property.Value with
+                | Some model -> entries.Add(property.Name, model)
+                | None -> valid <- false
+            if valid then Some(Map.ofSeq entries) else None
+        | _ -> None
+
+    let private entryPointModelsFromApi (element: JsonElement) : Map<string, HttpEntryPointModel> option =
+        if element.ValueKind <> JsonValueKind.Array then None
+        else
+            let entries = ResizeArray<string * HttpEntryPointModel>()
+            let names = HashSet<string>(StringComparer.Ordinal)
+            let mutable valid = true
+            for item in element.EnumerateArray() do
+                let name = tryString item "name"
+                match readEntryPointModel item with
+                | Some model when not (String.IsNullOrEmpty(name)) && names.Add(name) ->
+                    entries.Add(name, model)
+                | _ -> valid <- false
+            if valid then Some(Map.ofSeq entries) else None
+
+    let private defaultEntryPoints (models: Map<string, HttpEntryPointModel>) =
+        let selected =
+            models
+            |> Map.toSeq
+            |> Seq.choose (fun (name, model) -> if model.AsDefault then Some name else None)
+            |> Seq.toArray
+        if selected.Length > 0 then Array.sort selected
+        else models |> Map.toSeq |> Seq.map fst |> Seq.toArray
+
+    let private jsonNodeStringArray (values: string array) =
+        let result = JsonArray()
+        for value in values do result.Add(JsonValue.Create(value))
+        result
+
+    /// Mirrors 3.7.16 applyModel/mergeConfiguration: entrypoint defaults, inherited middleware/TLS,
+    /// multi-entrypoint router copies, and child parentRefs are projected before rawdata comparison.
+    /// Upstream: https://github.com/traefik/traefik/blob/v3.7.16/pkg/server/aggregator.go#L20-L82
+    /// and https://github.com/traefik/traefik/blob/v3.7.16/pkg/server/aggregator.go#L348-L400
+    let private projectExpectedDynamic (models: Map<string, HttpEntryPointModel>) (root: JsonElement) : JsonDocument option =
+        try
+            let rootNode = JsonNode.Parse(root.GetRawText()) :?> JsonObject
+            match rootNode["http"] with
+            | :? JsonObject as http when (match http["routers"] with | :? JsonObject -> true | _ -> false) ->
+                let routers = http["routers"] :?> JsonObject
+                let sourceRoutes =
+                    root.GetProperty("http").GetProperty("routers").EnumerateObject()
+                    |> Seq.map (fun property -> property.Name, property.Value)
+                    |> Seq.toArray
+                let output = JsonObject()
+                let splitNames = Dictionary<string, string[]>(StringComparer.Ordinal)
+                let anyModels = models |> Map.exists (fun _ model -> model.Applies)
+                let defaults = defaultEntryPoints models
+                let mutable valid = true
+                let addProjected name (router: JsonObject) =
+                    if output.ContainsKey(name) then valid <- false
+                    else output[name] <- router
+                let readNames (router: JsonElement) propertyName =
+                    match tryProperty router propertyName with
+                    | None -> Some [||]
+                    | Some value when value.ValueKind = JsonValueKind.Null -> Some [||]
+                    | Some value -> jsonArrayStrings value
+                let copyRoute (name: string) = routers[name].DeepClone() :?> JsonObject
+                let isRootRouter (router: JsonElement) =
+                    match tryProperty router "parentRefs" with
+                    | None -> true
+                    | Some value when value.ValueKind = JsonValueKind.Null -> true
+                    | _ -> false
+                for name, router in sourceRoutes do
+                    if isRootRouter router then
+                        match readNames router "entryPoints", readNames router "middlewares" with
+                        | Some configuredEntryPoints, Some configuredMiddlewares ->
+                            let entryPoints =
+                                if configuredEntryPoints.Length = 0 then defaults
+                                else configuredEntryPoints
+                            if anyModels then
+                                let unmodelled = ResizeArray<string>()
+                                let projectedNames = ResizeArray<string>()
+                                for entryPoint in entryPoints do
+                                    match Map.tryFind entryPoint models with
+                                    | Some model when model.Applies ->
+                                        let projectedName =
+                                            if entryPoints.Length > 1 then entryPoint + "-" + name else name
+                                        let projected = copyRoute name
+                                        projected["entryPoints"] <- jsonNodeStringArray [| entryPoint |]
+                                        if configuredMiddlewares.Length + model.Middlewares.Length > 0 then
+                                            projected["middlewares"] <-
+                                                jsonNodeStringArray (Array.append model.Middlewares configuredMiddlewares)
+                                        if tryProperty router "tls" |> Option.isNone then
+                                            match model.Tls with
+                                            | Some tls -> projected["tls"] <- JsonNode.Parse(tls.GetRawText())
+                                            | None -> ()
+                                        addProjected projectedName projected
+                                        projectedNames.Add(projectedName)
+                                    | _ -> unmodelled.Add(entryPoint)
+                                if unmodelled.Count > 0 || entryPoints.Length = 0 then
+                                    let projected = copyRoute name
+                                    projected["entryPoints"] <- jsonNodeStringArray (unmodelled.ToArray())
+                                    addProjected name projected
+                                    projectedNames.Add(name)
+                                splitNames[name] <- projectedNames.ToArray()
+                            else
+                                let projected = copyRoute name
+                                if entryPoints.Length > 0 then projected["entryPoints"] <- jsonNodeStringArray entryPoints
+                                addProjected name projected
+                                splitNames[name] <- [| name |]
+                        | _ -> valid <- false
+                for name, router in sourceRoutes do
+                    if not (isRootRouter router) then
+                        let projected = copyRoute name
+                        if anyModels then
+                            match readNames router "parentRefs" with
+                            | Some parentRefs ->
+                                let expanded = ResizeArray<string>()
+                                for parentRef in parentRefs do
+                                    let localName = withoutProviderSuffix "file" parentRef
+                                    match splitNames.TryGetValue(localName) with
+                                    | true, names -> expanded.AddRange(names)
+                                    | _ -> expanded.Add(parentRef)
+                                projected["parentRefs"] <- jsonNodeStringArray (expanded.ToArray())
+                            | None -> valid <- false
+                        addProjected name projected
+                if not valid then None
+                else
+                    http["routers"] <- output
+                    Some(JsonDocument.Parse(rootNode.ToJsonString()))
+            | :? JsonObject as http ->
+                Some(JsonDocument.Parse(rootNode.ToJsonString()))
+            | _ -> Some(JsonDocument.Parse(rootNode.ToJsonString()))
+        with _ -> None
+
     let private hasOpaqueDynamicSettings (root: JsonElement) : bool =
         let nonEmptyObject sectionName propertyName =
             match tryProperty root sectionName with
@@ -2225,11 +3022,6 @@ module Traefik =
         || nonEmptyObject "tls" "options"
         || nonEmptyObject "tls" "stores"
 
-    let private generationRulePrefix =
-        "(PathPrefix(`/api`) || PathPrefix(`/dashboard`)) && !Path(`/.dorothy-generation/"
-
-    let private generationRuleSuffix = "`)"
-    let private adminRule = "PathPrefix(`/api`) || PathPrefix(`/dashboard`)"
 
     let private generationHash (root: JsonElement) : string option =
         try
@@ -2238,7 +3030,7 @@ module Traefik =
                 let http = node["http"] :?> JsonObject
                 let routers = http["routers"] :?> JsonObject
                 let admin = routers["keroosha-admin"] :?> JsonObject
-                admin["rule"] <- JsonValue.Create(adminRule)
+                admin["rule"] <- JsonValue.Create(TraefikHttpGraphModel.adminRuleBase)
                 use stream = new MemoryStream()
                 use writer = new Utf8JsonWriter(stream, jsonWriterOptions)
                 writeSortedNode writer node
@@ -2252,91 +3044,242 @@ module Traefik =
         try
             let router = root.GetProperty("http").GetProperty("routers").GetProperty("keroosha-admin")
             let rule = tryString router "rule"
-            if rule = adminRule then not (hasOpaqueDynamicSettings root)
-            elif rule.StartsWith(generationRulePrefix, StringComparison.Ordinal)
-                 && rule.EndsWith(generationRuleSuffix, StringComparison.Ordinal) then
-                let hash =
-                    rule.Substring(
-                        generationRulePrefix.Length,
-                        rule.Length - generationRulePrefix.Length - generationRuleSuffix.Length
-                    )
-                fingerprintPattern.IsMatch(hash) && generationHash root = Some hash
+            if rule = TraefikHttpGraphModel.adminRuleBase then not (hasOpaqueDynamicSettings root)
+            elif TraefikHttpGraphModel.isGeneratedAdminRule rule then
+                generationHash root
+                |> Option.exists (fun digest -> rule = TraefikHttpGraphModel.generatedAdminRuleWithGeneration digest)
             else
                 false
         with _ -> false
 
-    let private apiDynamicMatches (api: ApiConfiguration) (expectedRoot: JsonElement) (generationMatches: bool) : bool =
+    let private apiDynamicMatches
+        (api: ApiConfiguration)
+        (expectedStatic: JsonElement option)
+        (expectedRoot: JsonElement)
+        (generationMatches: bool)
+        : bool =
         let rootFields = set [ "http"; "tcp"; "udp"; "tls" ]
         let validRoot = expectedRoot.ValueKind = JsonValueKind.Object && Set.isEmpty (Set.difference (objectNames expectedRoot) rootFields)
         if not validRoot || not generationMatches then false
         else
-            let expectedResources sectionName allowedFields resourceName =
-                expectedSectionResources expectedRoot sectionName allowedFields resourceName
-            let actualResources resourceName = actualApiResources api resourceName
-            let domainMatches sectionName allowedFields routerApiName serviceApiName middlewareApiName serviceMatcher =
-                match expectedResources sectionName allowedFields "routers",
-                      expectedResources sectionName allowedFields "services",
-                      (if String.IsNullOrEmpty(middlewareApiName) then Some Map.empty
-                       else expectedResources sectionName allowedFields "middlewares") with
-                | Some expectedRouters, Some expectedServices, Some expectedMiddlewares ->
-                    let routesMatch =
-                        resourcesMatch expectedRouters (actualResources routerApiName)
-                            (fun _ wanted found -> routerMatches wanted found)
-                    let servicesMatch =
-                        resourcesMatch expectedServices (actualResources serviceApiName)
-                            (fun _ wanted found -> serviceMatcher wanted found)
-                    let middlewaresMatch =
-                        if String.IsNullOrEmpty(middlewareApiName) then
-                            true
-                        else
-                            resourcesMatch expectedMiddlewares (actualResources middlewareApiName)
-                                (middlewareMatches expectedRouters expectedMiddlewares)
-                    routesMatch && servicesMatch && middlewaresMatch
-                | _ -> false
-            domainMatches "http" (set [ "routers"; "services"; "middlewares"; "serversTransports" ]) "routers" "services" "middlewares" httpServiceMatches
-            && domainMatches "tcp" (set [ "routers"; "services"; "middlewares"; "serversTransports" ]) "tcpRouters" "tcpServices" "tcpMiddlewares" serviceMatches
-            && domainMatches "udp" (set [ "routers"; "services" ]) "udpRouters" "udpServices" "" serviceMatches
-
-    let private apiEntrypointAddresses (element: JsonElement) : Map<string, string> option =
+            let models =
+                match expectedStatic with
+                | Some staticRoot -> entryPointModelsFromStatic staticRoot
+                | None -> entryPointModelsFromApi api.EntryPoints
+            match models |> Option.bind (fun values -> projectExpectedDynamic values expectedRoot) with
+            | None -> false
+            | Some projectedDocument ->
+                use projectedDocument = projectedDocument
+                let projectedRoot = projectedDocument.RootElement
+                let expectedResources sectionName allowedFields resourceName =
+                    expectedSectionResources projectedRoot sectionName allowedFields resourceName
+                let actualResources resourceName = actualApiResources api resourceName
+                let domainMatches sectionName allowedFields routerApiName serviceApiName middlewareApiName serviceMatcher protocol countRouterMiddlewareUsers =
+                    match expectedResources sectionName allowedFields "routers",
+                          expectedResources sectionName allowedFields "services",
+                          (if String.IsNullOrEmpty(middlewareApiName) then Some Map.empty
+                           else expectedResources sectionName allowedFields "middlewares") with
+                    | Some expectedRouters, Some expectedServices, Some expectedMiddlewares ->
+                        let routesMatch =
+                            resourcesMatch expectedRouters (actualResources routerApiName)
+                                (fun _ wanted found -> routerMatches protocol wanted found)
+                        let servicesMatch =
+                            resourcesMatch expectedServices (actualResources serviceApiName)
+                                (fun name wanted found -> serviceMatcher expectedRouters name wanted found)
+                        let middlewaresMatch =
+                            if String.IsNullOrEmpty(middlewareApiName) then
+                                true
+                            else
+                                resourcesMatch expectedMiddlewares (actualResources middlewareApiName)
+                                    (middlewareMatches countRouterMiddlewareUsers expectedRouters)
+                        routesMatch && servicesMatch && middlewaresMatch
+                    | _ -> false
+                domainMatches "http" (set [ "routers"; "services"; "middlewares"; "serversTransports" ]) "routers" "services" "middlewares" httpServiceMatches HttpProtocol true
+                && domainMatches "tcp" (set [ "routers"; "services"; "middlewares"; "serversTransports" ]) "tcpRouters" "tcpServices" "tcpMiddlewares" serviceMatches TcpProtocol false
+                && domainMatches "udp" (set [ "routers"; "services" ]) "udpRouters" "udpServices" "" serviceMatches UdpProtocol false
+    let private apiEntrypoints (element: JsonElement) : Map<string, JsonElement> option =
         if element.ValueKind <> JsonValueKind.Array then None
         else
-            let values = Dictionary<string, string>(StringComparer.Ordinal)
+            let values = Dictionary<string, JsonElement>(StringComparer.Ordinal)
             let mutable valid = true
             for item in element.EnumerateArray() do
                 let name = tryString item "name"
-                let address = tryString item "address"
                 if item.ValueKind <> JsonValueKind.Object
                    || String.IsNullOrEmpty(name)
-                   || String.IsNullOrEmpty(address)
-                   || not (values.TryAdd(name, address)) then
+                   || not (values.TryAdd(name, item)) then
                     valid <- false
             if not valid then None
             else Some(values |> Seq.map (fun pair -> pair.Key, pair.Value) |> Map.ofSeq)
 
-    let private staticEntrypointAddresses (root: JsonElement) : Map<string, string> option =
+    let private staticEntrypoints (root: JsonElement) : Map<string, JsonElement> option =
         match tryProperty root "entryPoints" with
         | Some entryPoints when entryPoints.ValueKind = JsonValueKind.Object ->
-            let values = Dictionary<string, string>(StringComparer.Ordinal)
+            let values = Dictionary<string, JsonElement>(StringComparer.Ordinal)
             let mutable valid = true
             for property in entryPoints.EnumerateObject() do
-                let address = tryString property.Value "address"
                 if property.Value.ValueKind <> JsonValueKind.Object
-                   || String.IsNullOrEmpty(address)
-                   || not (values.TryAdd(property.Name, address)) then
+                   || not (values.TryAdd(property.Name, property.Value)) then
                     valid <- false
             if not valid then None
             else Some(values |> Seq.map (fun pair -> pair.Key, pair.Value) |> Map.ofSeq)
         | _ -> None
 
+    let private normalizedEntrypoint (element: JsonElement) : JsonObject option =
+        try
+            match JsonNode.Parse(element.GetRawText()) with
+            | :? JsonObject as entryPoint ->
+                let mutable address = null
+                if not (entryPoint.TryGetPropertyValue("address", &address))
+                   || isNull address
+                   || not (address :? JsonValue)
+                   || (address :?> JsonValue).GetValueKind() <> JsonValueKind.String then
+                    None
+                else
+                    let objectField (parent: JsonObject) (name: string) =
+                        let mutable value = null
+                        if parent.TryGetPropertyValue(name, &value) then
+                            match value with
+                            | :? JsonObject as fields -> fields
+                            | _ -> invalidOp "Invalid entrypoint object."
+                        else
+                            let fields = JsonObject()
+                            parent[name] <- fields
+                            fields
+                    let defaultField (fields: JsonObject) (name: string) (value: JsonNode) =
+                        let mutable existing = null
+                        if fields.TryGetPropertyValue(name, &existing) then
+                            if isNull existing then invalidOp "Invalid entrypoint value."
+                        else
+                            fields[name] <- value
+                    let boolean (value: bool) = JsonValue.Create(value) :> JsonNode
+                    let integer (value: int64) = JsonValue.Create(value) :> JsonNode
+                    let text (value: string) = JsonValue.Create(value) :> JsonNode
+                    let defaultObject (fields: JsonObject) name values =
+                        let child = objectField fields name
+                        for key, value in values do defaultField child key value
+                        child
+                    let normalizeDuration (fields: JsonObject) (name: string) =
+                        let mutable value = null
+                        if fields.TryGetPropertyValue(name, &value) then
+                            match value with
+                            | :? JsonValue as jsonValue when jsonValue.GetValueKind() = JsonValueKind.String ->
+                                match TraefikStatic.tryDurationNanoseconds (jsonValue.GetValue<string>()) with
+                                | Some nanoseconds -> fields[name] <- integer nanoseconds
+                                | None -> invalidOp "Invalid entrypoint duration."
+                            | _ -> invalidOp "Invalid entrypoint duration."
+                    let rec removeEmptyArrays (fields: JsonObject) =
+                        let emptyArrays = ResizeArray<string>()
+                        for field in fields do
+                            match field.Value with
+                            | :? JsonObject as child -> removeEmptyArrays child
+                            | :? JsonArray as values when values.Count = 0 -> emptyArrays.Add(field.Key)
+                            | _ -> ()
+                        for name in emptyArrays do fields.Remove(name) |> ignore
+
+                    entryPoint.Remove("name") |> ignore
+                    defaultField entryPoint "allowACMEByPass" (boolean false)
+                    defaultField entryPoint "reusePort" (boolean false)
+                    defaultField entryPoint "asDefault" (boolean false)
+
+                    let transport = objectField entryPoint "transport"
+                    let lifeCycle =
+                        defaultObject transport "lifeCycle"
+                            [ "requestAcceptGraceTimeout", text "0s"
+                              "graceTimeOut", text "10s" ]
+                    let respondingTimeouts =
+                        defaultObject transport "respondingTimeouts"
+                            [ "readTimeout", text "1m0s"
+                              "writeTimeout", text "0s"
+                              "idleTimeout", text "3m0s" ]
+                    defaultField transport "keepAliveMaxTime" (text "0s")
+                    defaultField transport "keepAliveMaxRequests" (integer 0)
+
+                    let proxyProtocol = objectField entryPoint "proxyProtocol"
+                    defaultField proxyProtocol "insecure" (boolean false)
+                    defaultField proxyProtocol "trustedIPs" (JsonArray() :> JsonNode)
+
+                    let forwardedHeaders = objectField entryPoint "forwardedHeaders"
+                    defaultField forwardedHeaders "insecure" (boolean false)
+                    defaultField forwardedHeaders "trustedIPs" (JsonArray() :> JsonNode)
+                    defaultField forwardedHeaders "connection" (JsonArray() :> JsonNode)
+                    defaultField forwardedHeaders "notAppendXForwardedFor" (boolean false)
+
+                    let http = objectField entryPoint "http"
+                    defaultObject http "encodedCharacters"
+                        [ "allowEncodedSlash", boolean true
+                          "allowEncodedBackSlash", boolean true
+                          "allowEncodedNullCharacter", boolean true
+                          "allowEncodedSemicolon", boolean true
+                          "allowEncodedPercent", boolean true
+                          "allowEncodedQuestionMark", boolean true
+                          "allowEncodedHash", boolean true ]
+                    |> ignore
+                    defaultField http "encodeQuerySemicolons" (boolean false)
+                    defaultField http "sanitizePath" (boolean true)
+                    defaultField http "maxHeaderBytes" (integer 1048576)
+                    let mutable redirectionsNode = null
+                    if http.TryGetPropertyValue("redirections", &redirectionsNode) then
+                        match redirectionsNode with
+                        | :? JsonObject as redirections ->
+                            let mutable redirectNode = null
+                            if redirections.TryGetPropertyValue("entryPoint", &redirectNode) then
+                                match redirectNode with
+                                | :? JsonObject as redirect ->
+                                    defaultField redirect "scheme" (text "https")
+                                    defaultField redirect "permanent" (boolean true)
+                                    defaultField redirect "priority" (integer (Int64.MaxValue - 1L))
+                                | _ -> invalidOp "Invalid entrypoint redirect."
+                        | _ -> invalidOp "Invalid entrypoint redirections."
+
+                    defaultObject entryPoint "http2"
+                        [ "maxConcurrentStreams", integer 250
+                          "maxDecoderHeaderTableSize", integer 4096
+                          "maxEncoderHeaderTableSize", integer 4096 ]
+                    |> ignore
+                    let mutable http3Node = null
+                    if entryPoint.TryGetPropertyValue("http3", &http3Node) then
+                        match http3Node with
+                        | :? JsonObject as http3 -> defaultField http3 "advertisedPort" (integer 0)
+                        | _ -> invalidOp "Invalid entrypoint HTTP/3 configuration."
+
+                    let udp = defaultObject entryPoint "udp" [ "timeout", text "3s" ]
+                    defaultObject entryPoint "observability"
+                        [ "accessLogs", boolean true
+                          "metrics", boolean true
+                          "tracing", boolean true
+                          "traceVerbosity", text "minimal" ]
+                    |> ignore
+
+                    for durationName in [ "requestAcceptGraceTimeout"; "graceTimeOut" ] do
+                        normalizeDuration lifeCycle durationName
+                    for durationName in [ "readTimeout"; "writeTimeout"; "idleTimeout" ] do
+                        normalizeDuration respondingTimeouts durationName
+                    normalizeDuration transport "keepAliveMaxTime"
+                    normalizeDuration udp "timeout"
+                    removeEmptyArrays entryPoint
+                    Some entryPoint
+            | _ -> None
+        with _ -> None
+
     let private apiVersionMatches (api: ApiConfiguration) =
         tryString api.Version "Version" = Version
 
-    /// The 3.7.16 entrypoint API proves listener names and bound addresses, not other static setting values.
+    /// The entrypoint API exposes effective static listener values after Traefik applies defaults.
     let private apiStaticMatches (api: ApiConfiguration) (expectedRoot: JsonElement) : bool =
-        match staticEntrypointAddresses expectedRoot, apiEntrypointAddresses api.EntryPoints with
-        | Some expected, Some actual ->
-            expected = actual
-            && Map.tryFind "keroosha-admin" expected = Some("127.0.0.1:" + api.AdminPort.ToString(CultureInfo.InvariantCulture))
+        match staticEntrypoints expectedRoot, apiEntrypoints api.EntryPoints with
+        | Some expected, Some actual when expected.Count = actual.Count ->
+            let adminAddress =
+                Map.tryFind "keroosha-admin" expected
+                |> Option.bind (fun item -> tryString item "address" |> Option.ofObj)
+            adminAddress = Some("127.0.0.1:" + api.AdminPort.ToString(CultureInfo.InvariantCulture))
+            && (expected
+                |> Map.forall (fun name wanted ->
+                    match Map.tryFind name actual with
+                    | Some found ->
+                        match normalizedEntrypoint wanted, normalizedEntrypoint found with
+                        | Some expectedValues, Some actualValues -> JsonNode.DeepEquals(expectedValues :> JsonNode, actualValues :> JsonNode)
+                        | _ -> false
+                    | None -> false))
         | _ -> false
 
     let private apiRuntimeMatches
@@ -2347,7 +3290,7 @@ module Traefik =
         : bool =
         apiVersionMatches api
         && apiStaticMatches api expectedStatic
-        && apiDynamicMatches api expectedDynamic generationMatches
+        && apiDynamicMatches api (Some expectedStatic) expectedDynamic generationMatches
 
     let apiMatchesDynamic (apiConfiguration: ApiConfiguration option) (dynamicData: byte[] option) : bool =
         match apiConfiguration, dynamicData with
@@ -2355,7 +3298,7 @@ module Traefik =
             try
                 use document = JsonDocument.Parse(bytes)
                 let generationMatches = generationRuleMatches document.RootElement
-                apiDynamicMatches api document.RootElement generationMatches
+                apiDynamicMatches api None document.RootElement generationMatches
             with _ -> false
         | _ -> false
 
@@ -2456,15 +3399,16 @@ module Traefik =
                 dnsPatternCoversHost host commonName
         with _ -> false
 
-    let private sniFingerprintAt (bindAddress: IPAddress) (host: string) (port: int) : Task<string option> =
+    let private sniFingerprintAt (bindAddress: IPAddress) (host: string) (port: int) (cancellationToken: CancellationToken) : Task<string option> =
         task {
             try
                 use client = new TcpClient(bindAddress.AddressFamily)
-                use cancellation = new CancellationTokenSource(ConnectTimeoutMilliseconds)
-                do! client.ConnectAsync(bindAddress, port, cancellation.Token).ConfigureAwait(false)
+                use timeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
+                timeout.CancelAfter(ConnectTimeoutMilliseconds)
+                do! client.ConnectAsync(bindAddress, port, timeout.Token).ConfigureAwait(false)
                 use stream = new SslStream(client.GetStream(), false, RemoteCertificateValidationCallback(fun _ _ _ _ -> true))
                 let options = SslClientAuthenticationOptions(TargetHost = host)
-                do! stream.AuthenticateAsClientAsync(options, cancellation.Token).ConfigureAwait(false)
+                do! stream.AuthenticateAsClientAsync(options, timeout.Token).ConfigureAwait(false)
                 match stream.RemoteCertificate with
                 | null -> return None
                 | remote -> return Some(sha256Bytes(remote.GetRawCertData()))
@@ -2472,44 +3416,6 @@ module Traefik =
         }
 
 
-    let acmeCertificateFingerprint (environment: HostEnvironment) (paths: RuntimePaths) (resolverName: string) (host: string) : string option =
-        let storagePath = Path.Combine(paths.StateDir, "acme-" + sha256Text resolverName + ".json")
-        try
-            use document = JsonDocument.Parse(readBytes environment storagePath)
-            let root = document.RootElement
-            let resolverStorage = tryProperty root resolverName
-            let certificates = resolverStorage |> Option.bind (fun item -> tryProperty item "Certificates")
-            match certificates with
-            | Some values when values.ValueKind = JsonValueKind.Array ->
-                values.EnumerateArray()
-                |> Seq.tryPick (fun entry ->
-                    match tryProperty entry "domain" with
-                    | Some domain when domain.ValueKind = JsonValueKind.Object ->
-                        let candidates = ResizeArray<string>()
-                        match tryProperty domain "main" with
-                        | Some main when main.ValueKind = JsonValueKind.String -> candidates.Add(main.GetString())
-                        | _ -> ()
-                        match tryProperty domain "sans" with
-                        | Some sans when sans.ValueKind = JsonValueKind.Array ->
-                            for item in sans.EnumerateArray() do
-                                if item.ValueKind = JsonValueKind.String then candidates.Add(item.GetString())
-                        | _ -> ()
-                        if not (candidates |> Seq.exists (dnsPatternCoversHost host)) then None
-                        else
-                            match tryProperty entry "certificate" with
-                            | Some encoded when encoded.ValueKind = JsonValueKind.String && not (String.IsNullOrEmpty(encoded.GetString())) ->
-                                let raw = encoded.GetString()
-                                let pem =
-                                    if raw.Contains("-----BEGIN CERTIFICATE-----", StringComparison.Ordinal) then Encoding.ASCII.GetBytes(raw)
-                                    else
-                                        try Convert.FromBase64String(raw)
-                                        with _ -> Array.empty<byte>
-                                if pem.Length = 0 || not (certificateIsCurrentAt (environment.UtcNow()) pem) || not (certificateCoversHost pem host) then None
-                                else certificateFingerprint pem
-                            | _ -> None
-                    | _ -> None)
-            | _ -> None
-        with _ -> None
 
     let private serviceMaterialOwner (environment: HostEnvironment) : int * int =
         let uid, hostGid = hostOwner environment
@@ -2521,6 +3427,283 @@ module Traefik =
         | Some user, Some groupId -> user.Uid, groupId
         | _ -> parseIdCommand environment "-u", parseIdCommand environment "-g"
 
+    [<Literal>]
+    let private MaximumAcmeStorageBytes = 16 * 1024 * 1024
+
+    let private tryNativeObject (value: JsonObject) (name: string) =
+        match value[name] with
+        | :? JsonObject as child -> Some child
+        | _ -> None
+
+    let private nativeStringOr (value: JsonObject) (name: string) (fallback: string) =
+        match value[name] with
+        | :? JsonValue as child when child.GetValueKind() = JsonValueKind.String ->
+            match child.GetValue<string>() with
+            | null -> fallback
+            | text -> text
+        | _ -> fallback
+
+    let private acmeResolverSettings (request: Request) (resolverName: string) =
+        match Map.tryFind resolverName request.Resolvers with
+        | Some resolver -> resolver.Email, defaultArg resolver.CaServer DefaultCaServer
+        | None ->
+            let staticRoot =
+                request.Configuration
+                |> Option.bind (fun configuration -> tryNativeObject configuration "static")
+                |> Option.defaultValue (JsonObject())
+            let resolvers = tryNativeObject staticRoot "certificatesResolvers" |> Option.defaultValue (JsonObject())
+            let resolver = tryNativeObject resolvers resolverName |> Option.defaultValue (JsonObject())
+            let acme = tryNativeObject resolver "acme" |> Option.defaultValue (JsonObject())
+            nativeStringOr acme "email" "", nativeStringOr acme "caServer" DefaultCaServer
+
+    let private tryJsonString (element: JsonElement) (name: string) =
+        match tryProperty element name with
+        | Some value when value.ValueKind = JsonValueKind.String ->
+            match value.GetString() with
+            | null -> None
+            | text -> Some text
+        | _ -> None
+
+    let private jsonHasUniqueProperties (root: JsonElement) =
+        let rec visit (element: JsonElement) =
+            match element.ValueKind with
+            | JsonValueKind.Object ->
+                let names = HashSet<string>(StringComparer.Ordinal)
+                element.EnumerateObject()
+                |> Seq.forall (fun property -> names.Add(property.Name) && visit property.Value)
+            | JsonValueKind.Array -> element.EnumerateArray() |> Seq.forall visit
+            | _ -> true
+        visit root
+
+    let private sameAcmeAuthority (expectedUrl: string) (registrationUrl: string) =
+        try
+            let expected = Uri(expectedUrl, UriKind.Absolute)
+            let actual = Uri(registrationUrl, UriKind.Absolute)
+            expected.Scheme = actual.Scheme
+            && String.Equals(expected.IdnHost, actual.IdnHost, StringComparison.OrdinalIgnoreCase)
+            && expected.Port = actual.Port
+            && String.IsNullOrEmpty(actual.UserInfo)
+        with _ -> false
+
+    let private acmeAccountMatches (expectedEmail: string) (expectedCaServer: string) (resolverStorage: JsonElement) =
+        try
+            let account = tryProperty resolverStorage "Account"
+            match account with
+            | Some value when value.ValueKind = JsonValueKind.Object ->
+                let email = tryJsonString value "Email"
+                let privateKey = tryJsonString value "PrivateKey"
+                let registration = tryProperty value "Registration"
+                let registrationUri, registrationBody =
+                    match registration with
+                    | Some resource when resource.ValueKind = JsonValueKind.Object ->
+                        tryJsonString resource "uri",
+                        (tryProperty resource "body" |> Option.exists (fun body -> body.ValueKind = JsonValueKind.Object))
+                    | _ -> None, false
+                let privateKeyValid =
+                    match privateKey with
+                    | Some encoded ->
+                        try
+                            let bytes = Convert.FromBase64String(encoded)
+                            use rsa = RSA.Create()
+                            let mutable bytesRead = 0
+                            rsa.ImportRSAPrivateKey(bytes.AsSpan(), &bytesRead) |> ignore
+                            bytesRead = bytes.Length
+                        with _ -> false
+                    | None -> false
+                email = Some expectedEmail
+                && registrationBody
+                && (registrationUri |> Option.exists (sameAcmeAuthority expectedCaServer))
+                && privateKeyValid
+            | _ -> false
+        with _ -> false
+
+    let private acmeCertificateFingerprintFromEntry (now: DateTimeOffset) (host: string) (entry: JsonElement) =
+        try
+            let domain = tryProperty entry "domain"
+            let names =
+                match domain with
+                | Some value when value.ValueKind = JsonValueKind.Object ->
+                    let candidates = ResizeArray<string>()
+                    tryJsonString value "main" |> Option.iter candidates.Add
+                    match tryProperty value "sans" with
+                    | Some sans when sans.ValueKind = JsonValueKind.Array ->
+                        for item in sans.EnumerateArray() do
+                            if item.ValueKind = JsonValueKind.String then
+                                match item.GetString() with
+                                | null -> ()
+                                | name -> candidates.Add(name)
+                    | _ -> ()
+                    candidates
+                | _ -> ResizeArray<string>()
+            if not (names |> Seq.exists (dnsPatternCoversHost host)) then None
+            else
+                match tryJsonString entry "certificate", tryJsonString entry "key" with
+                | Some encodedCertificate, Some encodedKey when not (String.IsNullOrEmpty(encodedCertificate) || String.IsNullOrEmpty(encodedKey)) ->
+                    let certificatePem = Convert.FromBase64String(encodedCertificate)
+                    let privateKeyPem = Convert.FromBase64String(encodedKey)
+                    let certificateText = UTF8Encoding(false, true).GetString(certificatePem)
+                    let keyText = UTF8Encoding(false, true).GetString(privateKeyPem)
+                    use pair = X509Certificate2.CreateFromPem(certificateText.AsSpan(), keyText.AsSpan())
+                    if pair.HasPrivateKey
+                       && certificateIsCurrentAt now certificatePem
+                       && certificateCoversHost certificatePem host then
+                        certificateFingerprint certificatePem
+                    else None
+                | _ -> None
+        with _ -> None
+
+    let private readAcmeStorage (environment: HostEnvironment) (paths: RuntimePaths) (storagePath: string) =
+        try
+            let serviceUid, serviceGid = serviceAccountOwner environment
+            if not (assertRegular environment storagePath "ACME storage")
+               || not (metadataMatches environment storagePath "file" 0o600 serviceUid serviceGid) then None
+            else
+                match readBytesBounded environment storagePath MaximumAcmeStorageBytes with
+                | None -> None
+                | Some bytes ->
+                    let document = JsonDocument.Parse(ReadOnlyMemory<byte>(bytes), JsonDocumentOptions(MaxDepth = 64))
+                    if jsonHasUniqueProperties document.RootElement then Some document
+                    else
+                        document.Dispose()
+                        None
+        with _ -> None
+
+    let private acmeStoragePathsFromStaticRoot (root: JsonElement) =
+        let mutable paths = Map.empty
+        match tryProperty root "certificatesResolvers" with
+        | Some resolvers when resolvers.ValueKind = JsonValueKind.Object ->
+            for resolver in resolvers.EnumerateObject() do
+                let path =
+                    tryProperty resolver.Value "acme"
+                    |> Option.bind (fun acme -> tryJsonString acme "storage")
+                match path with
+                | Some value -> paths <- Map.add resolver.Name value paths
+                | None -> ()
+        | _ -> ()
+        paths
+
+    type private AcmeStoreCache
+        (environment: HostEnvironment, paths: RuntimePaths, resolverSettings: string -> string * string, storagePaths: Map<string, string>) =
+        let documents = Dictionary<string, JsonDocument option>(StringComparer.Ordinal)
+        let fingerprints = Dictionary<string * string, string option>()
+
+        let documentFor resolverName =
+            match documents.TryGetValue(resolverName) with
+            | true, document -> document
+            | _ ->
+                let _, caServer = resolverSettings resolverName
+                let storagePath =
+                    Map.tryFind resolverName storagePaths
+                    |> Option.defaultValue (TraefikTlsSettings.acmeStoragePath paths.StateDir resolverName caServer)
+                let document = readAcmeStorage environment paths storagePath
+                documents.Add(resolverName, document)
+                document
+
+        member _.AccountMatches(resolverName: string) =
+            let email, caServer = resolverSettings resolverName
+            match documentFor resolverName with
+            | Some document when document.RootElement.ValueKind = JsonValueKind.Object ->
+                match tryProperty document.RootElement resolverName with
+                | Some resolverStorage when resolverStorage.ValueKind = JsonValueKind.Object ->
+                    acmeAccountMatches email caServer resolverStorage
+                | _ -> false
+            | _ -> false
+
+        member _.Fingerprint(resolverName: string, host: string) =
+            let key = resolverName, host
+            match fingerprints.TryGetValue(key) with
+            | true, fingerprint -> fingerprint
+            | _ ->
+                let fingerprint =
+                    match documentFor resolverName with
+                    | Some document when document.RootElement.ValueKind = JsonValueKind.Object ->
+                        match tryProperty document.RootElement resolverName with
+                        | Some resolverStorage when resolverStorage.ValueKind = JsonValueKind.Object ->
+                            let email, caServer = resolverSettings resolverName
+                            if not (acmeAccountMatches email caServer resolverStorage) then None
+                            else
+                                match tryProperty resolverStorage "Certificates" with
+                                | Some certificates when certificates.ValueKind = JsonValueKind.Array ->
+                                    certificates.EnumerateArray()
+                                    |> Seq.tryPick (acmeCertificateFingerprintFromEntry (environment.UtcNow()) host)
+                                | _ -> None
+                        | _ -> None
+                    | _ -> None
+                fingerprints.Add(key, fingerprint)
+                fingerprint
+
+        interface IDisposable with
+            member _.Dispose() =
+                for document in documents.Values do
+                    document |> Option.iter (fun value -> value.Dispose())
+
+    let acmeCertificateFingerprint
+        (environment: HostEnvironment)
+        (paths: RuntimePaths)
+        (resolverName: string)
+        (expectedEmail: string)
+        (expectedCaServer: string)
+        (host: string)
+        : string option =
+        let storagePaths =
+            Map.ofList [ resolverName, TraefikTlsSettings.acmeStoragePath paths.StateDir resolverName expectedCaServer ]
+        use cache = new AcmeStoreCache(environment, paths, (fun _ -> expectedEmail, expectedCaServer), storagePaths)
+        cache.Fingerprint(resolverName, host)
+    let private previousAcmeStorage (previousStatic: byte[] option) (resolverName: string) =
+        match previousStatic with
+        | None -> None
+        | Some bytes ->
+            try
+                use document = JsonDocument.Parse(ReadOnlyMemory<byte>(bytes), JsonDocumentOptions(MaxDepth = 64))
+                if not (jsonHasUniqueProperties document.RootElement) then None
+                else
+                    let resolver =
+                        tryProperty document.RootElement "certificatesResolvers"
+                        |> Option.bind (fun values -> tryProperty values resolverName)
+                    let acme = resolver |> Option.bind (fun value -> tryProperty value "acme")
+                    match acme with
+                    | Some value when value.ValueKind = JsonValueKind.Object ->
+                        let caServer = tryJsonString value "caServer" |> Option.defaultValue DefaultCaServer
+                        Some(caServer, tryJsonString value "storage")
+                    | _ -> None
+            with _ -> None
+
+    let private sameAcmeDirectory (left: string) (right: string) =
+        try
+            String.Equals(Uri(left, UriKind.Absolute).AbsoluteUri, Uri(right, UriKind.Absolute).AbsoluteUri, StringComparison.Ordinal)
+        with _ -> false
+
+    /// Validates that an existing destination store is safe for this issuer. Resolver identity is
+    /// encoded in the managed path; historical name-only stores are reused only when the prior
+    /// static snapshot proves the exact same directory URL.
+    let private ensureAcmeIssuerTransitionSafe
+        (environment: HostEnvironment)
+        (paths: RuntimePaths)
+        (previousStatic: byte[] option)
+        (request: Request)
+        =
+        let staticData = Encoding.UTF8.GetBytes(renderStaticWithPrevious request paths "" previousStatic)
+        use staticDocument = JsonDocument.Parse(staticData)
+        let storagePaths = acmeStoragePathsFromStaticRoot staticDocument.RootElement
+        use stores = new AcmeStoreCache(environment, paths, acmeResolverSettings request, storagePaths)
+        let serviceUid, serviceGid = serviceAccountOwner environment
+        for KeyValue(resolverName, storagePath) in storagePaths do
+            let _, caServer = acmeResolverSettings request resolverName
+            match previousAcmeStorage previousStatic resolverName with
+            | Some (previousCaServer, Some previousPath)
+                when previousPath = storagePath && not (sameAcmeDirectory previousCaServer caServer) ->
+                fail "Traefik ACME storage cannot be reused across issuer changes"
+            | _ -> ()
+            match tryStat environment storagePath with
+            | None -> ()
+            | Some _ ->
+                assertRegular environment storagePath "ACME storage" |> ignore
+                if not (metadataMatches environment storagePath "file" 0o600 serviceUid serviceGid)
+                   || not (stores.AccountMatches(resolverName)) then
+                    fail "Traefik ACME storage is unsafe for the configured resolver"
+
+
+
     let readProtectedMaterial (_environment: HostEnvironment) (path: string) (expectedUid: int) (expectedGid: int) : byte[] =
         let descriptor = openChecked path false
         try
@@ -2531,17 +3714,79 @@ module Traefik =
             with _ -> fail "cannot read protected Traefik certificate material"
         finally nativeClose(descriptor) |> ignore
 
+    let private legacyRouteRequiresClientCertificate (request: Request) (entryPointName: string) =
+        let isRequired (optionReference: string) =
+            let separator = optionReference.IndexOf('@')
+            let optionName = if separator < 0 then optionReference else optionReference.Substring(0, separator)
+            let dynamicRoot =
+                request.Configuration
+                |> Option.bind (fun configuration -> tryNativeObject configuration "dynamic")
+                |> Option.defaultValue (JsonObject())
+            let tls = tryNativeObject dynamicRoot "tls" |> Option.defaultValue (JsonObject())
+            let options = tryNativeObject tls "options" |> Option.defaultValue (JsonObject())
+            let option = tryNativeObject options optionName
+            let clientAuth = option |> Option.bind (fun value -> tryNativeObject value "clientAuth")
+            clientAuth
+            |> Option.map (fun value -> nativeStringOr value "clientAuthType" "")
+            |> Option.exists (fun value -> value = "RequireAnyClientCert" || value = "RequireAndVerifyClientCert")
+
+        let entryPointOption =
+            request.Configuration
+            |> Option.bind (fun configuration -> tryNativeObject configuration "static")
+            |> Option.bind (fun staticRoot -> tryNativeObject staticRoot "entryPoints")
+            |> Option.bind (fun entryPoints -> tryNativeObject entryPoints entryPointName)
+            |> Option.bind (fun entryPoint -> tryNativeObject entryPoint "http")
+            |> Option.bind (fun http -> tryNativeObject http "tls")
+            |> Option.map (fun tls -> nativeStringOr tls "options" "default")
+            |> Option.defaultValue "default"
+        isRequired entryPointOption
+
+    [<Literal>]
+    let private MaximumConcurrentTlsProbes = 4
+
+    [<Literal>]
+    let private TlsProbeWallBudgetSeconds = 15
+
+    let private probeSniTargets (targets: (string * string * int) array) (deadlineTicks: int64) =
+        let observations: string option option array = Array.create targets.Length None
+        let mutable nextIndex = -1
+        let mutable attempted = 0
+        let remainingTicks = deadlineTicks - Stopwatch.GetTimestamp()
+        if targets.Length > 0 && remainingTicks > 0L then
+            let remainingMilliseconds = Math.Max(1.0, Math.Ceiling(float remainingTicks * 1000.0 / float Stopwatch.Frequency))
+            use cancellation = new CancellationTokenSource(TimeSpan.FromMilliseconds(remainingMilliseconds))
+            let worker () =
+                task {
+                    let mutable running = true
+                    while running do
+                        let index = Interlocked.Increment(&nextIndex)
+                        if index >= targets.Length || cancellation.IsCancellationRequested then
+                            running <- false
+                        else
+                            let host, bindAddress, port = targets[index]
+                            let mutable bindIp = Unchecked.defaultof<IPAddress>
+                            if IPAddress.TryParse(bindAddress, &bindIp) then
+                                Interlocked.Increment(&attempted) |> ignore
+                                let! fingerprint = sniFingerprintAt bindIp host port cancellation.Token
+                                observations[index] <- Some fingerprint
+                            else
+                                Interlocked.Increment(&attempted) |> ignore
+                                observations[index] <- Some None
+                }
+            let workers = Array.init (min MaximumConcurrentTlsProbes targets.Length) (fun _ -> worker ())
+            Task.WhenAll(workers).GetAwaiter().GetResult() |> ignore
+        let results = Dictionary<string * string * int, string option option>()
+        for index in 0 .. targets.Length - 1 do
+            results.Add(targets[index], observations[index])
+        results, attempted, targets.Length - attempted
+
     let private legacyTlsProbeTargets (request: Request) =
         let mutable targets = Set.empty
-        let mutable truncated = false
         let loopback = IPAddress.Loopback.ToString()
         for KeyValue(_, router) in request.Routers do
             if router.Tls.Kind = "provided" || router.Tls.Kind = "acme" then
-                let target = router.Host, loopback, request.EntryPoints[router.EntryPoint]
-                if not (targets.Contains(target)) then
-                    if targets.Count < 17 then targets <- targets.Add(target)
-                    else truncated <- true
-        targets, truncated
+                targets <- targets.Add((router.Host, loopback, request.EntryPoints[router.EntryPoint]))
+        targets
 
     let private certificateObservations
         (environment: HostEnvironment)
@@ -2549,34 +3794,32 @@ module Traefik =
         (request: Request)
         (certificateMaterialDigests: Map<string, string>)
         (probeEligible: bool)
-        : JsonObject * bool =
+        (acmeStores: AcmeStoreCache)
+        (probeDeadlineTicks: int64)
+        : JsonObject * bool * Set<string * string * int> * Set<string * string * int> * int * int * bool * Dictionary<string * string * int, string option option> =
         let observed = JsonObject()
         let mutable certificatesMatch = true
-        let hostsForCertificate = Dictionary<string, ResizeArray<string * int>>(StringComparer.Ordinal)
-        let acmeRoutes = ResizeArray<string * int * string>()
-        let legacyTargets, _ = legacyTlsProbeTargets request
-        let permittedTargets = legacyTargets |> Seq.truncate 16 |> Set.ofSeq
+        let hostsForCertificate = Dictionary<string, ResizeArray<string * string * int>>(StringComparer.Ordinal)
+        let acmeRoutes = ResizeArray<string * string * int * string>()
         let loopback = IPAddress.Loopback.ToString()
-        let sniCache = Dictionary<string * string * int, string option>()
-        let probeSni host bindAddress port =
-            let target = host, bindAddress, port
-            match sniCache.TryGetValue(target) with
-            | true, fingerprint -> fingerprint
-            | _ ->
-                let fingerprint =
-                    IPAddress.Parse(bindAddress)
-                    |> fun address -> sniFingerprintAt address host port
-                    |> fun operation -> operation.GetAwaiter().GetResult()
-                sniCache[target] <- fingerprint
-                fingerprint
+        let expectedFingerprints = Dictionary<string * string * int, Set<string>>()
+        let addExpected target fingerprint =
+            let values =
+                match expectedFingerprints.TryGetValue(target) with
+                | true, existing -> existing
+                | _ -> Set.empty
+            expectedFingerprints[target] <- values.Add(fingerprint)
+
         for KeyValue(_, router) in request.Routers do
-            let port = request.EntryPoints[router.EntryPoint]
+            let target = router.Host, loopback, request.EntryPoints[router.EntryPoint]
             match router.Tls.Kind with
             | "provided" ->
-                if not (hostsForCertificate.ContainsKey(router.Tls.Name)) then hostsForCertificate[router.Tls.Name] <- ResizeArray()
-                hostsForCertificate[router.Tls.Name].Add((router.Host, port))
-            | "acme" -> acmeRoutes.Add((router.Host, port, router.Tls.Name))
+                if not (hostsForCertificate.ContainsKey(router.Tls.Name)) then
+                    hostsForCertificate[router.Tls.Name] <- ResizeArray()
+                hostsForCertificate[router.Tls.Name].Add(target)
+            | "acme" -> acmeRoutes.Add((router.Host, router.EntryPoint, request.EntryPoints[router.EntryPoint], router.Tls.Name))
             | _ -> ()
+
         let expectedUid, expectedGid = serviceMaterialOwner environment
         for KeyValue(name, certificate) in request.Certificates do
             let digest = Map.tryFind name certificateMaterialDigests |> Option.defaultWith (fun () -> materialDigest certificate)
@@ -2592,22 +3835,47 @@ module Traefik =
             match fingerprint with
             | Some value -> observed[name] <- JsonValue.Create(value)
             | None -> ()
-            if not materialMatches || fingerprint <> Some certificate.Fingerprint || not (certificateIsCurrentAt (environment.UtcNow()) certificatePem) then certificatesMatch <- false
+            if not materialMatches
+               || fingerprint <> Some certificate.Fingerprint
+               || not (certificateIsCurrentAt (environment.UtcNow()) certificatePem) then
+                certificatesMatch <- false
             match hostsForCertificate.TryGetValue(name) with
             | true, routes ->
-                for host, port in routes do
+                for host, bindAddress, port in routes do
                     if not (certificateCoversHost certificatePem host) then certificatesMatch <- false
-                    if probeEligible && permittedTargets.Contains((host, loopback, port)) then
-                        let sni = probeSni host loopback port
-                        if sni <> Some certificate.Fingerprint then certificatesMatch <- false
-                        else observed[name] <- JsonValue.Create(certificate.Fingerprint)
+                    addExpected (host, bindAddress, port) certificate.Fingerprint
             | _ -> ()
-        for host, port, resolverName in acmeRoutes do
-            if probeEligible && permittedTargets.Contains((host, loopback, port)) then
-                let storedFingerprint = acmeCertificateFingerprint environment paths resolverName host
-                let sni = probeSni host loopback port
-                if storedFingerprint.IsNone || sni.IsNone || sni <> storedFingerprint then certificatesMatch <- false
-        observed, certificatesMatch
+
+        for host, _, port, resolverName in acmeRoutes do
+            match acmeStores.Fingerprint(resolverName, host) with
+            | Some fingerprint -> addExpected (host, loopback, port) fingerprint
+            | None -> certificatesMatch <- false
+
+        let legacyTargets = legacyTlsProbeTargets request
+        let mTlsTargets =
+            request.Routers
+            |> Seq.choose (fun (KeyValue(_, router)) ->
+                let target = router.Host, loopback, request.EntryPoints[router.EntryPoint]
+                if (router.Tls.Kind = "provided" || router.Tls.Kind = "acme")
+                   && legacyRouteRequiresClientCertificate request router.EntryPoint then Some target
+                else None)
+            |> Set.ofSeq
+        let eligibleTargets = Set.difference legacyTargets mTlsTargets
+        let probeResults, probesAttempted, notStarted =
+            if probeEligible then probeSniTargets (eligibleTargets |> Set.toArray) probeDeadlineTicks
+            else Dictionary<string * string * int, string option option>(), 0, 0
+        if probeEligible then
+            for target in eligibleTargets do
+                match probeResults.TryGetValue(target), expectedFingerprints.TryGetValue(target) with
+                | (true, Some(Some fingerprint)), (true, expected) when expected.Contains(fingerprint) -> ()
+                | (true, Some _), (true, _) -> certificatesMatch <- false
+                | (true, Some _), _ -> certificatesMatch <- false
+                | _ -> certificatesMatch <- false
+        let unprobedCount =
+            if probeEligible then mTlsTargets.Count + notStarted
+            else legacyTargets.Count
+        let truncated = probeEligible && notStarted > 0
+        observed, certificatesMatch, legacyTargets, mTlsTargets, probesAttempted, unprobedCount, truncated, probeResults
 
     // The public &&& combinator parenthesizes each operand. Leading grouping does not negate
     // the literal; the conservative remainder check below still excludes alternation/negation.
@@ -2732,19 +4000,23 @@ module Traefik =
             |> Set.ofSeq
         with _ -> Set.empty
 
-    let private nativeTlsObservations (environment: HostEnvironment) (paths: RuntimePaths) (request: Request) (probeEligible: bool) : JsonObject * bool =
+    let private nativeTlsObservations (request: Request)
+        (probeEligible: bool)
+        (acmeStores: AcmeStoreCache)
+        (probeDeadlineTicks: int64)
+        (legacyTargets: Set<string * string * int>)
+        (legacyMtlsTargets: Set<string * string * int>)
+        (legacyProbeResults: Dictionary<string * string * int, string option option>)
+        (legacyProbeAttempts: int)
+        (legacyUnprobed: int)
+        (legacyTruncated: bool)
+        : JsonObject * bool =
         let report = JsonObject()
-        let legacyTargets, legacyTargetsTruncated = legacyTlsProbeTargets request
-        let legacyProbeCount = min 16 legacyTargets.Count
-        let nativeProbeBudget = 16 - legacyProbeCount
-        let legacyPermitted = legacyTargets |> Seq.truncate 16 |> Set.ofSeq
         let mutable opaqueRoutes = 0
-        let mutable candidatesTruncated = false
         let localAddresses = localProbeAddresses ()
         let loopbackAddress = IPAddress.Loopback.ToString()
         let candidates =
             Dictionary<string * string * int, (Set<string> * Set<string> * bool)>()
-
         let configuration = defaultArg request.Configuration (JsonObject())
         let staticRoot = TraefikSettings.section configuration "static"
         let dynamicRoot = TraefikSettings.section configuration "dynamic"
@@ -2784,7 +4056,6 @@ module Traefik =
                 |> Set.ofSeq
             | _ -> allBinds
 
-
         let hostsInDomains (tls: JsonObject) =
             let result = HashSet<string>(StringComparer.Ordinal)
             match tryNativeNodeProperty tls "domains" with
@@ -2793,8 +4064,7 @@ module Traefik =
                     match domain with
                     | :? JsonObject as fields ->
                         match tryNativeStringProperty fields "main" with
-                        | Some main ->
-                            canonicalProbeHost main |> Option.iter (fun host -> result.Add(host) |> ignore)
+                        | Some main -> canonicalProbeHost main |> Option.iter (fun host -> result.Add(host) |> ignore)
                         | None -> ()
                         match tryNativeNodeProperty fields "sans" with
                         | Some (:? JsonArray as sans) ->
@@ -2807,7 +4077,6 @@ module Traefik =
             | _ -> ()
             result |> Seq.sortWith (fun left right -> StringComparer.Ordinal.Compare(left, right)) |> Seq.toList
 
-
         let clientAuthType (optionReference: string option) =
             let reference = defaultArg optionReference "default"
             let separator = reference.IndexOf('@')
@@ -2816,22 +4085,14 @@ module Traefik =
             |> Option.bind (fun option -> tryNativeObjectProperty option "clientAuth")
             |> Option.bind (fun auth -> tryNativeStringProperty auth "clientAuthType")
 
-        let addCandidate
-            (host: string)
-            (bindAddress: string)
-            (port: int)
-            (bindIsLocal: bool)
-            (resolverName: string option)
-            (authType: string option)
-            =
+        let addCandidate (host: string) (bindAddress: string) (port: int) (bindIsLocal: bool) (resolverName: string option) (authType: string option) =
             let key = host, bindAddress, port
             let resolvers = resolverName |> Option.toList |> Set.ofList
             let authTypes = authType |> Option.toList |> Set.ofList
             match candidates.TryGetValue(key) with
             | true, (oldResolvers, oldAuthTypes, oldLocal) ->
                 candidates[key] <- Set.union oldResolvers resolvers, Set.union oldAuthTypes authTypes, oldLocal && bindIsLocal
-            | _ when candidates.Count < 17 -> candidates.Add(key, (resolvers, authTypes, bindIsLocal))
-            | _ -> candidatesTruncated <- true
+            | _ -> candidates.Add(key, (resolvers, authTypes, bindIsLocal))
 
         let collectRouters (sectionName: string) (isTcp: bool) =
             match tryNativeObjectProperty dynamicRoot sectionName with
@@ -2865,7 +4126,8 @@ module Traefik =
                                             |> Option.filter (String.IsNullOrEmpty >> not)
                                         let authType = clientAuthType (tryNativeStringProperty tls "options")
                                         for host in hosts |> Seq.sortWith (fun left right -> StringComparer.Ordinal.Compare(left, right)) do
-                                            for bindAddress, port, local in ports do addCandidate host bindAddress port local resolverName authType
+                                            for bindAddress, port, local in ports do
+                                                addCandidate host bindAddress port local resolverName authType
                         | _ -> opaqueRoutes <- opaqueRoutes + 1
 
         collectRouters "http" false
@@ -2885,17 +4147,24 @@ module Traefik =
                     if domainNames |> Seq.exists (dnsPatternCoversHost host) then Some resolver else None
                 | _ -> None)
 
+        let mutable nativeTlsMatches = true
+        let acmeExpectedFingerprint resolver host =
+            match acmeStores.Fingerprint(resolver, host) with
+            | Some fingerprint -> Some fingerprint
+            | None ->
+                nativeTlsMatches <- false
+                None
+
         let expectedFingerprints (host: string) (resolvers: Set<string>) =
             if not resolvers.IsEmpty then
-                resolvers
-                |> Seq.choose (fun resolver -> acmeCertificateFingerprint environment paths resolver host)
-                |> Set.ofSeq
-                |> Some
-            elif request.Certificates.Count <= 32 then
+                let values = resolvers |> Seq.map (fun resolver -> acmeExpectedFingerprint resolver host) |> Seq.toArray
+                if values |> Array.exists Option.isNone then Some Set.empty
+                else values |> Array.choose id |> Set.ofArray |> Some
+            else
                 let matchingManaged =
                     request.Certificates
                     |> Seq.choose (fun (KeyValue(_, certificate)) ->
-                        if certificateCoversHost (Encoding.UTF8.GetBytes(certificate.CertificatePem)) host then
+                        if certificate.Usage = "server" && certificateCoversHost (Encoding.UTF8.GetBytes(certificate.CertificatePem)) host then
                             Some certificate.Fingerprint
                         else None)
                     |> Set.ofSeq
@@ -2907,65 +4176,71 @@ module Traefik =
                         |> Map.tryFind name
                         |> Option.map (fun certificate -> Set.singleton certificate.Fingerprint)
                         |> Option.orElse (defaultGeneratedResolver host |> Option.map (fun resolver ->
-                            acmeCertificateFingerprint environment paths resolver host |> Option.toList |> Set.ofList))
+                            acmeExpectedFingerprint resolver host |> Option.toList |> Set.ofList))
                     | None ->
                         defaultGeneratedResolver host
-                        |> Option.map (fun resolver -> acmeCertificateFingerprint environment paths resolver host |> Option.toList |> Set.ofList)
-            else None
+                        |> Option.map (fun resolver -> acmeExpectedFingerprint resolver host |> Option.toList |> Set.ofList)
 
         let candidatePairs =
             candidates
             |> Seq.map (fun item -> item.Key, item.Value)
             |> Seq.sortBy fst
             |> Seq.toArray
-        let legacyProbeSlots = min 16 legacyTargets.Count
-        let nativeBudget = 16 - legacyProbeSlots
-        let mutable nativeProbeCount = 0
-        let mutable nativeTlsMatches = true
+        let expectedByTarget = Dictionary<string * string * int, Set<string> option>()
+        let nativeProbeTargets = ResizeArray<string * string * int>()
         let mutable unprobedNative = opaqueRoutes
-        let mutable probeLimitReached = false
 
         for (host, bindAddress, port), (resolvers, authTypes, bindIsLocal) in candidatePairs do
-            let requiresClientCertificate =
-                authTypes.Contains("RequireAnyClientCert")
-                || authTypes.Contains("RequireAndVerifyClientCert")
-            if not probeEligible || not bindIsLocal then
-                unprobedNative <- unprobedNative + 1
-            elif legacyPermitted.Contains((host, bindAddress, port)) then
-                unprobedNative <- unprobedNative + 1
-            elif requiresClientCertificate then
-                unprobedNative <- unprobedNative + 1
-            elif nativeProbeCount >= nativeBudget then
-                probeLimitReached <- true
-                unprobedNative <- unprobedNative + 1
+            let target = host, bindAddress, port
+            let expected = expectedFingerprints host resolvers
+            if legacyTargets.Contains(target) then
+                if not (legacyMtlsTargets.Contains(target)) then
+                    match legacyProbeResults.TryGetValue(target) with
+                    | true, Some(Some fingerprint) ->
+                        match expected with
+                        | Some values when not (values.Contains(fingerprint)) -> nativeTlsMatches <- false
+                        | _ -> ()
+                    | true, Some None -> nativeTlsMatches <- false
+                    | true, None when expected.IsSome -> nativeTlsMatches <- false
+                    | _ -> ()
             else
-                let mutable bindIp = Unchecked.defaultof<IPAddress>
-                if not (IPAddress.TryParse(bindAddress, &bindIp)) then
+                let requiresClientCertificate =
+                    authTypes.Contains("RequireAnyClientCert")
+                    || authTypes.Contains("RequireAndVerifyClientCert")
+                if not probeEligible || not bindIsLocal || requiresClientCertificate then
                     unprobedNative <- unprobedNative + 1
                 else
-                    nativeProbeCount <- nativeProbeCount + 1
-                    let actual = sniFingerprintAt bindIp host port |> fun operation -> operation.GetAwaiter().GetResult()
-                    let expected = expectedFingerprints host resolvers
-                    let handshakeSucceeded = actual.IsSome
-                    let matches =
-                        match expected, actual with
-                        | Some values, Some fingerprint -> values.Contains(fingerprint)
-                        | Some _, None -> false
-                        | None, Some _ -> true
-                        | None, None -> false
-                    if not handshakeSucceeded || (expected.IsSome && not matches) then nativeTlsMatches <- false
-                    if expected.IsNone then unprobedNative <- unprobedNative + 1
+                    let mutable bindIp = Unchecked.defaultof<IPAddress>
+                    if not (IPAddress.TryParse(bindAddress, &bindIp)) then
+                        unprobedNative <- unprobedNative + 1
+                        nativeTlsMatches <- false
+                    else
+                        expectedByTarget[target] <- expected
+                        nativeProbeTargets.Add(target)
 
-        if candidatesTruncated then unprobedNative <- unprobedNative + 1
-        let truncated =
-            legacyTargetsTruncated
-            || candidatesTruncated
-            || probeLimitReached
-            || request.Certificates.Count > 32
+        let nativeProbeResults, nativeProbeAttempts, nativeNotStarted =
+            if probeEligible then probeSniTargets (nativeProbeTargets.ToArray()) probeDeadlineTicks
+            else Dictionary<string * string * int, string option option>(), 0, 0
+
+        for target in nativeProbeTargets do
+            match nativeProbeResults.TryGetValue(target), expectedByTarget[target] with
+            | (true, Some(Some fingerprint)), Some expected when expected.Contains(fingerprint) -> ()
+            | (true, Some(Some _)), Some _ -> nativeTlsMatches <- false
+            | (true, Some None), Some _ -> nativeTlsMatches <- false
+            | (true, Some(Some _)), None -> unprobedNative <- unprobedNative + 1
+            | (true, Some None), None ->
+                unprobedNative <- unprobedNative + 1
+                nativeTlsMatches <- false
+            | _ ->
+                unprobedNative <- unprobedNative + 1
+                nativeTlsMatches <- false
+
+        unprobedNative <- unprobedNative + legacyUnprobed
         report["unprobedCount"] <- JsonValue.Create(unprobedNative)
         report["opaqueRouterCount"] <- JsonValue.Create(opaqueRoutes)
-        report["nativeProbesAttempted"] <- JsonValue.Create(nativeProbeCount)
-        report["truncated"] <- JsonValue.Create(truncated)
+        report["legacyProbesAttempted"] <- JsonValue.Create(legacyProbeAttempts)
+        report["nativeProbesAttempted"] <- JsonValue.Create(nativeProbeAttempts)
+        report["truncated"] <- JsonValue.Create(legacyTruncated || nativeNotStarted > 0)
         report, nativeTlsMatches
 
     let private actualConfigHash (environment: HostEnvironment) (paths: RuntimePaths) : string =
@@ -3045,18 +4320,25 @@ module Traefik =
             try
                 isActive environment, isEnabled environment, unitMatches environment paths
             with _ -> false, false, false
-        let api = if active && ownerMatches then readApi request.AdminPort |> fun operation -> operation.GetAwaiter().GetResult() else None
+        let api =
+            if active && ownerMatches && request.ReadProbeSafe then readApi request.AdminPort |> fun operation -> operation.GetAwaiter().GetResult()
+            else None
         let apiMatches = apiMatchesRuntimeElements api expectedStaticRoot expectedDynamicRoot generationMatches
         let probeEligible =
             verifyPinnedBinary && ownerMatches && staticMatches && dynamicMatches
-            && active && effectiveUnit && apiMatches
-        let fingerprints, certificatesMatch = certificateObservations environment paths request certificateMaterialDigests probeEligible
-        let tlsObservations, nativeTlsMatches = nativeTlsObservations environment paths request probeEligible
+            && active && effectiveUnit && apiMatches && request.ReadProbeSafe
+        let acmeStoragePaths = acmeStoragePathsFromStaticRoot expectedStaticRoot
+        use acmeStores = new AcmeStoreCache(environment, paths, acmeResolverSettings request, acmeStoragePaths)
+        let probeDeadlineTicks = Stopwatch.GetTimestamp() + int64 TlsProbeWallBudgetSeconds * Stopwatch.Frequency
+        let fingerprints, certificatesMatch, legacyTargets, legacyMtlsTargets, legacyProbeAttempts, legacyUnprobed, legacyTruncated, legacyProbeResults =
+            certificateObservations environment paths request certificateMaterialDigests probeEligible acmeStores probeDeadlineTicks
+        let tlsObservations, nativeTlsMatches =
+            nativeTlsObservations request probeEligible acmeStores probeDeadlineTicks legacyTargets legacyMtlsTargets legacyProbeResults legacyProbeAttempts legacyUnprobed legacyTruncated
         let credentialsMatch = credentialFileMatches environment paths request.Configuration
         let pending = tryStat environment paths.RollbackPath |> Option.isSome
         let inSync =
             ownerMatches && staticMatches && dynamicMatches && active && enabled && effectiveUnit
-            && apiMatches && certificatesMatch && nativeTlsMatches && credentialsMatch
+            && apiMatches && certificatesMatch && nativeTlsMatches && credentialsMatch && request.ReadProbeSafe
             && (ignorePending || not pending)
         let configHash =
             match cachedConfigHash with
@@ -3104,11 +4386,19 @@ module Traefik =
                             metadataMatches environment (Path.Combine(paths.StateDir, filename)) "file" 0o600 serviceUid serviceGid
                         else false)
                 with _ -> false
+    let private existingStaticSnapshot (environment: HostEnvironment) (paths: RuntimePaths) =
+        try
+            let path = Path.Combine(paths.ConfigDir, "static.yml")
+            if assertRegular environment path "Traefik static configuration" then Some(readBytes environment path)
+            else None
+        with _ -> None
+
     let observeRuntime (environment: HostEnvironment) (requestElement: JsonElement) (listenHost: string) (ignorePending: bool) : JsonObject =
         let request = validateRequest requestElement
         let certificateMaterialDigests = request.Certificates |> Map.map (fun _ certificate -> materialDigest certificate)
         let paths = pathsFor environment
-        let expectedStaticData = Encoding.UTF8.GetBytes(renderStatic request paths listenHost)
+        let expectedStaticData =
+            Encoding.UTF8.GetBytes(renderStaticWithPrevious request paths listenHost (existingStaticSnapshot environment paths))
         let expectedDynamicData = Encoding.UTF8.GetBytes(renderDynamic request paths)
         use staticDocument = JsonDocument.Parse(expectedStaticData)
         use dynamicDocument = JsonDocument.Parse(expectedDynamicData)
@@ -3130,7 +4420,8 @@ module Traefik =
     let private waitForActivation (environment: HostEnvironment) (requestElement: JsonElement) (paths: RuntimePaths) (timeoutSeconds: float) : JsonObject =
         let request = validateRequest requestElement
         let certificateMaterialDigests = request.Certificates |> Map.map (fun _ certificate -> materialDigest certificate)
-        let expectedStaticData = Encoding.UTF8.GetBytes(renderStatic request paths "")
+        let expectedStaticData =
+            Encoding.UTF8.GetBytes(renderStaticWithPrevious request paths "" (existingStaticSnapshot environment paths))
         let expectedDynamicData = Encoding.UTF8.GetBytes(renderDynamic request paths)
         use staticDocument = JsonDocument.Parse(expectedStaticData)
         use dynamicDocument = JsonDocument.Parse(expectedDynamicData)
@@ -3214,10 +4505,11 @@ module Traefik =
         (binarySha256: string option)
         (wasActive: bool)
         (wasEnabled: bool)
+        (restartRequired: bool)
         (certificateFiles: string list)
         =
         let journal = JsonObject()
-        journal["version"] <- JsonValue.Create(2)
+        journal["version"] <- JsonValue.Create(3)
         journal["owner"] <- JsonValue.Create(ownerDigest ownerId)
         journal["static"] <- encodeSnapshot staticData
         journal["dynamic"] <- encodeSnapshot dynamicData
@@ -3228,6 +4520,7 @@ module Traefik =
         match binarySha256 with None -> journal["binarySha256"] <- null | Some value -> journal["binarySha256"] <- JsonValue.Create(value)
         journal["wasActive"] <- JsonValue.Create(wasActive)
         journal["wasEnabled"] <- JsonValue.Create(wasEnabled)
+        journal["restartRequired"] <- JsonValue.Create(restartRequired)
         let files = JsonArray()
         for filename in certificateFiles |> List.sortWith (fun (left: string) (right: string) -> StringComparer.Ordinal.Compare(left, right)) do files.Add(JsonValue.Create(filename))
         journal["certificateFiles"] <- files
@@ -3267,15 +4560,17 @@ module Traefik =
                     match version with
                     | Some 1 -> baseFields
                     | Some 2 -> Set.add "credentials" baseFields
+                    | Some 3 -> Set.add "restartRequired" (Set.add "credentials" baseFields)
                     | _ -> fail "Traefik rollback journal is invalid"
                 if objectNames journal <> expected then fail "Traefik rollback journal is invalid"
                 let owner = tryString journal "owner"
                 let binaryPresent = jsonBool (get "binaryPresent")
                 let wasActive = jsonBool (get "wasActive")
                 let wasEnabled = jsonBool (get "wasEnabled")
+                let restartRequired = if version = Some 3 then jsonBool (get "restartRequired") else Some true
                 let binarySha = if (get "binarySha256").ValueKind = JsonValueKind.Null then None else Some(stringValue "Traefik rollback journal is invalid" (get "binarySha256"))
                 let names = get "certificateFiles"
-                if owner <> ownerDigest ownerId || binaryPresent.IsNone || wasActive.IsNone || wasEnabled.IsNone || names.ValueKind <> JsonValueKind.Array then
+                if owner <> ownerDigest ownerId || binaryPresent.IsNone || wasActive.IsNone || wasEnabled.IsNone || restartRequired.IsNone || names.ValueKind <> JsonValueKind.Array then
                     fail "Traefik rollback journal is invalid"
                 match binarySha with Some value when not (fingerprintPattern.IsMatch(value)) -> fail "Traefik rollback journal is invalid" | _ -> ()
                 let certificateFiles =
@@ -3290,13 +4585,15 @@ module Traefik =
                 Some {
                     Static = decodeSnapshot (get "static")
                     Dynamic = decodeSnapshot (get "dynamic")
-                    Credentials = if version = Some 2 then decodeSnapshot (get "credentials") else None
+                    Credentials = if version = Some 1 then None else decodeSnapshot (get "credentials")
+                    CredentialsKnown = version <> Some 1
                     Unit = decodeSnapshot (get "unit")
                     ReleaseMarker = decodeSnapshot (get "releaseMarker")
                     BinaryPresent = binaryPresent.Value
                     BinarySha256 = binarySha
                     WasActive = wasActive.Value
                     WasEnabled = wasEnabled.Value
+                    RestartRequired = restartRequired.Value
                     CertificateFiles = certificateFiles
                 }
             with
@@ -3357,9 +4654,9 @@ module Traefik =
             fsyncDirectory paths.CertificateDir
         with _ -> fail errorMessage
 
-    let private recoverPendingTransaction (environment: HostEnvironment) (paths: RuntimePaths) (ownerId: string) (request: JsonElement) (groupId: int) (activationTimeout: float) : unit =
+    let private recoverPendingTransaction (environment: HostEnvironment) (paths: RuntimePaths) (ownerId: string) (request: JsonElement) (groupId: int) (activationTimeout: float) : PendingTransaction option =
         match loadPendingTransaction environment paths ownerId with
-        | None -> ()
+        | None -> None
         | Some journal ->
             let currentUnit = safeUnitStatus environment paths.UnitPath ownerId
             if currentUnit.IsSome then ensureEffectiveUnit environment paths
@@ -3368,59 +4665,100 @@ module Traefik =
             let oldDynamic = journal.Dynamic
             let oldUnit = journal.Unit
             let oldCredentials = journal.Credentials
+            let requestState = validateRequest request
+            let issuerFailure =
+                try
+                    ensureAcmeIssuerTransitionSafe environment paths oldStatic requestState
+                    None
+                with
+                | :? BackendError as error -> Some error.Message
+                | _ -> Some "Traefik ACME issuer transition could not be verified"
             let currentStatic = readOptional environment (Path.Combine(paths.ConfigDir, "static.yml"))
             let currentDynamic = readOptional environment (Path.Combine(paths.DynamicDir, "current.yml"))
-            let currentSync = observeRuntime environment request "" true
-            if currentSync["inSync"].GetValue<bool>() then
-                if currentStatic = oldStatic && udpWithdrawalRequiresRestart oldDynamic currentDynamic currentStatic then
+            let currentSync =
+                match issuerFailure with
+                | Some _ -> false
+                | None -> (observeRuntime environment request "" true).["inSync"].GetValue<bool>()
+            let currentCredentials = readCredentialSnapshot environment paths
+            let currentBinaryExists = assertRegular environment paths.BinaryPath "Traefik binary"
+            let currentBinaryHash = if currentBinaryExists then Some(binarySha256 environment paths.BinaryPath) else None
+            let priorCertificateFiles = entries paths.CertificateDir |> Set.ofArray
+            let priorFilesRestored =
+                currentStatic = oldStatic
+                && currentDynamic = oldDynamic
+                && (not journal.CredentialsKnown || currentCredentials = oldCredentials)
+                && currentUnit = oldUnit
+                && currentBinaryHash = journal.BinarySha256
+                && readOptional environment (Path.Combine(paths.InstallDir, ".keroosha-release.json")) = journal.ReleaseMarker
+                && priorCertificateFiles = Set.ofList journal.CertificateFiles
+            if currentSync then
+                let restartRequired =
+                    journal.RestartRequired
+                    || not journal.CredentialsKnown
+                    || currentBinaryHash <> journal.BinarySha256
+                    || udpWithdrawalRequiresRestart oldDynamic currentDynamic currentStatic
+                if restartRequired then
                     restartService environment
                     let result = waitForActivation environment request paths activationTimeout
-                    if not (result["inSync"].GetValue<bool>()) then fail "interrupted Traefik UDP withdrawal did not recover"
+                    if not (result["inSync"].GetValue<bool>()) then fail "interrupted Traefik restart intent did not recover"
                 removePendingTransaction environment paths ownerId
+                None
+            elif priorFilesRestored then
+                match issuerFailure with
+                | Some message -> fail message
+                | None -> Some journal
             else
-                let currentCredentials = readCredentialSnapshot environment paths
-                let currentBinaryExists = assertRegular environment paths.BinaryPath "Traefik binary"
-                let currentBinaryHash = if currentBinaryExists then Some(binarySha256 environment paths.BinaryPath) else None
                 let currentActive = isActive environment
-                let liveStaticMatches =
-                    if currentActive && currentStatic = oldStatic then
-                        match adminPortFromStatic oldStatic with
-                        | Some port ->
-                            try
-                                readApiStatic port
-                                |> fun operation -> operation.GetAwaiter().GetResult()
-                                |> fun api -> apiMatchesStatic api oldStatic
-                            with _ -> false
-                        | None -> false
-                    else true
                 let restartRequired =
-                    currentStatic <> oldStatic || currentCredentials <> oldCredentials || currentUnit <> oldUnit
-                    || currentBinaryHash <> journal.BinarySha256 || not liveStaticMatches
-                    || udpWithdrawalRequiresRestart oldDynamic currentDynamic oldStatic
+                    currentStatic <> oldStatic
+                    || (journal.CredentialsKnown && currentCredentials <> oldCredentials)
+                    || currentUnit <> oldUnit
+                    || currentBinaryHash <> journal.BinarySha256
                     || udpWithdrawalRequiresRestart currentDynamic oldDynamic oldStatic
-                if currentUnit.IsSome && (restartRequired || not journal.WasActive || not currentActive) then
+                if currentUnit.IsSome && currentActive && (restartRequired || not journal.WasActive) then
                     stopOwnedService environment paths ownerId
-                restoreFile environment (Path.Combine(paths.ConfigDir, "static.yml")) oldStatic 0o640 (Some groupId)
-                restoreFile environment (Path.Combine(paths.DynamicDir, "current.yml")) oldDynamic 0o640 (Some groupId)
-                restoreFile environment paths.CredentialsPath oldCredentials 0o600 None
-                restoreFile environment paths.UnitPath oldUnit 0o644 None
+                elif currentUnit.IsNone && currentActive then
+                    fail "interrupted Traefik service has no owned unit"
+                if currentStatic <> oldStatic then
+                    restoreFile environment (Path.Combine(paths.ConfigDir, "static.yml")) oldStatic 0o640 (Some groupId)
+                if currentDynamic <> oldDynamic then
+                    restoreFile environment (Path.Combine(paths.DynamicDir, "current.yml")) oldDynamic 0o640 (Some groupId)
+                let rollbackCredentials = if journal.CredentialsKnown then oldCredentials else currentCredentials
+                if journal.CredentialsKnown && currentCredentials <> oldCredentials then
+                    restoreFile environment paths.CredentialsPath oldCredentials 0o600 None
+                if currentUnit <> oldUnit then restoreFile environment paths.UnitPath oldUnit 0o644 None
+                let releaseMarkerPath = Path.Combine(paths.InstallDir, ".keroosha-release.json")
                 if not journal.BinaryPresent then
-                    for path in [ paths.BinaryPath; Path.Combine(paths.InstallDir, ".keroosha-release.json") ] do
-                        try File.Delete(path) with _ -> ()
-                elif currentBinaryHash = journal.BinarySha256 then
-                    restoreFile environment (Path.Combine(paths.InstallDir, ".keroosha-release.json")) journal.ReleaseMarker 0o644 None
+                    if currentBinaryExists then
+                        File.Delete(paths.BinaryPath)
+                        fsyncDirectory (Path.GetDirectoryName(paths.BinaryPath))
+                    if readOptional environment releaseMarkerPath <> journal.ReleaseMarker then
+                        restoreFile environment releaseMarkerPath journal.ReleaseMarker 0o644 None
+                elif currentBinaryHash = journal.BinarySha256 && readOptional environment releaseMarkerPath <> journal.ReleaseMarker then
+                    restoreFile environment releaseMarkerPath journal.ReleaseMarker 0o644 None
                 removeExtraCertificateFiles environment paths (Set.ofList journal.CertificateFiles) "cannot remove interrupted Traefik certificate material"
                 if currentUnit <> oldUnit then daemonReload environment
                 if oldUnit.IsSome then ensureEffectiveUnit environment paths
                 if isEnabled environment <> journal.WasEnabled then
                     if journal.WasEnabled then enableService environment else disableService environment
                 if isEnabled environment <> journal.WasEnabled then fail "cannot restore interrupted Traefik enablement state"
-                if journal.WasActive then
-                    if not (isActive environment) then startService environment
-                    elif restartRequired then restartService environment
-                    if not (waitForRollback environment paths activationTimeout oldStatic oldDynamic oldCredentials) then fail "cannot restore interrupted Traefik configuration"
-                if isActive environment <> journal.WasActive then fail "cannot restore interrupted Traefik service state"
-                removePendingTransaction environment paths ownerId
+                let rollbackVerified =
+                    if journal.WasActive then
+                        if not (isActive environment) then startService environment
+                        elif restartRequired then restartService environment
+                        waitForRollback environment paths activationTimeout oldStatic oldDynamic rollbackCredentials
+                    else not (isActive environment)
+                if isActive environment <> journal.WasActive && journal.WasActive then
+                    fail "cannot restore interrupted Traefik service state"
+                if rollbackVerified then
+                    removePendingTransaction environment paths ownerId
+                    match issuerFailure with
+                    | Some message -> fail message
+                    | None -> None
+                else
+                    match issuerFailure with
+                    | Some message -> fail message
+                    | None -> Some journal
 
     let private removeUnusedCertificates (environment: HostEnvironment) (paths: RuntimePaths) (request: Request) : unit =
         let wanted =
@@ -3441,43 +4779,83 @@ module Traefik =
         if request.Operation <> "apply" then fail "apply requires an apply operation"
         let paths = pathsFor environment
         validateCertificateMaterial request
-        let configStatus, stateStatus, installStatus, oldUnit = validateActualOwner environment paths request.OwnerId
-        if oldUnit.IsSome then ensureEffectiveUnit environment paths
-        let mutable wasActive = isActive environment
-        let mutable wasEnabled = isEnabled environment
-        if oldUnit.IsNone && (wasActive || wasEnabled) then fail "Traefik service name collides with an unowned systemd unit"
+        cleanupStaleTraefikTemporaryFiles environment paths request.OwnerId
+        let configStatus, stateStatus, installStatus, initialUnit = validateActualOwner environment paths request.OwnerId
+        if initialUnit.IsSome then ensureEffectiveUnit environment paths
+        let initiallyActive = isActive environment
+        let initiallyEnabled = isEnabled environment
+        if initialUnit.IsNone && (initiallyActive || initiallyEnabled) then fail "Traefik service name collides with an unowned systemd unit"
         let existingOwned = configStatus = "owned" || stateStatus = "owned" || installStatus = "owned"
         let _, serviceGroup = ensureLayout environment paths request.OwnerId existingOwned
-        recoverPendingTransaction environment paths request.OwnerId requestElement serviceGroup activationTimeout
-        let configStatus, stateStatus, installStatus, oldUnit = validateActualOwner environment paths request.OwnerId
-        if oldUnit.IsSome then ensureEffectiveUnit environment paths
-        wasActive <- isActive environment
-        wasEnabled <- isEnabled environment
-        if oldUnit.IsNone && (wasActive || wasEnabled) then fail "Traefik service name collides with an unowned systemd unit"
-        let oldStatic = readOptional environment (Path.Combine(paths.ConfigDir, "static.yml"))
-        let oldDynamic = readOptional environment (Path.Combine(paths.DynamicDir, "current.yml"))
-        let oldCredentials = readCredentialSnapshot environment paths
-        let oldBinaryExists = assertRegular environment paths.BinaryPath "Traefik binary"
-        let oldBinaryHash = if oldBinaryExists then Some(binarySha256 environment paths.BinaryPath) else None
-        let oldReleaseMarker = readOptional environment (Path.Combine(paths.InstallDir, ".keroosha-release.json"))
-        let oldUnitBytes = oldUnit
-        let currentUnit = Encoding.UTF8.GetBytes(unitText paths request.OwnerId request.Configuration)
-        let staticData = Encoding.UTF8.GetBytes(renderStatic request paths "")
+        let pending = recoverPendingTransaction environment paths request.OwnerId requestElement serviceGroup activationTimeout
+        let configStatus, stateStatus, installStatus, currentUnit = validateActualOwner environment paths request.OwnerId
+        if currentUnit.IsSome then ensureEffectiveUnit environment paths
+        if currentUnit.IsNone && (isActive environment || isEnabled environment) then fail "Traefik service name collides with an unowned systemd unit"
+        let wasActive = pending |> Option.map (fun transaction -> transaction.WasActive) |> Option.defaultWith (fun () -> isActive environment)
+        let wasEnabled = pending |> Option.map (fun transaction -> transaction.WasEnabled) |> Option.defaultWith (fun () -> isEnabled environment)
+        let oldStatic =
+            match pending with
+            | Some transaction -> transaction.Static
+            | None -> readOptional environment (Path.Combine(paths.ConfigDir, "static.yml"))
+        let oldDynamic =
+            match pending with
+            | Some transaction -> transaction.Dynamic
+            | None -> readOptional environment (Path.Combine(paths.DynamicDir, "current.yml"))
+        let oldCredentials =
+            match pending with
+            | Some transaction when transaction.CredentialsKnown -> transaction.Credentials
+            | _ -> readCredentialSnapshot environment paths
+        let oldBinaryExists =
+            pending
+            |> Option.map (fun transaction -> transaction.BinaryPresent)
+            |> Option.defaultWith (fun () -> assertRegular environment paths.BinaryPath "Traefik binary")
+        let oldBinaryHash =
+            match pending with
+            | Some transaction -> transaction.BinarySha256
+            | None -> if oldBinaryExists then Some(binarySha256 environment paths.BinaryPath) else None
+        let actualBinaryExists = assertRegular environment paths.BinaryPath "Traefik binary"
+        let actualBinaryHash = if actualBinaryExists then Some(binarySha256 environment paths.BinaryPath) else None
+        let oldReleaseMarker =
+            match pending with
+            | Some transaction -> transaction.ReleaseMarker
+            | None -> readOptional environment (Path.Combine(paths.InstallDir, ".keroosha-release.json"))
+        let oldUnitBytes =
+            match pending with
+            | Some transaction -> transaction.Unit
+            | None -> currentUnit
+        let currentUnitText = Encoding.UTF8.GetBytes(unitText paths request.OwnerId request.Configuration)
+        let staticData = Encoding.UTF8.GetBytes(renderStaticWithPrevious request paths "" oldStatic)
         let dynamicData = Encoding.UTF8.GetBytes(renderDynamic request paths)
-        let udpWithdrawalRestart = udpWithdrawalRequiresRestart oldDynamic (Some dynamicData) (Some staticData)
-        let currentCredentials = credentialData request.Configuration
-        let credentialsChanged = oldCredentials <> currentCredentials
+        let udpWithdrawalRestart =
+            wasActive && oldStatic = Some staticData
+            && udpUpdateRequiresRestart request.PreviousUdpEntryPoints oldDynamic (Some dynamicData) (Some staticData)
+        let desiredCredentials = credentialData request.Configuration
+        let credentialsChanged = oldCredentials <> desiredCredentials
         let liveStaticMatches =
             if wasActive && oldStatic = Some staticData then
                 readApiStatic request.AdminPort
                 |> fun operation -> operation.GetAwaiter().GetResult()
                 |> fun api -> apiMatchesStatic api (Some staticData)
             else false
-        let oldCertificateFiles = entries paths.CertificateDir |> Set.ofArray
-        savePendingTransaction environment paths request.OwnerId oldStatic oldDynamic oldCredentials oldUnitBytes oldReleaseMarker oldBinaryExists oldBinaryHash wasActive wasEnabled (Set.toList oldCertificateFiles)
-        let mutable binaryChanged = false
         let rootUid, rootGid = hostOwner environment
-        let unitChanged = oldUnitBytes <> Some currentUnit || not (metadataMatches environment paths.UnitPath "file" 0o644 rootUid rootGid)
+        let unitChanged = oldUnitBytes <> Some currentUnitText || not (metadataMatches environment paths.UnitPath "file" 0o644 rootUid rootGid)
+        ensureAcmeIssuerTransitionSafe environment paths oldStatic request
+        let restartRequired =
+            (pending |> Option.exists (fun transaction -> transaction.RestartRequired))
+            || (wasActive
+                && (oldStatic <> Some staticData
+                    || credentialsChanged
+                    || unitChanged
+                    || not liveStaticMatches
+                    || udpWithdrawalRestart
+                    || actualBinaryHash <> oldBinaryHash))
+        let oldCertificateFiles =
+            match pending with
+            | Some transaction -> Set.ofList transaction.CertificateFiles
+            | None -> entries paths.CertificateDir |> Set.ofArray
+        savePendingTransaction environment paths request.OwnerId oldStatic oldDynamic oldCredentials oldUnitBytes oldReleaseMarker oldBinaryExists oldBinaryHash wasActive wasEnabled restartRequired (Set.toList oldCertificateFiles)
+        let mutable binaryChanged = false
+        let mutable restartAttempted = false
         try
             binaryChanged <- ensureInstalledBinary environment paths request.OwnerId
             writeCredentialFile environment paths request.Configuration
@@ -3485,11 +4863,15 @@ module Traefik =
             ensureGroupedAtomicWrite environment (Path.Combine(paths.ConfigDir, "static.yml")) staticData 0o640 serviceGroup
             ensureGroupedAtomicWrite environment (Path.Combine(paths.DynamicDir, "current.yml")) dynamicData 0o640 serviceGroup
             if unitChanged then
-                writeAtomic environment paths.UnitPath currentUnit 0o644 (Some rootGid)
+                writeAtomic environment paths.UnitPath currentUnitText 0o644 (Some rootGid)
                 daemonReload environment
             if not (isEnabled environment) then enableService environment
-            if not (isActive environment) then startService environment
-            elif binaryChanged || oldStatic <> Some staticData || unitChanged || credentialsChanged || not liveStaticMatches || udpWithdrawalRestart then restartService environment
+            if not (isActive environment) then
+                if wasActive then restartAttempted <- true
+                startService environment
+            elif binaryChanged || restartRequired then
+                restartAttempted <- true
+                restartService environment
             let result = waitForActivation environment requestElement paths activationTimeout
             if not (result["inSync"].GetValue<bool>()) then fail "Traefik activation did not satisfy the bounded readiness checks"
             removePendingTransaction environment paths request.OwnerId
@@ -3501,41 +4883,65 @@ module Traefik =
                 match error with
                 | :? BackendError -> error.Message
                 | _ -> error.GetType().Name
-            try
-                let currentOwnedUnit = safeUnitStatus environment paths.UnitPath request.OwnerId
-                let currentDynamic = readOptional environment (Path.Combine(paths.DynamicDir, "current.yml"))
-                let rollbackUdpWithdrawal = udpWithdrawalRequiresRestart currentDynamic oldDynamic oldStatic
-                let restartRequired =
-                    binaryChanged || oldStatic <> Some staticData || unitChanged || credentialsChanged
-                    || not liveStaticMatches || udpWithdrawalRestart || rollbackUdpWithdrawal
-                let currentActive = isActive environment
-                if currentOwnedUnit.IsSome && (restartRequired || not wasActive || not currentActive) then
-                    stopOwnedService environment paths request.OwnerId
-                elif currentOwnedUnit.IsNone && currentActive then
-                    fail "interrupted Traefik service has no owned unit"
-                restoreFile environment (Path.Combine(paths.ConfigDir, "static.yml")) oldStatic 0o640 (Some serviceGroup)
-                restoreFile environment (Path.Combine(paths.DynamicDir, "current.yml")) oldDynamic 0o640 (Some serviceGroup)
-                restoreFile environment paths.CredentialsPath oldCredentials 0o600 None
-                restoreFile environment paths.UnitPath oldUnitBytes 0o644 None
-                if not oldBinaryExists then
-                    for path in [ paths.BinaryPath; Path.Combine(paths.InstallDir, ".keroosha-release.json") ] do
-                        try File.Delete(path) with _ -> ()
-                elif (assertRegular environment paths.BinaryPath "Traefik binary") && Some(binarySha256 environment paths.BinaryPath) = oldBinaryHash then
-                    restoreFile environment (Path.Combine(paths.InstallDir, ".keroosha-release.json")) oldReleaseMarker 0o644 None
-                removeExtraCertificateFiles environment paths oldCertificateFiles "cannot remove interrupted Traefik certificate material"
-                daemonReload environment
-                if oldUnitBytes.IsSome then ensureEffectiveUnit environment paths
-                if isEnabled environment <> wasEnabled then
-                    if wasEnabled then enableService environment else disableService environment
-                if isEnabled environment <> wasEnabled then fail "previous Traefik enablement state was not restored"
-                if wasActive then
-                    if not (isActive environment) then startService environment
-                    elif restartRequired then restartService environment
-                    if not (waitForRollback environment paths activationTimeout oldStatic oldDynamic oldCredentials) then fail "previous Traefik configuration was not restored"
-                if isActive environment <> wasActive then fail "previous Traefik service state was not restored"
-                removePendingTransaction environment paths request.OwnerId
-            with _ -> fail "Traefik activation failed and the prior configuration could not be restored"
-            fail ("Traefik activation failed; the prior configuration was restored: " + failureReason)
+            let rollbackFailure =
+                try
+                    let currentOwnedUnit = safeUnitStatus environment paths.UnitPath request.OwnerId
+                    let currentStatic = readOptional environment (Path.Combine(paths.ConfigDir, "static.yml"))
+                    let currentDynamic = readOptional environment (Path.Combine(paths.DynamicDir, "current.yml"))
+                    let currentCredentials = readCredentialSnapshot environment paths
+                    let currentUnitData = readOptional environment paths.UnitPath
+                    let currentBinaryExists = assertRegular environment paths.BinaryPath "Traefik binary"
+                    let currentBinaryHash = if currentBinaryExists then Some(binarySha256 environment paths.BinaryPath) else None
+                    let rollbackUdpWithdrawal = udpWithdrawalRequiresRestart currentDynamic oldDynamic oldStatic
+                    let rollbackRestartRequired =
+                        restartAttempted
+                        || currentBinaryHash <> oldBinaryHash
+                        || rollbackUdpWithdrawal
+                    let currentActive = isActive environment
+                    if currentOwnedUnit.IsSome && currentActive && (rollbackRestartRequired || not wasActive) then
+                        stopOwnedService environment paths request.OwnerId
+                    elif currentOwnedUnit.IsNone && currentActive then
+                        fail "interrupted Traefik service has no owned unit"
+                    if currentStatic <> oldStatic then
+                        restoreFile environment (Path.Combine(paths.ConfigDir, "static.yml")) oldStatic 0o640 (Some serviceGroup)
+                    if currentDynamic <> oldDynamic then
+                        restoreFile environment (Path.Combine(paths.DynamicDir, "current.yml")) oldDynamic 0o640 (Some serviceGroup)
+                    if currentCredentials <> oldCredentials then
+                        restoreFile environment paths.CredentialsPath oldCredentials 0o600 None
+                    if currentUnitData <> oldUnitBytes then restoreFile environment paths.UnitPath oldUnitBytes 0o644 None
+                    let releaseMarkerPath = Path.Combine(paths.InstallDir, ".keroosha-release.json")
+                    if not oldBinaryExists then
+                        if currentBinaryExists then
+                            File.Delete(paths.BinaryPath)
+                            fsyncDirectory (Path.GetDirectoryName(paths.BinaryPath))
+                        if readOptional environment releaseMarkerPath <> oldReleaseMarker then
+                            restoreFile environment releaseMarkerPath oldReleaseMarker 0o644 None
+                    elif currentBinaryHash = oldBinaryHash && readOptional environment releaseMarkerPath <> oldReleaseMarker then
+                        restoreFile environment releaseMarkerPath oldReleaseMarker 0o644 None
+                    removeExtraCertificateFiles environment paths oldCertificateFiles "cannot remove interrupted Traefik certificate material"
+                    if currentUnitData <> oldUnitBytes then daemonReload environment
+                    if oldUnitBytes.IsSome then ensureEffectiveUnit environment paths
+                    if isEnabled environment <> wasEnabled then
+                        if wasEnabled then enableService environment else disableService environment
+                    if isEnabled environment <> wasEnabled then fail "previous Traefik enablement state was not restored"
+                    if wasActive then
+                        if not (isActive environment) then startService environment
+                        elif rollbackRestartRequired then restartService environment
+                        if not (waitForRollback environment paths activationTimeout oldStatic oldDynamic oldCredentials) then
+                            fail "previous Traefik configuration could not be verified"
+                    if isActive environment <> wasActive then fail "previous Traefik service state was not restored"
+                    removePendingTransaction environment paths request.OwnerId
+                    None
+                with rollbackError ->
+                    let detail =
+                        match rollbackError with
+                        | :? BackendError -> rollbackError.Message
+                        | _ -> rollbackError.GetType().Name
+                    Some detail
+            match rollbackFailure with
+            | None -> fail ("Traefik activation failed; the prior configuration was restored: " + failureReason)
+            | Some detail ->
+                fail ("Traefik activation failed; the prior configuration could not be verified (" + failureReason + "): " + detail)
 
     let private read (environment: HostEnvironment) (requestElement: JsonElement) : JsonObject =
         let request = validateRequest requestElement
@@ -3562,6 +4968,7 @@ module Traefik =
         let request = validateRequest requestElement
         if request.Operation <> "delete" then fail "delete requires a delete operation"
         let paths = pathsFor environment
+        cleanupStaleTraefikTemporaryFiles environment paths request.OwnerId
         let configStatus, stateStatus, installStatus, _ = checkLayoutCollisions environment paths request.OwnerId
         let unitData = safeUnitStatus environment paths.UnitPath request.OwnerId
         if configStatus = "absent" && stateStatus = "absent" && installStatus = "absent" && unitData.IsNone then JsonObject()

@@ -270,7 +270,7 @@ type DslTests() =
         let websecure = entryPoint "websecure" { listen 8443 }
         let resolver = acmeResolver "letsencrypt" {
             email "ops@example.test"
-            challenge (Http01 "web")
+            challenge (AcmeChallenge.Http01 "web")
             caServer "https://acme.example.test/directory"
         }
         let certificate = pemCertificate "wildcard" {
@@ -289,14 +289,14 @@ type DslTests() =
                 host "api.example.test"
                 entryPoint "websecure"
                 backend "https://127.0.0.1:8443"
-                tls (Provided certificate)
+                tls (TraefikTlsMode.Provided certificate)
             }
         let acme =
             router "acme" {
                 host "acme.example.test"
                 entryPoint "websecure"
                 backend "http://127.0.0.1:8081"
-                tls (Acme resolver)
+                tls (TraefikTlsMode.Acme resolver)
             }
 
         let redirected =
@@ -309,11 +309,11 @@ type DslTests() =
         // Act
         let certificateName =
             match secure.Tls with
-            | Provided providedCertificate -> providedCertificate.Name
+            | TraefikTlsMode.Provided providedCertificate -> providedCertificate.Name
             | _ -> String.Empty
         let acmeResolverName =
             match acme.Tls with
-            | Acme acmeResolver -> acmeResolver.Name
+            | TraefikTlsMode.Acme acmeResolver -> acmeResolver.Name
             | _ -> String.Empty
 
         // Assert
@@ -324,13 +324,58 @@ type DslTests() =
         Assert.That(plain.Host, Is.EqualTo(LiteralString "plain.example.test"))
         Assert.That(plain.EntryPoint, Is.EqualTo(LiteralString "web"))
         Assert.That(plain.Target, Is.EqualTo(RouterTargetInput.Backend(LiteralString "http://127.0.0.1:8080")))
-        Assert.That(plain.Tls, Is.EqualTo(NoTls))
+        Assert.That(plain.Tls, Is.EqualTo(TraefikTlsMode.NoTls))
         Assert.That(
             redirected.Target,
             Is.EqualTo(RouterTargetInput.PermanentToOrigin(LiteralString "https://ovsianikov-history.ru"))
         )
         Assert.That(certificateName, Is.EqualTo("wildcard"))
         Assert.That(acmeResolverName, Is.EqualTo(resolver.Name))
+
+    [<Test>]
+    member _.``Named certificate references are typed for inbound and outbound TLS``() =
+        let identity = certificateRef "review-client"
+        let referenceNames (field: TraefikNativeField) =
+            match field.Value with
+            | TraefikNativeValue.Array [ TraefikNativeValue.Object item ] ->
+                match item["certificate"] with
+                | TraefikNativeValue.String(LiteralString name) -> [ name ]
+                | _ -> failwith "Expected a named certificate reference."
+            | _ -> failwith "Expected a certificate reference array."
+
+        let httpCertificates = httpServersTransportCertificates [ identity ]
+        let tcpCertificates = tcpServersTransportCertificates [ identity ]
+        let inboundCertificates = tlsCertificates [ identity ]
+        let forwardAuth = httpForwardAuthClientCertificate identity
+
+        Assert.That(referenceNames httpCertificates, Is.EqualTo<string list>([ "review-client" ]))
+        Assert.That(referenceNames tcpCertificates, Is.EqualTo<string list>([ "review-client" ]))
+        Assert.That(referenceNames inboundCertificates, Is.EqualTo<string list>([ "review-client" ]))
+        Assert.That(forwardAuth.Name, Is.EqualTo("clientCertificate"))
+        Assert.That(
+            forwardAuth.Value,
+            Is.EqualTo(TraefikNativeValue.String(LiteralString "review-client"))
+        )
+
+        let inboundRouter =
+            fun () ->
+                let client =
+                    pemClientCertificate "review-client" {
+                        chain (Content.pem "deferred client certificate")
+                        privateKey (Content.pem "deferred client key")
+                    }
+                traefik {
+                    entryPoint "web" { listen 8080 }
+                    client
+                    router "invalid-client-tls" {
+                        host "client.example.test"
+                        entryPoint "web"
+                        backend "https://127.0.0.1:8443"
+                        tls (TraefikTlsMode.Provided client)
+                    }
+                }
+
+        Assert.Throws<ArgumentException>(TestDelegate(fun () -> inboundRouter () |> ignore)) |> ignore
 
     [<Test>]
     member _.``Traefik redirect output origin retains canonical value and secrecy``() : Task =

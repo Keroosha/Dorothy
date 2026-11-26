@@ -15,13 +15,26 @@ open System.Text.Json.Nodes
 
 /// Bounded validation for native Traefik static configuration (v3.7.16).
 module TraefikStatic =
+    /// The bounded native API inventory includes the helper's private listener.
+    [<Literal>]
+    let internal MaximumObservedEntryPoints = 4096
+
     type private Bind =
         { Name: string
           Protocol: string
           Host: IPAddress option
           Port: int }
 
+    [<RequireQualifiedAccess>]
+    type ValidationFailure =
+        | SocketBind
+        | TrustNetwork
+
+    exception ValidationError of ValidationFailure
+
+
     let private fail () = invalidOp "Static Traefik configuration is invalid."
+    let private failAs (category: ValidationFailure) = raise (ValidationError category)
     let private privateAdminEntryPoint = "keroosha-admin"
 
     let private safeText (maxLength: int) (value: string) =
@@ -173,11 +186,11 @@ module TraefikStatic =
     let private requireHttpToken value =
         if not (isHttpToken value) then fail ()
 
-    let private tryDuration (value: string) =
+    let internal tryDurationNanoseconds (value: string) : int64 option =
         if String.IsNullOrEmpty(value) || value.Length > 64 then
-            false
+            None
         elif value = "0" then
-            true
+            Some 0L
         else
             let mutable index = 0
             let mutable sign = 1M
@@ -231,18 +244,28 @@ module TraefikStatic =
                             index <- index + unit.Length
                             partCount <- partCount + 1
 
-            valid
-            && partCount > 0
-            && totalNanoseconds * sign <= 9223372036854775807M
-            && totalNanoseconds * sign >= -9223372036854775808M
+            let signedNanoseconds = totalNanoseconds * sign
+            if valid
+               && partCount > 0
+               && signedNanoseconds <= 9223372036854775807M
+               && signedNanoseconds >= -9223372036854775808M then
+                Some(Decimal.ToInt64(Decimal.Truncate(signedNanoseconds)))
+            else
+                None
 
     let private validateDuration (node: JsonNode) =
-        if not (stringValue node |> tryDuration) then fail ()
+        if (stringValue node |> tryDurationNanoseconds).IsNone then fail ()
+
+    let private validatePositiveDuration (node: JsonNode) =
+        match stringValue node |> tryDurationNanoseconds with
+        | Some nanoseconds when nanoseconds > 0L -> ()
+        | _ -> fail ()
 
     let private validateDurationObject (node: JsonNode) (names: string list) =
         let fields = requireObject node
         validateMembers names fields
         for field in fields do validateDuration field.Value
+
 
     let private validateBoundedInteger (minimum: int64) (maximum: int64) (node: JsonNode) =
         let value = int64Value node
@@ -251,35 +274,37 @@ module TraefikStatic =
     let private parsePort (text: string) =
         if String.IsNullOrEmpty(text)
            || (text |> Seq.exists (fun character -> character < '0' || character > '9')) then
-            fail ()
+            failAs ValidationFailure.SocketBind
         let mutable port = 0
         if not (Int32.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, &port))
            || port < 1
            || port > 65535 then
-            fail ()
+            failAs ValidationFailure.SocketBind
         port
 
     let private parseAddress (name: string) (address: string) =
-        let address = safeText 255 address
+        let address =
+            try safeText 255 address
+            with _ -> failAs ValidationFailure.SocketBind
         let slash = address.IndexOf('/')
         let socketAddress, protocol =
             if slash < 0 then
                 address, "tcp"
             elif slash = 0 || address.IndexOf('/', slash + 1) >= 0 then
-                fail ()
+                failAs ValidationFailure.SocketBind
             else
                 let selected = address.Substring(slash + 1).ToLowerInvariant()
-                if selected <> "tcp" && selected <> "udp" then fail ()
+                if selected <> "tcp" && selected <> "udp" then failAs ValidationFailure.SocketBind
                 address.Substring(0, slash), selected
 
         let hostText, portText =
             if socketAddress.StartsWith("[", StringComparison.Ordinal) then
                 let close = socketAddress.IndexOf(']')
-                if close < 2 || close + 1 >= socketAddress.Length || socketAddress[close + 1] <> ':' then fail ()
+                if close < 2 || close + 1 >= socketAddress.Length || socketAddress[close + 1] <> ':' then failAs ValidationFailure.SocketBind
                 socketAddress.Substring(1, close - 1), socketAddress.Substring(close + 2)
             else
                 let colon = socketAddress.LastIndexOf(':')
-                if colon < 0 || socketAddress.IndexOf(':') <> colon then fail ()
+                if colon < 0 || socketAddress.IndexOf(':') <> colon then failAs ValidationFailure.SocketBind
                 socketAddress.Substring(0, colon), socketAddress.Substring(colon + 1)
 
         let host =
@@ -287,14 +312,15 @@ module TraefikStatic =
                 None
             else
                 let mutable parsed = Unchecked.defaultof<IPAddress>
-                if not (IPAddress.TryParse(hostText, &parsed)) then fail ()
+                if not (IPAddress.TryParse(hostText, &parsed)) then failAs ValidationFailure.SocketBind
                 if socketAddress.StartsWith("[", StringComparison.Ordinal) then
-                    if parsed.AddressFamily <> AddressFamily.InterNetworkV6 then fail ()
+                    if parsed.AddressFamily <> AddressFamily.InterNetworkV6 then failAs ValidationFailure.SocketBind
                 else
                     if parsed.AddressFamily <> AddressFamily.InterNetwork
                        || not (String.Equals(parsed.ToString(), hostText, StringComparison.Ordinal)) then
-                        fail ()
-                if parsed.Equals(IPAddress.Any) || parsed.Equals(IPAddress.IPv6Any) then None else Some parsed
+                        failAs ValidationFailure.SocketBind
+                let canonical = if parsed.IsIPv4MappedToIPv6 then parsed.MapToIPv4() else parsed
+                if canonical.Equals(IPAddress.Any) || canonical.Equals(IPAddress.IPv6Any) then None else Some canonical
 
         { Name = name
           Protocol = protocol
@@ -316,22 +342,33 @@ module TraefikStatic =
         let slash = value.IndexOf('/')
         let addressText, prefixText =
             if slash < 0 then value, None
-            elif slash = 0 || value.IndexOf('/', slash + 1) >= 0 then fail ()
+            elif slash = 0 || value.IndexOf('/', slash + 1) >= 0 then failAs ValidationFailure.TrustNetwork
             else value.Substring(0, slash), Some(value.Substring(slash + 1))
         let mutable address = Unchecked.defaultof<IPAddress>
-        if not (IPAddress.TryParse(addressText, &address)) then fail ()
+        if not (IPAddress.TryParse(addressText, &address)) then failAs ValidationFailure.TrustNetwork
         match prefixText with
         | None -> ()
         | Some text ->
             let mutable prefix = 0
-            let maximum = if address.AddressFamily = AddressFamily.InterNetwork then 32 else 128
+            let mappedIpv4 = address.IsIPv4MappedToIPv6
+            let maximum = if address.AddressFamily = AddressFamily.InterNetwork || mappedIpv4 then 32 else 128
             if not (Int32.TryParse(text, NumberStyles.None, CultureInfo.InvariantCulture, &prefix))
                || prefix < 1
-               || prefix > maximum then
-                fail ()
+               || (mappedIpv4 && prefix <= 96)
+               || prefix > (if mappedIpv4 then 128 else maximum) then
+                failAs ValidationFailure.TrustNetwork
 
     let private validateTrustedAddresses (node: JsonNode) =
-        validateStringArray node 64 validateIpOrCidr
+        try
+            validateStringArray node 64 validateIpOrCidr
+        with
+        | :? InvalidOperationException -> failAs ValidationFailure.TrustNetwork
+
+    let private validateNoTrustAll (node: JsonNode) =
+        try
+            if booleanValue node then failAs ValidationFailure.TrustNetwork
+        with
+        | :? InvalidOperationException -> failAs ValidationFailure.TrustNetwork
     let private pemStringValue (node: JsonNode) =
         match requireValue node with
         | :? JsonValue as value when value.GetValueKind() = JsonValueKind.String ->
@@ -346,7 +383,7 @@ module TraefikStatic =
             with _ -> fail ()
         | _ -> fail ()
 
-    let private validatePemAuthority (value: string) =
+    let private validatePemAuthority (validateValidity: bool) (value: string) =
         if not (value.Contains("-----BEGIN CERTIFICATE-----", StringComparison.Ordinal))
            || value.Contains("PRIVATE KEY", StringComparison.Ordinal) then
             fail ()
@@ -355,11 +392,12 @@ module TraefikStatic =
             try
                 certificates.ImportFromPem(value)
                 if certificates.Count = 0 || certificates.Count > 16 then fail ()
-                let now = DateTime.UtcNow
+                let now = if validateValidity then Some(DateTime.UtcNow) else None
                 for certificate in certificates do
-                    if certificate.NotBefore.ToUniversalTime() > now
-                       || certificate.NotAfter.ToUniversalTime() < now then
-                        fail ()
+                    match now with
+                    | Some current when certificate.NotBefore.ToUniversalTime() > current
+                                        || certificate.NotAfter.ToUniversalTime() < current -> fail ()
+                    | _ -> ()
                     let mutable isCertificateAuthority = false
                     for extension in certificate.Extensions do
                         match extension with
@@ -371,14 +409,14 @@ module TraefikStatic =
         finally
             for certificate in certificates do certificate.Dispose()
 
-    let private validatePemAuthorityValue (node: JsonNode) =
-        pemStringValue node |> validatePemAuthority
+    let private validatePemAuthorityValue (validateValidity: bool) (node: JsonNode) =
+        pemStringValue node |> validatePemAuthority validateValidity
 
-    let private validatePemAuthorities (node: JsonNode) =
+    let private validatePemAuthorities (validateValidity: bool) (node: JsonNode) =
         match requireValue node with
         | :? JsonArray as values ->
             if values.Count > 16 then fail ()
-            for value in values do validatePemAuthorityValue value
+            for value in values do validatePemAuthorityValue validateValidity value
         | _ -> fail ()
 
 
@@ -388,10 +426,24 @@ module TraefikStatic =
             @ (if allowConnection then [ "connection"; "notAppendXForwardedFor" ] else [])
         let fields = requireObject node
         validateMembers allowed fields
-        validateOptional fields "insecure" (fun value -> if booleanValue value then fail ())
+        validateOptional fields "insecure" validateNoTrustAll
         validateOptional fields "trustedIPs" validateTrustedAddresses
         validateOptional fields "connection" (fun value -> validateStringArray value 64 requireHttpToken)
         validateOptional fields "notAppendXForwardedFor" validateBoolean
+
+    let private validateProxyProtocol (node: JsonNode) =
+        let fields = requireObject node
+        validateMembers [ "insecure"; "trustedIPs" ] fields
+        validateOptional fields "insecure" validateNoTrustAll
+        match tryField fields "trustedIPs" with
+        | Some value ->
+            try
+                match requireValue value with
+                | :? JsonArray as addresses when addresses.Count > 0 -> validateTrustedAddresses value
+                | _ -> failAs ValidationFailure.TrustNetwork
+            with
+            | :? InvalidOperationException -> failAs ValidationFailure.TrustNetwork
+        | None -> failAs ValidationFailure.TrustNetwork
     let private validateRedirect (node: JsonNode) (sourceName: string) (redirects: ResizeArray<string * string>) =
         let fields = requireObject node
         validateMembers [ "to"; "scheme"; "permanent"; "priority" ] fields
@@ -498,7 +550,7 @@ module TraefikStatic =
         validateOptional fields "reusePort" (fun value -> if booleanValue value then fail ())
         validateOptional fields "asDefault" validateBoolean
         validateOptional fields "transport" validateTransport
-        validateOptional fields "proxyProtocol" (fun value -> validateTrustObject value false)
+        validateOptional fields "proxyProtocol" validateProxyProtocol
         validateOptional fields "forwardedHeaders" (fun value -> validateTrustObject value true)
         validateOptional fields "http" (fun value ->
             if bind.Protocol <> "tcp" then fail ()
@@ -696,7 +748,7 @@ module TraefikStatic =
                     if current <= previous then fail ()
                     previous <- current
             | _ -> fail ())
-        validateOptional fields "pushInterval" validateDuration
+        validateOptional fields "pushInterval" validatePositiveDuration
         validateOptional fields "serviceName" (fun value -> stringValue value |> ignore)
         validateOptional fields "resourceAttributes" validateStringAttributeMap
 
@@ -704,7 +756,7 @@ module TraefikStatic =
         let fields = requireObject node
         validateMembers [ "address"; "pushInterval"; "addEntryPointsLabels"; "addRoutersLabels"; "addServicesLabels"; "prefix" ] fields
         validateLocalHostPort "udp" (requiredField fields "address")
-        validateOptional fields "pushInterval" validateDuration
+        validateOptional fields "pushInterval" validatePositiveDuration
         validateOptional fields "addEntryPointsLabels" validateBoolean
         validateOptional fields "addRoutersLabels" validateBoolean
         validateOptional fields "addServicesLabels" validateBoolean
@@ -714,7 +766,7 @@ module TraefikStatic =
         let fields = requireObject node
         validateMembers [ "address"; "pushInterval"; "addEntryPointsLabels"; "addRoutersLabels"; "addServicesLabels"; "prefix" ] fields
         validateOptional fields "address" (validateLocalHostPort "udp")
-        validateOptional fields "pushInterval" validateDuration
+        validateOptional fields "pushInterval" validatePositiveDuration
         validateOptional fields "addEntryPointsLabels" validateBoolean
         validateOptional fields "addRoutersLabels" validateBoolean
         validateOptional fields "addServicesLabels" validateBoolean
@@ -727,7 +779,7 @@ module TraefikStatic =
             let endpoint = stringValue value
             if String.IsNullOrWhiteSpace(endpoint) then fail ()
             validateLocalHttpDestination endpoint [ "/" ])
-        validateOptional fields "pushInterval" validateDuration
+        validateOptional fields "pushInterval" validatePositiveDuration
         validateOptional fields "org" (fun value -> stringValue value |> ignore)
         validateOptional fields "bucket" (fun value -> stringValue value |> ignore)
         validateOptional fields "addEntryPointsLabels" validateBoolean
@@ -766,29 +818,28 @@ module TraefikStatic =
         if stringValue (requiredField fields "entryPoint") <> privateAdminEntryPoint then fail ()
         validateOptional fields "manualRouting" validateBoolean
         validateOptional fields "terminatingStatusCode" (validateBoundedInteger 100L 599L)
-    let private validateServerTransport (node: JsonNode) =
+    let private validateServerTransport (validateValidity: bool) (node: JsonNode) =
         let fields = requireObject node
         validateMembers [ "insecureSkipVerify"; "rootCAs"; "maxIdleConnsPerHost"; "forwardingTimeouts" ] fields
         validateOptional fields "insecureSkipVerify" (fun value -> if booleanValue value then fail ())
-        validateOptional fields "rootCAs" validatePemAuthorities
+        validateOptional fields "rootCAs" (validatePemAuthorities validateValidity)
         validateOptional fields "maxIdleConnsPerHost" (validateBoundedInteger 0L 1000000L)
         validateOptional fields "forwardingTimeouts" (fun value ->
             validateDurationObject value [ "dialTimeout"; "responseHeaderTimeout"; "idleConnTimeout" ])
 
-    let private validateTcpServerTls (node: JsonNode) =
+    let private validateTcpServerTls (validateValidity: bool) (node: JsonNode) =
         let fields = requireObject node
         validateMembers [ "insecureSkipVerify"; "rootCAs" ] fields
         validateOptional fields "insecureSkipVerify" (fun value -> if booleanValue value then fail ())
-        validateOptional fields "rootCAs" validatePemAuthorities
+        validateOptional fields "rootCAs" (validatePemAuthorities validateValidity)
 
-    let private validateTcpServerTransport (node: JsonNode) =
+    let private validateTcpServerTransport (validateValidity: bool) (node: JsonNode) =
         let fields = requireObject node
         validateMembers [ "dialKeepAlive"; "dialTimeout"; "terminationDelay"; "tls" ] fields
         for field in fields do
             match field.Key with
-            | "tls" -> validateTcpServerTls field.Value
+            | "tls" -> validateTcpServerTls validateValidity field.Value
             | _ -> validateDuration field.Value
-
     let private validateLog (node: JsonNode) =
         let fields = requireObject node
         validateMembers [ "level"; "format"; "noColor"; "otlp" ] fields
@@ -816,7 +867,7 @@ module TraefikStatic =
     /// Validate bounded native static fields, returning every user and legacy entrypoint protocol.
     /// EntryPoint.address defaults to TCP when its protocol suffix is omitted; HTTP/3 contributes
     /// an additional UDP socket on the same bind address and port.
-    let validate (legacy: Map<string, int>) (adminPort: int) (settings: JsonObject) : Map<string, string> =
+    let private validateWith (validateCertificateValidity: bool) (legacy: Map<string, int>) (adminPort: int) (settings: JsonObject) : Map<string, string> =
         if isNull settings || adminPort < 1 || adminPort > 65535 then fail ()
         let rootFields =
             [ "entryPoints"; "certificatesResolvers"; "global"; "core"; "log"; "accessLog"; "metrics"; "tracing"; "serversTransport"; "tcpServersTransport"; "ping"; "hostResolver" ]
@@ -827,7 +878,7 @@ module TraefikStatic =
         let binds = ResizeArray<Bind>()
         let redirects = ResizeArray<string * string>()
 
-        if legacy.Count + (tryField settings "entryPoints" |> Option.map (requireObject >> fun item -> item.Count) |> Option.defaultValue 0) > 64 then fail ()
+        if legacy.Count >= MaximumObservedEntryPoints then fail ()
         for KeyValue(name, port) in legacy do
             let name = requireEntryPointName name
             if not (names.Add(name)) || port < 1 || port > 65535 then fail ()
@@ -836,7 +887,7 @@ module TraefikStatic =
 
         validateOptional settings "entryPoints" (fun value ->
             let entryPoints = requireObject value
-            if entryPoints.Count > 64 then fail ()
+            if entryPoints.Count > 64 || legacy.Count + entryPoints.Count >= MaximumObservedEntryPoints then fail ()
             for field in entryPoints do
                 let name = requireEntryPointName field.Key
                 if not (names.Add(name)) then fail ()
@@ -854,15 +905,19 @@ module TraefikStatic =
         validateOptional settings "metrics" validateMetrics
         validateOptional settings "ping" validatePing
         validateOptional settings "tracing" validateTracing
-        validateOptional settings "serversTransport" validateServerTransport
-        validateOptional settings "tcpServersTransport" validateTcpServerTransport
+        validateOptional settings "serversTransport" (validateServerTransport validateCertificateValidity)
+        validateOptional settings "tcpServersTransport" (validateTcpServerTransport validateCertificateValidity)
 
+        // Only sockets sharing a port can collide; legacy maps can span many API pages.
+        binds.Sort(Comparison<Bind>(fun a b -> compare a.Port b.Port))
+        let adminBind = { Name = "admin"; Protocol = "tcp"; Host = Some IPAddress.Loopback; Port = adminPort }
         for index = 0 to binds.Count - 1 do
             let current = binds[index]
-            let adminBind = { current with Name = "admin"; Protocol = "tcp"; Host = Some IPAddress.Loopback; Port = adminPort }
-            if bindsOverlap current adminBind then fail ()
-            for otherIndex = index + 1 to binds.Count - 1 do
-                if bindsOverlap current binds[otherIndex] then fail ()
+            if bindsOverlap current adminBind then failAs ValidationFailure.SocketBind
+            let mutable next = index + 1
+            while next < binds.Count && binds[next].Port = current.Port do
+                if bindsOverlap current binds[next] then failAs ValidationFailure.SocketBind
+                next <- next + 1
 
         for _, target in redirects do
             if isReservedEntryPointName target
@@ -871,6 +926,14 @@ module TraefikStatic =
                 fail ()
 
         protocols
+    /// Admit a static configuration, including current validity windows for inline CA certificates.
+    let validate (legacy: Map<string, int>) (adminPort: int) (settings: JsonObject) : Map<string, string> =
+        validateWith true legacy adminPort settings
+
+    /// Validate retained static settings without treating an expired inline CA as an ownership error.
+    /// PEM structure, certificate-authority constraints, sockets and every other static rule remain enforced.
+    let validateForRead (legacy: Map<string, int>) (adminPort: int) (settings: JsonObject) : Map<string, string> =
+        validateWith false legacy adminPort settings
     let private staticObject (root: JsonObject) (name: string) =
         match tryField root name with
         | Some value -> requireObject value

@@ -122,7 +122,7 @@ for file in pebble.minica.pem cert.pem key.pem; do
 done
 scp -F "$SSH_CONFIG" -P "$SSH_PORT" "$state_dir/dns-tsig-secret" "$SSH_USER@$SSH_HOST:$guest_root/dns/tsig-secret"
 scp -F "$SSH_CONFIG" -P "$SSH_PORT" "$script_dir/guest-services.sh" "$SSH_USER@$SSH_HOST:$guest_root/guest-services.sh"
-ssh -F "$SSH_CONFIG" -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "chmod 700 '$guest_root/guest-services.sh'; bash '$guest_root/guest-services.sh' '$guest_root'"
+/usr/bin/ssh -F "$SSH_CONFIG" -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "chmod 700 '$guest_root/guest-services.sh' && bash '$guest_root/guest-services.sh' '$guest_root'"
 for file in upstream-ca.pem client-ca.pem; do
     scp -F "$SSH_CONFIG" -P "$SSH_PORT" "$SSH_USER@$SSH_HOST:$guest_root/certs/$file" "$state_dir/$file"
 done

@@ -8,15 +8,19 @@ open System.Text.Json.Nodes
 
 module Program =
     let private usage () =
-        Console.Error.WriteLine("Usage: keroosha-iac-helper apt|ufw|firewalld|traefik|docker|docker-job|swapfile|sshd|fail2ban|users|sudo|content|service|--version")
+        Console.Error.WriteLine("Usage: keroosha-iac-helper apt|ufw|firewalld|traefik-capabilities|traefik-v2|docker|docker-job|swapfile|sshd|fail2ban|users|sudo|content|service|--version")
         64
+
+    let private traefikCapabilityEnvelope =
+        """{"protocol":"dorothy-traefik","version":2,"capabilities":["traefik-v2"]}"""
 
     let private dispatch (command: string) (request: JsonElement) =
         match command with
         | "apt" -> Apt.handle HostEnvironment.system request
         | "ufw" -> Ufw.handle HostEnvironment.system request
         | "firewalld" -> Firewalld.handle HostEnvironment.system request
-        | "traefik" -> Traefik.handle HostEnvironment.system request
+        | "traefik" -> raise (Traefik.BackendError("The legacy Traefik command is disabled; use the negotiated traefik-v2 command."))
+        | "traefik-v2" -> Traefik.handle HostEnvironment.system request
         | "docker" -> DockerEngine.handle HostEnvironment.system request
         | "docker-job" -> DockerJob.handle HostEnvironment.system request
         | "swapfile" -> Swapfile.handle HostEnvironment.system request
@@ -91,11 +95,19 @@ module Program =
             with error ->
                 reportFailure error
                 1
+        elif arguments.Length = 1 && arguments[0] = "traefik-capabilities" then
+            try
+                verifyGlobalization ()
+                Console.Out.WriteLine(traefikCapabilityEnvelope)
+                0
+            with error ->
+                reportFailure error
+                1
         elif arguments.Length <> 1 then
             usage ()
         else
             match arguments[0] with
-            | command when command = "apt" || command = "ufw" || command = "firewalld" || command = "traefik" || command = "docker" || command = "docker-job" || command = "swapfile" || command = "sshd" || command = "fail2ban" || command = "users" || command = "sudo" || command = "content" || command = "service" ->
+            | command when command = "apt" || command = "ufw" || command = "firewalld" || command = "traefik" || command = "traefik-v2" || command = "docker" || command = "docker-job" || command = "swapfile" || command = "sshd" || command = "fail2ban" || command = "users" || command = "sudo" || command = "content" || command = "service" ->
                 try
                     verifyGlobalization ()
                     let requestText = Console.In.ReadToEnd()

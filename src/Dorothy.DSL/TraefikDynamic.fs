@@ -13,6 +13,14 @@ open System.Text.RegularExpressions
 /// Strict validation of the supported Traefik 3.7.16 file-provider HTTP, TCP, and UDP graphs.
 /// Unknown fields fail closed so a version bump cannot silently expand host access.
 module TraefikDynamic =
+    [<RequireQualifiedAccess>]
+    type ValidationFailure =
+        | UnresolvedReference
+        | ListenerProtocolMismatch
+        | UdpListenerOverlap
+        | ProxyProtocolPlacement
+    exception ValidationError of ValidationFailure
+
     let private reject () = invalidOp "Traefik dynamic configuration is invalid."
 
     let private safeString (value: string) =
@@ -23,19 +31,23 @@ module TraefikDynamic =
 
     let private validName (value: string) =
         let value = safeString value
-        if value.Length = 0 || value.Length > 128 then reject ()
-        for index = 0 to value.Length - 1 do
-            let character = value[index]
-            if not (Char.IsAsciiLetterOrDigit character || character = '_' || character = '-' || character = '.') then
-                reject ()
-        if not (Char.IsAsciiLetterOrDigit value[0]) then reject ()
+        if not (TraefikHttpGraphModel.isValidName 128 value) then reject ()
         value
+
+    let private unresolvedReference () =
+        raise (ValidationError ValidationFailure.UnresolvedReference)
+
     let private localReference (value: string) =
         let value = safeString value
-        if value.EndsWith("@file", StringComparison.Ordinal) then
-            value.Substring(0, value.Length - 5) |> validName
-        else
-            validName value
+        let name =
+            if value.EndsWith("@file", StringComparison.Ordinal) then
+                value.Substring(0, value.Length - 5)
+            elif value.Contains("@", StringComparison.Ordinal) then
+                unresolvedReference ()
+            else
+                value
+        if not (TraefikHttpGraphModel.isValidName 128 name) then unresolvedReference ()
+        name
 
     let private property (parent: JsonObject) (name: string) =
         let mutable value = Unchecked.defaultof<JsonNode>
@@ -162,9 +174,9 @@ module TraefikDynamic =
 
     let private optionalObject (parent: JsonObject) (name: string) (validate: JsonObject -> unit) =
         property parent name |> Option.iter (requireObject >> validate)
-    let private rejectGeneratedPrefix (prefix: string) (values: Map<string, 'T>) =
+    let private rejectGeneratedPrefix (prefix: string) (trustedNames: Set<string>) (values: Map<string, 'T>) =
         for KeyValue(name, _) in values do
-            if name.StartsWith(prefix, StringComparison.Ordinal) then reject ()
+            if name.StartsWith(prefix, StringComparison.Ordinal) && not (Set.contains name trustedNames) then reject ()
 
 
     let private validateHttpUrl (node: JsonNode) =
@@ -241,12 +253,13 @@ module TraefikDynamic =
 
     let private requireReference (values: Map<string, 'T>) (value: string) =
         let name = localReference value
-        if not (Map.containsKey name values) then reject ()
+        if not (Map.containsKey name values) then unresolvedReference ()
         name
 
     let private requireSetReference (values: Set<string>) (value: string) =
-        let name = validName value
-        if not (Set.contains name values) then reject ()
+        let name = safeString value
+        if not (TraefikHttpGraphModel.isValidName 128 name) || not (Set.contains name values) then
+            unresolvedReference ()
         name
 
     let private validateEndpointReferences (entryPoints: Map<string, string>) (protocol: string) (router: JsonObject) =
@@ -254,9 +267,13 @@ module TraefikDynamic =
         if List.isEmpty names then reject ()
         let seen = HashSet<string>(StringComparer.Ordinal)
         for name in names do
-            let name = validName name
-            if name = "keroosha-admin" || not (seen.Add name) || Map.tryFind name entryPoints <> Some protocol then reject ()
-
+            if not (TraefikHttpGraphModel.isValidName 128 name) then unresolvedReference ()
+            if name = "keroosha-admin" || not (seen.Add name) then reject ()
+            match Map.tryFind name entryPoints with
+            | None -> unresolvedReference ()
+            | Some actual when actual <> protocol ->
+                raise (ValidationError ValidationFailure.ListenerProtocolMismatch)
+            | Some _ -> ()
     let private validateTlsDomains (node: JsonNode) =
         let domains = requireArray node
         if domains.Count = 0 then reject ()
@@ -283,7 +300,7 @@ module TraefikDynamic =
 
     let private validateTcpRouterTls (resolvers: Set<string>) (tlsOptions: Set<string>) (node: JsonObject) =
         objectFields node [ "passthrough"; "options"; "certResolver"; "domains" ]
-        optionalBoolean node "passthrough"
+        let passthrough = property node "passthrough" |> Option.exists boolValue
         optionalStringField node "options"
         optionalStringField node "certResolver"
         optional node "options" (fun value ->
@@ -291,6 +308,7 @@ module TraefikDynamic =
             if name <> "default" && not (Set.contains name tlsOptions) then reject ())
         optional node "certResolver" (fun value -> requireSetReference resolvers (stringValue value) |> ignore)
         optional node "domains" validateTlsDomains
+        if passthrough && ([ "options"; "certResolver"; "domains" ] |> List.exists (fun field -> property node field |> Option.isSome)) then reject ()
 
     let private validateRouterObservability (node: JsonObject) =
         objectFields node [ "accessLogs"; "metrics"; "tracing"; "traceVerbosity" ]
@@ -339,12 +357,14 @@ module TraefikDynamic =
         optionalBoolean node "disableHTTP2"
         optionalStringField node "peerCertURI"
         optionalObject node "forwardingTimeouts" (fun timeouts ->
-            objectFields timeouts [ "dialTimeout"; "responseHeaderTimeout"; "idleConnTimeout"; "readIdleTimeout"; "pingTimeout" ]
+            objectFields timeouts [ "dialTimeout"; "responseHeaderTimeout"; "idleConnTimeout"; "readIdleTimeout"; "pingTimeout"; "readTimeout"; "writeTimeout" ]
             optionalDuration timeouts "dialTimeout"
             optionalDuration timeouts "responseHeaderTimeout"
             optionalDuration timeouts "idleConnTimeout"
             optionalDuration timeouts "readIdleTimeout"
-            optionalDuration timeouts "pingTimeout")
+            optionalDuration timeouts "pingTimeout"
+            optionalDuration timeouts "readTimeout"
+            optionalDuration timeouts "writeTimeout")
         match optionalString node "minVersion", optionalString node "maxVersion" with
         | Some "VersionTLS13", Some "VersionTLS12" -> reject ()
         | _ -> ()
@@ -367,6 +387,17 @@ module TraefikDynamic =
         optionalDuration node "terminationDelay"
         optionalObject node "proxyProtocol" (fun value -> validateProxyProtocol (value :> JsonNode))
         optionalObject node "tls" validateTcpTransportTls
+
+    let private validateTcpHealthCheck (node: JsonObject) =
+        objectFields node [ "port"; "send"; "expect"; "interval"; "unhealthyInterval"; "timeout" ]
+        optional node "port" (fun value ->
+            let port = intValue value
+            if port < 1 || port > 65535 then reject ())
+        optionalStringField node "send"
+        optionalStringField node "expect"
+        optionalDuration node "interval"
+        optionalDuration node "unhealthyInterval"
+        optionalDuration node "timeout"
 
     let private validateHealthCheck (node: JsonObject) =
         objectFields node
@@ -497,9 +528,13 @@ module TraefikDynamic =
             optional errors "maxRequestBodyBytes" integer64
             optionalStringArray errors "status")
 
-    let private validateHttpService (services: Map<string, JsonObject>) (transports: Map<string, JsonObject>) (graph: Dictionary<string, ResizeArray<string>>) (name: string) (node: JsonObject) =
-        objectFields node [ "loadBalancer"; "highestRandomWeight"; "weighted"; "mirroring"; "failover" ]
+    let private validateHttpService (services: Map<string, JsonObject>) (transports: Map<string, JsonObject>) (middlewares: Map<string, JsonObject>) (graph: Dictionary<string, ResizeArray<string>>) (name: string) (node: JsonObject) =
+        objectFields node [ "middlewares"; "loadBalancer"; "highestRandomWeight"; "weighted"; "mirroring"; "failover" ]
         let source = "service:" + name
+        optional node "middlewares" (fun value ->
+            for middleware in strings value do
+                let target = requireReference middlewares middleware
+                graph[source].Add("middleware:" + target))
         let strategy = [ "loadBalancer"; "highestRandomWeight"; "weighted"; "mirroring"; "failover" ]
         let selected = strategy |> List.filter (fun field -> property node field |> Option.isSome)
         if selected.Length <> 1 then reject ()
@@ -539,10 +574,9 @@ module TraefikDynamic =
         =
         let kinds =
             [ "addPrefix"; "basicAuth"; "buffering"; "chain"; "circuitBreaker"; "compress"; "contentType"
-              "digestAuth"; "errors"; "forwardAuth"; "grpcWeb"; "headers"; "ipAllowList"; "ipWhiteList"
+              "digestAuth"; "errors"; "forwardAuth"; "grpcWeb"; "headers"; "encodedCharacters"; "ipAllowList"; "ipWhiteList"
               "inFlightReq"; "passTLSClientCert"; "rateLimit"; "redirectRegex"; "redirectScheme"; "replacePath"
               "replacePathRegex"; "retry"; "stripPrefix"; "stripPrefixRegex" ]
-        objectFields node kinds
         if node.Count <> 1 then reject ()
         let field = node |> Seq.head |> fun pair -> pair.Key
         let validateIpList allowRejectStatus config =
@@ -599,6 +633,14 @@ module TraefikDynamic =
             optionalStringArray config "encodings"
             optionalStringField config "defaultEncoding")
         | "contentType" -> optionalObject node field (fun config -> objectFields config [ "autoDetect" ]; optionalBoolean config "autoDetect")
+        | "encodedCharacters" -> optionalObject node field (fun config ->
+            objectFields config
+                [ "allowEncodedSlash"; "allowEncodedBackSlash"; "allowEncodedNullCharacter"; "allowEncodedSemicolon"
+                  "allowEncodedPercent"; "allowEncodedQuestionMark"; "allowEncodedHash" ]
+            for allowed in
+                [ "allowEncodedSlash"; "allowEncodedBackSlash"; "allowEncodedNullCharacter"; "allowEncodedSemicolon"
+                  "allowEncodedPercent"; "allowEncodedQuestionMark"; "allowEncodedHash" ] do
+                optionalBoolean config allowed)
         | "errors" -> optionalObject node field (fun config ->
             objectFields config [ "status"; "statusRewrites"; "service"; "query"; "errorRequestHeaders" ]
             optionalStringArray config "status"
@@ -611,7 +653,7 @@ module TraefikDynamic =
             objectFields config
                 [ "address"; "tls"; "trustForwardHeader"; "authResponseHeaders"; "authResponseHeadersRegex"; "authRequestHeaders"
                   "addAuthCookiesToResponse"; "headerField"; "forwardBody"; "maxBodySize"; "maxResponseBodySize"
-                  "preserveLocationHeader"; "preserveRequestMethod" ]
+                  "preserveLocationHeader"; "preserveRequestMethod"; "authSigninURL" ]
             required config "address" validateHttpUrl |> ignore
             optionalObject config "tls" validateForwardAuthTls
             optionalBoolean config "trustForwardHeader"
@@ -624,7 +666,8 @@ module TraefikDynamic =
             optional config "maxBodySize" integer64
             optional config "maxResponseBodySize" integer64
             optionalBoolean config "preserveLocationHeader"
-            optionalBoolean config "preserveRequestMethod")
+            optionalBoolean config "preserveRequestMethod"
+            optionalStringField config "authSigninURL")
         | "grpcWeb" -> optionalObject node field (fun config -> objectFields config [ "allowOrigins" ]; optionalStringArray config "allowOrigins")
         | "headers" -> optionalObject node field (fun config ->
             objectFields config
@@ -678,11 +721,11 @@ module TraefikDynamic =
                 optionalBoolean info "notBefore"
                 optionalBoolean info "sans"
                 optionalBoolean info "serialNumber"
-                let validateDn dn =
-                    objectFields dn [ "country"; "province"; "locality"; "organization"; "organizationalUnit"; "commonName"; "serialNumber"; "domainComponent" ]
-                    for name in [ "country"; "province"; "locality"; "organization"; "organizationalUnit"; "commonName"; "serialNumber"; "domainComponent" ] do optionalBoolean dn name
-                optionalObject info "subject" validateDn
-                optionalObject info "issuer" validateDn))
+                let validateDn allowedFields (dn: JsonObject) =
+                    objectFields dn allowedFields
+                    for name in allowedFields do optionalBoolean dn name
+                optionalObject info "subject" (validateDn [ "country"; "province"; "locality"; "organization"; "organizationalUnit"; "commonName"; "serialNumber"; "domainComponent" ])
+                optionalObject info "issuer" (validateDn [ "country"; "province"; "locality"; "organization"; "commonName"; "serialNumber"; "domainComponent" ])))
         | "rateLimit" -> optionalObject node field (fun config ->
             objectFields config [ "average"; "period"; "burst"; "sourceCriterion"; "redis" ]
             optional config "average" nonNegativeInt64
@@ -718,9 +761,16 @@ module TraefikDynamic =
             optionalStringField config "regex"
             optionalStringField config "replacement")
         | "retry" -> optionalObject node field (fun config ->
-            objectFields config [ "attempts"; "initialInterval" ]
+            objectFields config
+                [ "attempts"; "timeout"; "initialInterval"; "maxRequestBodyBytes"; "status"
+                  "disableRetryOnNetworkError"; "retryNonIdempotentMethod" ]
             optionalInteger config "attempts"
-            optionalDuration config "initialInterval")
+            optionalDuration config "timeout"
+            optionalDuration config "initialInterval"
+            optional config "maxRequestBodyBytes" integer64
+            optionalStringArray config "status"
+            optionalBoolean config "disableRetryOnNetworkError"
+            optionalBoolean config "retryNonIdempotentMethod")
         | "stripPrefix" -> optionalObject node field (fun config ->
             objectFields config [ "prefixes"; "forceSlash" ]
             optionalStringArray config "prefixes"
@@ -728,19 +778,77 @@ module TraefikDynamic =
         | "stripPrefixRegex" -> optionalObject node field (fun config -> objectFields config [ "regex" ]; optionalStringArray config "regex")
         | _ -> reject ()
 
-    let private validateHttpRouter (entryPoints: Map<string, string>) (resolvers: Set<string>) (tlsOptions: Set<string>) (services: Map<string, JsonObject>) (middlewares: Map<string, JsonObject>) (legacyRouters: Set<string>) (name: string) (node: JsonObject) =
-        if name = "keroosha-admin" || Set.contains name legacyRouters then reject ()
-        objectFields node [ "entryPoints"; "middlewares"; "service"; "rule"; "ruleSyntax"; "priority"; "tls"; "observability" ]
-        validateEndpointReferences entryPoints "tcp" node
-        requiredString node "service" |> requireReference services |> ignore
+    let private validateTrustedAdminRouter (entryPoints: Map<string, string>) (node: JsonObject) =
+        objectFields node [ "entryPoints"; "service"; "rule"; "priority" ]
+        if requiredStrings node "entryPoints" <> [ "keroosha-admin" ] then reject ()
+        match Map.tryFind "keroosha-admin" entryPoints with
+        | None -> unresolvedReference ()
+        | Some "tcp" -> ()
+        | Some _ -> raise (ValidationError ValidationFailure.ListenerProtocolMismatch)
+        if requiredString node "service" <> "api@internal" then reject ()
+        if not (TraefikHttpGraphModel.isGeneratedAdminRule (requiredString node "rule")) then reject ()
+        if required node "priority" intValue <> 1000000 then reject ()
+
+    let private validateTrustedRedirectRouter (loweredGraph: TraefikHttpGraphModel.LoweredGraph) (node: JsonObject) =
+        objectFields node [ "entryPoints"; "middlewares"; "service"; "rule"; "tls" ]
+        if requiredString node "service" <> "noop@internal" then reject ()
+        match requiredStrings node "middlewares" with
+        | [ name ] when Set.contains name loweredGraph.RedirectMiddlewareNames -> ()
+        | _ -> reject ()
+
+    let private validateHttpRouter (entryPoints: Map<string, string>) (resolvers: Set<string>) (tlsOptions: Set<string>) (services: Map<string, JsonObject>) (middlewares: Map<string, JsonObject>) (routers: Map<string, JsonObject>) (routerGraph: Dictionary<string, ResizeArray<string>>) (routerChildren: Dictionary<string, int>) (legacyRouters: Set<string>) (loweredGraph: TraefikHttpGraphModel.LoweredGraph option) (name: string) (node: JsonObject) =
+        let trustedRouter =
+            loweredGraph
+            |> Option.exists (fun graph -> Set.contains name graph.RouterNames)
+        let internalTarget =
+            loweredGraph
+            |> Option.bind (fun graph -> Map.tryFind name graph.InternalTargets)
+        if (name = "keroosha-admin" || Set.contains name legacyRouters) && not trustedRouter then reject ()
+        if Option.isSome internalTarget && not trustedRouter then reject ()
+        match internalTarget with
+        | Some TraefikHttpGraphModel.GeneratedInternalTarget.AdminApi ->
+            if name <> "keroosha-admin" then reject ()
+            validateTrustedAdminRouter entryPoints node
+        | Some TraefikHttpGraphModel.GeneratedInternalTarget.RedirectNoop ->
+            match loweredGraph with
+            | Some graph -> validateTrustedRedirectRouter graph node
+            | None -> reject ()
+        | None ->
+            objectFields node [ "entryPoints"; "middlewares"; "service"; "rule"; "ruleSyntax"; "priority"; "tls"; "observability"; "parentRefs" ]
+        let parents =
+            match internalTarget, property node "parentRefs" with
+            | Some TraefikHttpGraphModel.GeneratedInternalTarget.AdminApi, None -> []
+            | Some TraefikHttpGraphModel.GeneratedInternalTarget.AdminApi, Some _ -> reject ()
+            | _, None ->
+                validateEndpointReferences entryPoints "tcp" node
+                []
+            | _, Some value ->
+                let references = strings value
+                if List.isEmpty references then reject ()
+                let seen = HashSet<string>(StringComparer.Ordinal)
+                references
+                |> List.map (fun reference ->
+                    let parent = requireReference routers reference
+                    if not (seen.Add parent) then reject ()
+                    routerGraph[name].Add(parent)
+                    routerChildren[parent] <- routerChildren[parent] + 1
+                    parent)
+        if not (List.isEmpty parents) then
+            if [ "entryPoints"; "tls"; "observability" ] |> List.exists (fun field -> property node field |> Option.isSome) then reject ()
         let rule = requiredString node "rule"
         if String.IsNullOrWhiteSpace(rule) then reject ()
         optionalStringField node "ruleSyntax"
         optionalInteger node "priority"
+        match internalTarget with
+        | Some TraefikHttpGraphModel.GeneratedInternalTarget.AdminApi
+        | Some TraefikHttpGraphModel.GeneratedInternalTarget.RedirectNoop -> ()
+        | None ->
+            optional node "service" (fun value -> requireReference services (stringValue value) |> ignore)
         optional node "middlewares" (fun value ->
             for middleware in strings value do requireReference middlewares middleware |> ignore)
-        optionalObject node "tls" (validateHttpRouterTls resolvers tlsOptions)
-        optionalObject node "observability" validateRouterObservability
+        if List.isEmpty parents && internalTarget <> Some TraefikHttpGraphModel.GeneratedInternalTarget.AdminApi then
+            optionalObject node "tls" (validateHttpRouterTls resolvers tlsOptions)
+            optionalObject node "observability" validateRouterObservability
 
     let private validateAcyclic (graph: Dictionary<string, ResizeArray<string>>) =
         let colors = Dictionary<string, byte>(StringComparer.Ordinal)
@@ -764,19 +872,28 @@ module TraefikDynamic =
                     else
                         colors[current] <- 2uy
 
-    let private validateHttp (entryPoints: Map<string, string>) (resolvers: Set<string>) (tlsOptions: Set<string>) (legacyRouters: Set<string>) (node: JsonObject) =
+    let private validateHttp (entryPoints: Map<string, string>) (resolvers: Set<string>) (tlsOptions: Set<string>) (legacyRouters: Set<string>) (loweredGraph: TraefikHttpGraphModel.LoweredGraph option) (node: JsonObject) =
         objectFields node [ "routers"; "services"; "middlewares"; "serversTransports" ]
         let routers = childObjects (Some node) "routers"
         let services = childObjects (Some node) "services"
         let middlewares = childObjects (Some node) "middlewares"
         let transports = childObjects (Some node) "serversTransports"
-        rejectGeneratedPrefix "keroosha-backend-" services
-        rejectGeneratedPrefix "keroosha-redirect-" middlewares
+        let trustedBackendServices =
+            loweredGraph |> Option.map (fun graph -> graph.BackendServiceNames) |> Option.defaultValue Set.empty
+        let trustedRedirectMiddlewares =
+            loweredGraph |> Option.map (fun graph -> graph.RedirectMiddlewareNames) |> Option.defaultValue Set.empty
+        rejectGeneratedPrefix "keroosha-backend-" trustedBackendServices services
+        rejectGeneratedPrefix "keroosha-redirect-" trustedRedirectMiddlewares middlewares
         let graph = Dictionary<string, ResizeArray<string>>(StringComparer.Ordinal)
+        let routerGraph = Dictionary<string, ResizeArray<string>>(StringComparer.Ordinal)
+        let routerChildren = Dictionary<string, int>(StringComparer.Ordinal)
         for KeyValue(name, _) in services do graph.Add("service:" + name, ResizeArray())
         for KeyValue(name, _) in middlewares do graph.Add("middleware:" + name, ResizeArray())
+        for KeyValue(name, _) in routers do
+            routerGraph.Add(name, ResizeArray())
+            routerChildren.Add(name, 0)
         for KeyValue(name, transport) in transports do validateHttpTransport transport
-        for KeyValue(name, service) in services do validateHttpService services transports graph name service
+        for KeyValue(name, service) in services do validateHttpService services transports middlewares graph name service
         for KeyValue(name, middleware) in middlewares do
             validateHttpMiddlewareConfig services graph ("middleware:" + name) middleware
         for edges in graph.Values do
@@ -784,19 +901,35 @@ module TraefikDynamic =
                 let edge = edges[index]
                 if not (graph.ContainsKey edge) then reject ()
         for KeyValue(name, router) in routers do
-            validateHttpRouter entryPoints resolvers tlsOptions services middlewares legacyRouters name router
+            validateHttpRouter entryPoints resolvers tlsOptions services middlewares routers routerGraph routerChildren legacyRouters loweredGraph name router
+        for KeyValue(name, router) in routers do
+            let hasService = property router "service" |> Option.isSome
+            let hasChildren = routerChildren[name] > 0
+            if hasService = hasChildren then reject ()
         validateAcyclic graph
+        validateAcyclic routerGraph
+
+    let private hostSniMatchers = Regex(@"\bHostSNI\s*\(([^()]*)\)", RegexOptions.CultureInvariant)
+
+    let private hasNonWildcardHostSni (rule: string) =
+        hostSniMatchers.Matches(rule)
+        |> Seq.cast<Match>
+        |> Seq.exists (fun matcher ->
+            let argument = matcher.Groups[1].Value.Trim()
+            argument <> "`*`" && argument <> "\"*\"")
 
     let private validateTcpRouter (entryPoints: Map<string, string>) (resolvers: Set<string>) (tlsOptions: Set<string>) (services: Map<string, JsonObject>) (middlewares: Map<string, JsonObject>) (node: JsonObject) =
         objectFields node [ "entryPoints"; "middlewares"; "service"; "rule"; "ruleSyntax"; "priority"; "tls" ]
         validateEndpointReferences entryPoints "tcp" node
         requiredString node "service" |> requireReference services |> ignore
-        if String.IsNullOrWhiteSpace(requiredString node "rule") then reject ()
+        let rule = requiredString node "rule"
+        if String.IsNullOrWhiteSpace(rule) then reject ()
         optionalStringField node "ruleSyntax"
         optionalInteger node "priority"
         optional node "middlewares" (fun value ->
             for middleware in strings value do requireReference middlewares middleware |> ignore)
         optionalObject node "tls" (validateTcpRouterTls resolvers tlsOptions)
+        if (property node "tls" |> Option.isNone) && hasNonWildcardHostSni rule then reject ()
 
     let private validateTcpWeightedServices (services: Map<string, JsonObject>) (graph: Dictionary<string, ResizeArray<string>>) (source: string) (node: JsonNode) =
         let values = requireArray node
@@ -816,7 +949,7 @@ module TraefikDynamic =
         if strategies.Length <> 1 then reject ()
         match strategies.Head with
         | "loadBalancer" -> optionalObject node "loadBalancer" (fun loadBalancer ->
-            objectFields loadBalancer [ "servers"; "serversTransport"; "proxyProtocol"; "terminationDelay" ]
+            objectFields loadBalancer [ "servers"; "serversTransport"; "proxyProtocol"; "terminationDelay"; "healthCheck" ]
             let servers = required loadBalancer "servers" requireArray
             if servers.Count = 0 then reject ()
             for server in servers do
@@ -825,13 +958,18 @@ module TraefikDynamic =
                 objectFields value [ "address"; "tls" ]
                 required value "address" validateHostPort |> ignore
                 optionalBoolean value "tls"
+            let hasNamedTransport = property loadBalancer "serversTransport" |> Option.isSome
             optional loadBalancer "serversTransport" (fun value -> requireReference transports (stringValue value) |> ignore)
-            optionalObject loadBalancer "proxyProtocol" validateProxyProtocol
-            optional loadBalancer "terminationDelay" integer)
+            if hasNamedTransport && ([ "proxyProtocol"; "terminationDelay" ] |> List.exists (fun field -> property loadBalancer field |> Option.isSome)) then
+                raise (ValidationError ValidationFailure.ProxyProtocolPlacement)
+            optionalObject loadBalancer "proxyProtocol" (fun value -> validateProxyProtocol (value :> JsonNode))
+            optional loadBalancer "terminationDelay" integer
+            optionalObject loadBalancer "healthCheck" validateTcpHealthCheck)
         | "weighted" -> optionalObject node "weighted" (fun weighted ->
-            objectFields weighted [ "services" ]
+            objectFields weighted [ "services"; "healthCheck" ]
             let children = required weighted "services" requireArray
-            validateTcpWeightedServices services graph source (children :> JsonNode))
+            validateTcpWeightedServices services graph source (children :> JsonNode)
+            optionalObject weighted "healthCheck" (fun value -> validateEmptyObject (value :> JsonNode)))
         | _ -> reject ()
 
     let private validateTcpMiddleware (node: JsonObject) =
@@ -862,9 +1000,12 @@ module TraefikDynamic =
         for KeyValue(_, router) in routers do validateTcpRouter entryPoints resolvers tlsOptions services middlewares router
         validateAcyclic graph
 
-    let private validateUdpRouter (entryPoints: Map<string, string>) (services: Map<string, JsonObject>) (node: JsonObject) =
+    let private validateUdpRouter (entryPoints: Map<string, string>) (services: Map<string, JsonObject>) (ownedEntryPoints: HashSet<string>) (node: JsonObject) =
         objectFields node [ "entryPoints"; "service" ]
         validateEndpointReferences entryPoints "udp" node
+        for entryPoint in requiredStrings node "entryPoints" do
+            if not (ownedEntryPoints.Add(entryPoint)) then
+                raise (ValidationError ValidationFailure.UdpListenerOverlap)
         requiredString node "service" |> requireReference services |> ignore
 
     let private validateUdpService (services: Map<string, JsonObject>) (graph: Dictionary<string, ResizeArray<string>>) (name: string) (node: JsonObject) =
@@ -900,10 +1041,63 @@ module TraefikDynamic =
         let routers = childObjects (Some node) "routers"
         let services = childObjects (Some node) "services"
         let graph = Dictionary<string, ResizeArray<string>>(StringComparer.Ordinal)
+        let ownedEntryPoints = HashSet<string>(StringComparer.Ordinal)
         for KeyValue(name, _) in services do graph.Add("service:" + name, ResizeArray())
         for KeyValue(name, service) in services do validateUdpService services graph name service
-        for KeyValue(_, router) in routers do validateUdpRouter entryPoints services router
+        for KeyValue(_, router) in routers do validateUdpRouter entryPoints services ownedEntryPoints router
         validateAcyclic graph
+
+    let private validateLoweredGraph (loweredGraph: TraefikHttpGraphModel.LoweredGraph) (dynamicRoot: JsonObject) =
+        let originalHttp = loweredGraph.Http
+        if isNull originalHttp then reject ()
+        let finalHttp = required dynamicRoot "http" requireObject
+        let originalRouters = childObjects (Some originalHttp) "routers"
+        let originalServices = childObjects (Some originalHttp) "services"
+        let originalMiddlewares = childObjects (Some originalHttp) "middlewares"
+        let routers = childObjects (Some finalHttp) "routers"
+        let services = childObjects (Some finalHttp) "services"
+        let middlewares = childObjects (Some finalHttp) "middlewares"
+        let requireNames (expected: Set<string>) (before: Map<string, JsonObject>) (after: Map<string, JsonObject>) =
+            for name in expected do
+                if not (Map.containsKey name before && Map.containsKey name after) then reject ()
+        requireNames loweredGraph.RouterNames originalRouters routers
+        requireNames loweredGraph.BackendServiceNames originalServices services
+        requireNames loweredGraph.RedirectMiddlewareNames originalMiddlewares middlewares
+        if not (Set.contains "keroosha-admin" loweredGraph.RouterNames)
+           || Map.tryFind "keroosha-admin" loweredGraph.InternalTargets <> Some TraefikHttpGraphModel.GeneratedInternalTarget.AdminApi then
+            reject ()
+        for KeyValue(name, target) in loweredGraph.InternalTargets do
+            if not (Set.contains name loweredGraph.RouterNames) then reject ()
+            match target with
+            | TraefikHttpGraphModel.GeneratedInternalTarget.AdminApi when name <> "keroosha-admin" -> reject ()
+            | TraefikHttpGraphModel.GeneratedInternalTarget.RedirectNoop when name = "keroosha-admin" -> reject ()
+            | _ -> ()
+        for name in loweredGraph.BackendServiceNames do
+            if not (name.StartsWith("keroosha-backend-", StringComparison.Ordinal)) then reject ()
+        for name in loweredGraph.RedirectMiddlewareNames do
+            if not (name.StartsWith("keroosha-redirect-", StringComparison.Ordinal)) then reject ()
+
+    let private validateCore (loweredGraph: TraefikHttpGraphModel.LoweredGraph option) entryPoints resolvers tlsOptions legacyRouters (dynamicRoot: JsonObject) =
+        objectFields dynamicRoot [ "http"; "tcp"; "udp"; "tls" ]
+        optionalObject dynamicRoot "http" (validateHttp entryPoints resolvers tlsOptions legacyRouters loweredGraph)
+        optionalObject dynamicRoot "tcp" (validateTcp entryPoints resolvers tlsOptions)
+        optionalObject dynamicRoot "udp" (validateUdp entryPoints)
+
+    /// Validates a merged helper graph; only lowerer-owned provenance permits its internal control routers.
+    let internal validateWithLegacy
+        (entryPoints: Map<string, string>)
+        (resolvers: Set<string>)
+        (tlsOptions: Set<string>)
+        (loweredGraph: TraefikHttpGraphModel.LoweredGraph)
+        (dynamicRoot: JsonObject)
+        : unit =
+        if Object.ReferenceEquals(loweredGraph, null) then reject ()
+        validateLoweredGraph loweredGraph dynamicRoot
+        let entryPoints =
+            match Map.tryFind "keroosha-admin" loweredGraph.InternalTargets with
+            | Some TraefikHttpGraphModel.GeneratedInternalTarget.AdminApi -> Map.add "keroosha-admin" "tcp" entryPoints
+            | _ -> entryPoints
+        validateCore (Some loweredGraph) entryPoints resolvers tlsOptions loweredGraph.RouterNames dynamicRoot
 
     /// Validates local, typed references and cycles in an optional native dynamic configuration.
     /// Entry-point values are the configured listener protocol (`tcp` or `udp`); HTTP and TCP routers
@@ -916,7 +1110,4 @@ module TraefikDynamic =
         (legacyRouters: Set<string>)
         (dynamicRoot: JsonObject)
         : unit =
-        objectFields dynamicRoot [ "http"; "tcp"; "udp"; "tls" ]
-        optionalObject dynamicRoot "http" (validateHttp entryPoints resolvers tlsOptions legacyRouters)
-        optionalObject dynamicRoot "tcp" (validateTcp entryPoints resolvers tlsOptions)
-        optionalObject dynamicRoot "udp" (validateUdp entryPoints)
+        validateCore None entryPoints resolvers tlsOptions legacyRouters dynamicRoot

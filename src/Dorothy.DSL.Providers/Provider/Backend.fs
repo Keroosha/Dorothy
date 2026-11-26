@@ -593,6 +593,75 @@ module SshTransport =
                     )
             | error -> return raise error
         }
+    let private verifyTraefikCapability
+        (connection: SshConnection)
+        (rid: string)
+        (digest: string)
+        (cancellationToken: CancellationToken)
+        =
+        task {
+            let remotePath = sprintf "/var/cache/keroosha-iac/helper/%s/%s" rid digest
+            let command =
+                if connection.User = "root" then
+                    sprintf "%s traefik-capabilities" remotePath
+                else
+                    sprintf "sudo -n -- %s traefik-capabilities" remotePath
+
+            let incompatibleMessage =
+                "The native helper does not support the required Traefik capability 'traefik-v2' (wire version 2); upgrade the provider/helper package. No Traefik operation was started."
+
+            try
+                let! response =
+                    runRemoteCommand
+                        connection
+                        "Traefik capability negotiation"
+                        command
+                        None
+                        cancellationToken
+                        false
+
+                try
+                    use document = JsonDocument.Parse(response)
+                    let root = document.RootElement
+
+                    if root.ValueKind <> JsonValueKind.Object then
+                        raise (FormatException("The Traefik capability envelope must be an object."))
+
+                    let properties = root.EnumerateObject() |> Seq.toArray
+                    let expectedNames = Set.ofList [ "protocol"; "version"; "capabilities" ]
+                    let names = properties |> Array.map (fun property -> property.Name) |> Set.ofArray
+
+                    if properties.Length <> expectedNames.Count || names <> expectedNames then
+                        raise (FormatException("The Traefik capability envelope has an unexpected shape."))
+
+                    let protocol = root.GetProperty("protocol")
+                    let version = root.GetProperty("version")
+                    let capabilities = root.GetProperty("capabilities")
+
+                    if protocol.ValueKind <> JsonValueKind.String
+                       || protocol.GetString() <> "dorothy-traefik"
+                       || version.ValueKind <> JsonValueKind.Number
+                       || version.GetInt32() <> 2
+                       || capabilities.ValueKind <> JsonValueKind.Array then
+                        raise (FormatException("The Traefik capability envelope does not identify wire version 2."))
+
+                    let advertised = capabilities.EnumerateArray() |> Seq.toArray
+
+                    if advertised.Length <> 1
+                       || advertised[0].ValueKind <> JsonValueKind.String
+                       || advertised[0].GetString() <> "traefik-v2" then
+                        raise (FormatException("The Traefik capability envelope omitted traefik-v2."))
+                with
+                | :? JsonException
+                | :? FormatException ->
+                    return raise (NativeHelperUnavailableException(incompatibleMessage))
+            with
+            | :? OperationCanceledException as error -> return raise error
+            | :? NativeHelperUnavailableException as error -> return raise error
+            | :? InvalidOperationException as error when error.Message.Contains("Usage: keroosha-iac-helper", StringComparison.Ordinal) ->
+                return raise (NativeHelperUnavailableException(incompatibleMessage))
+            | error -> return raise error
+        }
 
     let private runHelperWithOptions
         (connection: SshConnection)
@@ -613,14 +682,18 @@ module SshTransport =
             do! ensureRemoteHelper connection operationName rid helperPath digest cancellationToken
             do! verifyHelperProtocol connection rid digest cancellationToken
 
+            if helperCommand = "traefik" then
+                do! verifyTraefikCapability connection rid digest cancellationToken
+
             let remotePath = sprintf "/var/cache/keroosha-iac/helper/%s/%s" rid digest
+            let effectiveCommand = if helperCommand = "traefik" then "traefik-v2" else helperCommand
             let remoteCommand =
                 if connection.User = "root" then
-                    sprintf "exec %s %s" remotePath helperCommand
-                elif helperCommand = "sshd" || helperCommand = "firewalld" || helperCommand = "apt" then
-                    sprintf "sudo -n -- env SSH_CONNECTION=\"${SSH_CONNECTION-}\" %s %s" remotePath helperCommand
+                    sprintf "exec %s %s" remotePath effectiveCommand
+                elif effectiveCommand = "sshd" || effectiveCommand = "firewalld" || effectiveCommand = "apt" then
+                    sprintf "sudo -n -- env SSH_CONNECTION=\"${SSH_CONNECTION-}\" %s %s" remotePath effectiveCommand
                 else
-                    sprintf "sudo -n -- %s %s" remotePath helperCommand
+                    sprintf "sudo -n -- %s %s" remotePath effectiveCommand
 
             use requestStream = new MemoryStream(Encoding.UTF8.GetBytes(payload), false)
 

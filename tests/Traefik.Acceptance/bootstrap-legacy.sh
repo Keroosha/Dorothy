@@ -48,6 +48,7 @@ fi
 export HOME="$state_dir/home"
 export DOTNET_CLI_HOME="$state_dir/dotnet-home"
 export NUGET_PACKAGES="$state_dir/nuget-packages"
+export NUGET_HTTP_CACHE_PATH="$state_dir/nuget-http" XDG_CACHE_HOME="$state_dir/cache"
 export DOTNET_SKIP_FIRST_TIME_EXPERIENCE=1
 export DOTNET_NOLOGO=1
 export DOTNET_ROOT="$(dirname "$(readlink -f "$(command -v dotnet)")")"

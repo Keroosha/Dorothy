@@ -1,6 +1,7 @@
 namespace Dorothy.DSL
 
 open System
+open System.Net
 open System.Globalization
 open System.Buffers
 open System.Collections.Generic
@@ -38,6 +39,7 @@ type TraefikNamedNativeObject internal (name: string, value: TraefikNativeValue)
     member _.Value = value
 
 /// Structured static, dynamic, or DNS-credential configuration for one Traefik resource.
+/// Named references are local by default; external references are limited to the File provider (`name@file`).
 [<Sealed>]
 type TraefikConfigurationSpec internal (root: TraefikNativeValue) =
     member internal _.Root = root
@@ -73,6 +75,10 @@ type TraefikUdpEntryPointRef internal (name: string) =
 /// A named HTTP service reference.
 [<Sealed>]
 type TraefikHttpServiceRef internal (name: string) =
+    member internal _.Name = name
+/// A named HTTP parent-router reference.
+[<Sealed>]
+type TraefikHttpRouterRef internal (name: string) =
     member internal _.Name = name
 
 /// A named HTTP middleware reference.
@@ -115,19 +121,32 @@ type TraefikTlsOptionsRef internal (name: string) =
 type TraefikCertificateResolverRef internal (name: string) =
     member internal _.Name = name
 
+/// A named protected certificate identity reference.
+[<Sealed>]
+type TraefikCertificateRef internal (name: string) =
+    member internal _.Name = name
+
 /// A composable, safely quoted HTTP router rule.
 [<Sealed>]
-type TraefikHttpRule internal (expression: string) =
+type TraefikHttpRule internal (rule: TraefikHttpGraphModel.Rule) =
+    let expression = TraefikHttpGraphModel.renderGoRule rule
+    member internal _.Rule = rule
     member _.Expression = expression
     static member (&&&) (left: TraefikHttpRule, right: TraefikHttpRule) =
-        TraefikHttpRule("(" + left.Expression + ") && (" + right.Expression + ")")
+        TraefikHttpRule(TraefikHttpGraphModel.andAlso left.Rule right.Rule)
     static member (|||) (left: TraefikHttpRule, right: TraefikHttpRule) =
-        TraefikHttpRule("(" + left.Expression + ") || (" + right.Expression + ")")
+        TraefikHttpRule(TraefikHttpGraphModel.orElse left.Rule right.Rule)
 
 /// A composable, safely quoted TCP router rule.
 [<Sealed>]
 type TraefikTcpRule internal (expression: string) =
     member _.Expression = expression
+
+/// The network protocol suffix for a numeric Traefik entry-point listener address.
+[<RequireQualifiedAccess>]
+type TraefikListenerTransport =
+    | Tcp
+    | Udp
 
 /// Typed DNS credential environment-variable declaration.
 [<Sealed>]
@@ -327,76 +346,24 @@ module TraefikConfiguration =
 
 [<RequireQualifiedAccess>]
 module private TraefikRuleFormatting =
-    let private appendHexEscape (builder: StringBuilder) (marker: char) (format: string) (value: int) =
-        builder.Append('\\').Append(marker) |> ignore
-        builder.Append(value.ToString(format, CultureInfo.InvariantCulture)) |> ignore
-
-    let quoteGoString (value: string) =
-        if isNull value then invalidArg "rule" "A Traefik rule value cannot be null."
-        let builder = StringBuilder(value.Length + 2)
-        builder.Append('"') |> ignore
-        let mutable offset = 0
-
-        while offset < value.Length do
-            let mutable rune = Unchecked.defaultof<Rune>
-            let mutable consumed = 0
-            if Rune.DecodeFromUtf16(value.AsSpan(offset), &rune, &consumed) <> OperationStatus.Done then
-                invalidArg "rule" "A Traefik rule value must contain valid Unicode scalar values."
-            offset <- offset + consumed
-
-            match rune.Value with
-            | 0x22 -> builder.Append("\\\"") |> ignore
-            | 0x5C -> builder.Append("\\\\") |> ignore
-            | 0x07 -> builder.Append("\\a") |> ignore
-            | 0x08 -> builder.Append("\\b") |> ignore
-            | 0x0C -> builder.Append("\\f") |> ignore
-            | 0x0A -> builder.Append("\\n") |> ignore
-            | 0x0D -> builder.Append("\\r") |> ignore
-            | 0x09 -> builder.Append("\\t") |> ignore
-            | 0x0B -> builder.Append("\\v") |> ignore
-            | value when value < 0x20 || value = 0x7F -> appendHexEscape builder 'x' "X2" value
-            | value when value <= 0x7E -> builder.Append(char value) |> ignore
-            | value when value <= 0xFFFF -> appendHexEscape builder 'u' "X4" value
-            | value -> appendHexEscape builder 'U' "X8" value
-
-        builder.Append('"') |> ignore
-        builder.ToString()
+    let quoteGoString = TraefikHttpGraphModel.quoteGoString
 
 [<RequireQualifiedAccess>]
 module TraefikHttpRule =
-    let private renderMatcher kind (items: seq<string>) =
-        let items = Seq.toList items
-        if items.IsEmpty || items |> List.exists String.IsNullOrWhiteSpace then
-            invalidArg "rule" "A Traefik rule matcher requires one or more non-empty values."
-        kind + "(" + (items |> List.map TraefikRuleFormatting.quoteGoString |> String.concat ",") + ")"
-
-    let private renderAlternatives kind (items: seq<string>) =
-        let items = Seq.toList items
-        if items.IsEmpty || items |> List.exists String.IsNullOrWhiteSpace then
-            invalidArg "rule" "A Traefik rule matcher requires one or more non-empty values."
-        match items with
-        | [ value ] -> renderMatcher kind [ value ]
-        | _ ->
-            items
-            |> List.map (fun value -> renderMatcher kind [ value ])
-            |> String.concat " || "
-            |> fun expression -> "(" + expression + ")"
-
-    let host values = TraefikHttpRule(renderAlternatives "Host" values)
-    let hostRegexp values = TraefikHttpRule(renderAlternatives "HostRegexp" values)
-    let path value = TraefikHttpRule(renderMatcher "Path" [ value ])
-    let pathPrefix value = TraefikHttpRule(renderMatcher "PathPrefix" [ value ])
-    let pathRegexp value = TraefikHttpRule(renderMatcher "PathRegexp" [ value ])
-    let method' value = TraefikHttpRule(renderMatcher "Method" [ value ])
-    let header name value = TraefikHttpRule(renderMatcher "Header" [ name; value ])
-    let headerRegexp name value = TraefikHttpRule(renderMatcher "HeaderRegexp" [ name; value ])
-    let query name value = TraefikHttpRule(renderMatcher "Query" [ name; value ])
-    let queryRegexp name value = TraefikHttpRule(renderMatcher "QueryRegexp" [ name; value ])
-    let clientIp value = TraefikHttpRule(renderMatcher "ClientIP" [ value ])
+    let host values = TraefikHttpRule(TraefikHttpGraphModel.host values)
+    let hostRegexp values = TraefikHttpRule(TraefikHttpGraphModel.hostRegexp values)
+    let path value = TraefikHttpRule(TraefikHttpGraphModel.path value)
+    let pathPrefix value = TraefikHttpRule(TraefikHttpGraphModel.pathPrefix value)
+    let pathRegexp value = TraefikHttpRule(TraefikHttpGraphModel.pathRegexp value)
+    let method' value = TraefikHttpRule(TraefikHttpGraphModel.method' value)
+    let header name value = TraefikHttpRule(TraefikHttpGraphModel.header name value)
+    let headerRegexp name value = TraefikHttpRule(TraefikHttpGraphModel.headerRegexp name value)
+    let query name value = TraefikHttpRule(TraefikHttpGraphModel.query name value)
+    let queryRegexp name value = TraefikHttpRule(TraefikHttpGraphModel.queryRegexp name value)
+    let clientIp value = TraefikHttpRule(TraefikHttpGraphModel.clientIp value)
     let andAlso (left: TraefikHttpRule) (right: TraefikHttpRule) = left &&& right
     let orElse (left: TraefikHttpRule) (right: TraefikHttpRule) = left ||| right
-    let not (rule: TraefikHttpRule) = TraefikHttpRule("!(" + rule.Expression + ")")
-
+    let not (rule: TraefikHttpRule) = TraefikHttpRule(TraefikHttpGraphModel.not rule.Rule)
 [<RequireQualifiedAccess>]
 module TraefikTcpRule =
     let private matcher name (value: string) =
@@ -476,6 +443,32 @@ module TraefikConfigurationBuilders =
     let staticCertificatesResolvers = TraefikNamedNativeObjectMapBuilder("certificatesResolvers")
 
     let inline entryPointAddress value = nativeField "address" (nativeString value)
+    /// Builds a static listener address from a numeric IP, port, and TCP/UDP network transport.
+    let entryPointListener (address: IPAddress) (port: int) (transport: TraefikListenerTransport) =
+        let message = "Invalid, unsafe or unsupported Traefik listener socket binding."
+        if isNull address then invalidArg "address" message
+        if port < 1 || port > 65535 then invalidArg "port" message
+        if address.AddressFamily = System.Net.Sockets.AddressFamily.InterNetworkV6 && address.IsIPv4MappedToIPv6 then
+            invalidArg "address" message
+        let numericAddress = address.ToString().ToLowerInvariant()
+        let numericAddress =
+            if address.AddressFamily = System.Net.Sockets.AddressFamily.InterNetworkV6 then "[" + numericAddress + "]"
+            elif address.AddressFamily = System.Net.Sockets.AddressFamily.InterNetwork then numericAddress
+            else invalidArg "address" message
+        let protocol =
+            match transport with
+            | TraefikListenerTransport.Tcp -> "tcp"
+            | TraefikListenerTransport.Udp -> "udp"
+        nativeField
+            "address"
+            (nativeString (numericAddress + ":" + port.ToString(CultureInfo.InvariantCulture) + "/" + protocol))
+
+    /// Parses a numeric IP address before building a static listener; use entryPointAddress for other address forms.
+    let entryPointListenerAddress (address: string) (port: int) (transport: TraefikListenerTransport) =
+        let mutable numericAddress = Unchecked.defaultof<IPAddress>
+        if not (IPAddress.TryParse(address, &numericAddress)) then
+            invalidArg "address" "Invalid, unsafe or unsupported Traefik listener socket binding."
+        entryPointListener numericAddress port transport
     let inline entryPointReusePort value = nativeField "reusePort" (nativeBoolean value)
     let inline entryPointHttp3 value = nativeField "http3" (nativeObject { nativeField "advertisedPort" (nativeInteger value) })
     let entryPointForwardedHeaders fields = nativeField "forwardedHeaders" fields
@@ -483,7 +476,6 @@ module TraefikConfigurationBuilders =
     let entryPointTransport fields = nativeField "transport" fields
     let entryPointHttp fields = nativeField "http" fields
     let entryPointUdp fields = nativeField "udp" fields
-    let entryPointTcp fields = nativeField "tcp" fields
 
     let staticLog fields = nativeField "log" fields
     let staticAccessLog fields = nativeField "accessLog" fields
@@ -493,7 +485,6 @@ module TraefikConfigurationBuilders =
 
     let inline logLevel value = nativeField "level" (nativeString value)
     let inline logFormat value = nativeField "format" (nativeString value)
-    let inline logFilePath value = nativeField "filePath" (nativeString value)
     let inline accessLogFormat value = nativeField "format" (nativeString value)
 
     let inline acmeEmail value = nativeField "email" (nativeString value)
@@ -542,6 +533,7 @@ module TraefikConfigurationBuilders =
     let httpEntryPoint name = TraefikHttpEntryPointRef(TraefikConfigurationValidation.entryPointName name)
     let tcpEntryPoint name = TraefikTcpEntryPointRef(TraefikConfigurationValidation.entryPointName name)
     let udpEntryPoint name = TraefikUdpEntryPointRef(TraefikConfigurationValidation.entryPointName name)
+    let httpRouterRef name = TraefikHttpRouterRef(TraefikConfigurationValidation.name name)
     let httpServiceRef name = TraefikHttpServiceRef(TraefikConfigurationValidation.name name)
     let httpMiddlewareRef name = TraefikHttpMiddlewareRef(TraefikConfigurationValidation.name name)
     let tcpServiceRef name = TraefikTcpServiceRef(TraefikConfigurationValidation.name name)
@@ -551,17 +543,47 @@ module TraefikConfigurationBuilders =
     let tcpServersTransportRef name = TraefikTcpServersTransportRef(TraefikConfigurationValidation.name name)
     let tlsOptionsRef name = TraefikTlsOptionsRef(TraefikConfigurationValidation.name name)
     let certificateResolverRef name = TraefikCertificateResolverRef(TraefikConfigurationValidation.name name)
+    let certificateRef name = TraefikCertificateRef(TraefikConfigurationValidation.name name)
+
+    let private certificateReference (value: TraefikCertificateRef) =
+        nativeObject { nativeField "certificate" (nativeString value.Name) }
+
+    let private certificateReferences (values: seq<TraefikCertificateRef>) =
+        values |> Seq.map certificateReference |> nativeArray
+
+    /// References server identities in native `tls.certificates`.
+    let tlsCertificates (values: seq<TraefikCertificateRef>) =
+        nativeField "certificates" (certificateReferences values)
+
+    /// References outbound HTTP transport client identities.
+    let httpServersTransportCertificates (values: seq<TraefikCertificateRef>) =
+        nativeField "certificates" (certificateReferences values)
+
+    /// References outbound TCP transport client identities.
+    let tcpServersTransportCertificates (values: seq<TraefikCertificateRef>) =
+        nativeField "certificates" (certificateReferences values)
+
+    /// Selects a protected identity for ForwardAuth outbound TLS.
+    let httpForwardAuthClientCertificate (value: TraefikCertificateRef) =
+        nativeField "clientCertificate" (nativeString value.Name)
 
     let httpRule (rule: TraefikHttpRule) = nativeField "rule" (nativeString rule.Expression)
     let httpRouterEntryPoints (values: seq<TraefikHttpEntryPointRef>) =
         values |> Seq.map (fun value -> nativeString value.Name) |> nativeArray |> nativeField "entryPoints"
     let httpRouterService (value: TraefikHttpServiceRef) = nativeField "service" (nativeString value.Name)
+    /// Stores native parentRefs without flattening the parent router's rule or middleware.
+    let httpRouterParentRefs (values: seq<TraefikHttpRouterRef>) =
+        values |> Seq.map (fun value -> nativeString value.Name) |> nativeArray |> nativeField "parentRefs"
     let httpRouterMiddlewares (values: seq<TraefikHttpMiddlewareRef>) =
         values |> Seq.map (fun value -> nativeString value.Name) |> nativeArray |> nativeField "middlewares"
     let inline httpRouterPriority value = nativeField "priority" (nativeInteger value)
     let httpRouterTls fields = nativeField "tls" fields
     let httpTlsResolver (value: TraefikCertificateResolverRef) = nativeField "certResolver" (nativeString value.Name)
     let httpTlsOptions (value: TraefikTlsOptionsRef) = nativeField "options" (nativeString value.Name)
+
+    /// Adds HTTP middleware at the service level, distinct from router middlewares.
+    let httpServiceMiddlewares (values: seq<TraefikHttpMiddlewareRef>) =
+        values |> Seq.map (fun value -> nativeString value.Name) |> nativeArray |> nativeField "middlewares"
 
     let httpLoadBalancer fields = nativeField "loadBalancer" fields
     let inline httpServers (values: seq< ^T>) =
@@ -613,6 +635,13 @@ module TraefikConfigurationBuilders =
     let tcpServiceServersTransport (value: TraefikTcpServersTransportRef) = nativeField "serversTransport" (nativeString value.Name)
     let inline tcpProxyProtocolVersion value = nativeField "version" (nativeInteger value)
     let tcpProxyProtocol fields = nativeField "proxyProtocol" fields
+    let tcpHealthCheck fields = nativeField "healthCheck" fields
+    let inline tcpHealthCheckPort value = nativeField "port" (nativeInteger value)
+    let inline tcpHealthCheckSend value = nativeField "send" (nativeString value)
+    let inline tcpHealthCheckExpect value = nativeField "expect" (nativeString value)
+    let inline tcpHealthCheckInterval value = nativeField "interval" (nativeString value)
+    let inline tcpHealthCheckUnhealthyInterval value = nativeField "unhealthyInterval" (nativeString value)
+    let inline tcpHealthCheckTimeout value = nativeField "timeout" (nativeString value)
 
     let udpRouterEntryPoints (values: seq<TraefikUdpEntryPointRef>) =
         values |> Seq.map (fun value -> nativeString value.Name) |> nativeArray |> nativeField "entryPoints"

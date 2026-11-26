@@ -103,7 +103,7 @@ module Program =
                     }
                 }
                 staticLog (nativeObject {
-                    logLevel "DEBUG"
+                    logLevel (environment "TRAEFIK_ACCEPTANCE_LOG_LEVEL" "DEBUG")
                     logFormat "json"
                 })
                 staticAccessLog (nativeObject {
@@ -351,16 +351,30 @@ module Program =
             }
         }
 
-    let private sniProofConfiguration () =
+    let private sniProofConfiguration many =
         traefikConfiguration {
             staticConfiguration {
                 staticEntryPoints {
                     staticEntryPoint "sni-proof" { entryPointAddress "127.0.0.2:18449/tcp" }
+                    if many then
+                        for index in 1 .. 16 do
+                            staticEntryPoint (sprintf "many-%02d" index) {
+                                entryPointAddress (sprintf "127.0.0.1:%d/tcp" (21600 + index))
+                            }
                 }
             }
             dynamicConfiguration {
                 httpConfiguration {
                     httpRouters {
+                        if many then
+                            for index in 1 .. 16 do
+                                let name = sprintf "many-%02d" index
+                                httpRouter name {
+                                    httpRule (hostRule [ "example.org" ])
+                                    httpRouterEntryPoints [ httpEntryPoint name ]
+                                    httpRouterService (httpServiceRef "catalog")
+                                    httpRouterTls (nativeObject {})
+                                }
                         httpRouter "sni-proof" {
                             httpRule (hostRule [ "sni-proof.acceptance.test" ])
                             httpRouterEntryPoints [ httpEntryPoint "sni-proof" ]
@@ -385,7 +399,7 @@ module Program =
         }
 
     let private configuration (phase: string) =
-        if phase = "sni-proof-only" then sniProofConfiguration ()
+        if phase = "sni-proof-only" || phase = "review-seventeen-native" then sniProofConfiguration (phase = "review-seventeen-native")
         else fullConfiguration phase
 
     let private createHost (phase: string) =
@@ -411,14 +425,38 @@ module Program =
                     if phase <> "delete" then
                         traefik {
                             entryPoint "websecure" { listen 443 }
+                            if phase = "review-pagination" then
+                                // Numeric legacy listeners precede the structured input and its listener limit.
+                                for index in 0 .. 99 do
+                                    entryPoint (sprintf "page-%03d" index) { listen (21300 + index) }
+                            if phase = "review-seventeen" then
+                                // 16 distinct (example.org, port) pairs, followed by one different SNI certificate.
+                                // The original websecure declaration below supplies one of the first sixteen.
+                                for index in 1 .. 15 do
+                                    let name = sprintf "many-%02d" index
+                                    entryPoint name { listen (21500 + index) }
+                                    router name {
+                                        host "example.org"
+                                        entryPoint name
+                                        backend backendUrl
+                                        tls (TraefikTlsMode.Provided certificate)
+                                    }
+                                entryPoint "sni-proof" { listen 18449 }
+                                sniCertificate
+                                router "sni-proof" {
+                                    host "sni-proof.acceptance.test"
+                                    entryPoint "sni-proof"
+                                    backend backendUrl
+                                    tls (TraefikTlsMode.Provided sniCertificate)
+                                }
                             certificate
-                            if phase = "structured" || phase = "route-update" || phase = "rotate" || phase = "rollback" || phase = "withdraw-udp" || phase = "rollback-udp" || phase = "sni-proof-only" then
+                            if phase = "structured" || phase = "route-update" || phase = "rotate" || phase = "rollback" || phase = "withdraw-udp" || phase = "rollback-udp" || phase = "sni-proof-only" || phase = "review-seventeen-native" then
                                 sniCertificate
                             router "example" {
                                 host "example.org"
                                 entryPoint "websecure"
                                 backend backendUrl
-                                tls (Provided certificate)
+                                tls (TraefikTlsMode.Provided certificate)
                             }
                             if phase = "structured" || phase = "route-update" || phase = "rotate" || phase = "rollback" || phase = "withdraw-udp" || phase = "rollback-udp" then
                                 router "legacy-redirect" {
@@ -428,7 +466,15 @@ module Program =
                                     excludePathSubtree "/private"
                                 }
                             adminPort 19080
-                            if phase = "structured" || phase = "route-update" || phase = "rotate" || phase = "rollback" || phase = "withdraw-udp" || phase = "rollback-udp" || phase = "sni-proof-only" then
+                            if phase = "review-expiring-ca" then
+                                traefikConfiguration {
+                                    staticConfiguration {
+                                        staticServersTransport (nativeObject {
+                                            nativeField "rootCAs" (nativeArray [ nativeString (requiredFile "TRAEFIK_REVIEW_CA_FILE") ])
+                                        })
+                                    }
+                                }
+                            if phase = "structured" || phase = "route-update" || phase = "rotate" || phase = "rollback" || phase = "withdraw-udp" || phase = "rollback-udp" || phase = "sni-proof-only" || phase = "review-seventeen-native" then
                                 configuration phase
                         }
                 }

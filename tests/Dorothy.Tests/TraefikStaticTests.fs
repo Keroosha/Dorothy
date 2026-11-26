@@ -1,6 +1,8 @@
 namespace Dorothy.Tests
 
 open System
+open System.Security.Cryptography
+open System.Security.Cryptography.X509Certificates
 open System.Text.Json.Nodes
 open Dorothy.DSL
 open Dorothy.Tests.TestSupport
@@ -18,9 +20,18 @@ type TraefikStaticTests() =
     let validate legacy text = TraefikStatic.validate legacy adminPort (parse text)
 
     let assertInvalid (action: unit -> unit) =
-        let error = Assert.Throws<InvalidOperationException>(TestDelegate(action))
-        Assert.That(error.Message, Is.EqualTo("Static Traefik configuration is invalid."))
+        let error = Assert.Catch<Exception>(TestDelegate(action))
+        match error with
+        | TraefikStatic.ValidationError _ -> ()
+        | :? InvalidOperationException as invalid ->
+            Assert.That(invalid.Message, Is.EqualTo("Static Traefik configuration is invalid."))
+        | _ -> Assert.Fail("Unexpected static validation failure.")
 
+    let assertCategory (category: TraefikStatic.ValidationFailure) (action: unit -> unit) =
+        let error: exn = Assert.Throws<TraefikStatic.ValidationError>(TestDelegate(action)) :> exn
+        match error with
+        | TraefikStatic.ValidationError actual -> Assert.That(actual, Is.EqualTo(category))
+        | _ -> Assert.Fail("Expected the requested Traefik static validation category.")
     [<Test>]
     member _.``entrypoint protocols include legacy TCP and default TCP and normalize UDP``() =
         let actual =
@@ -39,14 +50,75 @@ type TraefikStaticTests() =
 
     [<Test>]
     member _.``bind validation rejects overlaps and the private admin port``() =
-        assertInvalid (fun () ->
+        assertCategory TraefikStatic.ValidationFailure.SocketBind (fun () ->
             validate Map.empty
                 """{"entryPoints":{"all":{"address":":8081"},"loopback":{"address":"127.0.0.1:8081/tcp"}}}"""
             |> ignore)
-        assertInvalid (fun () ->
+        assertCategory TraefikStatic.ValidationFailure.SocketBind (fun () ->
             validate Map.empty """{"entryPoints":{"admin":{"address":"127.0.0.1:6060"}}}"""
             |> ignore)
-        assertInvalid (fun () -> validate (Map.ofList [ "legacy", adminPort ]) "{}" |> ignore)
+        assertCategory TraefikStatic.ValidationFailure.SocketBind (fun () ->
+            validate (Map.ofList [ "legacy", adminPort ]) "{}" |> ignore)
+
+    [<Test>]
+    member _.``mapped IPv4 binds overlap and cannot claim the private admin socket``() =
+        assertCategory TraefikStatic.ValidationFailure.SocketBind (fun () ->
+            validate Map.empty """{"entryPoints":{"mapped":{"address":"[::ffff:127.0.0.1]:8081"},"ipv4":{"address":"127.0.0.1:8081"}}}"""
+            |> ignore)
+        assertCategory TraefikStatic.ValidationFailure.SocketBind (fun () ->
+            validate Map.empty (sprintf """{"entryPoints":{"mapped":{"address":"[::ffff:127.0.0.1]:%d"}}}""" adminPort)
+            |> ignore)
+
+    [<Test>]
+    member _.``mapped IPv4 CIDRs and empty secure PROXY trust are rejected``() =
+        for network in [ "::ffff:0.0.0.0/96"; "::ffff:0.0.0.0/1" ] do
+            let invalid =
+                sprintf """{"entryPoints":{"front":{"address":":8081","proxyProtocol":{"trustedIPs":["%s"]}}}}""" network
+            assertCategory TraefikStatic.ValidationFailure.TrustNetwork (fun () -> validate Map.empty invalid |> ignore)
+        assertCategory TraefikStatic.ValidationFailure.TrustNetwork (fun () ->
+            validate Map.empty """{"entryPoints":{"front":{"address":":8081","proxyProtocol":{}}}}"""
+            |> ignore)
+        assertCategory TraefikStatic.ValidationFailure.TrustNetwork (fun () ->
+            validate Map.empty """{"entryPoints":{"front":{"address":":8081","proxyProtocol":{"trustedIPs":[]}}}}"""
+            |> ignore)
+        let mappedSubnet =
+            validate Map.empty """{"entryPoints":{"front":{"address":":8081","proxyProtocol":{"trustedIPs":["::ffff:10.0.0.0/104"]}}}}"""
+        Assert.That(mappedSubnet, Is.EqualTo<Map<string,string>>(Map.ofList [ "front", "tcp" ]))
+
+    [<Test>]
+    member _.``exporter push intervals must be positive``() =
+        let invalid =
+            [ """{"metrics":{"datadog":{"address":"127.0.0.1:8125","pushInterval":"0s"}}}"""
+              """{"metrics":{"statsD":{"pushInterval":"-1s"}}}"""
+              """{"metrics":{"influxDB2":{"pushInterval":"0"}}}"""
+              """{"metrics":{"otlp":{"http":{"endpoint":"http://localhost:4318/v1/metrics"},"pushInterval":"0s"}}}""" ]
+        for settings in invalid do
+            assertInvalid (fun () -> validate Map.empty settings |> ignore)
+
+        validate Map.empty """{"metrics":{"datadog":{"address":"127.0.0.1:8125","pushInterval":"250ms"}}}"""
+        |> ignore
+        validate Map.empty """{"metrics":{"statsD":{"pushInterval":"1s"}}}""" |> ignore
+        validate Map.empty """{"metrics":{"influxDB2":{"pushInterval":"2s"}}}""" |> ignore
+        validate Map.empty """{"metrics":{"otlp":{"http":{"endpoint":"http://localhost:4318/v1/metrics"},"pushInterval":"3s"}}}"""
+        |> ignore
+
+    [<Test>]
+    member _.``Read accepts expired inline CAs but still enforces CA constraints``() =
+        use key = RSA.Create(2048)
+        let request = CertificateRequest("CN=expired static root", key, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1)
+        request.CertificateExtensions.Add(X509BasicConstraintsExtension(true, true, 1, true)) |> ignore
+        use expiredRoot =
+            request.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-2.0), DateTimeOffset.UtcNow.AddDays(-1.0))
+        let settings = parse """{"serversTransport":{"rootCAs":[]}}"""
+        settings.["serversTransport"].["rootCAs"].AsArray().Add(JsonValue.Create(expiredRoot.ExportCertificatePem()) :> JsonNode)
+
+        assertInvalid (fun () -> TraefikStatic.validate Map.empty adminPort settings |> ignore)
+        TraefikStatic.validateForRead Map.empty adminPort settings |> ignore
+
+        let leaf = createValidCertificateFixture "static leaf" [ "leaf.example.test" ]
+        let leafSettings = parse """{"serversTransport":{"rootCAs":[]}}"""
+        leafSettings.["serversTransport"].["rootCAs"].AsArray().Add(JsonValue.Create(leaf.LeafCertificatePem) :> JsonNode)
+        assertInvalid (fun () -> TraefikStatic.validateForRead Map.empty adminPort leafSettings |> ignore)
 
     [<Test>]
     member _.``TCP and UDP may share a port but HTTP3 reserves its implied UDP socket``() =
@@ -282,6 +354,7 @@ type TraefikStaticTests() =
               """{"entryPoints":{"web":{"address":":8081"},"WEB":{"address":":8082"}}}"""
               """{"entryPoints":{"front":{"address":":8081","command":"id"}}}"""
               """{"experimental":{"plugins":{"x":{"moduleName":"x"}}}}"""
+              """{"experimental":{"otlpLogs":true}}"""
               """{"tcpServersTransport":{"tls":{"rootCAs":["/etc/ssl/private.pem"]}}}"""
               """{"serversTransport":{"insecureSkipVerify":true}}"""
               """{"tcpServersTransport":{"tls":{"insecureSkipVerify":true}}}"""
@@ -321,10 +394,10 @@ type TraefikStaticTests() =
 
     [<Test>]
     member _.``trust all and malformed duration or telemetry endpoints are rejected``() =
-        assertInvalid (fun () ->
+        assertCategory TraefikStatic.ValidationFailure.TrustNetwork (fun () ->
             validate Map.empty """{"entryPoints":{"front":{"address":":8081","forwardedHeaders":{"insecure":true}}}}"""
             |> ignore)
-        assertInvalid (fun () ->
+        assertCategory TraefikStatic.ValidationFailure.TrustNetwork (fun () ->
             validate Map.empty """{"entryPoints":{"front":{"address":":8081","proxyProtocol":{"trustedIPs":["0.0.0.0/0"]}}}}"""
             |> ignore)
         assertInvalid (fun () ->

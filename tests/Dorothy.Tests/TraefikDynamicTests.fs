@@ -21,9 +21,24 @@ type TraefikDynamicTests() =
     let validateJson json = parse json |> validate
 
     let assertInvalidRoot (root: JsonObject) =
-        let error =
-            Assert.Throws<InvalidOperationException>(TestDelegate(fun () -> validate root))
-        Assert.That(error.Message, Is.EqualTo("Traefik dynamic configuration is invalid."))
+        try
+            validate root
+            Assert.Fail("Expected invalid Traefik dynamic configuration.")
+        with
+        | TraefikDynamic.ValidationError _ -> ()
+        | :? InvalidOperationException as invalid ->
+            Assert.That(invalid.Message, Is.EqualTo("Traefik dynamic configuration is invalid."))
+
+    let assertValidationFailure (expected: TraefikDynamic.ValidationFailure) (action: unit -> unit) =
+        let error: exn =
+            Assert.Throws<TraefikDynamic.ValidationError>(TestDelegate(fun () -> action ()))
+            :> exn
+        match error with
+        | TraefikDynamic.ValidationError actual -> Assert.That(actual, Is.EqualTo(expected))
+        | _ -> Assert.Fail("Expected the requested Traefik validation failure category.")
+
+    let assertFailure (expected: TraefikDynamic.ValidationFailure) json =
+        assertValidationFailure expected (fun () -> validateJson json)
 
     let assertInvalid json = parse json |> assertInvalidRoot
 
@@ -78,13 +93,12 @@ type TraefikDynamicTests() =
                       "echo": {
                         "loadBalancer": {
                           "servers": [{"address": "127.0.0.1:9443", "tls": true}],
-                          "serversTransport": "sni@file",
-                          "proxyProtocol": {"version": 2}
+                          "serversTransport": "sni@file"
                         }
                       }
                     },
                     "middlewares": {"allow-local": {"ipAllowList": {"sourceRange": ["127.0.0.1/32"]}}},
-                    "serversTransports": {"sni": {"tls": {"serverName": "origin.example.test", "certificates": [{"certificate": "tcp-client"}]}}}
+                    "serversTransports": {"sni": {"proxyProtocol": {"version": 2}, "tls": {"serverName": "origin.example.test", "certificates": [{"certificate": "tcp-client"}]}}}
                   },
                   "udp": {
                     "routers": {"dns-query": {"entryPoints": ["dns"], "service": "dns-pool@file"}},
@@ -201,9 +215,211 @@ type TraefikDynamicTests() =
 
     [<Test>]
     member _.``TCP proxy references validate PROXY versions SNI and transport identity``() =
-        assertInvalid """{"tcp":{"routers":{"r":{"entryPoints":["web"],"rule":"HostSNI(`x.test`)","service":"s"}},"services":{"s":{"loadBalancer":{"servers":[{"address":"127.0.0.1:9000"}],"serversTransport":"missing"}}}}}"""
+        assertInvalid """{"tcp":{"routers":{"r":{"entryPoints":["web"],"rule":"HostSNI(`x.test`)","service":"s","tls":{}}},"services":{"s":{"loadBalancer":{"servers":[{"address":"127.0.0.1:9000"}],"serversTransport":"missing"}}}}}"""
         assertInvalid """{"tcp":{"services":{"s":{"loadBalancer":{"servers":[{"address":"127.0.0.1:9000"}],"proxyProtocol":{"version":3}}}}}}"""
         assertInvalid """{"tcp":{"services":{"a":{"weighted":{"services":[{"name":"b"}]}},"b":{"weighted":{"services":[{"name":"a"}]}}}}}"""
-        assertInvalid """{"tcp":{"routers":{"r":{"entryPoints":["web"],"middlewares":["missing"],"rule":"HostSNI(`x.test`)","service":"s"}},"services":{"s":{"loadBalancer":{"servers":[{"address":"127.0.0.1:9000"}]}}}}}"""
+        assertInvalid """{"tcp":{"routers":{"r":{"entryPoints":["web"],"middlewares":["missing"],"rule":"HostSNI(`x.test`)","service":"s","tls":{}}},"services":{"s":{"loadBalancer":{"servers":[{"address":"127.0.0.1:9000"}]}}}}}"""
         assertInvalid """{"udp":{"services":{"a":{"weighted":{"services":[{"name":"b"}]}},"b":{"weighted":{"services":[{"name":"a"}]}}}}}"""
         assertInvalid """{"tcp":{"serversTransports":{"sni":{"tls":{"rootCAs":["/tmp/ca.pem"]}}}}}"""
+    [<Test>]
+    member _.``UDP routers cannot compete for one entry point``() =
+        assertInvalid """{"udp":{"routers":{"first":{"entryPoints":["dns"],"service":"s"},"second":{"entryPoints":["dns"],"service":"s"}},"services":{"s":{"loadBalancer":{"servers":[{"address":"127.0.0.1:5300"}]}}}}}"""
+
+        let entryPointsWithSecondUdp = Map.add "dns-alt" "udp" entryPoints
+        let distinct =
+            parse
+                """{"udp":{"routers":{"first":{"entryPoints":["dns"],"service":"s"},"second":{"entryPoints":["dns-alt"],"service":"s"}},"services":{"s":{"loadBalancer":{"servers":[{"address":"127.0.0.1:5300"}]}}}}}"""
+        TraefikDynamic.validate entryPointsWithSecondUdp resolvers tlsOptions legacyRouters distinct
+
+        let overlap =
+            parse
+                """{"udp":{"routers":{"first":{"entryPoints":["dns","dns-alt"],"service":"s"},"second":{"entryPoints":["dns-alt"],"service":"s"}},"services":{"s":{"loadBalancer":{"servers":[{"address":"127.0.0.1:5300"}]}}}}}"""
+        assertValidationFailure TraefikDynamic.ValidationFailure.UdpListenerOverlap (fun () ->
+            TraefikDynamic.validate entryPointsWithSecondUdp resolvers tlsOptions legacyRouters overlap)
+
+    [<Test>]
+    member _.``HTTP parentRefs retain multi-layer edges and service middleware order``() =
+        let root =
+            parse
+                """{"http":{
+                  "routers":{
+                    "root":{"entryPoints":["web"],"rule":"PathPrefix(`/multi`)","middlewares":["enrich"]},
+                    "middle":{"parentRefs":["root@file"],"rule":"Header(`X-Role`,`admin`)","middlewares":["child-chain"]},
+                    "leaf":{"parentRefs":["middle@file","root"],"rule":"PathPrefix(`/multi/admin`)","service":"admin"}
+                  },
+                  "services":{
+                    "admin":{"middlewares":["service-tag","prefix"],"loadBalancer":{"servers":[{"url":"http://127.0.0.1:9000"}]}}
+                  },
+                  "middlewares":{
+                    "enrich":{"headers":{"customRequestHeaders":{"X-Role":"admin"}}},
+                    "child-chain":{"chain":{"middlewares":["normalize"]}},
+                    "normalize":{"stripPrefix":{"prefixes":["/multi"]}},
+                    "service-tag":{"headers":{"customResponseHeaders":{"X-Dorothy-Service":"native"}}},
+                    "prefix":{"addPrefix":{"prefix":"/from-service"}}
+                  }
+                }}"""
+        validate root
+
+        let http = root["http"] :?> JsonObject
+        let routers = http["routers"] :?> JsonObject
+        Assert.That(routers["middle"].["parentRefs"].ToJsonString(), Is.EqualTo("[\"root@file\"]"))
+        Assert.That(routers["leaf"].["parentRefs"].ToJsonString(), Is.EqualTo("[\"middle@file\",\"root\"]"))
+        Assert.That(routers["root"].["middlewares"].ToJsonString(), Is.EqualTo("[\"enrich\"]"))
+        Assert.That(routers["middle"].["middlewares"].ToJsonString(), Is.EqualTo("[\"child-chain\"]"))
+        let services = http["services"] :?> JsonObject
+        Assert.That(services["admin"].["middlewares"].ToJsonString(), Is.EqualTo("[\"service-tag\",\"prefix\"]"))
+
+    [<Test>]
+    member _.``HTTP parent graphs reject missing edges cycles and child root-only fields``() =
+        assertInvalid """{"http":{"routers":{"child":{"parentRefs":["missing"],"rule":"Host(`x.test`)","service":"s"}},"services":{"s":{"loadBalancer":{"servers":[{"url":"http://127.0.0.1:9000"}]}}}}}"""
+        assertInvalid """{"http":{"routers":{"a":{"parentRefs":["b"],"rule":"Host(`x.test`)"},"b":{"parentRefs":["a"],"rule":"Host(`x.test`)"} }}}"""
+        assertInvalid
+            """{
+              "http": {
+                "routers": {
+                  "root": {
+                    "entryPoints": ["web"],
+                    "rule": "PathPrefix(`/`)",
+                    "service": "s"
+                  },
+                  "child": {
+                    "parentRefs": ["root"],
+                    "rule": "Host(`x.test`)",
+                    "service": "s"
+                  }
+                },
+                "services": {
+                  "s": {
+                    "loadBalancer": {
+                      "servers": [{"url": "http://127.0.0.1:9000"}]
+                    }
+                  }
+                }
+              }
+            }"""
+        assertInvalid """{"http":{"routers":{"root":{"entryPoints":["web"],"rule":"PathPrefix(`/`)"},"child":{"parentRefs":["root"],"entryPoints":["web"],"rule":"Host(`x.test`)","service":"s"}},"services":{"s":{"loadBalancer":{"servers":[{"url":"http://127.0.0.1:9000"}]}}}}}"""
+        assertInvalid """{"http":{"routers":{"root":{"entryPoints":["web"],"rule":"PathPrefix(`/`)"},"child":{"parentRefs":["root"],"rule":"Host(`x.test`)","service":"s","tls":{}}},"services":{"s":{"loadBalancer":{"servers":[{"url":"http://127.0.0.1:9000"}]}}}}}"""
+
+    [<Test>]
+    member _.``HTTP service middleware references participate in typed cycles``() =
+        assertInvalid """{"http":{"services":{"s":{"middlewares":["missing"],"loadBalancer":{"servers":[{"url":"http://127.0.0.1:9000"}]}}}}}"""
+        assertInvalid """{"http":{"services":{"s":{"middlewares":["errors"],"loadBalancer":{"servers":[{"url":"http://127.0.0.1:9000"}]}}},"middlewares":{"errors":{"errors":{"service":"s"}}}}}"""
+
+    [<Test>]
+    member _.``Named TCP transports own outgoing PROXY and termination delay``() =
+        validateJson """{"tcp":{"services":{"s":{"loadBalancer":{"servers":[{"address":"127.0.0.1:9000"}],"serversTransport":"upstream"}}},"serversTransports":{"upstream":{"proxyProtocol":{"version":2},"terminationDelay":"100ms"}}}}"""
+        validateJson """{"tcp":{"services":{"s":{"loadBalancer":{"servers":[{"address":"127.0.0.1:9000"}],"proxyProtocol":{"version":1}}}}}}"""
+        assertFailure TraefikDynamic.ValidationFailure.ProxyProtocolPlacement """{"tcp":{"services":{"s":{"loadBalancer":{"servers":[{"address":"127.0.0.1:9000"}],"serversTransport":"upstream","proxyProtocol":{"version":2}}}},"serversTransports":{"upstream":{"dialTimeout":"5s"}}}}"""
+        assertFailure TraefikDynamic.ValidationFailure.ProxyProtocolPlacement """{"tcp":{"services":{"s":{"loadBalancer":{"servers":[{"address":"127.0.0.1:9000"}],"serversTransport":"upstream","terminationDelay":100}}},"serversTransports":{"upstream":{"dialTimeout":"5s"}}}}"""
+
+    [<Test>]
+    member _.``TCP passthrough cannot claim ignored TLS policy and literal SNI needs TLS``() =
+        assertInvalid """{"tcp":{"routers":{"r":{"entryPoints":["web"],"rule":"HostSNI(`x.test`)","service":"s"}},"services":{"s":{"loadBalancer":{"servers":[{"address":"127.0.0.1:9000"}]}}}}}"""
+        assertInvalid """{"tcp":{"routers":{"r":{"entryPoints":["web"],"rule":"HostSNI(`x.test`)","service":"s","tls":{"passthrough":true,"options":"strict"}}},"services":{"s":{"loadBalancer":{"servers":[{"address":"127.0.0.1:9000"}]}}}}}"""
+        assertInvalid """{"tcp":{"routers":{"r":{"entryPoints":["web"],"rule":"HostSNI(`x.test`)","service":"s","tls":{"passthrough":true,"certResolver":"le"}}},"services":{"s":{"loadBalancer":{"servers":[{"address":"127.0.0.1:9000"}]}}}}}"""
+        assertInvalid """{"tcp":{"routers":{"r":{"entryPoints":["web"],"rule":"HostSNI(`x.test`)","service":"s","tls":{"passthrough":true,"domains":[{"main":"x.test"}]}}},"services":{"s":{"loadBalancer":{"servers":[{"address":"127.0.0.1:9000"}]}}}}}"""
+        validateJson """{"tcp":{"routers":{"r":{"entryPoints":["web"],"rule":"HostSNI(`*`)","service":"s"}},"services":{"s":{"loadBalancer":{"servers":[{"address":"127.0.0.1:9000"}]}}}}}"""
+
+    [<Test>]
+    member _.``TCP native health checks validate all load-balancer and weighted fields``() =
+        validateJson """{"tcp":{"services":{"s":{"loadBalancer":{"servers":[{"address":"127.0.0.1:9000"}],"healthCheck":{"port":9001,"send":"PING","expect":"PONG","interval":"5s","unhealthyInterval":"10s","timeout":"2s"}}}}}}"""
+        validateJson """{"tcp":{"services":{"parent":{"weighted":{"services":[{"name":"child"}],"healthCheck":{}}},"child":{"loadBalancer":{"servers":[{"address":"127.0.0.1:9000"}]}}}}}"""
+        assertInvalid """{"tcp":{"services":{"s":{"loadBalancer":{"servers":[{"address":"127.0.0.1:9000"}],"healthCheck":{"port":65536}}}}}}"""
+        assertInvalid """{"tcp":{"services":{"s":{"loadBalancer":{"servers":[{"address":"127.0.0.1:9000"}],"healthCheck":{"unexpected":true}}}}}}"""
+
+    [<Test>]
+    member _.``File-exposed HTTP middleware and transport fields are admitted exactly``() =
+        let root =
+            parse
+                """{"http":{
+                  "middlewares":{
+                    "retry":{"retry":{"attempts":3,"timeout":"10s","initialInterval":"100ms","maxRequestBodyBytes":4096,"status":["500-599"],"disableRetryOnNetworkError":true,"retryNonIdempotentMethod":true}},
+                    "signin":{"forwardAuth":{"address":"https://auth.example.test/check","authSigninURL":"https://login.example.test/sign-in"}},
+                    "path":{"encodedCharacters":{"allowEncodedSlash":true,"allowEncodedBackSlash":false,"allowEncodedNullCharacter":false,"allowEncodedSemicolon":false,"allowEncodedPercent":true,"allowEncodedQuestionMark":false,"allowEncodedHash":false}},
+                    "cert-info":{"passTLSClientCert":{"info":{"subject":{"organizationalUnit":true},"issuer":{"commonName":true}}}}
+                  },
+                  "serversTransports":{"timeouts":{"forwardingTimeouts":{"readTimeout":"2s","writeTimeout":"3s"}}}
+                }}"""
+        validate root
+
+        assertInvalid """{"http":{"middlewares":{"path":{"encodedCharacters":{"allowEncodedSlash":true,"allowEncodedNewline":true}}}}}"""
+        assertInvalid """{"http":{"middlewares":{"retry":{"retry":{"attempts":2,"futureOption":true}}}}}"""
+        assertInvalid """{"http":{"middlewares":{"cert-info":{"passTLSClientCert":{"info":{"issuer":{"organizationalUnit":true}}}}}}}"""
+        assertInvalid """{"http":{"models":{"front":{"middlewares":[],"tls":{},"observability":{"accessLogs":true}}}}}"""
+        assertInvalid """{"tcp":{"models":{"front":{}}}}"""
+        assertInvalid """{"tcp":{"services":{"s":{"loadBalancer":{"servers":[{"address":"127.0.0.1:9000","port":"9000"}]}}}}}"""
+
+        assertInvalid """{"http":{"serversTransports":{"workload":{"spiffe":{"trustDomain":"example.test"}}}}}"""
+        assertInvalid """{"tcp":{"serversTransports":{"workload":{"spiffe":{"trustDomain":"example.test"}}}}}"""
+        assertInvalid """{"tcp":{"serversTransports":{"workload":{"tls":{"spiffe":{"trustDomain":"example.test"}}}}}}"""
+    [<Test>]
+    member _.``Graph admission failures carry safe non-identifying categories``() =
+        assertFailure TraefikDynamic.ValidationFailure.UnresolvedReference """{"http":{"routers":{"r":{"entryPoints":["web"],"rule":"Host(`x.test`)","service":"missing"}}}}"""
+        assertFailure TraefikDynamic.ValidationFailure.ListenerProtocolMismatch """{"udp":{"routers":{"r":{"entryPoints":["web"],"service":"s"}},"services":{"s":{"loadBalancer":{"servers":[{"address":"127.0.0.1:5300"}]}}}}}"""
+        assertFailure TraefikDynamic.ValidationFailure.UdpListenerOverlap """{"udp":{"routers":{"a":{"entryPoints":["dns"],"service":"s"},"b":{"entryPoints":["dns"],"service":"s"}},"services":{"s":{"loadBalancer":{"servers":[{"address":"127.0.0.1:5300"}]}}}}}"""
+        assertFailure TraefikDynamic.ValidationFailure.ProxyProtocolPlacement """{"tcp":{"services":{"s":{"loadBalancer":{"servers":[{"address":"127.0.0.1:9000"}],"serversTransport":"upstream","proxyProtocol":{"version":2}}}},"serversTransports":{"upstream":{"dialTimeout":"5s"}}}}"""
+
+    [<Test>]
+    member _.``Trusted legacy lowering resolves native references but rejects user internal spoofing``() =
+        let backend = "http://127.0.0.1:9000"
+        let redirectOrigin = "https://redirect.example.test"
+        let hash (value: string) =
+            System.Security.Cryptography.SHA256.HashData(System.Text.Encoding.UTF8.GetBytes(value))
+            |> Convert.ToHexStringLower
+        let backendService = "keroosha-backend-" + hash backend
+        let redirectMiddleware = "keroosha-redirect-" + hash ("legacy-redirect\n" + redirectOrigin)
+        let routes: TraefikHttpGraphModel.LegacyRouter list =
+            [ { Name = "legacy-backend"
+                Host = "legacy.example.test"
+                EntryPoint = "legacy-web"
+                ExcludedPathSubtree = None
+                Target = TraefikHttpGraphModel.LegacyTarget.Backend backend
+                Tls = TraefikHttpGraphModel.LegacyTls.None }
+              { Name = "legacy-redirect"
+                Host = "redirect.example.test"
+                EntryPoint = "legacy-web"
+                ExcludedPathSubtree = None
+                Target = TraefikHttpGraphModel.LegacyTarget.Redirect redirectOrigin
+                Tls = TraefikHttpGraphModel.LegacyTls.None } ]
+        let makeRoot (service: string) =
+            let root =
+                parse
+                    """{"static":{},"dynamic":{"http":{"routers":{"native-share":{"entryPoints":["legacy-web"],"rule":"Host(`native.example.test`)","service":"placeholder","middlewares":["placeholder"]}}}}}"""
+            let http = (root["dynamic"] :?> JsonObject)["http"] :?> JsonObject
+            let routers = http["routers"] :?> JsonObject
+            let native = routers["native-share"] :?> JsonObject
+            native["service"] <- JsonValue.Create(service)
+            let middlewares = JsonArray()
+            middlewares.Add(JsonValue.Create(redirectMiddleware))
+            native["middlewares"] <- middlewares
+            root
+        let validateLegacy root =
+            TraefikSettings.validateWithLegacyRoutes
+                (Map.ofList [ "legacy-web", 8080 ])
+                19080
+                Set.empty
+                Set.empty
+                Set.empty
+                routes
+                root
+
+        let _, mergedDynamic = validateLegacy (makeRoot backendService)
+        let mergedHttp = mergedDynamic["http"] :?> JsonObject
+        Assert.That((mergedHttp["services"] :?> JsonObject).ContainsKey(backendService), Is.True)
+        Assert.That((mergedHttp["middlewares"] :?> JsonObject).ContainsKey(redirectMiddleware), Is.True)
+
+        for internalTarget in [ "api@internal"; "noop@internal" ] do
+            let error =
+                Assert.Throws<TraefikSettings.InvalidConfiguration>(
+                    TestDelegate(fun () -> validateLegacy (makeRoot internalTarget) |> ignore)
+                )
+            Assert.That(error.Message, Does.Not.Contain(internalTarget))
+
+        let adminSpoof =
+            parse
+                """{"static":{},"dynamic":{"http":{"routers":{"keroosha-admin":{"entryPoints":["legacy-web"],"rule":"Host(`attacker.example.test`)","service":"api@internal"}}}}}"""
+        let adminError =
+            Assert.Throws<TraefikSettings.InvalidConfiguration>(
+                TestDelegate(fun () -> validateLegacy adminSpoof |> ignore)
+            )
+        Assert.That(adminError.Message, Does.Not.Contain("keroosha-admin"))

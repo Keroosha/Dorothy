@@ -2,12 +2,14 @@
 set -euo pipefail
 umask 077
 
-if [[ $# != 2 ]]; then
-    printf 'Usage: client-checks.sh /var/tmp/dorothy-traefik-acceptance.XXXXXXXX protocols|after-reboot|route-update|rotation|udp-drift|udp-repaired\n' >&2
+if [[ $# != 3 ]]; then
+    printf 'Usage: client-checks.sh /var/tmp/dorothy-traefik-acceptance.XXXXXXXX protocols|after-reboot|route-update|rotation|udp-drift|udp-repaired <run-index>\n' >&2
     exit 2
 fi
 root=$(realpath -e -- "$1")
 mode=$2
+run_index=$3
+[[ "$run_index" =~ ^[1-9][0-9]{0,3}$ ]] || { printf 'Invalid client evidence run index.\n' >&2; exit 2; }
 case "$root" in
     /var/tmp/dorothy-traefik-acceptance.*) ;;
     *) printf 'Refusing to use a path outside the private guest temp root.\n' >&2; exit 2 ;;
@@ -27,6 +29,85 @@ fail() {
     printf 'acceptance client failure: %s\n' "$1" >&2
     exit 1
 }
+
+exact_body_checks=0
+legacy_redirect_status=0
+legacy_excluded_status=0
+native_excluded_status=0
+http2_version=not-tested
+http3_version=not-tested
+multi_http_count=0
+multi_other_count=0
+tcp_proxy_v2_verified=false
+tls_passthrough_verified=false
+udp_ingress_proofs=0
+udp_backend_proofs=0
+otel_spans_count=0
+otel_metrics_count=0
+post_reboot_trace_sha256=not-collected
+bad_upstream_ca_rejected=null
+negative_fixture_dir=''
+upstream_swap_active=false
+assert_exact_body() {
+    local body_file=$1 expected=$2 description=$3
+    printf '%s\n' "$expected" | cmp -s - "$body_file" \
+        || fail "$description returned a body other than the exact backend response"
+    exact_body_checks=$((exact_body_checks + 1))
+}
+write_metrics() {
+    local destination="$root/logs/client-metrics-$run_index.json"
+    [[ ! -e "$destination" && ! -L "$destination" ]] || fail 'client metrics path already exists'
+    jq -n \
+        --arg mode "$mode" \
+        --arg runIndex "$run_index" \
+        --arg http2Version "$http2_version" \
+        --arg http3Version "$http3_version" \
+        --arg postRebootTraceSha256 "$post_reboot_trace_sha256" \
+        --argjson exactBackendBodyChecks "$exact_body_checks" \
+        --argjson legacyRedirectStatus "$legacy_redirect_status" \
+        --argjson legacyExcludedStatus "$legacy_excluded_status" \
+        --argjson nativeExcludedStatus "$native_excluded_status" \
+        --argjson multiHttpBackendResponses "$multi_http_count" \
+        --argjson multiOtherBackendResponses "$multi_other_count" \
+        --argjson tcpProxyV2Verified "$tcp_proxy_v2_verified" \
+        --argjson tlsPassthroughVerified "$tls_passthrough_verified" \
+        --argjson udpIngressProofs "$udp_ingress_proofs" \
+        --argjson udpBackendProofs "$udp_backend_proofs" \
+        --argjson otelResourceSpansRecords "$otel_spans_count" \
+        --argjson otelResourceMetricsRecords "$otel_metrics_count" \
+        --argjson badUpstreamCaRejected "$bad_upstream_ca_rejected" \
+        '{
+            schema: 1,
+            mode: $mode,
+            runIndex: ($runIndex | tonumber),
+            exactBackendBodyChecks: $exactBackendBodyChecks,
+            legacyRedirectStatus: $legacyRedirectStatus,
+            legacyExcludedSubtreeStatus: $legacyExcludedStatus,
+            nativeExcludedSubtreeStatus: $nativeExcludedStatus,
+            multiUpstreamResponses: {
+                catalog: $multiHttpBackendResponses,
+                other: $multiOtherBackendResponses
+            },
+            protocols: {
+                http2Version: (if $http2Version == "not-tested" then null else $http2Version end),
+                http3Version: (if $http3Version == "not-tested" then null else $http3Version end),
+                tcpProxyV2Verified: $tcpProxyV2Verified,
+                tlsPassthroughVerified: $tlsPassthroughVerified,
+                udpIngressProofs: $udpIngressProofs,
+                udpBackendProofs: $udpBackendProofs
+            },
+            negativeControls: {
+                badUpstreamCaRejected: $badUpstreamCaRejected
+            },
+            telemetry: {
+                resourceSpansRecords: $otelResourceSpansRecords,
+                resourceMetricsRecords: $otelResourceMetricsRecords,
+                postRebootTraceEvidenceSha256: $postRebootTraceSha256
+            }
+        }' > "$destination" || fail 'could not write sanitized client metrics'
+    chmod 600 "$destination"
+}
+
 check_udp_http_control() {
     local body="$root/logs/client-udp-http-control.body" status
     if status=$(curl --silent --show-error \
@@ -56,8 +137,62 @@ stop_udp_capture() {
     fi
     return "$status"
 }
-cleanup_udp_capture() { stop_udp_capture || true; }
-trap cleanup_udp_capture EXIT
+restore_upstream_fixture() {
+    local certificate="$root/certs/upstream-server.pem"
+    local key="$root/certs/upstream-server.key"
+    local staged_certificate="$root/certs/.upstream-server.pem.restore.$$"
+    local staged_key="$root/certs/.upstream-server.key.restore.$$"
+    local status recovered=false
+    [[ -s "$negative_fixture_dir/original-upstream-server.pem" \
+       && -s "$negative_fixture_dir/original-upstream-server.key" ]] || return 1
+    install -o root -g root -m 644 "$negative_fixture_dir/original-upstream-server.pem" "$staged_certificate" || return 1
+    install -o root -g root -m 600 "$negative_fixture_dir/original-upstream-server.key" "$staged_key" || return 1
+    mv -fT -- "$staged_certificate" "$certificate" || return 1
+    mv -fT -- "$staged_key" "$key" || return 1
+    systemctl restart dorothy-traefik-acceptance-backends.service \
+        > "$root/logs/client-bad-upstream-restore.log" 2>&1 || return 1
+    for _ in $(seq 1 30); do
+        if status=$(curl --silent --show-error --fail --connect-timeout 2 --max-time 4 \
+            --resolve backend.acceptance.test:8081:127.0.0.1 \
+            --cacert "$root/certs/upstream-ca.pem" \
+            --output "$root/logs/client-bad-upstream-restored-direct.body" --write-out '%{http_code}' \
+            https://backend.acceptance.test:8081/health); then
+            if [[ "$status" == 200 ]] \
+               && printf '%s\n' tls-backend-ready | cmp -s - "$root/logs/client-bad-upstream-restored-direct.body"; then
+                if status=$(curl --silent --show-error --insecure --connect-timeout 2 --max-time 5 \
+                    --resolve shop.acceptance.test:18443:127.0.0.1 \
+                    --output "$root/logs/client-bad-upstream-restored-route.body" --write-out '%{http_code}' \
+                    https://shop.acceptance.test:18443/secure/health) \
+                   && [[ "$status" == 200 ]] \
+                   && printf '%s\n' tls-backend:/secure/health | cmp -s - "$root/logs/client-bad-upstream-restored-route.body"; then
+                    recovered=true
+                    break
+                fi
+            fi
+        fi
+        sleep 1
+    done
+    [[ "$recovered" == true ]] || return 1
+    upstream_swap_active=false
+}
+cleanup_client_fixtures() {
+    local status=$?
+    trap - EXIT
+    stop_udp_capture || true
+    if [[ "$upstream_swap_active" == true ]] && ! restore_upstream_fixture; then
+        printf 'Could not restore the original HTTPS backend certificate after a failed negative control.\n' >&2
+        status=1
+    fi
+    if [[ -n "$negative_fixture_dir" && "$negative_fixture_dir" == "$root/logs/.negative-tls."* \
+       && -d "$negative_fixture_dir" && ! -L "$negative_fixture_dir" ]]; then
+        if ! rm -rf -- "$negative_fixture_dir"; then
+            printf 'Could not remove private negative-control TLS fixture material.\n' >&2
+            status=1
+        fi
+    fi
+    exit "$status"
+}
+trap cleanup_client_fixtures EXIT
 
 start_udp_capture() {
     local capture_file=$1 started=false
@@ -129,9 +264,11 @@ probe_udp_path() {
     stop_udp_capture || fail 'bounded UDP packet capture did not stop cleanly'
     capture_has_nonce_at "$capture_file" "$port" "$nonce" \
         || fail "UDP capture did not observe nonce ingress to listener :$port"
+    udp_ingress_proofs=$((udp_ingress_proofs + 1))
     if [[ "$expect_backend" == true ]]; then
         capture_has_nonce_at "$capture_file" 19002 "$nonce" \
             || fail 'positive UDP capture did not observe the nonce at backend :19002'
+        udp_backend_proofs=$((udp_backend_proofs + 1))
     elif capture_has_nonce_at "$capture_file" 19002 "$nonce"; then
         fail 'withdrawn UDP route forwarded the nonce to old backend :19002'
     fi
@@ -186,6 +323,7 @@ if [[ "$mode" == udp-drift || "$mode" == udp-repaired ]]; then
         probe_udp_reply surviving-restored 19003 127.0.0.4
         printf 'Both UDP echo routes and the independent HTTP control passed after repair.\n'
     fi
+    write_metrics
     exit 0
 fi
 
@@ -197,7 +335,7 @@ legacy_status=$(curl --silent --show-error --insecure \
     --output "$legacy_body" --write-out '%{http_code}' \
     https://example.org/legacy-check)
 [[ "$legacy_status" == 200 ]] || fail "legacy TLS route returned status $legacy_status"
-grep -Fq 'http-backend:/legacy-check' "$legacy_body" || fail 'legacy checkpoint route missed the backend'
+assert_exact_body "$legacy_body" 'http-backend:/legacy-check;forwarded:' 'legacy TLS route'
 
 http_body="$root/logs/client-http.body"
 http_headers="$root/logs/client-http.headers"
@@ -206,7 +344,7 @@ http_status=$(curl --silent --show-error --compressed \
     --dump-header "$http_headers" --output "$http_body" --write-out '%{http_code}' \
     'http://shop.acceptance.test:18081/items/42?origin=acceptance')
 [[ "$http_status" == 200 ]] || fail "HTTP route returned status $http_status"
-grep -Fq 'http-backend:/items/42?origin=acceptance' "$http_body" || fail 'ordered add-prefix/strip-prefix chain did not restore the original path'
+assert_exact_body "$http_body" 'http-backend:/items/42?origin=acceptance;forwarded:' 'ordered add-prefix/strip-prefix route'
 grep -Eiq '^content-encoding:[[:space:]]*gzip' "$http_headers" || fail 'HTTP compression middleware did not negotiate gzip'
 
 status_body="$root/logs/client-shared-service.body"
@@ -215,7 +353,7 @@ status_code=$(curl --silent --show-error \
     --output "$status_body" --write-out '%{http_code}' \
     http://shop.acceptance.test:18081/status)
 [[ "$status_code" == 200 ]] || fail "shared HTTP service route returned status $status_code"
-grep -Fq 'http-backend:/status' "$status_body" || fail 'shared HTTP service returned an unexpected backend body'
+assert_exact_body "$status_body" 'http-backend:/status;forwarded:' 'shared HTTP service route'
 
 other_body="$root/logs/client-other-backend.body"
 other_code=$(curl --silent --show-error \
@@ -223,7 +361,7 @@ other_code=$(curl --silent --show-error \
     --output "$other_body" --write-out '%{http_code}' \
     http://shop.acceptance.test:18081/other/42)
 [[ "$other_code" == 200 ]] || fail "second HTTP backend route returned status $other_code"
-grep -Fq 'other-backend:/other/42' "$other_body" || fail 'second HTTP path did not reach its distinct backend'
+assert_exact_body "$other_body" 'other-backend:/other/42' 'second HTTP backend route'
 
 catalog_health=$(curl --fail --silent --show-error --max-time 2 http://127.0.0.1:8080/health) \
     || fail 'direct catalog backend health control failed'
@@ -262,9 +400,17 @@ for index in $(seq 1 12); do
     [[ "$multi_status" == 200 ]] || fail "multi-upstream request $index returned status $multi_status"
     response=$(<"$multi_body")
     case "$response" in
-        "http-backend:/multi/request-$index"*) multi_http=true ;;
-        "other-backend:/multi/request-$index"*) multi_other=true ;;
-        *) fail "multi-upstream request $index returned an unknown backend response" ;;
+        "http-backend:/multi/request-$index;forwarded:")
+            multi_http=true
+            multi_http_count=$((multi_http_count + 1))
+            assert_exact_body "$multi_body" "http-backend:/multi/request-$index;forwarded:" 'multi-upstream catalog backend'
+            ;;
+        "other-backend:/multi/request-$index")
+            multi_other=true
+            multi_other_count=$((multi_other_count + 1))
+            assert_exact_body "$multi_body" "other-backend:/multi/request-$index" 'multi-upstream other backend'
+            ;;
+        *) fail "multi-upstream request $index returned an unknown or non-exact backend response" ;;
     esac
 done
 [[ "$multi_http" == true && "$multi_other" == true ]] || fail 'multi-upstream load balancer did not use both healthy servers'
@@ -281,7 +427,25 @@ excluded_status=$(curl --silent --show-error \
     --resolve shop.acceptance.test:18081:127.0.0.1 \
     --output "$root/logs/client-excluded-subtree.body" --write-out '%{http_code}' \
     http://shop.acceptance.test:18081/multi/private/hidden)
-[[ "$excluded_status" == 404 ]] || fail "excluded HTTP subtree returned status $excluded_status"
+native_excluded_status=$excluded_status
+[[ "$excluded_status" == 404 ]] || fail "native excluded HTTP subtree returned status $excluded_status"
+
+legacy_redirect_headers="$root/logs/client-legacy-redirect.headers"
+legacy_redirect_status=$(curl --silent --show-error --insecure \
+    --resolve redirect.acceptance.test:443:127.0.0.1 \
+    --dump-header "$legacy_redirect_headers" --output "$root/logs/client-legacy-redirect.body" \
+    --write-out '%{http_code}' \
+    'https://redirect.acceptance.test/from/legacy?source=acceptance')
+[[ "$legacy_redirect_status" == 301 ]] || fail "legacy permanent redirect returned status $legacy_redirect_status"
+legacy_redirect_location=$(awk 'tolower($1) == "location:" { sub(/^[^:]*:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }' "$legacy_redirect_headers")
+[[ "$legacy_redirect_location" == 'https://target.acceptance.test/from/legacy?source=acceptance' ]] \
+    || fail 'legacy redirect returned an unexpected Location header'
+
+legacy_excluded_status=$(curl --silent --show-error --insecure \
+    --resolve redirect.acceptance.test:443:127.0.0.1 \
+    --output "$root/logs/client-legacy-excluded-subtree.body" --write-out '%{http_code}' \
+    https://redirect.acceptance.test/private/hidden)
+[[ "$legacy_excluded_status" == 404 ]] || fail "legacy excluded redirect subtree returned status $legacy_excluded_status"
 
 unknown_status=$(curl --silent --show-error \
     --resolve outsider.acceptance.test:18081:127.0.0.1 \
@@ -294,7 +458,7 @@ sni_status=$(curl --silent --show-error --insecure \
     --output "$sni_body" --write-out '%{http_code}' \
     https://sni-proof.acceptance.test:18449/sni-proof)
 [[ "$sni_status" == 200 ]] || fail "SNI proof listener returned status $sni_status"
-grep -Fq 'http-backend:/sni-proof;forwarded:127.0.0.1' "$sni_body" || fail 'SNI proof router did not reach the expected backend'
+assert_exact_body "$sni_body" 'http-backend:/sni-proof;forwarded:127.0.0.1' 'SNI proof router'
 proof_certificate="$root/certs/sni-proof.pem"
 [[ -s "$proof_certificate" ]] || fail 'SNI proof certificate snapshot is missing'
 certificate_fingerprint() {
@@ -574,40 +738,140 @@ check_tlsalpn_acme() {
     }
 }
 
-if [[ "$mode" == protocols ]]; then
-    acme_failures=()
-    run_acme_check dns-01 check_dns_acme
-    run_acme_check http-01 check_http01_acme
-    run_acme_check tls-alpn-01 check_tlsalpn_acme
-    ((${#acme_failures[@]} == 0)) || fail "independent ACME checks failed: ${acme_failures[*]}"
+
+check_bad_upstream_ca() {
+    local bad_ca="$negative_fixture_dir/bad-upstream-ca.pem"
+    local bad_ca_key="$negative_fixture_dir/bad-upstream-ca.key"
+    local bad_cert="$negative_fixture_dir/bad-upstream-server.pem"
+    local bad_key="$negative_fixture_dir/bad-upstream-server.key"
+    local bad_csr="$negative_fixture_dir/bad-upstream-server.csr"
+    local direct_status route_status
+    openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+        -keyout "$bad_ca_key" -out "$bad_ca" -subj '/CN=Dorothy Untrusted Upstream CA' -days 2 \
+        -addext 'basicConstraints=critical,CA:TRUE' \
+        -addext 'keyUsage=critical,keyCertSign,cRLSign' \
+        > "$root/logs/client-bad-upstream-ca.log" 2>&1 \
+        || fail 'could not create an independent upstream issuer'
+    openssl req -new -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes \
+        -keyout "$bad_key" -out "$bad_csr" -subj '/CN=backend.acceptance.test' \
+        > "$root/logs/client-bad-upstream-request.log" 2>&1 \
+        || fail 'could not create the independent HTTPS backend identity'
+    cat > "$negative_fixture_dir/bad-upstream.ext" <<'EOF'
+basicConstraints=critical,CA:FALSE
+keyUsage=critical,digitalSignature
+extendedKeyUsage=serverAuth
+subjectAltName=DNS:backend.acceptance.test,IP:127.0.0.1
+EOF
+    openssl x509 -req -in "$bad_csr" -CA "$bad_ca" -CAkey "$bad_ca_key" -CAcreateserial \
+        -out "$bad_cert" -days 2 -sha256 -extfile "$negative_fixture_dir/bad-upstream.ext" \
+        > "$root/logs/client-bad-upstream-sign.log" 2>&1 \
+        || fail 'could not sign the independent HTTPS backend identity'
+    chmod 600 "$bad_ca_key" "$bad_key"
+    openssl verify -purpose sslserver -verify_hostname backend.acceptance.test -CAfile "$bad_ca" "$bad_cert" \
+        > "$root/logs/client-bad-upstream-self-verify.log" 2>&1 \
+        || fail 'independent upstream certificate is not a valid server-auth identity'
+    if openssl verify -purpose sslserver -verify_hostname backend.acceptance.test \
+        -CAfile "$root/certs/upstream-ca.pem" "$bad_cert" \
+        > "$root/logs/client-bad-upstream-trusted-ca-negative.log" 2>&1; then
+        fail 'independent upstream certificate chains to the configured upstream CA'
+    fi
+    [[ -f "$root/certs/upstream-server.pem" && ! -L "$root/certs/upstream-server.pem" \
+       && -f "$root/certs/upstream-server.key" && ! -L "$root/certs/upstream-server.key" ]] \
+        || fail 'original HTTPS backend certificate pair is missing or unsafe'
+    cp --preserve=mode,ownership,timestamps "$root/certs/upstream-server.pem" \
+        "$negative_fixture_dir/original-upstream-server.pem"
+    cp --preserve=mode,ownership,timestamps "$root/certs/upstream-server.key" \
+        "$negative_fixture_dir/original-upstream-server.key"
+
+    if direct_status=$(curl --silent --show-error --fail --resolve backend.acceptance.test:8081:127.0.0.1 \
+        --cacert "$bad_ca" --output "$root/logs/client-bad-upstream-direct.body" --write-out '%{http_code}' \
+        https://backend.acceptance.test:8081/health); then
+        :
+    else
+        fail 'independent HTTPS backend certificate failed its own issuing CA control'
+    fi
+    [[ "$direct_status" == 200 ]] \
+        || fail "independent HTTPS backend returned status $direct_status under its own CA"
+    assert_exact_body "$root/logs/client-bad-upstream-direct.body" 'tls-backend-ready' 'independent HTTPS backend'
+
+    upstream_swap_active=true
+    install -o root -g root -m 644 "$bad_cert" "$root/certs/.upstream-server.pem.acceptance"
+    install -o root -g root -m 600 "$bad_key" "$root/certs/.upstream-server.key.acceptance"
+    mv -fT -- "$root/certs/.upstream-server.pem.acceptance" "$root/certs/upstream-server.pem"
+    mv -fT -- "$root/certs/.upstream-server.key.acceptance" "$root/certs/upstream-server.key"
+    systemctl restart dorothy-traefik-acceptance-backends.service \
+        > "$root/logs/client-bad-upstream-inject.log" 2>&1 \
+        || fail 'could not activate the independent HTTPS backend certificate'
+    if direct_status=$(curl --silent --show-error --fail --connect-timeout 2 --max-time 5 \
+        --resolve backend.acceptance.test:8081:127.0.0.1 \
+        --cacert "$bad_ca" --output "$root/logs/client-bad-upstream-direct-active.body" --write-out '%{http_code}' \
+        https://backend.acceptance.test:8081/health); then
+        :
+    else
+        fail 'active independent HTTPS backend certificate failed its own CA control'
+    fi
+    [[ "$direct_status" == 200 ]] \
+        || fail "active independent HTTPS backend returned status $direct_status under its own CA"
+    assert_exact_body "$root/logs/client-bad-upstream-direct-active.body" 'tls-backend-ready' 'active independent HTTPS backend'
+    if curl --silent --show-error --fail --connect-timeout 2 --max-time 5 \
+        --resolve backend.acceptance.test:8081:127.0.0.1 \
+        --cacert "$root/certs/upstream-ca.pem" \
+        --output "$root/logs/client-bad-upstream-direct-trusted-ca.body" \
+        https://backend.acceptance.test:8081/health; then
+        fail 'HTTPS backend certificate was accepted by the unrelated configured upstream CA'
+    fi
+    route_status=$(curl --silent --show-error --insecure --connect-timeout 2 --max-time 5 \
+        --resolve shop.acceptance.test:18443:127.0.0.1 \
+        --output "$root/logs/client-bad-upstream-route.body" --write-out '%{http_code}' \
+        https://shop.acceptance.test:18443/secure/health) \
+        || fail 'secure Traefik route did not return an HTTP response for the upstream-CA negative control'
+    [[ "$route_status" == 502 ]] \
+        || fail "configured upstream trust policy returned status $route_status instead of rejecting the unrelated CA"
+    bad_upstream_ca_rejected=true
+    restore_upstream_fixture || fail 'original HTTPS backend certificate did not recover after the bad-CA control'
+}
+
+
+if [[ "$mode" == protocols || "$mode" == after-reboot ]]; then
+    if [[ "$mode" == protocols ]]; then
+        acme_failures=()
+        run_acme_check dns-01 check_dns_acme
+        run_acme_check http-01 check_http01_acme
+        run_acme_check tls-alpn-01 check_tlsalpn_acme
+        ((${#acme_failures[@]} == 0)) || fail "independent ACME checks failed: ${acme_failures[*]}"
+        protocol_ca="$root/certs/pebble-issued-root.pem"
+    else
+        [[ -s "$root/certs/pebble-rotated-issued-root.pem" ]] || fail 'pre-reboot rotated CA trust snapshot is missing'
+        [[ -s "$root/certs/pebble-reboot-issued-root.pem" ]] || fail 'post-reboot CA trust snapshot is missing'
+        old_root="$root/certs/pebble-rotated-issued-root.pem"
+        reboot_root="$root/certs/pebble-reboot-issued-root.pem"
+        root_bundle="$root/certs/pebble-rotated-reboot-roots.pem"
+        cat "$old_root" "$reboot_root" > "$root_bundle"
+        chmod 644 "$root_bundle"
+        protocol_ca=$root_bundle
+    fi
 
     secure_url=https://shop.acceptance.test:18443/secure/health
     h2_version=$(curl --silent --show-error --fail --http2 \
         --resolve shop.acceptance.test:18443:127.0.0.1 \
-        --cacert "$root/certs/pebble-issued-root.pem" \
+        --cacert "$protocol_ca" \
         --output "$root/logs/client-http2.body" --write-out '%{http_version}' "$secure_url")
     [[ "$h2_version" == 2 ]] || fail "TLS entrypoint negotiated HTTP/$h2_version instead of HTTP/2"
+    assert_exact_body "$root/logs/client-http2.body" 'tls-backend:/secure/health' 'HTTP/2 secure route'
+    http2_version=$h2_version
     h3_version=$(curl --silent --show-error --fail --http3-only \
         --resolve shop.acceptance.test:18443:127.0.0.1 \
-        --cacert "$root/certs/pebble-issued-root.pem" \
+        --cacert "$protocol_ca" \
         --output "$root/logs/client-http3.body" --write-out '%{http_version}' "$secure_url")
     [[ "$h3_version" == 3 ]] || fail "TLS entrypoint negotiated HTTP/$h3_version instead of HTTP/3"
+    assert_exact_body "$root/logs/client-http3.body" 'tls-backend:/secure/health' 'HTTP/3 secure route'
+    http3_version=$h3_version
 
-    mtls_url=https://mtls.acceptance.test:18444/mtls/positive
-    mtls_body="$root/logs/client-mtls.body"
-    mtls_code=$(curl --silent --show-error --fail \
-        --resolve mtls.acceptance.test:18444:127.0.0.1 \
-        --cacert "$root/certs/pebble-issued-root.pem" \
-        --cert "$root/certs/client.pem" --key "$root/certs/client.key" \
-        --output "$mtls_body" --write-out '%{http_code}' "$mtls_url")
-    [[ "$mtls_code" == 200 ]] || fail 'trusted mTLS client was not accepted'
-    grep -Fq 'http-backend:/mtls/positive' "$mtls_body" || fail 'mTLS route did not reach its HTTP service'
-    if curl --silent --show-error --fail \
-        --resolve mtls.acceptance.test:18444:127.0.0.1 \
-        --cacert "$root/certs/pebble-issued-root.pem" \
-        --output "$root/logs/client-mtls-negative.body" \
-        https://mtls.acceptance.test:18444/mtls/negative; then
-        fail 'mTLS route accepted a client without a certificate'
+    if [[ "$mode" == protocols ]]; then
+        negative_fixture_dir=$(mktemp -d "$root/logs/.negative-tls.XXXXXXXX") \
+            || fail 'could not create a private upstream TLS negative-control directory'
+        chmod 700 "$negative_fixture_dir"
+        check_bad_upstream_ca
     fi
 
     timeout 8 perl -MIO::Socket::INET -MSocket=inet_aton -e '
@@ -661,6 +925,7 @@ if [[ "$mode" == protocols ]]; then
         die "bad echoed application payload" unless substr($response, 28) eq $message;
         print "v2 signature/version/family/length/source/destination/ports/payload verified";
     ' > "$root/logs/client-proxy-v2.bin" || fail 'TCP backend did not return a complete PROXY v2 frame and full-duplex payload'
+    tcp_proxy_v2_verified=true
 
     probe_udp_path baseline 19000 127.0.0.3 true true
 
@@ -669,7 +934,8 @@ if [[ "$mode" == protocols ]]; then
             -connect 127.0.0.1:19000 -servername backend.acceptance.test \
             -CAfile "$root/certs/upstream-ca.pem" \
             > "$root/logs/client-tcp-passthrough.body" 2> "$root/logs/client-tcp-passthrough.tls"
-    grep -Fq 'tls-backend:/tls-passthrough' "$root/logs/client-tcp-passthrough.body" || fail 'TCP TLS passthrough did not reach the upstream TLS server'
+    assert_exact_body "$root/logs/client-tcp-passthrough.body" 'tls-backend:/tls-passthrough' 'TCP TLS passthrough'
+    tls_passthrough_verified=true
 fi
 
 if [[ "$mode" == rotation ]]; then
@@ -766,16 +1032,14 @@ if [[ "$mode" == after-reboot ]]; then
         "$root/logs/client-post-reboot-tls.body" \
         --resolve shop.acceptance.test:18443:127.0.0.1 \
         || fail 'post-reboot DNS certificate was not trusted by the saved CA snapshots'
-    grep -Fq 'tls-backend:/secure/health' "$root/logs/client-post-reboot-tls.body" \
-        || fail 'post-reboot DNS route returned an unexpected backend body'
+    assert_exact_body "$root/logs/client-post-reboot-tls.body" 'tls-backend:/secure/health' 'post-reboot DNS route'
     verify_reboot_certificate mtls \
         https://mtls.acceptance.test:18444/mtls/reboot \
         "$root/logs/client-post-reboot-mtls.body" \
         --resolve mtls.acceptance.test:18444:127.0.0.1 \
         --cert "$root/certs/client.pem" --key "$root/certs/client.key" \
         || fail 'post-reboot mTLS certificate or client policy was not trusted by the saved CA snapshots'
-    grep -Fq 'http-backend:/mtls/reboot' "$root/logs/client-post-reboot-mtls.body" \
-        || fail 'post-reboot mTLS route returned an unexpected backend body'
+    assert_exact_body "$root/logs/client-post-reboot-mtls.body" 'http-backend:/mtls/reboot;forwarded:' 'post-reboot mTLS route'
 
     [[ -s "$root/logs/acme-account-fingerprints-before-reboot.txt" ]] \
         || fail 'pre-reboot ACME account/store retention evidence is missing'
@@ -799,7 +1063,7 @@ legacy_api_status=$(curl --silent --show-error --insecure \
     --output "$root/logs/client-legacy-api.body" --write-out '%{http_code}' \
     https://example.org/api/entrypoints)
 [[ "$legacy_api_status" == 200 ]] || fail "legacy traffic listener returned unexpected status $legacy_api_status for /api"
-grep -Fq 'http-backend:/api/entrypoints' "$root/logs/client-legacy-api.body" || fail 'Traefik API was served on legacy websecure port 443'
+assert_exact_body "$root/logs/client-legacy-api.body" 'http-backend:/api/entrypoints;forwarded:' 'legacy API router'
 
 secure_api_status=$(curl --silent --show-error --insecure \
     --resolve shop.acceptance.test:18443:127.0.0.1 \
@@ -849,6 +1113,34 @@ if [[ "$mode" == protocols ]]; then
     done
     grep -q 'ResourceSpans #' "$root/logs/otelcol.log" || fail 'OTel collector received no Traefik traces'
     grep -q 'ResourceMetrics #' "$root/logs/otelcol.log" || fail 'OTel collector received no Traefik metrics'
+    otel_spans_count=$(grep -c 'ResourceSpans #' "$root/logs/otelcol.log" || true)
+    otel_metrics_count=$(grep -c 'ResourceMetrics #' "$root/logs/otelcol.log" || true)
+elif [[ "$mode" == after-reboot ]]; then
+    offset_file="$root/logs/otel-before-reboot.bytes"
+    [[ -f "$offset_file" && ! -L "$offset_file" ]] || fail 'pre-reboot OTel log boundary is missing'
+    otel_offset=$(<"$offset_file")
+    [[ "$otel_offset" =~ ^[0-9]+$ ]] || fail 'pre-reboot OTel log boundary is malformed'
+    current_otel="$root/logs/otel-after-reboot-current.log"
+    otel_evidence="$root/logs/otel-after-reboot-evidence.txt"
+    for _ in $(seq 1 60); do
+        current_size=$(stat --format='%s' "$root/logs/otelcol.log")
+        if (( current_size > otel_offset )); then
+            tail -c "+$((otel_offset + 1))" "$root/logs/otelcol.log" > "$current_otel"
+            if grep -q 'ResourceSpans #' "$current_otel" \
+               && grep -q 'ResourceMetrics #' "$current_otel"; then
+                break
+            fi
+        fi
+        sleep 2
+    done
+    grep -q 'ResourceSpans #' "$current_otel" || fail 'post-reboot OTel log contains no new Traefik traces'
+    grep -q 'ResourceMetrics #' "$current_otel" || fail 'post-reboot OTel log contains no new Traefik metrics'
+    grep -E 'ResourceSpans #|ResourceMetrics #' "$current_otel" > "$otel_evidence"
+    otel_spans_count=$(grep -c 'ResourceSpans #' "$otel_evidence" || true)
+    otel_metrics_count=$(grep -c 'ResourceMetrics #' "$otel_evidence" || true)
+    post_reboot_trace_sha256=$(sha256sum "$otel_evidence" | awk '{ print $1 }')
+    chmod 600 "$current_otel" "$otel_evidence"
 fi
 
+write_metrics
 printf 'Protocol clients passed for %s.\n' "$mode"

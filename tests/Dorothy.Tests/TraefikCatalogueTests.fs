@@ -105,10 +105,21 @@ module private TraefikCatalogueFixture =
                                     }
                                 )
                             }
+                            httpRouter "api-parent" {
+                                httpRule (pathPrefixRule "/multilayer")
+                                httpRouterEntryPoints [ httpEntryPoint "front" ]
+                                httpRouterMiddlewares [ httpMiddlewareRef "layer-mark" ]
+                            }
+                            httpRouter "api-child" {
+                                httpRule (headerRule "X-Route-Layer" "admin")
+                                httpRouterParentRefs [ httpRouterRef "api-parent" ]
+                                httpRouterService (httpServiceRef "catalog")
+                            }
                         }
 
                         httpServices {
                             httpService "catalog" {
+                                httpServiceMiddlewares [ httpMiddlewareRef "service-mark" ]
                                 httpLoadBalancer (
                                     nativeObject {
                                         httpServers [ "http://127.0.0.1:18080"; "http://127.0.0.1:18081" ]
@@ -128,6 +139,24 @@ module private TraefikCatalogueFixture =
                         }
 
                         httpMiddlewares {
+                            httpMiddleware "layer-mark" {
+                                httpMiddlewareHeaders (
+                                    nativeObject {
+                                        nativeField "customRequestHeaders" (
+                                            nativeObject { nativeField "X-Route-Layer" (nativeString "admin") }
+                                        )
+                                    }
+                                )
+                            }
+                            httpMiddleware "service-mark" {
+                                httpMiddlewareHeaders (
+                                    nativeObject {
+                                        nativeField "customResponseHeaders" (
+                                            nativeObject { nativeField "X-Dorothy-Service" (nativeString "native") }
+                                        )
+                                    }
+                                )
+                            }
                             httpMiddleware "compress" { httpMiddlewareCompress }
                             httpMiddleware "strip-items" { httpMiddlewareStripPrefix [ "/items" ] }
                             httpMiddleware "redirect" { httpMiddlewareRedirectScheme "https" true }
@@ -137,7 +166,11 @@ module private TraefikCatalogueFixture =
                         httpServersTransports {
                             httpServersTransport "upstream" {
                                 nativeField "forwardingTimeouts" (
-                                    nativeObject { nativeField "dialTimeout" (nativeString "3s") }
+                                    nativeObject {
+                                        nativeField "dialTimeout" (nativeString "3s")
+                                        nativeField "readTimeout" (nativeString "2s")
+                                        nativeField "writeTimeout" (nativeString "4s")
+                                    }
                                 )
                             }
                         }
@@ -158,8 +191,16 @@ module private TraefikCatalogueFixture =
                                 tcpLoadBalancer (
                                     nativeObject {
                                         tcpServers [ "127.0.0.1:15432" ]
-                                        tcpProxyProtocol (nativeObject { tcpProxyProtocolVersion 2 })
                                         tcpServiceServersTransport (tcpServersTransportRef "database-upstream")
+                                        tcpHealthCheck (
+                                            nativeObject {
+                                                tcpHealthCheckPort 15432
+                                                tcpHealthCheckSend "PING"
+                                                tcpHealthCheckExpect "PONG"
+                                                tcpHealthCheckInterval "10s"
+                                                tcpHealthCheckTimeout "2s"
+                                            }
+                                        )
                                     }
                                 )
                             }
@@ -170,7 +211,10 @@ module private TraefikCatalogueFixture =
                             }
                         }
                         tcpServersTransports {
-                            tcpServersTransport "database-upstream" { nativeField "dialTimeout" (nativeString "5s") }
+                            tcpServersTransport "database-upstream" {
+                                nativeField "dialTimeout" (nativeString "5s")
+                                tcpProxyProtocol (nativeObject { tcpProxyProtocolVersion 2 })
+                            }
                         }
                     }
 
@@ -311,15 +355,33 @@ type TraefikCatalogueTests() =
                 Is.EqualTo<string list>([ "compress"; "strip-items" ])
             )
 
-            let httpLoadBalancer =
-                objectProperty (objectProperty (objectProperty http "services") "catalog") "loadBalancer"
+            let apiChild = objectProperty (objectProperty http "routers") "api-child"
+            Assert.That((objectProperty apiChild "parentRefs").ToJsonString(), Is.EqualTo("[\"api-parent\"]"))
+            Assert.That((objectProperty apiChild "rule").GetValue<string>(), Does.Contain("Header("))
+            let apiParent = objectProperty (objectProperty http "routers") "api-parent"
+            Assert.That((objectProperty apiParent "middlewares").ToJsonString(), Is.EqualTo("[\"layer-mark\"]"))
+            Assert.That((objectProperty apiParent "rule").GetValue<string>(), Does.Contain("PathPrefix("))
+            let catalogService = objectProperty (objectProperty http "services") "catalog"
+            Assert.That((objectProperty catalogService "middlewares").ToJsonString(), Is.EqualTo("[\"service-mark\"]"))
+            let httpLoadBalancer = objectProperty catalogService "loadBalancer"
+            Assert.That((httpLoadBalancer.AsObject().ContainsKey("middlewares")), Is.False)
             Assert.That((objectProperty httpLoadBalancer "serversTransport").GetValue<string>(), Is.EqualTo("upstream"))
             Assert.That((objectProperty http "serversTransports").AsObject().ContainsKey("upstream"), Is.True)
+            let upstream = objectProperty (objectProperty http "serversTransports") "upstream"
+            let upstreamTimeouts = objectProperty upstream "forwardingTimeouts"
+            Assert.That((objectProperty upstreamTimeouts "readTimeout").GetValue<string>(), Is.EqualTo("2s"))
+            Assert.That((objectProperty upstreamTimeouts "writeTimeout").GetValue<string>(), Is.EqualTo("4s"))
 
             let tcp = objectProperty dynamic "tcp"
             let tcpLoadBalancer =
                 objectProperty (objectProperty (objectProperty tcp "services") "database") "loadBalancer"
             Assert.That((objectProperty tcpLoadBalancer "serversTransport").GetValue<string>(), Is.EqualTo("database-upstream"))
+            Assert.That((tcpLoadBalancer.AsObject().ContainsKey("proxyProtocol")), Is.False)
+            let tcpHealthCheck = objectProperty tcpLoadBalancer "healthCheck"
+            Assert.That((objectProperty tcpHealthCheck "port").GetValue<int>(), Is.EqualTo(15432))
+            Assert.That((objectProperty tcpHealthCheck "send").GetValue<string>(), Is.EqualTo("PING"))
+            let namedTcpTransport = objectProperty (objectProperty tcp "serversTransports") "database-upstream"
+            Assert.That((objectProperty (objectProperty namedTcpTransport "proxyProtocol") "version").GetValue<int>(), Is.EqualTo(2))
             Assert.That((objectProperty tcp "serversTransports").AsObject().ContainsKey("database-upstream"), Is.True)
             Assert.That(composedRule.Expression, Does.Contain("&&"))
             Assert.That(composedRule.Expression, Does.Contain(" || "))
@@ -372,3 +434,70 @@ type TraefikCatalogueTests() =
 
         Assert.Throws<ArgumentException>(TestDelegate(fun () -> duplicateField () |> ignore)) |> ignore
         Assert.Throws<ArgumentException>(TestDelegate(fun () -> duplicateObject () |> ignore)) |> ignore
+
+    [<Test>]
+    member _.``HTTP rule builder preserves exact matcher and composition grammar``() =
+        let singleHost = hostRule [ "shop.example.test" ]
+        let multipleHosts = hostRule [ "one.example.test"; "two.example.test" ]
+        let composed =
+            (hostRule [ "shop.example.test" ] &&& pathPrefixRule "/items")
+            ||| notRule (pathRegexpRule "^/private($|/)")
+
+        Assert.That(singleHost.Expression, Is.EqualTo("Host(\"shop.example.test\")"))
+        Assert.That(
+            multipleHosts.Expression,
+            Is.EqualTo("(Host(\"one.example.test\") || Host(\"two.example.test\"))")
+        )
+        Assert.That(
+            composed.Expression,
+            Is.EqualTo("((Host(\"shop.example.test\")) && (PathPrefix(\"/items\"))) || (!(PathRegexp(\"^/private($|/)\")))")
+        )
+
+    [<Test>]
+    member _.``Typed listener constructors render numeric IPv4 and IPv6 addresses``() =
+        let specification =
+            traefikConfiguration {
+                staticConfiguration {
+                    staticEntryPoints {
+                        staticEntryPoint "front" {
+                            entryPointListenerAddress "192.0.2.10" 8080 TraefikListenerTransport.Tcp
+                        }
+                        staticEntryPoint "dns" {
+                            entryPointListener (System.Net.IPAddress.Parse("2001:db8::1")) 5353 TraefikListenerTransport.Udp
+                        }
+                    }
+                }
+            }
+        let output = TraefikConfiguration.resolve specification
+        let json = OutputUtilities.GetValueAsync(output).GetAwaiter().GetResult()
+        use document = System.Text.Json.JsonDocument.Parse(json)
+        let configurationRoot = Dorothy.HostHelper.TraefikSettings.parse json
+        Dorothy.HostHelper.TraefikSettings.validate
+            (Map.empty: Map<string, int>) 19080 Set.empty Set.empty Set.empty configurationRoot
+        |> ignore
+        let entryPoints = document.RootElement.GetProperty("static").GetProperty("entryPoints")
+        let front = entryPoints.GetProperty("front")
+        let dns = entryPoints.GetProperty("dns")
+        Assert.That(front.GetProperty("address").GetString(), Is.EqualTo("192.0.2.10:8080/tcp"))
+        Assert.That(dns.GetProperty("address").GetString(), Is.EqualTo("[2001:db8::1]:5353/udp"))
+        Assert.That(front.EnumerateObject() |> Seq.exists (fun field -> field.Name = "tcp"), Is.False)
+        let invalidAddress =
+            TestDelegate(fun () ->
+                entryPointListenerAddress "listener.example.test" 8080 TraefikListenerTransport.Tcp
+                |> ignore)
+        let invalidPort =
+            TestDelegate(fun () ->
+                entryPointListener (System.Net.IPAddress.Parse("192.0.2.10")) 0 TraefikListenerTransport.Tcp
+                |> ignore)
+        let addressError = Assert.Throws<ArgumentException>(invalidAddress)
+        let portError = Assert.Throws<ArgumentException>(invalidPort)
+        Assert.That(addressError.Message, Does.Contain("Invalid, unsafe or unsupported Traefik listener socket binding."))
+        Assert.That(addressError.Message, Does.Not.Contain("listener.example.test"))
+        Assert.That(portError.Message, Does.Contain("Invalid, unsafe or unsupported Traefik listener socket binding."))
+        let mappedAddressFailure =
+            TestDelegate(fun () ->
+                entryPointListener (System.Net.IPAddress.Parse("::ffff:192.0.2.10")) 8080 TraefikListenerTransport.Tcp
+                |> ignore)
+        let mappedAddressError = Assert.Throws<ArgumentException>(mappedAddressFailure)
+        Assert.That(mappedAddressError.Message, Does.Contain("Invalid, unsafe or unsupported Traefik listener socket binding."))
+        Assert.That(mappedAddressError.Message, Does.Not.Contain("192.0.2.10"))

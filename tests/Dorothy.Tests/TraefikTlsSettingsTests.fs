@@ -56,7 +56,13 @@ type TraefikTlsSettingsTests() =
         let originalResolver = originalResolvers["le"] :?> JsonObject
         let originalAcme = originalResolver["acme"] :?> JsonObject
 
-        Assert.That(storage, Is.EqualTo(Path.Combine("/var/lib/traefik", "acme-" + digest("le") + ".json")))
+        let defaultIssuer = "https://acme-v02.api.letsencrypt.org/directory"
+        Assert.That(storage, Is.EqualTo(TraefikTlsSettings.acmeStoragePath "/var/lib/traefik" "le" defaultIssuer))
+        Assert.That(storage, Is.Not.EqualTo(TraefikTlsSettings.legacyAcmeStoragePath "/var/lib/traefik" "le"))
+        Assert.That(
+            TraefikTlsSettings.acmeStoragePath "/var/lib/traefik" "le" "https://ca.example.test/directory",
+            Is.Not.EqualTo(storage)
+        )
         Assert.That(originalAcme.ContainsKey("storage"), Is.False)
         Assert.That(transformed, Is.Not.SameAs(staticRoot))
 
@@ -303,3 +309,40 @@ type TraefikTlsSettingsTests() =
         Assert.That(Traefik.probeHostsFromRule false "!Host(`negated.example.test`)", Is.Empty)
         Assert.That(Traefik.probeHostsFromRule false "Host(`one.example.test`) || Host(`two.example.test`)", Is.Empty)
         Assert.That(Traefik.probeHostsFromRule false "PathPrefix(`/catalog`) && Host(`shop.example.test`)", Is.Empty)
+
+    [<Test>]
+    member _.``EAB HMAC accepts only the pinned Lego URL-safe base64 encodings``() =
+        let makeConfiguration (encoded: string) =
+            let configuration =
+                parse """{"static":{"certificatesResolvers":{"le":{"acme":{"eab":{"kid":"account","hmacEncoded":"__8"},"httpChallenge":{"entryPoint":"web"}}}}}}"""
+            let staticRoot = configuration["static"] :?> JsonObject
+            let resolvers = staticRoot["certificatesResolvers"] :?> JsonObject
+            let resolver = resolvers["le"] :?> JsonObject
+            let acme = resolver["acme"] :?> JsonObject
+            let eab = acme["eab"] :?> JsonObject
+            eab["hmacEncoded"] <- JsonValue.Create(encoded)
+            configuration
+
+        for encoded in [ "__8"; "__8=" ] do
+            validate Set.empty Set.empty (makeConfiguration encoded)
+        for encoded in [ "+/8="; "__8=="; "__=8"; "A"; "" ] do
+            assertInvalid Set.empty Set.empty (makeConfiguration encoded)
+
+    [<Test>]
+    member _.``TLS options accept pinned TLS 1.3 suites and ML-KEM groups``() =
+        let supported =
+            parse """{
+              "dynamic":{"tls":{"options":{"post-quantum":{
+                "minVersion":"VersionTLS13",
+                "cipherSuites":["TLS_AES_128_GCM_SHA256","TLS_AES_256_GCM_SHA384","TLS_CHACHA20_POLY1305_SHA256"],
+                "curvePreferences":["X25519MLKEM768","SecP256r1MLKEM768","SecP384r1MLKEM1024"]
+              }}}}
+            }"""
+        validate Set.empty Set.empty supported
+
+        let unsupportedSuite =
+            parse """{"dynamic":{"tls":{"options":{"default":{"cipherSuites":["TLS_UNSUPPORTED"]}}}}}"""
+        let unsupportedCurve =
+            parse """{"dynamic":{"tls":{"options":{"default":{"curvePreferences":["MLKEM_UNKNOWN"]}}}}}"""
+        assertInvalid Set.empty Set.empty unsupportedSuite
+        assertInvalid Set.empty Set.empty unsupportedCurve
