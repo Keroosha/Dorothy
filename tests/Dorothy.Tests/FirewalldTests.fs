@@ -301,6 +301,32 @@ type FirewalldTests() =
             Assert.That(File.ReadAllText configPath, Is.EqualTo "DefaultZone=trusted\nFirewallBackend=nftables\nStrictForwardPorts=no\n"))
 
     [<Test>]
+    member this.``StrictForwardPorts retry after interrupted vendor-only Delete preserves foreign key``() =
+        this.WithHost(fun env root calls ->
+            let vendorPath = Path.Combine(root, "usr/lib/firewalld/firewalld.conf")
+            File.WriteAllText(vendorPath, "DefaultZone=public\nStrictForwardPorts=no\n")
+            this.Invoke env "apply" strictConfiguration |> ignore
+            let configPath = Path.Combine(root, "etc/firewalld/firewalld.conf")
+            File.WriteAllText(configPath, "DefaultZone=public\nStrictForwardPorts=yes\nForeignOption=keep\n")
+            let mutable failedReloads = 0
+            let interrupted =
+                { env with
+                    Run = fun executable arguments input ->
+                        let result = env.Run executable arguments input
+                        if executable = "firewall-cmd" && arguments = [ "--reload" ] && failedReloads < 2 then
+                            failedReloads <- failedReloads + 1
+                            { result with ExitCode = 1; Stderr = "reload interrupted" }
+                        else result }
+            Assert.Throws<NativeFirewalld.BackendError>(fun () -> this.Invoke interrupted "delete" strictConfiguration |> ignore) |> ignore
+            let journalPath = Path.Combine(root, "var/lib/keroosha-iac/firewalld/settings-strict-forward-ports.json")
+            Assert.That(File.Exists journalPath, Is.True)
+            this.Invoke env "delete" strictConfiguration |> ignore
+            Assert.That(File.ReadAllText configPath, Is.EqualTo "DefaultZone=public\nForeignOption=keep\n")
+            let snapshot = this.Invoke env "read" strictConfiguration
+            Assert.That(snapshot["actual"].GetValue<string>(), Is.EqualTo "no")
+            Assert.That(File.Exists journalPath, Is.False))
+
+    [<Test>]
     member this.``StrictForwardPorts refuses foreign setting changes without overwriting``() =
         this.WithHost(fun env root calls ->
             let configPath = Path.Combine(root, "etc/firewalld/firewalld.conf")

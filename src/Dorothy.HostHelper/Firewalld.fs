@@ -625,7 +625,12 @@ module Firewalld =
             writeStrictConfig environment before beforeMode
             firewall environment [ "--check-config" ] |> ignore
             firewall environment [ "--reload" ] |> ignore
-            setOptional journal "managed" before
+            // The bytes in pending.before are rollback material, not the resource's
+            // ownership snapshot. Preserve the latter across interrupted Delete.
+            let managedBefore = optionalString journal "managed"
+            let baseline = optionalString journal "baseline"
+            let recoveredManaged = if managedBefore = baseline then before else managedBefore
+            setOptional journal "managed" recoveredManaged
             journal["pending"] <- null
             saveJournal environment c journal
 
