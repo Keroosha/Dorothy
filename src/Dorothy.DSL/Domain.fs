@@ -432,13 +432,11 @@ type DebianBuilder() =
                     invalidArg "usesDirectory" (sprintf "Container '%s' references a host directory that is not declared in this Debian environment's content block." container.Name)
         let firewalldObjects = firewalld |> Option.map _.Objects |> Option.defaultValue []
         let strictForwardPorts = firewalld |> Option.bind _.StrictForwardPorts
+        let firewalldConfigurations = firewalldObjects |> List.map _.Value
         let dockerGuardPolicies =
             firewalldObjects
             |> List.filter (fun item ->
-                item.Kind = "policy"
-                && item.Value.Target = "DROP"
-                && item.Value.Priority < 0
-                && List.contains "docker" item.Value.Egress)
+                FirewalldGraph.isEffectiveDockerGuard firewalldConfigurations item.Value)
         for container in docker |> Option.map _.Containers |> Option.defaultValue [] do
             for policy in container.FirewalldPolicyDependencies do
                 let declared = firewalldObjects |> List.exists (fun item -> Object.ReferenceEquals(item, policy))

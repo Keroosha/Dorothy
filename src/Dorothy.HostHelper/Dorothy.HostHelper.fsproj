@@ -15,6 +15,10 @@
     <Compile Include="Fail2BanCliData.fs" />
     <Compile Include="../Dorothy.DSL/FirewalldModel.fs" Link="FirewalldModel.fs" />
     <Compile Include="../Dorothy.DSL/TraefikPathModel.fs" Link="TraefikPathModel.fs" />
+    <Compile Include="FieldRuntime.fs" />
+    <Compile Include="FirewalldRuntime.fs" />
+    <Compile Include="FirewalldLifecycle.fs" />
+    <Compile Include="FirewalldReferences.fs" />
     <Compile Include="Firewalld.fs" />
     <Compile Include="Apt.fs" />
     <Compile Include="Ufw.fs" />

@@ -8,7 +8,7 @@ open System.Text.Json.Nodes
 
 module Program =
     let private usage () =
-        Console.Error.WriteLine("Usage: keroosha-iac-helper apt|ufw|firewalld|traefik|docker|docker-job|swapfile|sshd|fail2ban|users|sudo|content|service|--version")
+        Console.Error.WriteLine("Usage: keroosha-iac-helper apt|ufw|firewalld|firewalld-recover|firewalld-recover-boot|traefik|docker|docker-job|swapfile|sshd|fail2ban|users|sudo|content|service|--version")
         64
 
     let private dispatch (command: string) (request: JsonElement) =
@@ -83,7 +83,25 @@ module Program =
 
     [<EntryPoint>]
     let main (arguments: string array) =
-        if arguments.Length = 1 && arguments[0] = "--version" then
+        if arguments.Length = 1 && arguments[0] = "firewalld-recover-boot" then
+            try
+                verifyGlobalization ()
+                Firewalld.recoverPendingBoot HostEnvironment.system
+                Console.Out.WriteLine("{}")
+                0
+            with error ->
+                reportFailure error
+                1
+        elif arguments.Length = 1 && arguments[0] = "firewalld-recover" then
+            try
+                verifyGlobalization ()
+                Firewalld.recoverPending HostEnvironment.system
+                Console.Out.WriteLine("{}")
+                0
+            with error ->
+                reportFailure error
+                1
+        elif arguments.Length = 1 && arguments[0] = "--version" then
             try
                 verifyGlobalization ()
                 Console.Out.WriteLine("keroosha-iac-helper protocol 1")

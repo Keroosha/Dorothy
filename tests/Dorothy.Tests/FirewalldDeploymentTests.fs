@@ -96,3 +96,327 @@ type FirewalldDeploymentTests() =
             let plan = Dorothy.HostHelper.Apt.planTransaction [ "docker.io" ] desired state
             Assert.That(plan.Removals, Is.Empty)
             Assert.That(plan.Installs, Is.Empty)
+
+    [<Test>]
+    member _.``Compiled Firewalld catalogue resolves declared references and keeps typed consumer syntax``() =
+        let specification =
+            firewalld {
+                service "application" { includes [ "transport" ] }
+                zone "external" {
+                    interfaces [ "enp+" ]
+                    services [ "application" ]
+                    transportPorts [ tcpPortRange 8440 8443; udpPort 53 ]
+                    forwardPort (tcpPort 8444) (Some "192.0.2.50") (Some (tcpPort 444))
+                    icmpBlocks [ "echo-request" ]
+                    icmpBlockInversion
+                    sources [ sourceIPSet "trusted"; sourceAddress "203.0.113.0/24"; sourceMac "02:00:00:00:00:01" ]
+                    richRules
+                        [ richRule {
+                              family FirewalldFamily.IPv4
+                              sourceAddress "198.51.100.0/24"
+                              richService "application"
+                              accept
+                              limit 10 FirewalldLimitUnit.Minute
+                          }
+                          richRule {
+                              family FirewalldFamily.IPv4
+                              sourceMac "02:00:00:00:00:02"
+                              richService "application"
+                              drop
+                          }
+                          richRule {
+                              family FirewalldFamily.IPv4
+                              sourceAddress "192.0.2.0/24"
+                              forwardPort (tcpPort 8443) (Some "192.0.2.50") (Some (tcpPort 443))
+                          } ]
+                }
+                ipset "trusted" {
+                    ipsetType "hash:ip"
+                    ipsetOptions [ "family", "inet" ]
+                    entries [ "192.0.2.0/24" ]
+                }
+                service "transport" {
+                    servicePorts [ tcpPortRange 8440 8443; udpPort 53 ]
+                    sourcePorts [ tcpPort 1024 ]
+                    includes [ "vendor-base" ]
+                    helpers [ "ftp" ]
+                    modules [ "nf_conntrack" ]
+                }
+                helper "ftp" {
+                    helperModule "nf_conntrack_ftp"
+                    helperFamily FirewalldFamily.IPv4
+                    helperPorts [ tcpPort 21 ]
+                }
+                icmpType "echo-request" { icmpDestinations [ FirewalldFamily.IPv4 ] }
+                setting "DefaultZone" "public"
+                policy "host-web" {
+                    ingressZones [ "external" ]
+                    egressZones [ "HOST" ]
+                    services [ "application" ]
+                    target FirewalldTarget.Accept
+                    priority -10
+                }
+            }
+        let ordered = specification.Objects |> List.map (fun item -> item.Kind, item.Name)
+        let index identity = ordered |> List.findIndex ((=) identity)
+        Assert.That(index ("helper", "ftp"), Is.LessThan(index ("service", "transport")))
+        Assert.That(index ("service", "transport"), Is.LessThan(index ("service", "application")))
+        Assert.That(index ("service", "application"), Is.LessThan(index ("zone", "external")))
+        Assert.That(index ("ipset", "trusted"), Is.LessThan(index ("zone", "external")))
+        Assert.That(ordered, Does.Contain(("settings", "DefaultZone")))
+
+        let application =
+            specification.Objects |> List.find (fun item -> item.Kind = "service" && item.Name = "application")
+        let applicationConfiguration = FirewalldModel.parse application.Configuration
+        Assert.That(applicationConfiguration.Elements |> List.exists (fun element -> element.Name = "include"), Is.True)
+
+        let external = specification.Objects |> List.find (fun item -> item.Kind = "zone" && item.Name = "external")
+        let externalConfiguration = FirewalldModel.parse external.Configuration
+        Assert.That(externalConfiguration.Ports, Does.Contain("8440-8443/tcp"))
+        Assert.That(FirewalldModel.references external.Value, Does.Contain(("service", "application")))
+        Assert.That(FirewalldModel.references external.Value, Does.Contain(("ipset", "trusted")))
+        Assert.That(FirewalldModel.references external.Value, Does.Contain(("icmptype", "echo-request")))
+
+        let legacy = zone "legacy" { ports [ 80, Tcp ] }
+        Assert.That((FirewalldModel.parse legacy.Configuration).Ports, Does.Contain("80/tcp"))
+
+    [<Test>]
+    member _.``Firewalld rejects dependency cycles and ambiguous ownership``() =
+        let invalid =
+            [ (fun () ->
+                  firewalld {
+                      service "first" { includes [ "second" ] }
+                      service "second" { includes [ "first" ] }
+                  }
+                  |> ignore)
+              (fun () ->
+                  firewalld {
+                      zone "shared" {}
+                      policy "shared" { ingressZones [ "HOST" ]; egressZones [ "public" ] }
+                  }
+                  |> ignore)
+              (fun () ->
+                  firewalld {
+                      zone "wildcard" { interfaces [ "enp+" ] }
+                      zone "literal" { interfaces [ "enp0s3" ] }
+                  }
+                  |> ignore)
+              (fun () ->
+                  firewalld {
+                      zone "first" { sources [ sourceAddress "192.0.2.0/24" ] }
+                      zone "second" { sources [ sourceAddress "192.0.2.0/24" ] }
+                  }
+                  |> ignore) ]
+        for action in invalid do
+            Assert.Throws<ArgumentException>(TestDelegate action) |> ignore
+
+    [<Test>]
+    member _.``Strict Docker gate rejects perforated or bypassed guards but keeps HOST services``() =
+        let hostService =
+            policy "host-ssh" {
+                ingressZones [ "public" ]
+                egressZones [ "HOST" ]
+                services [ "ssh" ]
+                target FirewalldTarget.Accept
+                priority -20
+            }
+        let guard =
+            policy "docker-block" {
+                ingressZones [ "public" ]
+                egressZones [ "docker" ]
+                target FirewalldTarget.Drop
+                priority -10
+            }
+        let perforatedGuard =
+            policy "docker-block" {
+                ingressZones [ "public" ]
+                egressZones [ "docker" ]
+                target FirewalldTarget.Drop
+                priority -10
+                richRules [ richRule { richService "ssh"; accept } ]
+            }
+        let safeRichGuard =
+            policy "docker-block" {
+                ingressZones [ "public" ]
+                egressZones [ "docker" ]
+                target FirewalldTarget.Drop
+                priority -10
+                richRules [ richRule { richService "ssh"; drop } ]
+            }
+        let earlierAllow =
+            policy "docker-allow" {
+                ingressZones [ "public" ]
+                egressZones [ "docker" ]
+                target FirewalldTarget.Accept
+                priority -20
+            }
+        let hostRichService =
+            policy "host-rich-service" {
+                ingressZones [ "public" ]
+                egressZones [ "HOST" ]
+                target FirewalldTarget.Accept
+                priority -15
+                richRules [ richRule { richService "ssh"; accept } ]
+            }
+        let hostOriginated =
+            policy "host-originated" {
+                ingressZones [ "HOST" ]
+                egressZones [ "ANY" ]
+                services [ "ssh" ]
+                target FirewalldTarget.Accept
+                priority -20
+            }
+        let continues =
+            policy "continue-docker" {
+                ingressZones [ "ANY" ]
+                egressZones [ "docker" ]
+                target FirewalldTarget.Continue
+                priority -20
+            }
+        let anyGuard =
+            policy "docker-any-block" {
+                ingressZones [ "ANY" ]
+                egressZones [ "docker" ]
+                target FirewalldTarget.Drop
+                priority -10
+            }
+        let compile (policies: FirewalldObjectSpec list) (containerGuard: FirewalldObjectSpec) =
+            let firewall =
+                firewalld {
+                    strictForwardPorts true
+                    zone "public" {}
+                    hostService
+                    yield! policies
+                    containerGuard
+                }
+            let docker =
+                docker {
+                    container "web" {
+                        image "nginx:1.27"
+                        restart unlessStopped
+                        dependsOnFirewalld containerGuard
+                    }
+                }
+            debian {
+                docker
+                firewall
+            }
+        Assert.DoesNotThrow(fun () -> compile [] guard |> ignore)
+        Assert.Throws<ArgumentException>(fun () -> compile [] perforatedGuard |> ignore) |> ignore
+        Assert.Throws<ArgumentException>(fun () -> compile [ earlierAllow ] guard |> ignore) |> ignore
+        Assert.DoesNotThrow(fun () -> compile [ hostOriginated ] anyGuard |> ignore)
+        Assert.DoesNotThrow(fun () -> compile [ continues ] anyGuard |> ignore)
+        Assert.Throws<ArgumentException>(fun () -> compile [] safeRichGuard |> ignore) |> ignore
+        Assert.DoesNotThrow(fun () -> compile [ hostRichService ] guard |> ignore)
+
+    [<Test>]
+    member _.``Docker readiness unit depends only on effective docker guard and preserves old resource names``() =
+        let hostService =
+            policy "host-ssh" {
+                ingressZones [ "public" ]
+                egressZones [ "HOST" ]
+                services [ "ssh" ]
+                target FirewalldTarget.Accept
+                priority -20
+            }
+        let guard =
+            policy "docker-block" {
+                ingressZones [ "public" ]
+                egressZones [ "docker" ]
+                target FirewalldTarget.Drop
+                priority -10
+            }
+        let host =
+            sshHost "guarded" {
+                Address "192.0.2.2"
+                User "root"
+                debian {
+                    docker {
+                        container "web" {
+                            image "nginx:1.27"
+                            restart unlessStopped
+                            dependsOnFirewalld guard
+                        }
+                    }
+                    firewalld {
+                        strictForwardPorts true
+                        zone "public" {}
+                        hostService
+                        guard
+                    }
+                }
+            }
+        FirewalldDeploymentFixture.captured.Clear()
+        FirewalldDeploymentFixture.host <- Some host
+        Deployment.TestAsync<FirewalldDependencyStack>(FirewalldDeploymentFixture.Mocks(), TestOptions()).GetAwaiter().GetResult() |> ignore
+        let name (resource: Resource) = OutputUtilities.GetValueAsync(resource.Urn).Result.Split("::") |> Array.last
+        let captured = FirewalldDeploymentFixture.captured |> Seq.filter (fun args -> not (args.Resource :? Stack)) |> Seq.toArray
+        let guardResource =
+            captured
+            |> Array.find (fun args -> args.Args :? HostServiceArgs && name args.Resource = "guarded-docker-firewall-guard")
+        let specification: Output<string> = Input<string>.op_Implicit((guardResource.Args :?> HostServiceArgs).Specification)
+        let encoded = OutputUtilities.GetValueAsync(specification).Result
+        use specificationDocument = System.Text.Json.JsonDocument.Parse encoded
+        let unit = specificationDocument.RootElement.GetProperty("configuration").GetString()
+        Assert.That(unit, Is.EqualTo(FirewalldGuardUnit.configuration [ guard ]))
+        Assert.That(unit, Does.Contain("--policy=docker-block"))
+        Assert.That(unit, Does.Not.Contain("--policy=host-ssh"))
+        Assert.That(unit, Does.Contain("--info-policy=docker-block"))
+        Assert.That(unit, Does.Contain("target: DROP"))
+        Assert.That(unit, Does.Contain("priority: -10"))
+        Assert.That(unit, Does.Contain("ingress-zones: public"))
+        Assert.That(unit, Does.Contain("egress-zones: docker"))
+        Assert.That(unit, Does.Contain("--list-services"))
+        Assert.That(unit, Does.Contain("--list-ports"))
+        Assert.That(unit, Does.Contain("--list-protocols"))
+        Assert.That(unit, Does.Contain("--list-source-ports"))
+        Assert.That(unit, Does.Contain("--list-forward-ports"))
+        Assert.That(unit, Does.Contain("--list-rich-rules"))
+        Assert.That(unit, Does.Contain("ExecStart=:/bin/sh -ec"))
+        let dependencies: Output<ImmutableArray<Resource>> = InputList<Resource>.op_Implicit guardResource.Options.DependsOn
+        let dependencyNames = OutputUtilities.GetValueAsync(dependencies).Result |> Seq.map name |> Set.ofSeq
+        Assert.That(dependencyNames, Does.Contain("guarded-firewalld-policy-docker-block"))
+        Assert.That(dependencyNames, Does.Not.Contain("guarded-firewalld-policy-host-ssh"))
+
+    [<Test>]
+    member _.``Firewalld resources depend on declared parents and ignore external definitions``() =
+        let baseService = service "base" { servicePorts [ tcpPort 8080 ] }
+        let apiService = service "api" { includes [ "base"; "vendor-base" ] }
+        let firewall =
+            firewalld {
+                apiService
+                zone "public" {
+                    services [ "api" ]
+                    sources [ sourceIPSet "trusted" ]
+                }
+                setting "DefaultZone" "public"
+                ipset "trusted" {
+                    ipsetType "hash:ip"
+                    entries [ "192.0.2.0/24" ]
+                }
+                baseService
+            }
+        let host =
+            sshHost "graph" {
+                Address "192.0.2.2"
+                User "root"
+                debian { firewall }
+            }
+        FirewalldDeploymentFixture.captured.Clear()
+        FirewalldDeploymentFixture.host <- Some host
+        Deployment.TestAsync<FirewalldDependencyStack>(FirewalldDeploymentFixture.Mocks(), TestOptions()).GetAwaiter().GetResult() |> ignore
+        let name (resource: Resource) = OutputUtilities.GetValueAsync(resource.Urn).Result.Split("::") |> Array.last
+        let captured = FirewalldDeploymentFixture.captured |> Seq.filter (fun args -> not (args.Resource :? Stack)) |> Seq.toArray
+        let firewalldResource resourceName =
+            captured |> Array.find (fun args -> args.Args :? FirewalldArgs && name args.Resource = resourceName)
+        let dependencies (args: ResourceTransformationArgs) =
+            let output: Output<ImmutableArray<Resource>> = InputList<Resource>.op_Implicit args.Options.DependsOn
+            OutputUtilities.GetValueAsync(output).Result |> Seq.map name |> Set.ofSeq
+        let apiDependencies = firewalldResource "graph-firewalld-service-api" |> dependencies
+        Assert.That(apiDependencies, Does.Contain("graph-firewalld-service-base"))
+        Assert.That(apiDependencies, Does.Not.Contain("graph-firewalld-service-vendor-base"))
+        let zoneDependencies = firewalldResource "graph-firewalld-zone-public" |> dependencies
+        Assert.That(zoneDependencies, Does.Contain("graph-firewalld-service-api"))
+        Assert.That(zoneDependencies, Does.Contain("graph-firewalld-ipset-trusted"))
+        let settingDependencies = firewalldResource "graph-firewalld-setting-DefaultZone" |> dependencies
+        Assert.That(settingDependencies, Does.Contain("graph-firewalld-zone-public"))

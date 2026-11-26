@@ -13,17 +13,21 @@ module private FirewalldProviderLogic =
     let zoneToken = "keroosha:debian:FirewalldZone"
     let policyToken = "keroosha:debian:FirewalldPolicy"
     let settingsToken = "keroosha:debian:FirewalldSettings"
-    let tokens = [ zoneToken; policyToken; settingsToken ]
+    let private resourceKinds =
+        Map.ofList [
+            zoneToken, "zone"; policyToken, "policy"; settingsToken, "settings"
+            "keroosha:debian:FirewalldService", "service"; "keroosha:debian:FirewalldIPSet", "ipset"
+            "keroosha:debian:FirewalldIcmpType", "icmptype"; "keroosha:debian:FirewalldHelper", "helper"
+        ]
+    let handles token = Map.containsKey token resourceKinds
     let kind token =
-        if token = zoneToken then "zone"
-        elif token = policyToken then "policy"
-        elif token = settingsToken then "settings"
-        else invalidOp "Unexpected firewalld resource token."
+        Map.tryFind token resourceKinds |> Option.defaultWith (fun () -> invalidOp "Unexpected firewalld resource token.")
 
 
     let schema =
-        let resource = """{"inputProperties":{"connection":{"$ref":"#/types/keroosha:debian:SshConnection"},"configuration":{"type":"string"}},"requiredInputs":["connection","configuration"],"properties":{"connection":{"$ref":"#/types/keroosha:debian:SshConnection"},"configuration":{"type":"string"},"exists":{"type":"boolean"},"actual":{"type":"string"},"inSync":{"type":"boolean"}},"required":["connection","configuration","exists","actual","inSync"]}"""
-        "{\"name\":\"keroosha\",\"version\":\"0.1.0\",\"resources\":{" + (tokens |> List.map (fun token -> "\"" + token + "\":" + resource) |> String.concat ",") + "}}"
+        let resource = """{"inputProperties":{"connection":{"$ref":"#/types/keroosha:debian:SshConnection"},"configuration":{"type":"string"}},"requiredInputs":["connection","configuration"],"properties":{"connection":{"$ref":"#/types/keroosha:debian:SshConnection"},"configuration":{"type":"string"},"exists":{"type":"boolean"},"actual":{"type":"string"},"inSync":{"type":"boolean"},"permanentInSync":{"type":"boolean"},"runtimeObserved":{"type":"boolean"},"runtimeInSync":{"type":"boolean"}},"required":["connection","configuration","exists","actual","inSync","permanentInSync","runtimeObserved","runtimeInSync"]}"""
+        let resources = resourceKinds.Keys |> Seq.map (fun token -> "\"" + token + "\":" + resource) |> String.concat ","
+        "{\"name\":\"keroosha\",\"version\":\"0.1.0\",\"resources\":{" + resources + "}}"
 
     let private tryGetMap (value: PropertyValue) =
         let mutable result = ImmutableDictionary<string, PropertyValue>.Empty
@@ -188,7 +192,9 @@ module private FirewalldProviderLogic =
                     let c = FirewalldModel.parse text
                     if c.Kind <> expectedKind then invalidArg "configuration" "Configuration kind differs from resource token."
                     normalized["configuration"] <- withDependencies value (PropertyValue(FirewalldModel.toJson c))
-                with _ -> addFailure failures "configuration" "Invalid firewalld configuration, fields, target, port, priority or resource kind."
+                with
+                | :? ArgumentException as error -> addFailure failures "configuration" error.Message
+                | :? System.Text.Json.JsonException -> addFailure failures "configuration" "Expected valid firewalld configuration JSON."
         normalized, unknown, failures
 
     let immutable (values: Dictionary<string, PropertyValue>) =
@@ -222,11 +228,16 @@ module private FirewalldProviderLogic =
     let outputs (values: Dictionary<string, PropertyValue>) (snapshot: FirewalldSnapshot option) =
         let result = Dictionary<string, PropertyValue>(values)
         match snapshot with
-        | None -> for key in [ "exists"; "actual"; "inSync" ] do result[key] <- PropertyValue.Computed
+        | None ->
+            for key in [ "exists"; "actual"; "inSync"; "permanentInSync"; "runtimeObserved"; "runtimeInSync" ] do
+                result[key] <- PropertyValue.Computed
         | Some s ->
             result["exists"] <- PropertyValue s.Exists
             result["actual"] <- PropertyValue s.Actual
             result["inSync"] <- PropertyValue s.InSync
+            result["permanentInSync"] <- PropertyValue s.PermanentInSync
+            result["runtimeObserved"] <- PropertyValue s.RuntimeObserved
+            result["runtimeInSync"] <- PropertyValue s.RuntimeInSync
         result
 
     let preview token values =
@@ -285,14 +296,14 @@ module private FirewalldProviderLogic =
             response.DeleteBeforeReplace <- false
         response
 
-/// One provider implementation for independently owned zones, policies, and global settings.
+/// One resource token per independently owned permanent object kind; one settings instance per daemon key.
 [<Sealed>]
 type FirewalldProvider() =
     inherit Pulumi.Experimental.Provider.Provider()
-    static member ZoneToken = "keroosha:debian:FirewalldZone"
+    static member ZoneToken = FirewalldProviderLogic.zoneToken
     static member SettingsToken = FirewalldProviderLogic.settingsToken
-    static member PolicyToken = "keroosha:debian:FirewalldPolicy"
-    static member Handles token = List.contains token FirewalldProviderLogic.tokens
+    static member PolicyToken = FirewalldProviderLogic.policyToken
+    static member Handles token = FirewalldProviderLogic.handles token
     static member Schema = FirewalldProviderLogic.schema
 
     override _.GetSchema(_, ct) =

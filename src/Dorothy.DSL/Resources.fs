@@ -614,6 +614,12 @@ type FirewalldResource(token: string, name: string, args: FirewalldArgs, options
     [<DefaultValue>]
     val mutable private inSync: Output<bool>
     [<DefaultValue>]
+    val mutable private permanentInSync: Output<bool>
+    [<DefaultValue>]
+    val mutable private runtimeInSync: Output<bool>
+    [<DefaultValue>]
+    val mutable private runtimeObserved: Output<bool>
+    [<DefaultValue>]
     val mutable private actual: Output<string>
     [<Output("exists")>]
     member this.Exists
@@ -623,6 +629,18 @@ type FirewalldResource(token: string, name: string, args: FirewalldArgs, options
     member this.InSync
         with get () = this.inSync
         and private set value = this.inSync <- value
+    [<Output("permanentInSync")>]
+    member this.PermanentInSync
+        with get () = this.permanentInSync
+        and private set value = this.permanentInSync <- value
+    [<Output("runtimeInSync")>]
+    member this.RuntimeInSync
+        with get () = this.runtimeInSync
+        and private set value = this.runtimeInSync <- value
+    [<Output("runtimeObserved")>]
+    member this.RuntimeObserved
+        with get () = this.runtimeObserved
+        and private set value = this.runtimeObserved <- value
     [<Output("actual")>]
     member this.Actual
         with get () = this.actual
@@ -1700,79 +1718,88 @@ module Host =
         match host.Firewalld, firewalldPackage with
         | Some firewall, Some packageSet ->
             let zones = Collections.Generic.Dictionary<string, Resource>(StringComparer.Ordinal)
+            let objectsByIdentity = Dictionary<string * string, FirewalldObjectSpec>()
+            for specification in firewall.Objects do
+                objectsByIdentity.Add((specification.Kind, specification.Name), specification)
             let create (specification: FirewalldObjectSpec) dependencies =
                 let args = FirewalldArgs()
                 args.Connection <- Input<AptConnectionArgs>.op_Implicit connection
                 args.Configuration <- Input<string>.op_Implicit specification.Configuration
-                let token = if specification.Kind = "zone" then "keroosha:debian:FirewalldZone" else "keroosha:debian:FirewalldPolicy"
-                FirewalldResource(token, host.Name + "-firewalld-" + specification.Kind + "-" + specification.Name,
-                                  args, ProviderContract.resourceOptionsWithDependencies dependencies) :> Resource
-            // Zones are serialized so an interface transfer cannot race another managed zone.
-            let mutable prior =
+                let token =
+                    match specification.Kind with
+                    | "zone" -> "keroosha:debian:FirewalldZone"
+                    | "policy" -> "keroosha:debian:FirewalldPolicy"
+                    | "service" -> "keroosha:debian:FirewalldService"
+                    | "ipset" -> "keroosha:debian:FirewalldIPSet"
+                    | "icmptype" -> "keroosha:debian:FirewalldIcmpType"
+                    | "helper" -> "keroosha:debian:FirewalldHelper"
+                    | "settings" -> "keroosha:debian:FirewalldSettings"
+                    | _ -> invalidArg "kind" "Unsupported firewalld resource kind."
+                let resourceName =
+                    if specification.Kind = "settings" then
+                        host.Name + "-firewalld-setting-" + FirewalldModel.settingKey specification.Value
+                    else
+                        host.Name + "-firewalld-" + specification.Kind + "-" + specification.Name
+                FirewalldResource(token, resourceName, args, ProviderContract.resourceOptionsWithDependencies dependencies) :> Resource
+            // Zones are serialized so an interface or source transfer cannot race another managed zone.
+            let baseDependency =
                 firewalldSettingsResource
                 |> Option.map (fun resource -> resource :> Resource)
                 |> Option.defaultValue (packageSet :> Resource)
-            for specification in firewall.Objects |> List.filter (fun value -> value.Kind = "zone") do
-                let resource = create specification [ prior ]
-                zones.Add(specification.Name, resource)
-                firewalldResources.Add(specification, resource)
-                prior <- resource
-            for specification in firewall.Objects |> List.filter (fun value -> value.Kind = "policy") do
-                let referenced = specification.Value.Ingress @ specification.Value.Egress
-                let dependencies =
-                    referenced
+            let mutable priorZone = baseDependency
+            for specification in firewall.Objects do
+                let parentDependencies =
+                    FirewalldModel.references specification.Value
+                    |> List.distinct
+                    |> List.choose (fun identity ->
+                        match objectsByIdentity.TryGetValue identity with
+                        | true, parent ->
+                            match firewalldResources.TryGetValue parent with
+                            | true, resource -> Some resource
+                            | _ -> None
+                        | _ -> None)
+                let policyZones =
+                    if specification.Kind = "policy" then
+                        specification.Value.Ingress @ specification.Value.Egress
+                    else []
+                let zoneDependencies =
+                    policyZones
                     |> List.choose (fun name -> match zones.TryGetValue name with true, resource -> Some resource | _ -> None)
                 let referencesUnmanagedZone =
-                    referenced |> List.exists (fun name -> name <> "ANY" && name <> "HOST" && not (zones.ContainsKey name))
+                    policyZones
+                    |> List.exists (fun name -> name <> "ANY" && name <> "HOST" && not (zones.ContainsKey name))
                 let ownerDependencies =
-                    if referencesUnmanagedZone then dockerEngine |> Option.map (fun engine -> [ engine :> Resource ]) |> Option.defaultValue []
+                    if referencesUnmanagedZone then
+                        dockerEngine |> Option.map (fun engine -> [ engine :> Resource ]) |> Option.defaultValue []
                     else []
-                let resource = create specification (prior :: dependencies @ ownerDependencies)
+                let orderingDependencies =
+                    if specification.Kind = "zone" || specification.Kind = "policy" then [ priorZone ]
+                    else []
+                let dependencies =
+                    [ baseDependency ]
+                    @ orderingDependencies
+                    @ parentDependencies
+                    @ zoneDependencies
+                    @ ownerDependencies
+                    |> List.distinct
+                let resource = create specification dependencies
                 firewalldResources.Add(specification, resource)
+                if specification.Kind = "zone" then
+                    zones.Add(specification.Name, resource)
+                    priorZone <- resource
         | _, None | None, _ -> ()
         let dockerFirewallGuard =
             match host.Firewalld |> Option.bind _.StrictForwardPorts, dockerEngine with
             | Some true, Some engine ->
+                let configurations = host.Firewalld.Value.Objects |> List.map _.Value
                 let guardPolicies =
                     host.Firewalld.Value.Objects
                     |> List.filter (fun specification ->
-                        specification.Kind = "policy"
-                        && specification.Value.Target = "DROP"
-                        && List.contains "docker" specification.Value.Egress)
+                        FirewalldGraph.isEffectiveDockerGuard configurations specification.Value)
                 if guardPolicies.IsEmpty then None
                 else
-                    let unitName = host.Name + "-docker-firewall-guard.service"
-                    let unitLines =
-                        [ "[Unit]"
-                          "Description=Dorothy strict Firewalld readiness gate for Docker"
-                          "Requires=firewalld.service"
-                          "After=firewalld.service"
-                          "Before=docker.service"
-                          ""
-                          "[Service]"
-                          "Type=oneshot"
-                          "ExecStart=/usr/bin/firewall-cmd --state"
-                          "ExecStart=/usr/bin/grep -Fqx StrictForwardPorts=yes /etc/firewalld/firewalld.conf" ]
-                        @ (guardPolicies
-                           |> List.collect (fun policy ->
-                               let infoCheck setting =
-                                   "ExecStart=/bin/sh -ec \"/usr/bin/firewall-cmd --info-policy="
-                                   + policy.Name
-                                   + " | /usr/bin/grep -Fxq '  "
-                                   + setting
-                                   + "'\""
-                               [ infoCheck "target: DROP"
-                                 infoCheck ("priority: " + string policy.Value.Priority)
-                                 "ExecStart=/usr/bin/firewall-cmd --policy=" + policy.Name + " --query-egress-zone=docker" ]
-                               @ (policy.Value.Ingress
-                                  |> List.map (fun zone ->
-                                      "ExecStart=/usr/bin/firewall-cmd --policy=" + policy.Name + " --query-ingress-zone=" + zone))))
-                        @ [ "RemainAfterExit=yes"
-                            ""
-                            "[Install]"
-                            "RequiredBy=docker.service"
-                            "" ]
-                    let configuration = String.concat "\n" unitLines
+                    let unitName = FirewalldGuardUnit.name host.Name
+                    let configuration = FirewalldGuardUnit.configuration guardPolicies
                     let specification = HostServiceSpec(unitName, true, configuration, [], true)
                     let args = HostServiceArgs()
                     args.Connection <- Input<AptConnectionArgs>.op_Implicit connection
