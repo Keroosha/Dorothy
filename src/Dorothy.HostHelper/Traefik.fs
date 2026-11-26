@@ -2253,6 +2253,7 @@ module Traefik =
     type private HttpEntryPointModel =
         { Middlewares: string array
           Tls: JsonElement option
+          Observability: JsonElement option
           AsDefault: bool
           Applies: bool }
     type private RouterProtocol =
@@ -2419,6 +2420,7 @@ module Traefik =
         | "mirroring" :: _, "mirrorBody" -> actual.ValueKind = JsonValueKind.True
         | "mirroring" :: _, "maxBodySize" -> isInteger -1L
         | "errors" :: "failover" :: _, "maxRequestBodyBytes" -> isInteger -1L
+        | "observability" :: _, _ -> false
         | _, _ when actual.ValueKind = JsonValueKind.False ->
             not (Set.contains name defaultTrueBooleanFields)
         | _ -> false
@@ -2456,6 +2458,7 @@ module Traefik =
                         | _ -> false
                     | _, Some found -> jsonConfigMatches propertyPath property.Value found
                     | _, None when property.Value.ValueKind = JsonValueKind.False
+                                   && path <> [ "observability" ]
                                    && not (Set.contains property.Name defaultTrueBooleanFields) -> true
                     | _, None when property.Value.ValueKind = JsonValueKind.Null -> true
                     | _ -> false)
@@ -2559,7 +2562,7 @@ module Traefik =
         else
             index <- index + 1
             skipRuleWhitespace rule &index
-            if index >= rule.Length || (rule[index] <> '`' && rule[index] <> char 39) then false
+            if index >= rule.Length || (rule[index] <> '`' && rule[index] <> '"' && rule[index] <> char 39) then false
             else
                 let quote = rule[index]
                 index <- index + 1
@@ -2607,13 +2610,6 @@ module Traefik =
         | Some wanted, Some found -> wanted = found
         | _ -> false
 
-    let private defaultRouterObservability (value: JsonElement) =
-        value.ValueKind = JsonValueKind.Object
-        && objectNames value = set [ "accessLogs"; "metrics"; "tracing"; "traceVerbosity" ]
-        && (tryProperty value "accessLogs" |> Option.exists (fun flag -> flag.ValueKind = JsonValueKind.True))
-        && (tryProperty value "metrics" |> Option.exists (fun flag -> flag.ValueKind = JsonValueKind.True))
-        && (tryProperty value "tracing" |> Option.exists (fun flag -> flag.ValueKind = JsonValueKind.True))
-        && (tryProperty value "traceVerbosity" |> Option.exists (jsonStringIs "minimal"))
 
     let private routerMatches (protocol: RouterProtocol) (expected: JsonElement) (actual: JsonElement) : bool =
         let allowedFields, fieldsComparedSeparately =
@@ -2673,8 +2669,6 @@ module Traefik =
                 elif property.Name = "entryPoints" then true
                 elif property.Name = "priority" && protocol <> UdpProtocol then true
                 elif property.Name = "middlewares" && protocol <> UdpProtocol then middlewareMatches
-                elif property.Name = "observability" && protocol = HttpProtocol then
-                    defaultRouterObservability property.Value
                 elif property.Name = "ruleSyntax" && protocol <> UdpProtocol then
                     jsonStringIs "v3" property.Value
                 else false)
@@ -2849,8 +2843,14 @@ module Traefik =
                 | Some value when value.ValueKind = JsonValueKind.Null -> Some None
                 | Some value when value.ValueKind = JsonValueKind.Object -> Some(Some value)
                 | _ -> None
-            match asDefault, http with
-            | Some asDefaultValue, Some httpValue ->
+            let observability =
+                match tryProperty config "observability" with
+                | None -> Some None
+                | Some value when value.ValueKind = JsonValueKind.Null -> Some None
+                | Some value when value.ValueKind = JsonValueKind.Object -> Some(Some value)
+                | _ -> None
+            match asDefault, http, observability with
+            | Some asDefaultValue, Some httpValue, Some observabilityValue ->
                 let middlewares =
                     match httpValue |> Option.bind (fun value -> tryProperty value "middlewares") with
                     | None -> Some [||]
@@ -2867,8 +2867,9 @@ module Traefik =
                     Some {
                         Middlewares = middlewareNames
                         Tls = tlsValue
+                        Observability = observabilityValue
                         AsDefault = asDefaultValue
-                        Applies = middlewareNames.Length > 0 || tlsValue.IsSome
+                        Applies = middlewareNames.Length > 0 || tlsValue.IsSome || observabilityValue.IsSome
                     }
                 | _ -> None
             | _ -> None
@@ -2913,7 +2914,40 @@ module Traefik =
         for value in values do result.Add(JsonValue.Create(value))
         result
 
-    /// Mirrors 3.7.16 applyModel/mergeConfiguration: entrypoint defaults, inherited middleware/TLS,
+    let private setRootObservability
+        (router: JsonElement)
+        (model: HttpEntryPointModel option)
+        (projected: JsonObject)
+        =
+        let routerValues =
+            match tryProperty router "observability" with
+            | Some value when value.ValueKind = JsonValueKind.Object -> Some value
+            | _ -> None
+        let modelValues = model |> Option.bind (fun value -> value.Observability)
+        let isUnset name (value: JsonElement) =
+            value.ValueKind = JsonValueKind.Null
+            || (name = "traceVerbosity"
+                && value.ValueKind = JsonValueKind.String
+                && String.IsNullOrEmpty(value.GetString()))
+        let effectiveValue name =
+            match routerValues |> Option.bind (fun value -> tryProperty value name) with
+            | Some value when not (isUnset name value) -> Some value
+            | _ ->
+                modelValues
+                |> Option.bind (fun value -> tryProperty value name)
+                |> Option.filter (isUnset name >> not)
+        let valueNode (name: string) (fallback: JsonNode) : JsonNode =
+            match effectiveValue name with
+            | Some value -> JsonNode.Parse(value.GetRawText())
+            | None -> fallback
+        let observability = JsonObject()
+        observability["accessLogs"] <- valueNode "accessLogs" (JsonValue.Create(true) :> JsonNode)
+        observability["metrics"] <- valueNode "metrics" (JsonValue.Create(true) :> JsonNode)
+        observability["tracing"] <- valueNode "tracing" (JsonValue.Create(true) :> JsonNode)
+        observability["traceVerbosity"] <- valueNode "traceVerbosity" (JsonValue.Create("minimal") :> JsonNode)
+        projected["observability"] <- observability
+
+    /// Mirrors 3.7.16 applyModel/mergeConfiguration: entrypoint defaults, inherited middleware/TLS/observability,
     /// multi-entrypoint router copies, and child parentRefs are projected before rawdata comparison.
     /// Upstream: https://github.com/traefik/traefik/blob/v3.7.16/pkg/server/aggregator.go#L20-L82
     /// and https://github.com/traefik/traefik/blob/v3.7.16/pkg/server/aggregator.go#L348-L400
@@ -2970,18 +3004,21 @@ module Traefik =
                                             match model.Tls with
                                             | Some tls -> projected["tls"] <- JsonNode.Parse(tls.GetRawText())
                                             | None -> ()
+                                        setRootObservability router (Some model) projected
                                         addProjected projectedName projected
                                         projectedNames.Add(projectedName)
                                     | _ -> unmodelled.Add(entryPoint)
                                 if unmodelled.Count > 0 || entryPoints.Length = 0 then
                                     let projected = copyRoute name
                                     projected["entryPoints"] <- jsonNodeStringArray (unmodelled.ToArray())
+                                    setRootObservability router None projected
                                     addProjected name projected
                                     projectedNames.Add(name)
                                 splitNames[name] <- projectedNames.ToArray()
                             else
                                 let projected = copyRoute name
                                 if entryPoints.Length > 0 then projected["entryPoints"] <- jsonNodeStringArray entryPoints
+                                setRootObservability router None projected
                                 addProjected name projected
                                 splitNames[name] <- [| name |]
                         | _ -> valid <- false
@@ -3697,10 +3734,19 @@ module Traefik =
             match tryStat environment storagePath with
             | None -> ()
             | Some _ ->
-                assertRegular environment storagePath "ACME storage" |> ignore
-                if not (metadataMatches environment storagePath "file" 0o600 serviceUid serviceGid)
-                   || not (stores.AccountMatches(resolverName)) then
-                    fail "Traefik ACME storage is unsafe for the configured resolver"
+                let descriptor = openChecked storagePath false
+                try
+                    let metadata = statDescriptor descriptor
+                    if metadata.Mode <> 0o600 || metadata.Uid <> serviceUid || metadata.Gid <> serviceGid then
+                        fail "Traefik ACME storage has unsafe ownership or permissions"
+                    use handle = new SafeFileHandle(nativeint descriptor, false)
+                    // Traefik creates a zero-length store even for a configured, unused resolver.
+                    // There is no account to overwrite there. Issued routes still require a
+                    // validated account and matching leaf/key before readiness or a positive Read.
+                    if RandomAccess.GetLength(handle) <> 0L && not (stores.AccountMatches(resolverName)) then
+                        fail "Traefik ACME storage is unsafe for the configured resolver"
+                finally
+                    nativeClose(descriptor) |> ignore
 
 
 

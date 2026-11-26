@@ -28,7 +28,8 @@ fail() {
 }
 request() {
     local label=$1 port=$2 host=$3 path=$4 method=${5:-GET} status
-    shift 5 || true
+    shift 4
+    if (( $# )); then shift; fi
     local body="$root/logs/review-http-$label.body"
     local headers="$root/logs/review-http-$label.headers"
     local -a options=(--noproxy '*' --silent --show-error --connect-timeout 2 --max-time 8 -H "Host: $host")
@@ -42,7 +43,7 @@ request_secure() {
     local label=$1 port=$2 host=$3 path=$4 status
     local body="$root/logs/review-http-$label.body"
     local headers="$root/logs/review-http-$label.headers"
-    status=$(curl --noproxy '*' --insecure --silent --show-error --connect-timeout 2 --max-time 8 \
+    status=$(curl --noproxy '*' --cacert "$root/certs/sni-proof.pem" --silent --show-error --connect-timeout 2 --max-time 8 \
         --resolve "$host:$port:127.0.0.1" -H "Host: $host" -D "$headers" -o "$body" -w '%{http_code}' \
         "https://$host:$port$path") || fail "HTTPS request $label could not reach its listener"
     [[ "$status" == 200 ]] || fail "HTTPS request $label returned status $status"
@@ -145,7 +146,7 @@ tcp_exchange() {
         > "$root/logs/review-tcp-$label.log" 2>&1 || fail "TCP probe $label did not satisfy its wire assertion"
 }
 udp_exchange() {
-    local label=$1 port=$2 payload=$3 output="$root/logs/review-udp-$label.response"
+    local label=$1 port=$2 payload=$3 output="$root/logs/review-udp-$1.response"
     timeout 5 perl -MIO::Socket::INET -e '
         use strict;
         use warnings;
@@ -216,7 +217,27 @@ check_http_routes() {
             || fail 'IPv6 forwarded-header request could not reach its loopback listener'
         [[ "$status" == 200 ]] || fail "IPv6 forwarded-header request returned status $status"
         grep -Fq 'forwarded:2001:db8::77' "$body" || fail 'IPv6 forwarded-header trust did not preserve the trusted XFF value'
-        printf 'IPv6 forwarded-header probe passed.\n' > "$root/logs/review-ipv6-evidence.log"
+        # Real IPv6 connection (no client-supplied PROXY header). Check the backend echo,
+        # including both IPv6 addresses and the actual client's ephemeral port.
+        timeout 8 perl -MSocket=AF_INET6,SOCK_STREAM,SHUT_WR,inet_pton,pack_sockaddr_in6,unpack_sockaddr_in6 -e '
+            use strict; use warnings;
+            my $loop = inet_pton(AF_INET6, "::1");
+            socket(my $s, AF_INET6, SOCK_STREAM, 0) or die "socket: $!";
+            connect($s, pack_sockaddr_in6(19017, $loop)) or die "connect: $!";
+            my ($port, $source) = unpack_sockaddr_in6(getsockname($s));
+            my $payload = "tcp6-review-$$";
+            syswrite($s, $payload) == length($payload) or die "short write";
+            shutdown($s, SHUT_WR) or die "shutdown: $!";
+            my $wire = do { local $/; <$s> };
+            defined($wire) && length($wire) >= 52 or die "missing TCP6 frame";
+            substr($wire,0,12) eq "\r\n\r\n\0\r\nQUIT\n" or die "missing signature";
+            my ($v,$f,$n) = unpack("CCn", substr($wire,12,4));
+            $v == 0x21 && $f == 0x21 && $n >= 36 or die "not v2 TCP6";
+            substr($wire,16,32) eq $source.$loop or die "incorrect TCP6 addresses";
+            substr($wire,48,4) eq pack("nn",$port,19017) or die "incorrect TCP6 ports";
+            substr($wire,16+$n) eq $payload or die "incorrect TCP6 payload";
+        ' || fail 'Named transport did not preserve the actual loopback IPv6 tuple'
+        printf 'IPv6 forwarded header and backend-observed TCP6 PROXY v2 tuple/payload passed.\n' | tee "$root/logs/review-ipv6-evidence.log"
     else
         printf 'IPv6 loopback unavailable; IPv6 forwarded-header probe not configured.\n' > "$root/logs/review-ipv6-evidence.log"
     fi
@@ -238,7 +259,7 @@ case "$mode" in
         exit 0
         ;;
     udp-conflict-control)
-        nonce="review-udp-conflict-control-$RANDOM-$RANDOM"
+        nonce=$(openssl rand -hex 8)
         udp_exchange conflict-control 19015 "$nonce"
         for _ in $(seq 1 30); do
             grep -aFq -- "$nonce" "$root/logs/udp-echo.log" && break
@@ -258,8 +279,9 @@ case "$mode" in
         tcp_exchange proxy-v2-trusted 19011 127.0.0.1 v2-trusted 203.0.113.77
         tcp_exchange proxy-v2-untrusted 19011 127.0.0.2 v2-untrusted 127.0.0.2
 
-        udp_a="review-udp-a-$RANDOM-$RANDOM"
-        udp_b="review-udp-b-$RANDOM-$RANDOM"
+        # socat's hex dump renders 16 ASCII bytes per row. Match the complete random datagram.
+        udp_a=$(openssl rand -hex 8)
+        udp_b=$(openssl rand -hex 8)
         udp_exchange a 19013 "$udp_a"
         udp_exchange b 19014 "$udp_b"
         for _ in $(seq 1 30); do
@@ -271,6 +293,9 @@ case "$mode" in
         done
         grep -aFq -- "$udp_a" "$root/logs/udp-echo.log" || fail 'UDP router A did not reach its distinct backend'
         grep -aFq -- "$udp_b" "$root/logs/review-udp-b.log" || fail 'UDP router B did not reach its distinct backend'
+        if grep -aFq -- "$udp_b" "$root/logs/udp-echo.log" || grep -aFq -- "$udp_a" "$root/logs/review-udp-b.log"; then
+            fail 'A review datagram also reached the other backend'
+        fi
 
         printf 'HTTP/TCP/UDP route and backend assertions passed.\n'
         ;;

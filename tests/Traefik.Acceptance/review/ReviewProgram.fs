@@ -34,7 +34,7 @@ module ReviewProgram =
 
     let private entryPointHttpDefaults middleware tls =
         nativeObject {
-            nativeField "middlewares" (nativeArray [ nativeString middleware ])
+            nativeField "middlewares" (nativeArray [ nativeString (middleware + "@file") ])
             if tls then nativeField "tls" (nativeObject {})
         }
 
@@ -102,6 +102,7 @@ module ReviewProgram =
                     if includeProxyPlacement then
                         staticEntryPoint "review-proxy-placement" { entryPointAddress "127.0.0.1:19016/tcp" }
                     if ipv6 then
+                        staticEntryPoint "review-proxy-v6" { entryPointAddress "[::1]:19017/tcp" }
                         staticEntryPoint "review-v6" {
                             entryPointAddress "[::1]:18182/tcp"
                             entryPointForwardedHeaders (nativeObject {
@@ -184,6 +185,12 @@ module ReviewProgram =
                             httpRouterPriority 1000
                             httpRouterService (httpServiceRef "review-other")
                         }
+                        // Without the explicit priority, this longer rule would select the other backend.
+                        httpRouter "review-priority-competitor" {
+                            httpRule (hostRule [ "sni-proof.acceptance.test" ] &&& pathPrefixRule "/priority/explicit/selected")
+                            httpRouterEntryPoints [ httpEntryPoint "review-front" ]
+                            httpRouterService (httpServiceRef "review-main")
+                        }
                         httpRouter "review-chain-one" {
                             httpRule (hostRule [ "sni-proof.acceptance.test" ] &&& pathPrefixRule "/base/chain-one")
                             httpRouterEntryPoints [ httpEntryPoint "review-front" ]
@@ -199,12 +206,10 @@ module ReviewProgram =
                         httpRouter "review-layer-parent" {
                             httpRule (hostRule [ "multi.example.test" ] &&& pathPrefixRule "/multilayer")
                             httpRouterEntryPoints [ httpEntryPoint "review-front" ]
-                            httpRouterService (httpServiceRef "review-main")
                             httpRouterMiddlewares [ httpMiddlewareRef "review-layer-request-header" ]
                         }
                         httpRouter "review-layer-child" {
                             httpRule (andRule (hostRule [ "multi.example.test" ]) (andRule (pathPrefixRule "/multilayer") (headerRule "X-Dorothy-Layer" "admin")))
-                            httpRouterEntryPoints [ httpEntryPoint "review-front" ]
                             httpRouterService (httpServiceRef "review-other")
                             httpRouterParentRefs [ httpRouterRef "review-layer-parent" ]
                         }
@@ -312,7 +317,10 @@ module ReviewProgram =
                         }
                         tcpRouter "review-proxy-v2" {
                             tcpRule (tcpHostSniRule "*")
-                            tcpRouterEntryPoints [ tcpEntryPoint "review-proxy-v2" ]
+                            tcpRouterEntryPoints [
+                                tcpEntryPoint "review-proxy-v2"
+                                if ipv6 then tcpEntryPoint "review-proxy-v6"
+                            ]
                             tcpRouterService (tcpServiceRef "review-proxy-v2")
                         }
                         if includeProxyPlacement then

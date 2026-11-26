@@ -110,12 +110,23 @@ type TraefikBackendTests() =
           AdminPort = adminPort }
 
     let apiConfigurationFromArrays (routers: JsonElement) (services: JsonElement) (middlewares: JsonElement) =
-        let resources (items: JsonElement) =
+        let resources isRouter (items: JsonElement) =
             let result = JsonObject()
             for item in items.EnumerateArray() do
                 let name = item.GetProperty("name").GetString()
                 match JsonNode.Parse(item.GetRawText()) with
                 | :? JsonObject as value ->
+                    let mutable parentRefs = Unchecked.defaultof<JsonElement>
+                    let rootRouter =
+                        not (item.TryGetProperty("parentRefs", &parentRefs))
+                        || parentRefs.ValueKind = JsonValueKind.Null
+                    if isRouter && rootRouter && not (value.ContainsKey("observability")) then
+                        let observability = JsonObject()
+                        observability["accessLogs"] <- JsonValue.Create(true)
+                        observability["metrics"] <- JsonValue.Create(true)
+                        observability["tracing"] <- JsonValue.Create(true)
+                        observability["traceVerbosity"] <- JsonValue.Create("minimal")
+                        value["observability"] <- observability
                     value.Remove("name") |> ignore
                     value.Remove("provider") |> ignore
                     value.Remove("type") |> ignore
@@ -123,9 +134,9 @@ type TraefikBackendTests() =
                 | _ -> invalidOp "API fixture resource must be an object."
             result
         let rawData = JsonObject()
-        rawData["routers"] <- resources routers
-        rawData["services"] <- resources services
-        rawData["middlewares"] <- resources middlewares
+        rawData["routers"] <- resources true routers
+        rawData["services"] <- resources false services
+        rawData["middlewares"] <- resources false middlewares
         rawData["tcpRouters"] <- JsonObject()
         rawData["tcpServices"] <- JsonObject()
         rawData["tcpMiddlewares"] <- JsonObject()
@@ -686,7 +697,7 @@ type TraefikBackendTests() =
         let rawData =
             """{
               "routers":{
-                "keroosha-admin@file":{"rule":"PathPrefix(`/api`) || PathPrefix(`/dashboard`)","entryPoints":["keroosha-admin"],"service":"api@internal","priority":1000000,"status":"enabled"},
+                "keroosha-admin@file":{"rule":"PathPrefix(`/api`) || PathPrefix(`/dashboard`)","entryPoints":["keroosha-admin"],"service":"api@internal","priority":1000000,"observability":{"accessLogs":true,"metrics":true,"tracing":true,"traceVerbosity":"minimal"},"status":"enabled"},
                 "healthy@file":{"entryPoints":["web"],"middlewares":["observe@file"],"service":"healthy-service","rule":"Host(`healthy.test`)","priority":20,"observability":{"accessLogs":true,"metrics":true,"tracing":true,"traceVerbosity":"minimal"},"status":"enabled","using":["web"]}
               },
               "services":{
@@ -918,6 +929,7 @@ type TraefikBackendTests() =
         let admin = dynamic.RootElement.GetProperty("http").GetProperty("routers").GetProperty("keroosha-admin")
         let adminNode = JsonNode.Parse(admin.GetRawText()) :?> JsonObject
         adminNode["status"] <- JsonValue.Create("enabled")
+        adminNode["observability"] <- JsonNode.Parse("""{"accessLogs":true,"metrics":true,"tracing":true,"traceVerbosity":"minimal"}""")
         let routers = JsonObject()
         routers["keroosha-admin@file"] <- adminNode
         let rawData = JsonObject()
@@ -1539,7 +1551,7 @@ type TraefikBackendTests() =
                 }
               },
               "tcp":{
-                "routers":{"echo":{"entryPoints":["t"],"rule":"HostSNI(`*`)","middlewares":["one"],"service":"echo","priority":0,"tls":{"passthrough":false}}},
+                "routers":{"echo":{"entryPoints":["t"],"rule":"HostSNI(\"*\")","middlewares":["one"],"service":"echo","priority":0,"tls":{"passthrough":false}}},
                 "middlewares":{"one":{"ipAllowList":{"sourceRange":["127.0.0.1/32"]}}},
                 "services":{"echo":{"loadBalancer":{"servers":[{"address":"127.0.0.1:19001"}]}}}
               }
@@ -1565,7 +1577,7 @@ type TraefikBackendTests() =
                 "dashboard@internal":{"status":"enabled"},
                 "noop@internal":{"status":"enabled"}
               },
-              "tcpRouters":{"echo@file":{"entryPoints":["t"],"middlewares":["one@file"],"service":"echo","rule":"HostSNI(`*`)","priority":-1,"tls":{"options":"default"},"status":"enabled","using":["t"]}},
+              "tcpRouters":{"echo@file":{"entryPoints":["t"],"middlewares":["one@file"],"service":"echo","rule":"HostSNI(\"*\")","priority":-1,"tls":{"options":"default"},"status":"enabled","using":["t"]}},
               "tcpMiddlewares":{"one@file":{"ipAllowList":{"sourceRange":["127.0.0.1/32"]},"status":"enabled"}},
               "tcpServices":{"echo@file":{"loadBalancer":{"servers":[{"address":"127.0.0.1:19001"}]},"status":"enabled","usedBy":["echo@file"]}}
             }"""
@@ -1615,7 +1627,7 @@ type TraefikBackendTests() =
             }"""
         let rawData =
             """{
-              "routers":{"keroosha-admin@file":{"entryPoints":["keroosha-admin"],"service":"api@internal","rule":"PathPrefix(`/api`) || PathPrefix(`/dashboard`)","priority":1000000,"status":"enabled"}},
+              "routers":{"keroosha-admin@file":{"entryPoints":["keroosha-admin"],"service":"api@internal","rule":"PathPrefix(`/api`) || PathPrefix(`/dashboard`)","priority":1000000,"observability":{"accessLogs":true,"metrics":true,"tracing":true,"traceVerbosity":"minimal"},"status":"enabled"}},
               "services":{"timed@file":{"loadBalancer":{"servers":[{"url":"http://127.0.0.1:9000"}],"strategy":"wrr","passHostHeader":true,"responseForwarding":{"flushInterval":"1m0s"}},"status":"enabled","type":"loadbalancer"}},
               "middlewares":{}
             }"""
@@ -1633,3 +1645,99 @@ type TraefikBackendTests() =
         Assert.That(
             Traefik.apiMatchesDynamic (Some apiWithEmptyUsers) (Some(Encoding.UTF8.GetBytes(dynamic))),
             Is.True)
+    [<Test>]
+    member _.``API comparison applies root observability precedence and observation-only listener splitting``() =
+        let dynamic =
+            """{
+              "http":{
+                "routers":{
+                  "keroosha-admin":{"rule":"PathPrefix(`/api`) || PathPrefix(`/dashboard`)","entryPoints":["keroosha-admin"],"service":"api@internal","priority":1000000},
+                  "site":{"entryPoints":["front","other"],"rule":"Host(`obs.test`)","service":"app","observability":{"tracing":true}},
+                  "parent":{"entryPoints":["front","other"],"rule":"Host(`parent.test`)"},
+                  "child":{"parentRefs":["parent"],"rule":"Header(`x`,`child`)","service":"app"}
+                },
+                "services":{"app":{"loadBalancer":{"servers":[{"url":"http://127.0.0.1:9000"}]}}}
+              }
+            }"""
+        let rawData =
+            """{
+              "routers":{
+                "keroosha-admin@file":{"entryPoints":["keroosha-admin"],"service":"api@internal","rule":"PathPrefix(`/api`) || PathPrefix(`/dashboard`)","priority":1000000,"observability":{"accessLogs":true,"metrics":true,"tracing":true,"traceVerbosity":"minimal"},"status":"enabled","using":["keroosha-admin"]},
+                "front-site@file":{"entryPoints":["front"],"service":"app","rule":"Host(`obs.test`)","priority":16,"observability":{"accessLogs":false,"metrics":true,"tracing":true,"traceVerbosity":"minimal"},"status":"enabled","using":["front"]},
+                "site@file":{"entryPoints":["other"],"service":"app","rule":"Host(`obs.test`)","priority":16,"observability":{"accessLogs":true,"metrics":true,"tracing":true,"traceVerbosity":"minimal"},"status":"enabled","using":["other"]},
+                "front-parent@file":{"entryPoints":["front"],"rule":"Host(`parent.test`)","priority":19,"observability":{"accessLogs":false,"metrics":true,"tracing":false,"traceVerbosity":"minimal"},"status":"enabled","using":["front"]},
+                "parent@file":{"entryPoints":["other"],"rule":"Host(`parent.test`)","priority":19,"observability":{"accessLogs":true,"metrics":true,"tracing":true,"traceVerbosity":"minimal"},"status":"enabled","using":["other"]},
+                "child@file":{"service":"app","rule":"Header(`x`,`child`)","parentRefs":["front-parent@file","parent@file"],"priority":19,"status":"enabled"}
+              },
+              "services":{
+                "app@file":{"loadBalancer":{"servers":[{"url":"http://127.0.0.1:9000"}],"strategy":"wrr","passHostHeader":true,"responseForwarding":{"flushInterval":"100ms"}},"status":"enabled","type":"loadbalancer","usedBy":["child@file","front-site@file","site@file"]}
+              },
+              "middlewares":{}
+            }"""
+        let entryPoints =
+            """[
+              {"name":"keroosha-admin","address":"127.0.0.1:19080"},
+              {"name":"front","address":"127.0.0.1:18081","observability":{"accessLogs":false,"tracing":false}},
+              {"name":"other","address":"127.0.0.1:18082"}
+            ]"""
+        let matches (raw: string) =
+            let api = apiConfigurationFromJson 19080 raw entryPoints """{"Version":"3.7.16"}"""
+            Traefik.apiMatchesDynamic (Some api) (Some(Encoding.UTF8.GetBytes(dynamic)))
+        let mutate (update: JsonObject -> unit) =
+            let candidate = JsonNode.Parse(rawData) :?> JsonObject
+            update candidate
+            matches (candidate.ToJsonString())
+        let mutateObservability (routerName: string) (update: JsonObject -> unit) =
+            mutate (fun root ->
+                let routers = root["routers"] :?> JsonObject
+                let route = routers[routerName] :?> JsonObject
+                let observability = route["observability"] :?> JsonObject
+                update observability)
+
+        Assert.That(matches rawData, Is.True)
+        Assert.That(
+            mutateObservability "front-site@file" (fun observability ->
+                observability["accessLogs"] <- JsonValue.Create(true)),
+            Is.False,
+            "The router inherits listener values where it has no explicit override.")
+        Assert.That(
+            mutateObservability "front-site@file" (fun observability ->
+                observability["tracing"] <- JsonValue.Create(false)),
+            Is.False,
+            "An explicit router value takes precedence over the listener model.")
+        Assert.That(
+            mutateObservability "site@file" (fun observability ->
+                observability["metrics"] <- JsonValue.Create(false)),
+            Is.False,
+            "Unmodeled root routers retain native observability defaults.")
+        Assert.That(
+            mutateObservability "site@file" (fun observability ->
+                observability["stale"] <- JsonValue.Create(false)),
+            Is.False,
+            "Unknown observability fields remain drift.")
+
+        let missingNativeDefaultBlock =
+            mutate (fun root ->
+                let routers = root["routers"] :?> JsonObject
+                let route = routers["parent@file"] :?> JsonObject
+                route.Remove("observability") |> ignore)
+        Assert.That(missingNativeDefaultBlock, Is.False, "Root routers must expose the complete native observability block.")
+
+        let missingListenerModel =
+            mutate (fun root ->
+                let routers = root["routers"] :?> JsonObject
+                let route = routers["front-site@file"] :?> JsonObject
+                route.Remove("observability") |> ignore)
+        Assert.That(missingListenerModel, Is.False, "A configured non-default model cannot be omitted.")
+
+        let childWithObservability =
+            mutate (fun root ->
+                let routers = root["routers"] :?> JsonObject
+                let child = routers["child@file"] :?> JsonObject
+                let observability = JsonObject()
+                observability["accessLogs"] <- JsonValue.Create(true)
+                observability["metrics"] <- JsonValue.Create(true)
+                observability["tracing"] <- JsonValue.Create(true)
+                observability["traceVerbosity"] <- JsonValue.Create("minimal")
+                child["observability"] <- observability)
+        Assert.That(childWithObservability, Is.False, "Child routers do not inherit root defaults.")

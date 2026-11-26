@@ -32,6 +32,7 @@ esac
     exit 2
 }
 source "$state_dir/handle.env"
+traefik_urn=$(jq -er '[.deployment.resources[] | select(.type=="keroosha:debian:Traefik")] | select(length==1) | .[0].urn' "$state_dir/legacy-checkpoint.json")
 [[ -f "$state_dir/pulumi-project/Pulumi.acceptance.yaml" && -f "$state_dir/pulumi-project/Pulumi.yaml" ]] || {
     printf 'Existing private acceptance Pulumi project state is missing.\n' >&2
     exit 2
@@ -190,7 +191,7 @@ description: Private review acceptance phase on the existing sandbox resource
 EOF
 chmod 600 "$manifest"
 log_path="$state_dir/logs/review-${phase}-${pulumi_command}.log"
-if ! (cd "$pulumi_project" && pulumi "$pulumi_command" "$@" --stack acceptance --non-interactive --color=never) \
+if ! (cd "$pulumi_project" && pulumi "$pulumi_command" "$@" --target "$traefik_urn" --stack acceptance --non-interactive --color=never) \
     > "$log_path" 2>&1; then
     printf 'Review Pulumi command failed; see %s.\n' "$log_path" >&2
     exit 1

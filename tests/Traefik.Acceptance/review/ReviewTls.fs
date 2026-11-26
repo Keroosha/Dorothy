@@ -107,6 +107,7 @@ module ReviewTls =
             User "root"
             Port 22
             debian {
+                apt { "ca-certificates"; "openssl" }
                 traefik {
                     adminPort 19080
                     reviewConfiguration phase
