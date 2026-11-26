@@ -307,13 +307,14 @@ type FirewalldTests() =
             let vendorPath = Path.Combine(root, "usr/lib/firewalld/firewalld.conf")
             let vendor = "DefaultZone=public\nStrictForwardPorts=no\n"
             File.WriteAllText(vendorPath, vendor)
+            File.SetUnixFileMode(vendorPath, enum<UnixFileMode> 0o640)
             let result = this.Invoke env "apply" strictConfiguration
             Assert.That(result["actual"].GetValue<string>(), Is.EqualTo "yes")
             Assert.That(result["inSync"].GetValue<bool>(), Is.True)
             let overridePath = Path.Combine(root, "etc/firewalld/firewalld.conf")
             let managed = "DefaultZone=public\nStrictForwardPorts=yes\n"
             Assert.That(File.ReadAllText overridePath, Is.EqualTo managed)
-            Assert.That(int (File.GetUnixFileMode overridePath), Is.EqualTo 0o600)
+            Assert.That(int (File.GetUnixFileMode overridePath), Is.EqualTo 0o640)
             let read = this.Invoke env "read" strictConfiguration
             Assert.That(read["actual"].GetValue<string>(), Is.EqualTo "yes")
             Assert.That(read["inSync"].GetValue<bool>(), Is.True)
