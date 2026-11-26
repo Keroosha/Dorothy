@@ -29,9 +29,9 @@ type TraefikRouterTarget =
 type TraefikRouter =
     { Host: string
       EntryPoint: string
+      ExcludedPathSubtree: string option
       Target: TraefikRouterTarget
       Tls: TraefikRouterTls }
-
 /// Independently resolved provider maps preserve their Pulumi dependencies and secret boundaries.
 type TraefikResolvedSpec =
     { EntryPoints: Output<ImmutableDictionary<string, int>>
@@ -93,6 +93,7 @@ type RouterPart =
     | Host of TraefikStringInput
     | EntryPoint of TraefikStringInput
     | Target of RouterTargetInput
+    | ExcludedPathSubtree of string
     | Tls of TraefikTlsMode
 
 [<RequireQualifiedAccess>]
@@ -112,9 +113,9 @@ type RouterDefinition =
     { Name: string
       Host: TraefikStringInput
       EntryPoint: TraefikStringInput
+      ExcludedPathSubtree: string option
       Target: RouterTargetInput
       Tls: TraefikTlsMode }
-
 [<RequireQualifiedAccess>]
 type TraefikDeclaration =
     | EntryPoint of EntryPointDefinition
@@ -160,12 +161,20 @@ type RouterBuilder internal (name: string) =
         let entryPoint = select "entryPoint" (function RouterPart.EntryPoint value -> Some value | _ -> None)
         let target = select "target" (function RouterPart.Target value -> Some value | _ -> None)
         let tls = select "tls" (function RouterPart.Tls value -> Some value | _ -> None) |> Option.defaultValue TraefikTlsMode.NoTls
+        let excludedPathSubtree =
+            select "excludedPathSubtree" (function RouterPart.ExcludedPathSubtree value -> Some value | _ -> None)
+        excludedPathSubtree
+        |> Option.iter (fun value ->
+            if not (TraefikPathModel.isCanonicalSubtree value) then
+                invalidArg "excludedPathSubtree" "A router path exclusion must be a canonical absolute subtree."
+        )
 
         match host, entryPoint, target with
         | Some hostValue, Some entryPointValue, Some targetValue ->
             { Name = name
               Host = hostValue
               EntryPoint = entryPointValue
+              ExcludedPathSubtree = excludedPathSubtree
               Target = targetValue
               Tls = tls }
         | _ -> invalidArg "router" "A router requires host, entryPoint, and exactly one backend or redirect target."
@@ -490,6 +499,7 @@ type TraefikSpec internal (
                         { Host = host
                           EntryPoint = entryPoint
                           Target = target
+                          ExcludedPathSubtree = router.ExcludedPathSubtree
                           Tls = tls })
                 TraefikOutput.immutableDictionary resolved)
 
@@ -603,6 +613,11 @@ type TraefikBuilder() =
             TraefikValidation.validateNameWithReserved "entryPoint" [ "keroosha-admin"; "traefik" ] entryPoint.Name
         for router in routers do
             TraefikValidation.validateNameWithReserved "router" [ "keroosha-admin" ] router.Name
+            router.ExcludedPathSubtree
+            |> Option.iter (fun value ->
+                if not (TraefikPathModel.isCanonicalSubtree value) then
+                    invalidArg "excludedPathSubtree" "A router path exclusion must be a canonical absolute subtree."
+            )
         for resolver in resolvers do TraefikValidation.validateName "acmeResolver" resolver.Name
         for certificate in certificates do TraefikValidation.validateName "certificate" certificate.Name
         let validateUnique fieldName (values: seq<string>) =
@@ -681,6 +696,8 @@ module TraefikBuilders =
     /// Sets a router's Host rule value.
     let inline host (value: ^T) : RouterPart =
         ((^T or TraefikFields) : (static member Host : ^T -> RouterPart) value)
+    /// Excludes one canonical absolute path subtree from the router.
+    let excludePathSubtree (value: string) = RouterPart.ExcludedPathSubtree value
 
     /// Selects a permanent redirect to an absolute HTTP or HTTPS origin.
     let redirect (value: TraefikRedirect) =

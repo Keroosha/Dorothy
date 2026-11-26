@@ -55,6 +55,9 @@ module TraefikBackend =
             json.WriteStartObject()
             json.WriteString("host", router.Host)
             json.WriteString("entryPoint", router.EntryPoint)
+            match router.ExcludedPathSubtree with
+            | Some path -> json.WriteString("excludedPathSubtree", path)
+            | None -> ()
             match router.Target with
             | TraefikRouterTarget.Backend backend ->
                 json.WriteString("backend", backend)

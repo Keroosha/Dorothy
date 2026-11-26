@@ -292,6 +292,33 @@ type TraefikBackendTests() =
         Assert.That(idnDynamic.RootElement.GetProperty("http").GetProperty("routers").GetProperty("idn").GetProperty("rule").GetString(), Is.EqualTo("Host(`xn--e1afmkfd.xn--p1ai`)"))
 
     [<Test>]
+    member _.``Native excluded path subtree rules separate exact and descendant paths and reject invalid request values``() =
+        let requestJson (excludedPathSubtree: string option) =
+            let subtreeProperty =
+                match excludedPathSubtree with
+                | Some rawJson -> ",\"excludedPathSubtree\":" + rawJson
+                | None -> ""
+            """{"operation":"apply","ownerId":"unit-test-traefik","entryPoints":{"web":31080},"resolvers":{},"routers":{"site":{"host":"site.example.test","entryPoint":"web","backend":"http://127.0.0.1:9000","tls":{"kind":"none","name":""}"""
+            + subtreeProperty
+            + """}},"certificates":{},"adminPort":19080}"""
+
+        let renderRule excludedPathSubtree =
+            use request = JsonDocument.Parse(requestJson excludedPathSubtree)
+            use dynamicConfig = JsonDocument.Parse(Traefik.renderDynamicConfig request.RootElement paths)
+            dynamicConfig.RootElement.GetProperty("http").GetProperty("routers").GetProperty("site").GetProperty("rule").GetString()
+
+        Assert.That(renderRule None, Is.EqualTo("Host(`site.example.test`)"))
+        Assert.That(
+            renderRule (Some "\"/admin\""),
+            Is.EqualTo("Host(`site.example.test`) && !PathRegexp(`^(/|%2[fF])+admin($|/|%2[fF])`)"))
+
+        for invalidValue in
+            [ "17"; "true"; "null"; "[]"; "\"admin\""; "\"/\""; "\"/admin/\""; "\"/admin//\"";
+              "\"/admin/../secret\""; "\"/admin?x\""; "\"/admin`\"" ] do
+            let failure = TestDelegate(fun () -> renderRule (Some invalidValue) |> ignore)
+            Assert.Throws<Traefik.BackendError>(failure) |> ignore
+
+    [<Test>]
     member _.``Validation rejects unsafe names and admin port collisions``() =
         // Arrange
         use unsafeName = JsonDocument.Parse("""{
@@ -360,14 +387,14 @@ type TraefikBackendTests() =
         use request = JsonDocument.Parse("""{
           "operation":"apply","ownerId":"unit-test-traefik","entryPoints":{"web":31080},
           "resolvers":{"le":{"email":"ops@example.test","httpChallengeEntryPoint":"web"}},
-          "routers":{"site":{"host":"site.example.test","entryPoint":"web","backend":"http://127.0.0.1:9000","tls":{"kind":"acme","name":"le"}}},
+          "routers":{"site":{"host":"site.example.test","entryPoint":"web","backend":"http://127.0.0.1:9000","excludedPathSubtree":"/admin","tls":{"kind":"acme","name":"le"}}},
           "certificates":{},"adminPort":19080
         }""")
         let dynamicBytes = Encoding.UTF8.GetBytes(Traefik.renderDynamicConfig request.RootElement paths)
         let serviceName = "keroosha-backend-" + digest "http://127.0.0.1:9000"
         use routers = JsonDocument.Parse($"""[
           {{"name":"keroosha-admin@file","provider":"file","rule":"PathPrefix(`/api`) || PathPrefix(`/dashboard`)","entryPoints":["keroosha-admin"],"service":"api@internal","status":"enabled","middlewares":[]}},
-          {{"name":"site@file","provider":"file","rule":"Host(`site.example.test`)","entryPoints":["web"],"service":"{serviceName}","status":"enabled","middlewares":[],"tls":{{"certResolver":"le","options":"default"}}}}
+          {{"name":"site@file","provider":"file","rule":"Host(`site.example.test`) && !PathRegexp(`^(/|%%2[fF])+admin($|/|%%2[fF])`)","entryPoints":["web"],"service":"{serviceName}","status":"enabled","middlewares":[],"tls":{{"certResolver":"le","options":"default"}}}}
         ]""")
         use services = JsonDocument.Parse($"""[
           {{"name":"{serviceName}@file","provider":"file","status":"enabled","type":"loadbalancer","loadBalancer":{{"servers":[{{"url":"http://127.0.0.1:9000"}}]}}}}

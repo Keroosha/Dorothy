@@ -595,6 +595,53 @@ type TraefikRedirectProviderTests() =
             Assert.That(response.Failures, Is.Not.Empty, origin)
 
     [<Test>]
+    member _.``Provider Check validates excluded path subtrees and Diff reports updates``() =
+        let provider = DorothyProvider()
+        let map = TraefikRedirectProviderTestValues.map
+        let text = TraefikRedirectProviderTestValues.string
+        let withExcludedPathSubtree path =
+            let inputs = TraefikRedirectProviderTestValues.traefikBackendInput "http://127.0.0.1:8080" 19080
+            let routers = TraefikRedirectProviderTestValues.mapContents inputs["routers"]
+            let router = TraefikRedirectProviderTestValues.mapContents routers["example"]
+            inputs.SetItem(
+                "routers",
+                map [ "example", PropertyValue(router.SetItem("excludedPathSubtree", text path)) ]
+            )
+        let desired = withExcludedPathSubtree "/admin"
+        let checkedResponse = TraefikRedirectProviderTestValues.check provider desired
+        let checkedRouters = TraefikRedirectProviderTestValues.mapContents checkedResponse.Inputs["routers"]
+        let checkedRouter = TraefikRedirectProviderTestValues.mapContents checkedRouters["example"]
+        let oldInputs = TraefikRedirectProviderTestValues.traefikBackendInput "http://127.0.0.1:8080" 19080
+        let oldOutputs =
+            TraefikRedirectProviderTestValues.inputMap [
+                "inSync", TraefikRedirectProviderTestValues.boolean true
+            ]
+        let diff = TraefikRedirectProviderTestValues.diff provider oldInputs oldOutputs desired
+
+        Assert.That(checkedResponse.Failures, Is.Empty)
+        Assert.That(checkedRouter["excludedPathSubtree"], Is.EqualTo(text "/admin"))
+        Assert.That(diff.Changes.HasValue, Is.True)
+        Assert.That(diff.Changes.Value, Is.True)
+        Assert.That(diff.Diffs.Contains("routers"), Is.True)
+        Assert.That(
+            diff.DetailedDiff["routers.example.excludedPathSubtree"].Kind,
+            Is.EqualTo(PropertyDiffKind.Add)
+        )
+
+        for path in [
+            "/"
+            "/admin/"
+            "/admin//health"
+            "/admin/../health"
+            "/admin?debug=true"
+            "Path(`/admin`)"
+            "!Path(`/admin`)"
+        ] do
+            let response =
+                TraefikRedirectProviderTestValues.check provider (withExcludedPathSubtree path)
+            Assert.That(response.Failures, Is.Not.Empty, path)
+
+    [<Test>]
     member _.``Provider Create preview preserves unknown redirect origin``() =
         // Arrange
         let provider = DorothyProvider()

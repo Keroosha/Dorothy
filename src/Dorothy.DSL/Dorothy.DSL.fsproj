@@ -10,6 +10,7 @@
         <Compile Include="Quantities.fs" />
         <Compile Include="Ufw.fs" />
         <Compile Include="FirewalldModel.fs" />
+        <Compile Include="TraefikPathModel.fs" />
         <Compile Include="Firewalld.fs" />
         <Compile Include="Cloudflare.fs" />
         <Compile Include="Certificates.fs" />
