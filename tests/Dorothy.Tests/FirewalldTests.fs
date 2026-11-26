@@ -163,6 +163,7 @@ type FirewalldTests() =
         let changed = DiffRequest(urn token, "owner", oldOutputs.SetItem("inSync", PropertyValue true), inputs renamed, ImmutableArray<string>.Empty, oldInputs)
         Assert.That(provider.Diff(changed, CancellationToken.None).Result.Replaces, Does.Contain "configuration")
         let same = DiffRequest(urn token, "owner", oldOutputs.SetItem("inSync", PropertyValue true), oldInputs, ImmutableArray<string>.Empty, oldInputs)
+        Assert.That(provider.Diff(changed, CancellationToken.None).Result.DeleteBeforeReplace, Is.False)
         Assert.That(provider.Diff(same, CancellationToken.None).Result.Changes.Value, Is.False)
 
     member private _.WithHost(action: Dorothy.HostHelper.HostEnvironment -> string -> ResizeArray<string list> -> unit) =
@@ -264,6 +265,42 @@ type FirewalldTests() =
             Assert.That(calls |> Seq.filter (fun args -> args = [ "firewall-cmd"; "--reload" ]) |> Seq.length, Is.EqualTo 2))
 
     [<Test>]
+    member this.``StrictForwardPorts refuses same-object replacement while the old generation remains active``() =
+        this.WithHost(fun env root _ ->
+            let oldOwner, newOwner = "old-settings-generation", "new-settings-generation"
+            this.InvokeOwner env oldOwner "apply" strictConfiguration |> ignore
+            let configPath = Path.Combine(root, "etc/firewalld/firewalld.conf")
+            let before = File.ReadAllText configPath
+            Assert.Throws<NativeFirewalld.BackendError>(fun () -> this.InvokeOwner env newOwner "apply" strictConfiguration |> ignore) |> ignore
+            Assert.That(File.ReadAllText configPath, Is.EqualTo before)
+            let observed = this.InvokeOwner env oldOwner "read" strictConfiguration
+            Assert.That(observed["actual"].GetValue<string>(), Is.EqualTo "yes")
+            Assert.That(observed["inSync"].GetValue<bool>(), Is.True))
+
+    [<Test>]
+    member this.``DROP Docker policy refuses same-object replacement while the old guard remains active``() =
+        this.WithHost(fun env root _ ->
+            File.WriteAllText(Path.Combine(root, "etc/firewalld/zones/docker.xml"), "<zone target=\"ACCEPT\"/>")
+            let config = (policy "blockdocker" { ingressZones [ "public" ]; egressZones [ "docker" ]; target FirewalldTarget.Drop; priority -10 }).Configuration
+            this.InvokeOwner env "old-policy-generation" "apply" config |> ignore
+            let policyPath = Path.Combine(root, "etc/firewalld/policies/blockdocker.xml")
+            let before = File.ReadAllText policyPath
+            Assert.Throws<NativeFirewalld.BackendError>(fun () -> this.InvokeOwner env "new-policy-generation" "apply" config |> ignore) |> ignore
+            Assert.That(File.ReadAllText policyPath, Is.EqualTo before)
+            let observed = this.InvokeOwner env "old-policy-generation" "read" config
+            Assert.That(observed["inSync"].GetValue<bool>(), Is.True))
+
+    [<Test>]
+    member this.``StrictForwardPorts delete restores only its inherited key and preserves later unrelated edits``() =
+        this.WithHost(fun env root _ ->
+            let configPath = Path.Combine(root, "etc/firewalld/firewalld.conf")
+            File.WriteAllText(configPath, "DefaultZone=public\nStrictForwardPorts=no\n")
+            this.Invoke env "apply" strictConfiguration |> ignore
+            File.WriteAllText(configPath, "DefaultZone=trusted\nFirewallBackend=nftables\nStrictForwardPorts=yes\n")
+            this.Invoke env "delete" strictConfiguration |> ignore
+            Assert.That(File.ReadAllText configPath, Is.EqualTo "DefaultZone=trusted\nFirewallBackend=nftables\nStrictForwardPorts=no\n"))
+
+    [<Test>]
     member this.``StrictForwardPorts refuses foreign setting changes without overwriting``() =
         this.WithHost(fun env root calls ->
             let configPath = Path.Combine(root, "etc/firewalld/firewalld.conf")
@@ -281,7 +318,7 @@ type FirewalldTests() =
     member this.``StrictForwardPorts failed first reload restores config and releases ownership``() =
         this.WithHost(fun env root calls ->
             let configPath = Path.Combine(root, "etc/firewalld/firewalld.conf")
-            let baseline = "DefaultZone=public\nStrictForwardPorts=no\n"
+            let baseline = "DefaultZone=public\nFirewallBackend=nftables\nStrictForwardPorts=no\n"
             File.WriteAllText(configPath, baseline)
             let mutable failed = false
             let failing =

@@ -1722,11 +1722,76 @@ module Host =
                 let resource = create specification (prior :: dependencies @ ownerDependencies)
                 firewalldResources.Add(specification, resource)
         | _, None | None, _ -> ()
+        let dockerFirewallGuard =
+            match host.Firewalld |> Option.bind _.StrictForwardPorts, dockerEngine with
+            | Some true, Some engine ->
+                let guardPolicies =
+                    host.Firewalld.Value.Objects
+                    |> List.filter (fun specification ->
+                        specification.Kind = "policy"
+                        && specification.Value.Target = "DROP"
+                        && List.contains "docker" specification.Value.Egress)
+                if guardPolicies.IsEmpty then None
+                else
+                    let unitName = host.Name + "-docker-firewall-guard.service"
+                    let unitLines =
+                        [ "[Unit]"
+                          "Description=Dorothy strict Firewalld readiness gate for Docker"
+                          "Requires=firewalld.service"
+                          "After=firewalld.service"
+                          "Before=docker.service"
+                          ""
+                          "[Service]"
+                          "Type=oneshot"
+                          "ExecStart=/usr/bin/firewall-cmd --state"
+                          "ExecStart=/usr/bin/grep -Fqx StrictForwardPorts=yes /etc/firewalld/firewalld.conf" ]
+                        @ (guardPolicies
+                           |> List.collect (fun policy ->
+                               let infoCheck setting =
+                                   "ExecStart=/bin/sh -ec \"/usr/bin/firewall-cmd --info-policy="
+                                   + policy.Name
+                                   + " | /usr/bin/grep -Fxq '  "
+                                   + setting
+                                   + "'\""
+                               [ infoCheck "target: DROP"
+                                 infoCheck ("priority: " + string policy.Value.Priority)
+                                 "ExecStart=/usr/bin/firewall-cmd --policy=" + policy.Name + " --query-egress-zone=docker" ]
+                               @ (policy.Value.Ingress
+                                  |> List.map (fun zone ->
+                                      "ExecStart=/usr/bin/firewall-cmd --policy=" + policy.Name + " --query-ingress-zone=" + zone))))
+                        @ [ "RemainAfterExit=yes"
+                            ""
+                            "[Install]"
+                            "RequiredBy=docker.service"
+                            "" ]
+                    let configuration = String.concat "\n" unitLines
+                    let specification = HostServiceSpec(unitName, true, configuration, [], true)
+                    let args = HostServiceArgs()
+                    args.Connection <- Input<AptConnectionArgs>.op_Implicit connection
+                    args.Specification <- Input<string>.op_Implicit(HostContentInputs.service specification)
+                    args.Triggers <-
+                        Input<string>.op_Implicit(
+                            System.Text.Json.JsonSerializer.Serialize(
+                                guardPolicies |> List.map _.Configuration |> List.toArray))
+                    args.RestartOnChange <- Input<bool>.op_Implicit true
+                    let dependencies =
+                        [ engine :> Resource ]
+                        @ (firewalldSettingsResource |> Option.map (fun value -> value :> Resource) |> Option.toList)
+                        @ (guardPolicies |> List.map (fun policy -> firewalldResources[policy]))
+                    let resource =
+                        HostServiceResource(
+                            host.Name + "-docker-firewall-guard",
+                            args,
+                            ProviderContract.resourceOptionsWithDependencies dependencies)
+                    Some(resource :> Resource)
+            | _ -> None
 
         let dockerContainers =
             match host.Docker, dockerEngine with
             | Some specification, Some engine ->
-                DockerDeployment.deploy host engine specification hostContentDirectories firewalldResources completeJob
+                DockerDeployment.deploy
+                    host engine specification hostContentDirectories firewalldResources
+                    (dockerFirewallGuard |> Option.toList) completeJob
             | Some _, None -> invalidOp "A Docker declaration must have its engine prerequisite resource."
             | None, _ -> []
 

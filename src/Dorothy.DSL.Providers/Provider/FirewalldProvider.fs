@@ -235,6 +235,7 @@ module private FirewalldProviderLogic =
         outputs normalized None
 
     let owner (urn: Pulumi.Urn) (connection: SshConnection) = urn.ToString() + "::" + connection.Address
+    let generationOwner (urn: Pulumi.Urn) (connection: SshConnection) = owner urn connection + "::" + Guid.NewGuid().ToString("N")
 
     let run timeout ct action =
         task {
@@ -279,7 +280,9 @@ module private FirewalldProviderLogic =
             response.Diffs <- diffs
             response.Replaces <- replaces
             response.DetailedDiff <- details
-            response.DeleteBeforeReplace <- replaces.Count > 0
+            // Replacement Create must run while the old guard still owns the object.
+            // A same-object replacement is rejected by the helper's existing journal owner check.
+            response.DeleteBeforeReplace <- false
         response
 
 /// One provider implementation for independently owned zones, policies, and global settings.
@@ -320,7 +323,7 @@ type FirewalldProvider() =
         else
             FirewalldProviderLogic.run request.Timeout ct (fun token -> task {
                 let values, connection, configuration = FirewalldProviderLogic.parse request.Type request.Inputs
-                let owner = FirewalldProviderLogic.owner request.Urn connection
+                let owner = FirewalldProviderLogic.generationOwner request.Urn connection
                 let! snapshot = FirewalldBackend.apply connection owner configuration token
                 let response = CreateResponse()
                 response.Id <- owner

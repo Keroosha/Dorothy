@@ -329,6 +329,7 @@ type HostContentTests() =
         Assert.That(dependencies, Does.Contain "storage-host-content-app-data")
         Assert.That(dependencies, Does.Contain "storage-host-content-content-root")
         Assert.That(dependencies, Does.Contain "storage-host-firewalld-policy-docker-block")
+        Assert.That(dependencies, Does.Contain "storage-host-docker-firewall-guard")
         Assert.That(dependencies, Does.Not.Contain "storage-host-firewalld-policy-unrelated-policy")
         Assert.That(dependencies, Does.Not.Contain "storage-host-content-unused-data")
         let dockerArgs = appArgs.Args :?> Pulumi.Docker.ContainerArgs
@@ -385,6 +386,36 @@ type HostContentTests() =
         Assert.That(policyError.ParamName, Is.EqualTo "dependsOnFirewalld")
 
     [<Test>]
+    member _.``Strict Docker guard requires negative policy priority``() =
+        let guard =
+            Dorothy.DSL.Firewalld.policy "guard" {
+                Dorothy.DSL.Firewalld.ingressZones [ "public" ]
+                Dorothy.DSL.Firewalld.egressZones [ "docker" ]
+                Dorothy.DSL.Firewalld.target FirewalldTarget.Drop
+                Dorothy.DSL.Firewalld.priority 10
+            }
+        let app = container "strict-priority-app" {
+            DockerBuilders.restart unlessStopped
+            image "example/app:latest"
+            DockerBuilders.dependsOnFirewalld guard
+        }
+        let error =
+            Assert.Throws<ArgumentException>(fun () ->
+                sshHost "strict-priority-host" {
+                    Address "192.0.2.4"
+                    User "operator"
+                    debian {
+                        docker { app }
+                        Dorothy.DSL.Firewalld.firewalld {
+                            Dorothy.DSL.Firewalld.strictForwardPorts true
+                            Dorothy.DSL.Firewalld.zone "public" { Dorothy.DSL.Firewalld.services [ "ssh" ] }
+                            guard
+                        }
+                    }
+                } |> ignore)
+        Assert.That(error.ParamName, Is.EqualTo "strictForwardPorts")
+
+    [<Test>]
     [<NonParallelizable>]
     member _.``Docker container does not inherit an unrelated firewalld policy``() =
         let mocks = ContentMocks()
@@ -401,6 +432,7 @@ type HostContentTests() =
             |> Set.ofSeq
         Assert.That(dependencies, Does.Not.Contain "independent-host-firewalld-policy-docker-policy")
         Assert.That(dependencies, Does.Contain "independent-host")
+        Assert.That(dependencies, Does.Not.Contain "independent-host-docker-firewall-guard")
 
     [<Test>]
     member _.``Secret text keeps specification and provider content fingerprints secret``() =

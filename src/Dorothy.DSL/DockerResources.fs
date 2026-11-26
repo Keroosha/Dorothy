@@ -65,7 +65,7 @@ module internal DockerDeployment =
             let minutePart = if hours > 0L || minutes > 0L then minutes.ToString(CultureInfo.InvariantCulture) + "m" else ""
             hourPart + minutePart + seconds + "s"
 
-    let deploy (host: HostSpec) (engine: CustomResource) (specification: DockerSpec) (hostContentDirectories: IReadOnlyDictionary<HostContentDirectory, Resource>) (firewalldResources: IReadOnlyDictionary<FirewalldObjectSpec, Resource>) (completeJob: string -> Pulumi.Docker.Container -> TimeSpan -> Output<ImmutableArray<string>> -> Resource) =
+    let deploy (host: HostSpec) (engine: CustomResource) (specification: DockerSpec) (hostContentDirectories: IReadOnlyDictionary<HostContentDirectory, Resource>) (firewalldResources: IReadOnlyDictionary<FirewalldObjectSpec, Resource>) (hostPrerequisites: Resource list) (completeJob: string -> Pulumi.Docker.Container -> TimeSpan -> Output<ImmutableArray<string>> -> Resource) =
 
 
         let endpoint = UriBuilder("ssh", host.Address, host.Port)
@@ -89,12 +89,12 @@ module internal DockerDeployment =
             providerArgs.RegistryAuth.Add(input auth)
         let providerOptions = CustomResourceOptions()
         providerOptions.Version <- "5.2.0"
-        providerOptions.DependsOn <- InputList<Resource>.op_Implicit [| engine :> Resource |]
+        providerOptions.DependsOn <- InputList<Resource>.op_Implicit(Array.ofList ((engine :> Resource) :: hostPrerequisites))
         let provider = Pulumi.Docker.Provider(host.Name + "-docker", providerArgs, providerOptions)
         let options () =
             let value = CustomResourceOptions()
             value.Provider <- provider
-            value.DependsOn <- InputList<Resource>.op_Implicit [| engine :> Resource |]
+            value.DependsOn <- InputList<Resource>.op_Implicit(Array.ofList ((engine :> Resource) :: hostPrerequisites))
             value
         let existingNetworks = Dictionary<string, Input<string>>(StringComparer.Ordinal)
         let existingVolumes = Dictionary<string, Input<string>>(StringComparer.Ordinal)
@@ -248,6 +248,7 @@ module internal DockerDeployment =
                 |> List.map (fun policy -> firewalldResources[policy])
             let dependencies =
                 [ engine :> Resource ]
+                @ hostPrerequisites
                 @ (container.Dependencies |> List.map (fun dependency -> ready[dependency.Name]))
                 @ directoryDependencies
                 @ firewallDependencies

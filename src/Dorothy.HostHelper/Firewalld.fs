@@ -545,23 +545,31 @@ module Firewalld =
                 File.Delete physical
                 HostFiles.syncDirectory (Path.GetDirectoryName physical)
 
-    let private strictBaseline environment (etcContents: string option) (vendorContents: string option) =
+    let private strictBaseline environment (etcContents: string option) (_vendorContents: string option) =
         let baseline = JsonObject()
         baseline["etcExists"] <- JsonValue.Create(etcContents.IsSome)
-        setOptional baseline "etcContents" etcContents
-        setOptional baseline "vendorContents" vendorContents
+        setOptional baseline "etcStrictValue" (etcContents |> Option.bind strictValue)
         baseline["etcMode"] <- JsonValue.Create(strictFileMode environment etcContents)
         baseline.ToJsonString()
 
     let private parseStrictBaseline (text: string) =
         let baseline = JsonNode.Parse(text).AsObject()
-        let expected = set [ "etcExists"; "etcContents"; "vendorContents"; "etcMode" ]
-        if baseline.Count <> expected.Count || (baseline |> Seq.map (fun pair -> pair.Key) |> Set.ofSeq) <> expected then
-            fail "Invalid StrictForwardPorts ownership baseline."
-        baseline["etcExists"].GetValue<bool>(),
-        optionalString baseline "etcContents",
-        optionalString baseline "vendorContents",
-        baseline["etcMode"].GetValue<int>()
+        let keys = baseline |> Seq.map (fun pair -> pair.Key) |> Set.ofSeq
+        let expected = set [ "etcExists"; "etcStrictValue"; "etcMode" ]
+        if keys = expected then
+            baseline["etcExists"].GetValue<bool>(),
+            optionalString baseline "etcStrictValue",
+            baseline["etcMode"].GetValue<int>()
+        else
+            // Read journals written by the previous provider version, but restore only
+            // the setting it owns; never replay the old complete firewalld.conf.
+            let legacy = set [ "etcExists"; "etcContents"; "vendorContents"; "etcMode" ]
+            if keys <> legacy then fail "Invalid StrictForwardPorts ownership baseline."
+            let etcContents = optionalString baseline "etcContents"
+            baseline["etcExists"].GetValue<bool>(),
+            (etcContents |> Option.bind strictValue),
+            baseline["etcMode"].GetValue<int>()
+
 
     let private writeStrictSnapshot (exists: bool) (actual: bool) (inSync: bool) =
         let result = JsonObject()
@@ -621,7 +629,18 @@ module Firewalld =
             journal["pending"] <- null
             saveJournal environment c journal
 
-    let private transactStrictSetting (environment: HostEnvironment) (c: FirewalldModel.Configuration) (journal: JsonObject) (releaseOnRollback: bool) (before: string option) (beforeMode: int) (after: string option) (afterMode: int) =
+    let private transactStrictSetting
+        (environment: HostEnvironment)
+        (c: FirewalldModel.Configuration)
+        (journal: JsonObject)
+        (releaseOnRollback: bool)
+        (before: string option)
+        (beforeMode: int)
+        (after: string option)
+        (afterMode: int)
+        (managedBefore: string option)
+        (managedAfter: string option)
+        =
         guardCurrentConfiguration environment
         saveStrictPending journal before after beforeMode afterMode
         saveJournal environment c journal
@@ -633,14 +652,14 @@ module Firewalld =
             try
                 writeStrictConfig environment before beforeMode
                 firewall environment [ "--reload" ] |> ignore
-                setOptional journal "managed" before
+                setOptional journal "managed" managedBefore
                 journal["pending"] <- null
                 saveJournal environment c journal
             with rollbackError ->
                 fail ("StrictForwardPorts apply failed: " + diagnostic originalError.Message + "; rollback failed: " + diagnostic rollbackError.Message + "; journal retained for recovery.")
             if releaseOnRollback then File.Delete(path environment (journalPath c))
             fail ("StrictForwardPorts apply failed; original firewalld.conf restored and reloaded: " + diagnostic originalError.Message)
-        setOptional journal "managed" after
+        setOptional journal "managed" managedAfter
         journal["pending"] <- null
         saveJournal environment c journal
 
@@ -677,38 +696,42 @@ module Firewalld =
                 let currentValue = strictValue currentEffective
                 let managedContents = optionalString journal "managed"
                 let managedValue = managedContents |> Option.bind strictValue
+                let baselineText = optionalString journal "baseline" |> Option.defaultWith (fun () -> fail "Missing StrictForwardPorts baseline.")
+                let baselineExists, _, _ = parseStrictBaseline baselineText
                 if existingJournal.IsSome && strictBoolean currentValue <> strictBoolean managedValue then
                     fail "StrictForwardPorts changed independently; refusing to overwrite firewalld.conf."
+                if existingJournal.IsSome && baselineExists && current.IsNone then
+                    fail "firewalld.conf disappeared independently; refusing to change StrictForwardPorts."
                 if operation = "apply" then
-                    let after = Some(setStrictValue currentEffective (Some(if desired then "yes" else "no")))
+                    let desiredValue = Some(if desired then "yes" else "no")
+                    let after = Some(setStrictValue currentEffective desiredValue)
+                    let managedBefore = managedContents
+                    let managedBase =
+                        if existingJournal.IsSome then managedContents |> Option.defaultValue currentEffective
+                        else currentEffective
+                    let managedAfter = Some(setStrictValue managedBase desiredValue)
                     if existingJournal.IsSome && current = after then
-                        setOptional journal "managed" current
+                        setOptional journal "managed" managedAfter
                         saveJournal environment c journal
                     else
                         let afterMode = if current.IsSome then currentMode else 0o600
-                        transactStrictSetting environment c journal existingJournal.IsNone current currentMode after afterMode
+                        transactStrictSetting environment c journal existingJournal.IsNone current currentMode after afterMode managedBefore managedAfter
                     strictSnapshot environment owner c
                 else
-                    let baselineText = optionalString journal "baseline" |> Option.defaultWith (fun () -> fail "Missing StrictForwardPorts baseline.")
-                    let baselineExists, baselineEtc, baselineVendor, baselineMode = parseStrictBaseline baselineText
-                    let baselineEffective =
-                        match baselineEtc, baselineVendor with
-                        | Some value, _ -> value
-                        | None, Some value -> value
-                        | None, None -> ""
-                    let baselineValue = strictValue baselineEffective
+                    let _, baselineStrictValue, _ = parseStrictBaseline baselineText
                     let restoredContents =
-                        let candidate = setStrictValue currentEffective baselineValue
                         if baselineExists then
-                            if current = managedContents then baselineEtc
-                            else Some candidate
+                            Some(setStrictValue currentEffective baselineStrictValue)
                         else
-                            let vendorBaseline = defaultArg baselineVendor ""
-                            if current = managedContents || candidate = vendorBaseline then None else Some candidate
-                    let restoreMode =
-                        if baselineExists && current = managedContents then baselineMode
-                        else currentMode
-                    transactStrictSetting environment c journal false current currentMode restoredContents restoreMode
+                            match current with
+                            | None -> None
+                            | Some _ when current = managedContents -> None
+                            | Some _ -> Some(setStrictValue currentEffective baselineStrictValue)
+                    let managedRestored =
+                        restoredContents
+                        |> Option.orElse (readFile environment vendorStrictConfigPath)
+                        |> Option.defaultValue ""
+                    transactStrictSetting environment c journal false current currentMode restoredContents currentMode managedContents (Some managedRestored)
                     File.Delete(path environment (journalPath c))
                     JsonObject() :> JsonNode
         else fail "Unsupported StrictForwardPorts operation."
