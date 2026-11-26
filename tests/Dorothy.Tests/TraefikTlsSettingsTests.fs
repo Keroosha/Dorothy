@@ -5,9 +5,11 @@ open System.IO
 open System.Security.Cryptography
 open System.Security.Cryptography.X509Certificates
 open System.Text
+open System.Net
 open System.Text.Json.Nodes
 open Dorothy.DSL
 open NUnit.Framework
+open Dorothy.HostHelper
 
 [<TestFixture>]
 type TraefikTlsSettingsTests() =
@@ -263,3 +265,41 @@ type TraefikTlsSettingsTests() =
 
         let unknown = parse """{"dynamic":{"tls":{"options":{"default":{"allowInsecure":true}}}}}"""
         assertInvalid Set.empty Set.empty unknown
+
+    [<Test>]
+    member _.``TLS probe bind selection is numeric local and preserves address family``() =
+        let localAddress, localPort =
+            Traefik.resolveProbeBind "192.0.2.44:9443/tcp" (set [ "192.0.2.44" ])
+            |> Option.defaultWith (fun () -> failwith "Expected the explicitly local address to resolve.")
+        let wildcardV4, wildcardV4Port =
+            Traefik.resolveProbeBind ":8443/tcp" Set.empty
+            |> Option.defaultWith (fun () -> failwith "Expected the IPv4 wildcard to resolve to loopback.")
+        let wildcardV6, wildcardV6Port =
+            Traefik.resolveProbeBind "[::]:8443/tcp" Set.empty
+            |> Option.defaultWith (fun () -> failwith "Expected the IPv6 wildcard to resolve to loopback.")
+
+        Assert.That(localAddress.ToString(), Is.EqualTo("192.0.2.44"))
+        Assert.That(localPort, Is.EqualTo(9443))
+        Assert.That(wildcardV4.ToString(), Is.EqualTo(IPAddress.Loopback.ToString()))
+        Assert.That(wildcardV6.ToString(), Is.EqualTo(IPAddress.IPv6Loopback.ToString()))
+        Assert.That(wildcardV4Port, Is.EqualTo(8443))
+        Assert.That(wildcardV6Port, Is.EqualTo(8443))
+        let nonLocal = Traefik.resolveProbeBind "192.0.2.45:9443/tcp" (set [ "192.0.2.44" ])
+        let hostname = Traefik.resolveProbeBind "proxy.example.test:9443/tcp" (set [ "proxy.example.test" ])
+        Assert.That(Option.isNone nonLocal, Is.True)
+        Assert.That(Option.isNone hostname, Is.True)
+
+    [<Test>]
+    member _.``SNI host extraction accepts only unambiguous positive literal matchers``() =
+        Assert.That(
+            Traefik.probeHostsFromRule false """(Host("shop.example.test")) && (PathPrefix("/catalog"))""",
+            Is.EqualTo<string list>([ "shop.example.test" ])
+        )
+        Assert.That(
+            Traefik.probeHostsFromRule true "HostSNI(`db.example.test`)",
+            Is.EqualTo<string list>([ "db.example.test" ])
+        )
+        Assert.That(Traefik.probeHostsFromRule false "HostRegexp(`{subdomain:[a-z]+}.example.test`)", Is.Empty)
+        Assert.That(Traefik.probeHostsFromRule false "!Host(`negated.example.test`)", Is.Empty)
+        Assert.That(Traefik.probeHostsFromRule false "Host(`one.example.test`) || Host(`two.example.test`)", Is.Empty)
+        Assert.That(Traefik.probeHostsFromRule false "PathPrefix(`/catalog`) && Host(`shop.example.test`)", Is.Empty)

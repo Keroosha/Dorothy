@@ -9,6 +9,7 @@ open System.Globalization
 open System.IO
 open System.IO.Compression
 open System.Net
+open System.Net.NetworkInformation
 open System.Net.Http
 open System.Net.Security
 open System.Net.Sockets
@@ -2292,12 +2293,12 @@ module Traefik =
                 dnsPatternCoversHost host commonName
         with _ -> false
 
-    let private sniFingerprint (host: string) (port: int) : Task<string option> =
+    let private sniFingerprintAt (bindAddress: IPAddress) (host: string) (port: int) : Task<string option> =
         task {
             try
-                use client = new TcpClient()
+                use client = new TcpClient(bindAddress.AddressFamily)
                 use cancellation = new CancellationTokenSource(ConnectTimeoutMilliseconds)
-                do! client.ConnectAsync(IPAddress.Loopback, port, cancellation.Token).ConfigureAwait(false)
+                do! client.ConnectAsync(bindAddress, port, cancellation.Token).ConfigureAwait(false)
                 use stream = new SslStream(client.GetStream(), false, RemoteCertificateValidationCallback(fun _ _ _ _ -> true))
                 let options = SslClientAuthenticationOptions(TargetHost = host)
                 do! stream.AuthenticateAsClientAsync(options, cancellation.Token).ConfigureAwait(false)
@@ -2306,6 +2307,7 @@ module Traefik =
                 | remote -> return Some(sha256Bytes(remote.GetRawCertData()))
             with _ -> return None
         }
+
 
     let acmeCertificateFingerprint (environment: HostEnvironment) (paths: RuntimePaths) (resolverName: string) (host: string) : string option =
         let storagePath = Path.Combine(paths.StateDir, "acme-" + sha256Text resolverName + ".json")
@@ -2369,28 +2371,39 @@ module Traefik =
     let private legacyTlsProbeTargets (request: Request) =
         let mutable targets = Set.empty
         let mutable truncated = false
+        let loopback = IPAddress.Loopback.ToString()
         for KeyValue(_, router) in request.Routers do
             if router.Tls.Kind = "provided" || router.Tls.Kind = "acme" then
-                let target = router.Host, request.EntryPoints[router.EntryPoint]
+                let target = router.Host, loopback, request.EntryPoints[router.EntryPoint]
                 if not (targets.Contains(target)) then
                     if targets.Count < 17 then targets <- targets.Add(target)
                     else truncated <- true
         targets, truncated
 
-    let private certificateObservations (environment: HostEnvironment) (paths: RuntimePaths) (request: Request) (certificateMaterialDigests: Map<string, string>) : JsonObject * bool =
+    let private certificateObservations
+        (environment: HostEnvironment)
+        (paths: RuntimePaths)
+        (request: Request)
+        (certificateMaterialDigests: Map<string, string>)
+        (probeEligible: bool)
+        : JsonObject * bool =
         let observed = JsonObject()
         let mutable certificatesMatch = true
         let hostsForCertificate = Dictionary<string, ResizeArray<string * int>>(StringComparer.Ordinal)
         let acmeRoutes = ResizeArray<string * int * string>()
         let legacyTargets, _ = legacyTlsProbeTargets request
         let permittedTargets = legacyTargets |> Seq.truncate 16 |> Set.ofSeq
-        let sniCache = Dictionary<string * int, string option>()
-        let probeSni host port =
-            let target = host, port
+        let loopback = IPAddress.Loopback.ToString()
+        let sniCache = Dictionary<string * string * int, string option>()
+        let probeSni host bindAddress port =
+            let target = host, bindAddress, port
             match sniCache.TryGetValue(target) with
             | true, fingerprint -> fingerprint
             | _ ->
-                let fingerprint = sniFingerprint host port |> fun operation -> operation.GetAwaiter().GetResult()
+                let fingerprint =
+                    IPAddress.Parse(bindAddress)
+                    |> fun address -> sniFingerprintAt address host port
+                    |> fun operation -> operation.GetAwaiter().GetResult()
                 sniCache[target] <- fingerprint
                 fingerprint
         for KeyValue(_, router) in request.Routers do
@@ -2421,21 +2434,53 @@ module Traefik =
             | true, routes ->
                 for host, port in routes do
                     if not (certificateCoversHost certificatePem host) then certificatesMatch <- false
-                    if permittedTargets.Contains((host, port)) then
-                        let sni = probeSni host port
+                    if probeEligible && permittedTargets.Contains((host, loopback, port)) then
+                        let sni = probeSni host loopback port
                         if sni <> Some certificate.Fingerprint then certificatesMatch <- false
                         else observed[name] <- JsonValue.Create(certificate.Fingerprint)
             | _ -> ()
         for host, port, resolverName in acmeRoutes do
-            if permittedTargets.Contains((host, port)) then
+            if probeEligible && permittedTargets.Contains((host, loopback, port)) then
                 let storedFingerprint = acmeCertificateFingerprint environment paths resolverName host
-                let sni = probeSni host port
+                let sni = probeSni host loopback port
                 if storedFingerprint.IsNone || sni.IsNone || sni <> storedFingerprint then certificatesMatch <- false
         observed, certificatesMatch
 
-    let private nativeHostRulePattern = Regex("""(?:^|[^A-Za-z0-9_])Host\s*\(([^)]*)\)""", RegexOptions.CultureInvariant)
-    let private nativeHostSniPattern = Regex("""(?:^|[^A-Za-z0-9_])HostSNI\s*\(([^)]*)\)""", RegexOptions.CultureInvariant)
-    let private nativeHostLiteralPattern = Regex("""`([^`]+)`""", RegexOptions.CultureInvariant)
+    // The public &&& combinator parenthesizes each operand. Leading grouping does not negate
+    // the literal; the conservative remainder check below still excludes alternation/negation.
+    let private nativeHostRulePattern = Regex("""^\s*(?:\(\s*)*Host\s*\(([^()]*)\)""", RegexOptions.CultureInvariant)
+    let private nativeHostSniPattern = Regex("""^\s*(?:\(\s*)*HostSNI\s*\(([^()]*)\)""", RegexOptions.CultureInvariant)
+    let private nativeHostLiteralPattern = Regex("""(?:`([^`]+)`|"([^"]+)")""", RegexOptions.CultureInvariant)
+    let private nativeHostArgumentsPattern = Regex("""^\s*(?:`[^`]+`|"[^"]+")\s*(?:,\s*(?:`[^`]+`|"[^"]+"))*\s*$""", RegexOptions.CultureInvariant)
+    let private nativeAmbiguousHostPattern = Regex("""(?:Host(?:SNI)?Regexp\s*\(|(?:^|[^A-Za-z0-9_])!?\s*Host(?:SNI)?\s*\()""", RegexOptions.CultureInvariant)
+
+    let private canonicalProbeHost (value: string) =
+        try
+            let host = validateDnsName value
+            let mutable address = Unchecked.defaultof<IPAddress>
+            if IPAddress.TryParse(host, &address) then None else Some host
+        with _ -> None
+
+    /// Conservative SNI extraction: only a positive leading Host/HostSNI list of quoted DNS literals.
+    let probeHostsFromRule (isTcp: bool) (rule: string) : string list =
+        if String.IsNullOrWhiteSpace rule then []
+        else
+            let trimmed = rule.TrimStart()
+            let pattern = if isTcp then nativeHostSniPattern else nativeHostRulePattern
+            let matcher = pattern.Match(trimmed)
+            let result = HashSet<string>(StringComparer.Ordinal)
+            if matcher.Success then
+                let arguments = matcher.Groups[1].Value
+                let remainder = trimmed.Substring(matcher.Length)
+                if nativeHostArgumentsPattern.IsMatch(arguments)
+                   && not (remainder.Contains("!", StringComparison.Ordinal))
+                   && not (remainder.Contains("||", StringComparison.Ordinal))
+                   && not (nativeAmbiguousHostPattern.IsMatch(remainder)) then
+                    for hostMatch in (nativeHostLiteralPattern.Matches(arguments) |> Seq.cast<Match>) do
+                        let host = if hostMatch.Groups[1].Success then hostMatch.Groups[1].Value else hostMatch.Groups[2].Value
+                        canonicalProbeHost host |> Option.iter (fun value -> result.Add(value) |> ignore)
+            result |> Seq.sortWith (fun left right -> StringComparer.Ordinal.Compare(left, right)) |> Seq.toList
+
 
     let private tryNativeNodeProperty (value: JsonObject) (name: string) =
         let mutable property: JsonNode = null
@@ -2463,19 +2508,68 @@ module Traefik =
         | :? JsonValue as scalar when scalar.GetValueKind() = JsonValueKind.False -> Some false
         | _ -> None
 
-    let private tryNativePort (address: string) =
-        if String.IsNullOrWhiteSpace address
-           || address.EndsWith("/udp", StringComparison.OrdinalIgnoreCase) then None
+    let private tryNativeBind (address: string) (localAddresses: Set<string>) =
+        if String.IsNullOrWhiteSpace address then None
         else
-            let text =
-                if address.Contains("://", StringComparison.Ordinal) then address
-                else "tcp://" + address
-            let mutable uri = Unchecked.defaultof<Uri>
-            if Uri.TryCreate(text, UriKind.Absolute, &uri) && uri.Port >= 1 && uri.Port <= 65535 then
-                Some uri.Port
-            else None
+            let slash = address.IndexOf('/')
+            let socketAddress, protocol =
+                if slash < 0 then address, "tcp"
+                elif slash = 0 || address.IndexOf('/', slash + 1) >= 0 then "", ""
+                else address.Substring(0, slash), address.Substring(slash + 1).ToLowerInvariant()
+            if protocol <> "tcp" || String.IsNullOrEmpty(socketAddress) then None
+            else
+                let hostText, portText, bracketed =
+                    if socketAddress.StartsWith("[", StringComparison.Ordinal) then
+                        let close = socketAddress.IndexOf(']')
+                        if close < 2 || close + 1 >= socketAddress.Length || socketAddress[close + 1] <> ':' then "", "", false
+                        else socketAddress.Substring(1, close - 1), socketAddress.Substring(close + 2), true
+                    else
+                        let colon = socketAddress.LastIndexOf(':')
+                        if colon < 0 || socketAddress.IndexOf(':') <> colon then "", "", false
+                        else socketAddress.Substring(0, colon), socketAddress.Substring(colon + 1), false
+                let mutable port = 0
+                if String.IsNullOrEmpty(portText)
+                   || not (Int32.TryParse(portText, NumberStyles.None, CultureInfo.InvariantCulture, &port))
+                   || port < 1 || port > 65535 then None
+                else
+                    let mutable parsed = Unchecked.defaultof<IPAddress>
+                    let parsedAddress =
+                        if String.IsNullOrEmpty(hostText) then Some IPAddress.Any
+                        elif IPAddress.TryParse(hostText, &parsed) then Some parsed
+                        else None
+                    match parsedAddress with
+                    | None -> None
+                    | Some ip when bracketed && ip.AddressFamily <> AddressFamily.InterNetworkV6 -> None
+                    | Some ip when not bracketed && not (String.IsNullOrEmpty(hostText)) && ip.AddressFamily <> AddressFamily.InterNetwork -> None
+                    | Some ip ->
+                        let probeAddress =
+                            if ip.Equals(IPAddress.Any) then IPAddress.Loopback
+                            elif ip.Equals(IPAddress.IPv6Any) then IPAddress.IPv6Loopback
+                            else ip
+                        let local = IPAddress.IsLoopback(probeAddress) || localAddresses.Contains(probeAddress.ToString())
+                        Some(probeAddress, port, local)
 
-    let private nativeTlsObservations (environment: HostEnvironment) (paths: RuntimePaths) (request: Request) : JsonObject * bool =
+    /// Resolves a numeric listener to a safe local probe target; hostnames and non-local IPs are never contacted.
+    let resolveProbeBind (address: string) (localAddresses: Set<string>) : (IPAddress * int) option =
+        match tryNativeBind address localAddresses with
+        | Some (ip, port, true) -> Some(ip, port)
+        | _ -> None
+
+    let private localProbeAddresses () =
+        try
+            NetworkInterface.GetAllNetworkInterfaces()
+            |> Seq.truncate 64
+            |> Seq.collect (fun networkInterface ->
+                try
+                    networkInterface.GetIPProperties().UnicastAddresses
+                    |> Seq.truncate 256
+                    |> Seq.map (fun address -> address.Address.ToString())
+                with _ -> Seq.empty)
+            |> Seq.truncate 512
+            |> Set.ofSeq
+        with _ -> Set.empty
+
+    let private nativeTlsObservations (environment: HostEnvironment) (paths: RuntimePaths) (request: Request) (probeEligible: bool) : JsonObject * bool =
         let report = JsonObject()
         let legacyTargets, legacyTargetsTruncated = legacyTlsProbeTargets request
         let legacyProbeCount = min 16 legacyTargets.Count
@@ -2483,8 +2577,10 @@ module Traefik =
         let legacyPermitted = legacyTargets |> Seq.truncate 16 |> Set.ofSeq
         let mutable opaqueRoutes = 0
         let mutable candidatesTruncated = false
+        let localAddresses = localProbeAddresses ()
+        let loopbackAddress = IPAddress.Loopback.ToString()
         let candidates =
-            Dictionary<string * int, (Set<string> * Set<string>)>()
+            Dictionary<string * string * int, (Set<string> * Set<string> * bool)>()
 
         let configuration = defaultArg request.Configuration (JsonObject())
         let staticRoot = TraefikSettings.section configuration "static"
@@ -2501,33 +2597,30 @@ module Traefik =
             defaultStore
             |> Option.bind (fun store -> tryNativeObjectProperty store "defaultGeneratedCert")
 
-        let mutable entryPointPorts = request.EntryPoints
+        let mutable entryPointBinds =
+            request.EntryPoints
+            |> Map.map (fun _ port -> loopbackAddress, port, true)
         match tryNativeObjectProperty staticRoot "entryPoints" with
         | Some entryPoints ->
             for entryPoint in entryPoints do
                 match entryPoint.Value with
                 | :? JsonObject as settings ->
-                    match tryNativeStringProperty settings "address" |> Option.bind tryNativePort with
-                    | Some port -> entryPointPorts <- Map.add entryPoint.Key port entryPointPorts
+                    match tryNativeStringProperty settings "address" |> Option.bind (fun address -> tryNativeBind address localAddresses) with
+                    | Some (address, port, local) -> entryPointBinds <- Map.add entryPoint.Key (address.ToString(), port, local) entryPointBinds
                     | None -> ()
                 | _ -> ()
         | None -> ()
-        let allPorts = entryPointPorts |> Map.toSeq |> Seq.map snd |> Set.ofSeq
+        let allBinds = entryPointBinds |> Map.toSeq |> Seq.map snd |> Set.ofSeq
 
-        let canonicalProbeHost (value: string) =
-            try
-                let host = validateDnsName value
-                let mutable address = Unchecked.defaultof<IPAddress>
-                if IPAddress.TryParse(host, &address) then None else Some host
-            with _ -> None
+        let portsForRouter (router: JsonObject) =
+            match tryNativeNodeProperty router "entryPoints" with
+            | Some (:? JsonArray as names) when names.Count > 0 ->
+                names
+                |> Seq.choose tryNativeString
+                |> Seq.choose (fun name -> Map.tryFind name entryPointBinds)
+                |> Set.ofSeq
+            | _ -> allBinds
 
-        let hostsInRule (pattern: Regex) (rule: string) =
-            let result = HashSet<string>(StringComparer.Ordinal)
-            for matcher in (pattern.Matches(rule) |> Seq.cast<Match>) do
-                for hostMatch in (nativeHostLiteralPattern.Matches(matcher.Groups[1].Value) |> Seq.cast<Match>) do
-                    canonicalProbeHost hostMatch.Groups[1].Value
-                    |> Option.iter (fun host -> result.Add(host) |> ignore)
-            result |> Seq.sortWith (fun left right -> StringComparer.Ordinal.Compare(left, right)) |> Seq.toList
 
         let hostsInDomains (tls: JsonObject) =
             let result = HashSet<string>(StringComparer.Ordinal)
@@ -2551,16 +2644,6 @@ module Traefik =
             | _ -> ()
             result |> Seq.sortWith (fun left right -> StringComparer.Ordinal.Compare(left, right)) |> Seq.toList
 
-        let portsForRouter (router: JsonObject) =
-            match tryNativeNodeProperty router "entryPoints" with
-            | Some (:? JsonArray as names) ->
-                let ports =
-                    names
-                    |> Seq.choose tryNativeString
-                    |> Seq.choose (fun name -> Map.tryFind name entryPointPorts)
-                    |> Set.ofSeq
-                if ports.IsEmpty then allPorts else ports
-            | _ -> allPorts
 
         let clientAuthType (optionReference: string option) =
             let reference = defaultArg optionReference "default"
@@ -2572,20 +2655,22 @@ module Traefik =
 
         let addCandidate
             (host: string)
+            (bindAddress: string)
             (port: int)
+            (bindIsLocal: bool)
             (resolverName: string option)
             (authType: string option)
             =
-            let key = host, port
+            let key = host, bindAddress, port
             let resolvers = resolverName |> Option.toList |> Set.ofList
             let authTypes = authType |> Option.toList |> Set.ofList
             match candidates.TryGetValue(key) with
-            | true, (oldResolvers, oldAuthTypes) ->
-                candidates[key] <- Set.union oldResolvers resolvers, Set.union oldAuthTypes authTypes
-            | _ when candidates.Count < 17 -> candidates.Add(key, (resolvers, authTypes))
+            | true, (oldResolvers, oldAuthTypes, oldLocal) ->
+                candidates[key] <- Set.union oldResolvers resolvers, Set.union oldAuthTypes authTypes, oldLocal && bindIsLocal
+            | _ when candidates.Count < 17 -> candidates.Add(key, (resolvers, authTypes, bindIsLocal))
             | _ -> candidatesTruncated <- true
 
-        let collectRouters (sectionName: string) (isTcp: bool) (pattern: Regex) =
+        let collectRouters (sectionName: string) (isTcp: bool) =
             match tryNativeObjectProperty dynamicRoot sectionName with
             | None -> ()
             | Some section ->
@@ -2607,7 +2692,7 @@ module Traefik =
                                     for host in hostsInDomains tls do hosts.Add(host) |> ignore
                                     match tryNativeStringProperty router "rule" with
                                     | Some rule ->
-                                        for host in hostsInRule pattern rule do hosts.Add(host) |> ignore
+                                        for host in probeHostsFromRule isTcp rule do hosts.Add(host) |> ignore
                                     | None -> ()
                                     let ports = portsForRouter router
                                     if hosts.Count = 0 || ports.IsEmpty then opaqueRoutes <- opaqueRoutes + 1
@@ -2617,11 +2702,11 @@ module Traefik =
                                             |> Option.filter (String.IsNullOrEmpty >> not)
                                         let authType = clientAuthType (tryNativeStringProperty tls "options")
                                         for host in hosts |> Seq.sortWith (fun left right -> StringComparer.Ordinal.Compare(left, right)) do
-                                            for port in ports do addCandidate host port resolverName authType
+                                            for bindAddress, port, local in ports do addCandidate host bindAddress port local resolverName authType
                         | _ -> opaqueRoutes <- opaqueRoutes + 1
 
-        collectRouters "http" false nativeHostRulePattern
-        collectRouters "tcp" true nativeHostSniPattern
+        collectRouters "http" false
+        collectRouters "tcp" true
 
         let defaultGeneratedResolver (host: string) =
             defaultGenerated
@@ -2677,11 +2762,13 @@ module Traefik =
         let mutable unprobedNative = opaqueRoutes
         let mutable probeLimitReached = false
 
-        for (host, port), (resolvers, authTypes) in candidatePairs do
+        for (host, bindAddress, port), (resolvers, authTypes, bindIsLocal) in candidatePairs do
             let requiresClientCertificate =
                 authTypes.Contains("RequireAnyClientCert")
                 || authTypes.Contains("RequireAndVerifyClientCert")
-            if legacyPermitted.Contains((host, port)) then
+            if not probeEligible || not bindIsLocal then
+                unprobedNative <- unprobedNative + 1
+            elif legacyPermitted.Contains((host, bindAddress, port)) then
                 unprobedNative <- unprobedNative + 1
             elif requiresClientCertificate then
                 unprobedNative <- unprobedNative + 1
@@ -2689,18 +2776,22 @@ module Traefik =
                 probeLimitReached <- true
                 unprobedNative <- unprobedNative + 1
             else
-                nativeProbeCount <- nativeProbeCount + 1
-                let actual = sniFingerprint host port |> fun operation -> operation.GetAwaiter().GetResult()
-                let expected = expectedFingerprints host resolvers
-                let handshakeSucceeded = actual.IsSome
-                let matches =
-                    match expected, actual with
-                    | Some values, Some fingerprint -> values.Contains(fingerprint)
-                    | Some _, None -> false
-                    | None, Some _ -> true
-                    | None, None -> false
-                if not handshakeSucceeded || (expected.IsSome && not matches) then nativeTlsMatches <- false
-                if expected.IsNone then unprobedNative <- unprobedNative + 1
+                let mutable bindIp = Unchecked.defaultof<IPAddress>
+                if not (IPAddress.TryParse(bindAddress, &bindIp)) then
+                    unprobedNative <- unprobedNative + 1
+                else
+                    nativeProbeCount <- nativeProbeCount + 1
+                    let actual = sniFingerprintAt bindIp host port |> fun operation -> operation.GetAwaiter().GetResult()
+                    let expected = expectedFingerprints host resolvers
+                    let handshakeSucceeded = actual.IsSome
+                    let matches =
+                        match expected, actual with
+                        | Some values, Some fingerprint -> values.Contains(fingerprint)
+                        | Some _, None -> false
+                        | None, Some _ -> true
+                        | None, None -> false
+                    if not handshakeSucceeded || (expected.IsSome && not matches) then nativeTlsMatches <- false
+                    if expected.IsNone then unprobedNative <- unprobedNative + 1
 
         if candidatesTruncated then unprobedNative <- unprobedNative + 1
         let truncated =
@@ -2793,8 +2884,11 @@ module Traefik =
             with _ -> false, false, false
         let api = if active && ownerMatches then readApi request.AdminPort |> fun operation -> operation.GetAwaiter().GetResult() else None
         let apiMatches = apiMatchesRuntimeElements api expectedStaticRoot expectedDynamicRoot generationMatches
-        let fingerprints, certificatesMatch = certificateObservations environment paths request certificateMaterialDigests
-        let tlsObservations, nativeTlsMatches = nativeTlsObservations environment paths request
+        let probeEligible =
+            verifyPinnedBinary && ownerMatches && staticMatches && dynamicMatches
+            && active && effectiveUnit && apiMatches
+        let fingerprints, certificatesMatch = certificateObservations environment paths request certificateMaterialDigests probeEligible
+        let tlsObservations, nativeTlsMatches = nativeTlsObservations environment paths request probeEligible
         let credentialsMatch = credentialFileMatches environment paths request.Configuration
         let pending = tryStat environment paths.RollbackPath |> Option.isSome
         let inSync =
@@ -2880,12 +2974,13 @@ module Traefik =
         let generationMatches = generationRuleMatches dynamicDocument.RootElement
         let cachedConfigHash = actualConfigHash environment paths
         let deadline = Stopwatch.GetTimestamp() + int64 (timeoutSeconds * float Stopwatch.Frequency)
+        let fullVerificationIntervalTicks = 2L * Stopwatch.Frequency
+        let mutable lastFullVerification = 0L
         let mutable latest = JsonObject()
         latest["inSync"] <- JsonValue.Create(false)
         latest["actualConfigHash"] <- JsonValue.Create(cachedConfigHash)
         latest["certificateFingerprints"] <- JsonObject()
         latest["tlsObservations"] <- JsonObject()
-        let mutable fullVerificationAttempted = false
         let mutable complete = false
         while not complete do
             let candidate =
@@ -2893,28 +2988,32 @@ module Traefik =
                     environment request certificateMaterialDigests paths expectedStaticData expectedDynamicData
                     staticDocument.RootElement dynamicDocument.RootElement generationMatches
                     true false (Some cachedConfigHash)
-            if candidate["inSync"].GetValue<bool>() && not fullVerificationAttempted then
-                fullVerificationAttempted <- true
+            let now = Stopwatch.GetTimestamp()
+            let fullVerificationAttempted =
+                candidate["inSync"].GetValue<bool>()
+                && (lastFullVerification = 0L || now - lastFullVerification >= fullVerificationIntervalTicks)
+            if fullVerificationAttempted then
                 latest <-
                     observeRuntimePrepared
                         environment request certificateMaterialDigests paths expectedStaticData expectedDynamicData
                         staticDocument.RootElement dynamicDocument.RootElement generationMatches
                         true true None
+                lastFullVerification <- Stopwatch.GetTimestamp()
                 if latest["inSync"].GetValue<bool>() then complete <- true
             else
                 latest <- candidate
-                if fullVerificationAttempted && latest["inSync"].GetValue<bool>() then
+                if candidate["inSync"].GetValue<bool>() then
                     latest["inSync"] <- JsonValue.Create(false)
             if not complete && Stopwatch.GetTimestamp() >= deadline then
-                latest <-
-                    observeRuntimePrepared
-                        environment request certificateMaterialDigests paths expectedStaticData expectedDynamicData
-                        staticDocument.RootElement dynamicDocument.RootElement generationMatches
-                        true true None
+                if not fullVerificationAttempted then
+                    latest <-
+                        observeRuntimePrepared
+                            environment request certificateMaterialDigests paths expectedStaticData expectedDynamicData
+                            staticDocument.RootElement dynamicDocument.RootElement generationMatches
+                            true true None
                 complete <- true
             elif not complete then
                 Thread.Sleep(ActivationPollMilliseconds)
-
         latest
     let private readOptional (environment: HostEnvironment) (path: string) : byte[] option =
         if assertRegular environment path "Traefik owned file" then Some(readBytes environment path) else None
