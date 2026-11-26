@@ -118,17 +118,18 @@ module FirewalldBackend =
             let! output = invoke false "apply" connection ownerId configuration None ct
             use document = JsonDocument.Parse output
             let root = document.RootElement
-            let nonce = readNonce root
-            let staged = parseSnapshot output
-            let activationReceipt = optionalBool root "activationReceipt" = Some true
-            if not staged.PermanentInSync
-               || (staged.RuntimeObserved && not staged.RuntimeInSync)
-               || (not staged.RuntimeObserved && not activationReceipt) then
-                invalidOp "Firewalld mutation did not converge before fresh-connection confirmation."
-            do! confirm connection ownerId configuration nonce ct
+            if propertyNames root <> set [ "unchanged" ] || not (readBool root "unchanged") then
+                let nonce = readNonce root
+                let staged = parseSnapshot output
+                let activationReceipt = optionalBool root "activationReceipt" = Some true
+                if not staged.PermanentInSync
+                   || (staged.RuntimeObserved && not staged.RuntimeInSync)
+                   || (not staged.RuntimeObserved && not activationReceipt) then
+                    invalidOp "Firewalld mutation did not converge before fresh-connection confirmation."
+                do! confirm connection ownerId configuration nonce ct
             let! confirmed = invoke false "read" connection ownerId configuration None ct
             let snapshot = parseSnapshot confirmed
-            if not snapshot.InSync then invalidOp "Firewalld mutation was confirmed but did not remain in sync."
+            if not snapshot.InSync then invalidOp "Firewalld apply did not leave the owned resource in sync."
             return snapshot
         })
 

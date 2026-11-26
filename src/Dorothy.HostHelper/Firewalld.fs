@@ -1170,13 +1170,17 @@ module Firewalld =
                   + " Pre-seed the permanent default/interface zone to permit the actual SSH server port before installing firewalld.")
 
 
+    let private pendingFor environment (c: FirewalldModel.Configuration) =
+        FirewalldLifecycle.pending environment
+        |> Option.exists (fun tx -> tx.Configuration.Kind = c.Kind && tx.Configuration.Name = c.Name)
+
     let private snapshot environment (c: FirewalldModel.Configuration) journal =
         let actual = effective environment c.Kind c.Name
         let overrideFile = readFile environment (objectPath "/etc/firewalld" c.Kind c.Name)
         let objectPending =
             journal
             |> Option.exists (fun (value: JsonObject) -> not (isNull value["pending"]))
-        let pending = objectPending || (FirewalldLifecycle.pending environment |> Option.isSome)
+        let pending = objectPending || pendingFor environment c
         let managed =
             match journal with
             | Some value ->
@@ -2090,7 +2094,7 @@ module Firewalld =
                 match value["pending"] with
                 | :? JsonObject as pending -> Some pending
                 | _ -> None)
-        let pending = pendingNode.IsSome
+        let pending = pendingNode.IsSome || pendingFor environment c
         let managedContents =
             match pendingNode with
             | Some value when value.ContainsKey "managedAfter" -> optionalString value "managedAfter"
@@ -2111,7 +2115,7 @@ module Firewalld =
             && (if settingRuntimeObservable key then runtimeInSync else activationReceipt)
         let result = JsonObject()
         result["exists"] <- JsonValue.Create effective.IsSome
-        result["actual"] <- JsonValue.Create(runtimeValue |> Option.orElse permanentValue |> Option.defaultValue "")
+        result["actual"] <- JsonValue.Create(defaultArg permanentValue "")
         result["inSync"] <- JsonValue.Create inSync
         result["permanentActual"] <- match permanentValue with None -> null | Some value -> JsonValue.Create value :> JsonNode
         result["runtimeActual"] <- match runtimeValue with None -> null | Some value -> JsonValue.Create value :> JsonNode
@@ -2234,7 +2238,10 @@ module Firewalld =
                             result["transactionNonce"] <- JsonValue.Create nonce
                             result :> JsonNode
                         else
-                            settingsSnapshot environment owner c key desired
+                            // No file, ownership or daemon mutation; there is no transaction to confirm.
+                            let unchanged = JsonObject()
+                            unchanged["unchanged"] <- JsonValue.Create true
+                            unchanged :> JsonNode
                     else
                         let otherOwnersRemain = not (settingsJournalFiles environment c).IsEmpty
                         let transactDelete after afterMode managedAfter =
@@ -2322,8 +2329,6 @@ module Firewalld =
                 let result = strictSettings environment operation owner transactionNonce c
                 if operation = "read" then
                     let snapshot = result.AsObject()
-                    if FirewalldLifecycle.pending environment |> Option.isSome then
-                        snapshot["inSync"] <- JsonValue.Create false
                     try
                         ensureNoSplitZones environment
                         result

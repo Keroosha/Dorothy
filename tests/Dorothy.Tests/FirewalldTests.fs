@@ -254,6 +254,10 @@ type FirewalldTests() =
         let result = call ()
         if operation = "apply" || operation = "delete" then
             match result["transactionNonce"] with
+            | null when operation = "apply" && result.AsObject().ContainsKey("unchanged") ->
+                Assert.That(result["unchanged"].GetValue<bool>(), Is.True)
+                node["operation"] <- System.Text.Json.Nodes.JsonValue.Create "read"
+                call ()
             | null -> result
             | nonce ->
                 node["operation"] <- System.Text.Json.Nodes.JsonValue.Create "confirm"
@@ -268,6 +272,23 @@ type FirewalldTests() =
 
     member private this.Invoke environment operation configuration =
         this.InvokeOwner environment "test-owner" operation configuration
+
+    [<Test>]
+    member this.``Pending confirmation does not report drift in unrelated objects``() =
+        this.WithHost(fun env _ _ ->
+            this.InvokeOwner env "stable-owner" "apply" zoneConfiguration |> ignore
+            let next = (zone "waiting" { target FirewalldTarget.Drop }).Configuration
+            let request = System.Text.Json.Nodes.JsonObject()
+            request["configuration"] <- System.Text.Json.Nodes.JsonValue.Create next
+            request["ownerId"] <- System.Text.Json.Nodes.JsonValue.Create "waiting-owner"
+            request["operation"] <- System.Text.Json.Nodes.JsonValue.Create "apply"
+            use payload = JsonDocument.Parse(request.ToJsonString())
+            let staged = NativeFirewalld.handle env payload.RootElement
+            Assert.That(staged["transactionNonce"].GetValue<string>(), Is.Not.Empty)
+            let stable = this.InvokeOwner env "stable-owner" "read" zoneConfiguration
+            let waiting = this.InvokeOwner env "waiting-owner" "read" next
+            Assert.That(stable["inSync"].GetValue<bool>(), Is.True)
+            Assert.That(waiting["inSync"].GetValue<bool>(), Is.False))
 
     [<Test>]
     member this.``Helper owns only declared permanent zone and restores absent built-in override``() =
