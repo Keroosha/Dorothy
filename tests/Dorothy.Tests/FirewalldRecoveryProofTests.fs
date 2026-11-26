@@ -231,6 +231,20 @@ type FirewalldRecoveryProofTests() =
             Assert.That(calls |> Seq.exists (fun args -> List.contains "--reload" args), Is.False))
 
     [<Test>]
+    member _.``Reload preimage accepts native coalescing of both destination and source intervals``() =
+        let sourcePort range = element "source-port" [ "port", range; "protocol", "tcp" ] []
+        let declared = { configuration with Ports = [ "8000-8010/tcp"; "8005-8015/tcp" ]; Elements = [ sourcePort "9000-9004"; sourcePort "9003-9008" ] }
+        let coalesced = { configuration with Ports = [ "8000-8015/tcp" ]; Elements = [ sourcePort "9000-9008" ] }
+        withSelectorRuntime coalesced (selectorValues coalesced) (fun environment calls _ _ ->
+            let xml = Some(FieldRuntime.render declared)
+            let proof = FirewalldRecoveryProof.reloadProof environment declared xml xml
+            Assert.That(proof["beforePresent"].GetValue<bool>(), Is.True)
+            let changed = Some(FieldRuntime.render { declared with Elements = [ sourcePort "9000-9007" ] })
+            Assert.Throws<InvalidOperationException>(fun () ->
+                FirewalldRecoveryProof.reloadProof environment declared changed xml |> ignore) |> ignore
+            Assert.That(calls, Does.Not.Contain [ "firewall-cmd"; "--reload" ]))
+
+    [<Test>]
     member _.``Dropped runtime port repair has an exact active and postboot inverse``() =
         withRuntime [] [ "ssh" ] (fun environment _ setPorts ->
             let snapshot = FirewalldRuntime.inspectRuntime environment "zone" "quiet" |> Option.get

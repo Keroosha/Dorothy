@@ -120,7 +120,7 @@ module FirewalldRecoveryProof =
         addStrings "services" (FirewalldRuntime.normalizeFieldValues snapshot.Kind "services" snapshot.Services)
         addStrings "ports" (FirewalldRuntime.normalizeFieldValues snapshot.Kind "ports" snapshot.Ports)
         addStrings "protocols" snapshot.Protocols
-        addStrings "sourcePorts" snapshot.SourcePorts
+        addStrings "sourcePorts" (FirewalldRuntime.normalizeFieldValues snapshot.Kind "source-ports" snapshot.SourcePorts)
         addElements "forwardPorts" snapshot.ForwardPorts
         node["masquerade"] <- JsonValue.Create snapshot.Masquerade
         node["forward"] <- JsonValue.Create snapshot.Forward

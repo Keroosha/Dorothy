@@ -1482,10 +1482,12 @@ module Host =
         // Keep explicitly declared docker.io in its original main APT owner. Ordering
         // the whole owner after firewalld avoids both first-start races and package removal.
         let mainDependencies =
-            if host.Docker.IsSome then
-                (firewalldPackage |> Option.map (fun resource -> resource :> Resource) |> Option.toList)
-                @ (firewalldSettingsResource |> Option.map (fun resource -> resource :> Resource) |> Option.toList)
-            else []
+            // Both APT owners can bootstrap the native helper on their first SSH
+            // connection. Do not start a second dpkg/apt operation on this host.
+            (firewalldPackage |> Option.map (fun resource -> resource :> Resource) |> Option.toList)
+            @ (if host.Docker.IsSome then
+                   firewalldSettingsResource |> Option.map (fun resource -> resource :> Resource) |> Option.toList
+               else [])
         let mainApt = createAptPackageSet host.Name mainPackages mainDependencies false
 
 

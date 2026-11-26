@@ -2,9 +2,45 @@ namespace Dorothy.HostHelper
 
 open System
 open System.Globalization
+open System.IO
+open System.Runtime.InteropServices
 open System.Text
 open System.Text.Json
 open System.Text.Json.Nodes
+
+// Debian's firewalld nftables backend uses libnftables1. A minimal installation
+// need not include the optional nft executable or enable nftables.service.
+module private FirewalldNftTable =
+    [<DllImport("libnftables.so.1")>]
+    extern nativeint nft_ctx_new(uint32 flags)
+    [<DllImport("libnftables.so.1")>]
+    extern void nft_ctx_free(nativeint ctx)
+    [<DllImport("libnftables.so.1")>]
+    extern void nft_ctx_output_set_flags(nativeint ctx, uint32 flags)
+    [<DllImport("libnftables.so.1")>]
+    extern int nft_ctx_buffer_output(nativeint ctx)
+    [<DllImport("libnftables.so.1")>]
+    extern int nft_ctx_buffer_error(nativeint ctx)
+    [<DllImport("libnftables.so.1")>]
+    extern nativeint nft_ctx_get_output_buffer(nativeint ctx)
+    [<DllImport("libnftables.so.1")>]
+    extern int nft_run_cmd_from_buffer(nativeint ctx, [<MarshalAs(UnmanagedType.LPUTF8Str)>] string cmd)
+
+    let printTable () =
+        let ctx = nft_ctx_new 0u
+        if ctx = 0n then 1
+        else
+            try
+                nft_ctx_output_set_flags(ctx, 16u) // NFT_CTX_OUTPUT_JSON
+                if nft_ctx_buffer_output(ctx) < 0 || nft_ctx_buffer_error(ctx) < 0
+                   || nft_run_cmd_from_buffer(ctx, "list table inet firewalld") <> 0 then 1
+                else
+                    let output = nft_ctx_get_output_buffer ctx
+                    if output = 0n then 1
+                    else
+                        Console.Out.Write(Marshal.PtrToStringUTF8 output)
+                        0
+            finally nft_ctx_free ctx
 
 module Program =
     let private usage () =
@@ -18,6 +54,12 @@ module Program =
         let host = HostEnvironment.system
         { host with
             Run = fun executable arguments input ->
+                let executable, arguments =
+                    match executable, arguments with
+                    | "nft", [ "-j"; "list"; "table"; "inet"; "firewalld" ] ->
+                        if File.Exists "/usr/sbin/nft" then "/usr/sbin/nft", arguments
+                        else Environment.ProcessPath, [ "firewalld-nft-table" ]
+                    | _ -> executable, arguments
                 host.Run "/usr/bin/timeout" ("--kill-after=5s" :: "75s" :: executable :: arguments) input }
 
     let private dispatch (command: string) (request: JsonElement) =
@@ -34,6 +76,7 @@ module Program =
         | "users" -> Users.handle HostEnvironment.system request
         | "sudo" -> Sudo.handle HostEnvironment.system request
         | "content" -> Content.handle HostEnvironment.system request
+        | "service" when fst (request.TryGetProperty "dockerFence") -> Services.handle firewalldEnvironment request
         | "service" -> Services.handle HostEnvironment.system request
         | _ -> invalidArg "command" "Unsupported helper command."
 
@@ -92,7 +135,12 @@ module Program =
 
     [<EntryPoint>]
     let main (arguments: string array) =
-        if arguments.Length = 5 && arguments[0] = "firewalld-docker-gate" then
+        if arguments.Length = 1 && arguments[0] = "firewalld-nft-table" then
+            // Fixed read-only query, no request text or commands from the caller.
+            try FirewalldNftTable.printTable ()
+            with
+            | :? DllNotFoundException | :? EntryPointNotFoundException -> 1
+        elif arguments.Length = 5 && arguments[0] = "firewalld-docker-gate" then
             try
                 let fence = FirewalldGateModel.parseArguments arguments[1] arguments[2] arguments[3] arguments[4]
                 FirewalldDockerGate.verify firewalldEnvironment [ fence ]

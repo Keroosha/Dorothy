@@ -1838,6 +1838,9 @@ module Firewalld =
         // Lifecycle validates the candidate immediately before arming. Guard a
         // different disk rollback preimage as well, before any mutation.
         if before <> desired then validate None before
+        let prove build =
+            try build ()
+            with :? InvalidOperationException as error -> fail error.Message
         let runtimeMatches () =
             let observation = FirewalldRuntime.observe environment c
             observation.Observed && observation.InSync
@@ -1847,7 +1850,7 @@ module Firewalld =
                 let effectiveBefore = effective environment c.Kind c.Name
                 let effectiveAfter =
                     desired |> Option.orElseWith (fun () -> readFile environment (objectPath "/usr/lib/firewalld" c.Kind c.Name))
-                FirewalldRecoveryProof.reloadProof environment c effectiveBefore effectiveAfter,
+                prove (fun () -> FirewalldRecoveryProof.reloadProof environment c effectiveBefore effectiveAfter),
                 (fun () ->
                     firewall environment [ "--check-config" ] |> ignore
                     firewall environment [ "--reload" ] |> ignore)
@@ -1858,7 +1861,7 @@ module Firewalld =
                 let live =
                     FirewalldRuntime.inspectRuntime environment c.Kind c.Name
                     |> Option.defaultWith (fun () -> fail "Unable to observe the loaded firewalld object before proving a runtime repair.")
-                let proof = FirewalldRecoveryProof.runtimeRepairProof environment c live
+                let proof = prove (fun () -> FirewalldRecoveryProof.runtimeRepairProof environment c live)
                 proof,
                 (fun () ->
                     firewall environment [ "--check-config" ] |> ignore

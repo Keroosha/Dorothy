@@ -883,7 +883,7 @@ type FirewalldTests() =
             let foreignPort = [ "--zone=apps"; "--add-port=8443/tcp" ]
             Assert.That((env.Run "firewall-cmd" foreignPort None).ExitCode, Is.EqualTo 0)
             calls.Clear()
-            Assert.Catch<InvalidOperationException>(fun () -> this.Invoke env "apply" config |> ignore) |> ignore
+            Assert.Throws<NativeFirewalld.BackendError>(fun () -> this.Invoke env "apply" config |> ignore) |> ignore
             let live = Dorothy.HostHelper.FirewalldRuntime.inspectRuntime env "zone" "apps" |> Option.get
             Assert.That(live.Ports, Is.EquivalentTo [ "8443/tcp" ])
             Assert.That(File.ReadAllBytes file = beforeFile, Is.True)
