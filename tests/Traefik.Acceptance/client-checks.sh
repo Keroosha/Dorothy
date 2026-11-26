@@ -466,7 +466,7 @@ check_dns_acme() {
     local secure_url=https://shop.acceptance.test:18443/secure/health
     local issued=false serial_before serial_after initial_file="$root/logs/acme-acceptance-serial-before.txt"
     for _ in $(seq 1 90); do
-        if curl --silent --show-error --insecure --connect-timeout 2 --max-time 5 \
+        if curl --silent --show-error --fail --cacert "$root/certs/pebble-issued-root.pem" --connect-timeout 2 --max-time 5 \
             --resolve shop.acceptance.test:18443:127.0.0.1 \
             --output "$root/logs/client-acme-trigger.body" "$secure_url" \
            && grep -Fq 'tls-backend:/secure/health' "$root/logs/client-acme-trigger.body"; then
@@ -519,7 +519,7 @@ check_dns_acme() {
 check_http01_acme() {
     local url=https://http01.acceptance.test:18443/http01/probe issued=false
     for _ in $(seq 1 90); do
-        if curl --silent --show-error --insecure --connect-timeout 2 --max-time 5 \
+        if curl --silent --show-error --fail --cacert "$root/certs/pebble-issued-root.pem" --connect-timeout 2 --max-time 5 \
             --resolve http01.acceptance.test:18443:127.0.0.1 \
             --output "$root/logs/client-http01-trigger.body" "$url" \
            && grep -Fq 'http-backend:/http01/probe' "$root/logs/client-http01-trigger.body"; then
@@ -548,7 +548,7 @@ check_http01_acme() {
 check_tlsalpn_acme() {
     local url=https://tlsalpn.acceptance.test:5001/tlsalpn/probe issued=false
     for _ in $(seq 1 90); do
-        if curl --silent --show-error --insecure --connect-timeout 2 --max-time 5 \
+        if curl --silent --show-error --fail --cacert "$root/certs/pebble-issued-root.pem" --connect-timeout 2 --max-time 5 \
             --resolve tlsalpn.acceptance.test:5001:127.0.0.1 \
             --output "$root/logs/client-tlsalpn-trigger.body" "$url" \
            && grep -Fq 'http-backend:/tlsalpn/probe' "$root/logs/client-tlsalpn-trigger.body"; then
@@ -678,7 +678,7 @@ if [[ "$mode" == rotation ]]; then
     rotate_url=https://shop.acceptance.test:18443/secure/health
     rotated=false
     for _ in $(seq 1 90); do
-        if curl --silent --show-error --insecure \
+        if curl --silent --show-error --fail --cacert "$root/certs/pebble-rotated-issued-root.pem" --connect-timeout 2 --max-time 5 \
             --resolve shop.acceptance.test:18443:127.0.0.1 \
             --output "$root/logs/client-rotation-trigger.body" "$rotate_url" 2>/dev/null \
            && grep -Fq 'tls-backend:/secure/health' "$root/logs/client-rotation-trigger.body"; then
@@ -704,7 +704,7 @@ if [[ "$mode" == rotation ]]; then
     mtls_rotated_url=https://mtls.acceptance.test:18444/mtls/rotated
     mtls_rotated=false
     for _ in $(seq 1 90); do
-        if curl --silent --show-error --insecure \
+        if curl --silent --show-error --fail --cacert "$root/certs/pebble-rotated-issued-root.pem" --connect-timeout 2 --max-time 5 \
             --resolve mtls.acceptance.test:18444:127.0.0.1 \
             --cert "$root/certs/client.pem" --key "$root/certs/client.key" \
             --output "$root/logs/client-rotation-mtls-trigger.body" "$mtls_rotated_url" 2>/dev/null \
