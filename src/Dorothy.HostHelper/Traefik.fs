@@ -5245,7 +5245,7 @@ module Traefik =
         // The generic rollback handler must not replace the newly observed external bytes.
         try confirmUnchanged ()
         with error ->
-            if not hasPending && admissionInvocation environment = admitted then removePendingTransaction environment paths request.OwnerId
+            if admitted.IsSome && not hasPending && admissionInvocation environment = admitted then removePendingTransaction environment paths request.OwnerId
             raise error
         let mutable binaryChanged = false
         let mutable restartAttempted = false
@@ -5284,6 +5284,14 @@ module Traefik =
                 match error with
                 | :? BackendError -> error.Message
                 | _ -> error.GetType().Name
+            if admitted.IsNone then
+                // StopUnit addresses the unit, not one InvocationID. A failed
+                // start cannot reserve the stopped state for a later undo.
+                let sampled =
+                    try admissionInvocation environment |> Option.defaultValue "stopped"
+                    with :? BackendError -> "unknown"
+                fail ("Traefik activation failed from stopped baseline: " + failureReason
+                      + "; rollback sample=" + sampled + "; no automatic stop, restore or journal retirement; use offline maintenance")
             let rollbackFailure =
                 try
                     if candidateJob.IsNone then verifyInvocation ()
@@ -5309,7 +5317,7 @@ module Traefik =
                         || currentBinaryHash <> oldBinaryHash
                         || rollbackUdpWithdrawal
                     let currentActive = isActive environment
-                    if currentOwnedUnit.IsSome && currentActive && (rollbackRestartRequired || not wasActive) then
+                    if currentOwnedUnit.IsSome && currentActive && rollbackRestartRequired then
                         stopOwnedService environment paths request.OwnerId
                     elif currentOwnedUnit.IsNone && currentActive then
                         fail "interrupted Traefik service has no owned unit"

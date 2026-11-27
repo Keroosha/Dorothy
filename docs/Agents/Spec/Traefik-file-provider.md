@@ -65,6 +65,8 @@ If the bound target fails readiness, the helper restores the exact dynamic preim
 
 ### Stopped-service operator handoff
 
+When Apply begins with a stopped unit and activation fails after journaling, it leaves the journal and staged files for this handoff. A `stopped` sample in the error is historical, not a lease: a later `StopUnit` would address whichever invocation is live, not necessarily the helper's. Identify any independent process before choosing a maintenance window; do not edit the journal or stop it merely because the deployment failed.
+
 This is a **local host administrator** operation, not a Pulumi property or a `traefik-v2` verb. Build `src/Dorothy.TraefikMaintenance/Dorothy.TraefikMaintenance.fsproj` with `dotnet publish -c Release -r linux-x64 --self-contained` (select the guest architecture), verify the binary digest, and install it separately as root-owned `/usr/local/sbin/dorothy-traefik-maintenance` mode `0700`. Do not put it in the provider bundle or grant deploy users sudo for it. Limit deployment delegation to the intended immutable helper **and exact command**; accounts already able to run arbitrary root commands or replace privileged executables are trusted administrators.
 
 1. Back up the owned configuration, protected material, journal and state privately. Identify the owner from the resource ID in the known checkpoint, **not** from a newly observed file. Review the proposed declaration and the incident before proceeding.

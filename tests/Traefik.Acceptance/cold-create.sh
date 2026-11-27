@@ -44,6 +44,10 @@ for pass in first recreated; do
         if TRAEFIK_ACCEPTANCE_PHASE=withdraw-udp up > "$log/http-refusal" 2>&1; then exit 1; fi
         grep -Fq 'cannot establish that the dynamic rollback file represents the running graph' "$log/http-refusal"
         control http-witness > "$log/http-after"; cmp "$log/http-before" "$log/http-after"; control http-restore
+        control nojob-arm
+        if TRAEFIK_ACCEPTANCE_PHASE=withdraw-udp up > "$log/nojob-refusal" 2>&1; then exit 1; fi
+        grep -Fq 'rollback sample=stopped; no automatic stop, restore or journal retirement' "$log/nojob-refusal"
+        control nojob-assert > "$log/nojob-live"
     else
         control race-arm
         if TRAEFIK_ACCEPTANCE_PHASE=withdraw-udp up > "$log/independent-refusal" 2>&1; then exit 1; fi
