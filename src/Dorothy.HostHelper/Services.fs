@@ -19,6 +19,65 @@ module Services =
             fail "Invalid systemd unit name."
         if name.EndsWith(".service", StringComparison.Ordinal) then name else name + ".service"
 
+    // A missing unit has no merged ExecStartPre in PID 1. Ask systemd's own
+    // offline loader whether this exact drop-in slot would contribute a
+    // mandatory command once a service fragment exists. Never load or start
+    // a substitute docker.service in the live manager.
+    let internal coldHookEffective (environment: HostEnvironment) (path: string) (body: byte[]) =
+        try
+            let paths = environment.Run "/usr/bin/busctl"
+                            [ "--system"; "--json=short"; "get-property"; "org.freedesktop.systemd1"
+                              "/org/freedesktop/systemd1"; "org.freedesktop.systemd1.Manager"; "UnitPath" ] None
+            if paths.ExitCode <> 0 || paths.Stderr <> "" then false
+            else
+                use reply = JsonDocument.Parse(paths.Stdout)
+                let root = reply.RootElement
+                let lookup = root.GetProperty("data").EnumerateArray() |> Seq.map _.GetString() |> Seq.toArray
+                let ownerDir = Path.GetDirectoryName(Path.GetDirectoryName path)
+                let validDir (d: string) =
+                    Path.IsPathFullyQualified d && Path.GetFullPath(d) = d && not (d.Contains ':') && not (d |> Seq.exists Char.IsControl)
+                let missingFragment d =
+                    try File.GetAttributes(Path.Combine(d, "docker.service")) |> ignore; false
+                    with :? FileNotFoundException | :? DirectoryNotFoundException -> true
+                if root.GetProperty("type").GetString() <> "as" || not (Array.forall validDir lookup)
+                   || (lookup |> Array.filter ((=) ownerDir)).Length <> 1
+                   || not (Array.forall missingFragment lookup) then false
+                else
+                    let stage = Directory.CreateTempSubdirectory("dorothy-unit-proof-")
+                    try
+                        let fragment = stage.CreateSubdirectory("fragment")
+                        let shadow = stage.CreateSubdirectory("slot")
+                        let empty = stage.CreateSubdirectory("no-generators")
+                        let main = Path.Combine(fragment.FullName, "docker.service")
+                        File.WriteAllText(main, "[Service]\nType=notify\nExecStart=/usr/bin/false\n")
+                        // Preserve PID 1's priority order, including .control
+                        // and generator output. Only the owned basename is
+                        // shadowed, immediately ahead of its real directory.
+                        let dirs = lookup |> Array.collect (fun d -> if d = ownerDir then [| shadow.FullName; d |] else [| d |])
+                        let probe = Path.Combine(shadow.CreateSubdirectory("docker.service.d").FullName, Path.GetFileName path)
+                        File.WriteAllBytes(probe, body)
+                        let argv =
+                            [ "-i"; "LC_ALL=C"; "PATH=/usr/sbin:/usr/bin:/sbin:/bin"
+                              "SYSTEMD_UNIT_PATH=" + String.concat ":" dirs
+                              "SYSTEMD_ENVIRONMENT_GENERATOR_PATH=" + empty.FullName; "SYSTEMD_GENERATOR_PATH=" + empty.FullName
+                              "/usr/bin/systemd-analyze"; "--system"; "--man=no"; "--generators=no"; "--recursive-errors=no"; "verify"; main ]
+                        let verify () = environment.Run "/usr/bin/env" argv None
+                        let clean = verify ()
+                        if clean.ExitCode <> 0 || clean.Stdout <> "" || clean.Stderr <> "" then false
+                        else
+                            // Success alone also happens when a later drop-in
+                            // reset the command list. Only this *required*,
+                            // private, absent executable may cause the second
+                            // verification to fail. No target command runs.
+                            let witness = Path.Combine(stage.FullName, "must-not-exist")
+                            File.AppendAllText(probe, "ExecStartPre=" + witness + "\n")
+                            let error = "docker.service: Command " + witness + " is not executable: No such file or directory"
+                            let observed = verify ()
+                            observed.ExitCode = 1 && observed.Stdout = "" && (observed.Stderr = error || observed.Stderr = error + "\n")
+                    finally
+                        stage.Delete(true)
+        with _ -> false
+
     let private hookReceipt hash = "# Dorothy docker.service per-start SHA-256: " + hash
 
     let handle (environment: HostEnvironment) (request: JsonElement) : JsonNode =
@@ -51,14 +110,19 @@ module Services =
         let verifyGate = function
             | [] -> FirewalldDockerGate.verifyReadiness environment
             | policies -> FirewalldDockerGate.verify environment policies
+        let mutable coldBootstrap = false
         let hookLoaded () =
+            coldBootstrap <- false
             match hook with
             | None -> true
-            | Some(_, _, _, commands) ->
+            | Some(p, body, _, commands) ->
                 let r = invoke [ "show"; "--property=LoadState,ExecStartPre,NeedDaemonReload"; "--"; "docker.service" ]
                 let lines = r.Stdout.Split('\n')
                 let absent = Array.contains "LoadState=not-found" lines
-                if absent then fences = Some [] && (r.ExitCode = 0 || r.ExitCode = 4) && String.IsNullOrWhiteSpace r.Stderr
+                if absent then
+                    coldBootstrap <- true
+                    fences = Some [] && (r.ExitCode = 0 || r.ExitCode = 4) && r.Stderr = ""
+                    && Array.contains "NeedDaemonReload=no" lines && coldHookEffective environment p body
                 else
                     r.ExitCode = 0 && String.IsNullOrWhiteSpace r.Stderr
                     && Array.contains "LoadState=loaded" lines && Array.contains "NeedDaemonReload=no" lines
@@ -115,6 +179,10 @@ module Services =
         if operation = "apply" then
             // Check the new gate now. Restarting an already active RequiredBy unit to
             // perform the check also stops its dependent Docker service and workloads.
+            // Before APT, reject an opaque/conflicting site configuration
+            // without publishing files or activating our bootstrap oneshot.
+            if fences = Some [] && not (hookLoaded ()) && coldBootstrap then
+                fail "Cannot prove a required Docker bootstrap check in the prospective systemd configuration; refusing before package installation."
             fences |> Option.iter verifyGate
             let fileChanged = managed && (not (File.Exists path) || File.ReadAllText path <> configuration || int (File.GetUnixFileMode path) <> 0o644)
             let writeUnit () =
@@ -136,7 +204,7 @@ module Services =
             elif not (enabled initial) then run [ "enable"; "--"; name ]
             let restart = request.GetProperty("restart").GetBoolean()
             if active initial && fences.IsNone && (fileChanged || restart) then run [ "restart"; "--"; name ]
-            elif not (active initial) then run [ "start"; "--"; name ]
+            elif not (active initial || coldBootstrap) then run [ "start"; "--"; name ]
         elif operation = "delete" then
             if loaded initial then
                 if fences.IsNone then run [ "stop"; "--"; name ]
@@ -158,13 +226,14 @@ module Services =
         let fileMatches = not managed || (File.Exists path && File.ReadAllText path = configuration && int (File.GetUnixFileMode path) = 0o644)
         let gateMatches =
             match fences with
-            | Some values when operation = "read" && fileMatches && active state && enabled state ->
+            | Some values when operation = "read" && fileMatches && enabled state ->
                 try hookOnDisk && hookLoaded () && (verifyGate values; true)
                 with :? Firewalld.BackendError -> false
             | _ -> true
         let result = JsonObject()
         result["exists"] <- JsonValue.Create(loaded state && (not managed || File.Exists path))
-        result["inSync"] <- JsonValue.Create(fileMatches && gateMatches && active state && enabled state)
+        let readyState = active state || (coldBootstrap && Map.tryFind "ActiveState" state = Some "inactive")
+        result["inSync"] <- JsonValue.Create(fileMatches && gateMatches && readyState && enabled state)
         result["active"] <- JsonValue.Create(active state)
         result["enabled"] <- JsonValue.Create(enabled state)
         result :> JsonNode

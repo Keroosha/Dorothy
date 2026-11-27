@@ -1489,6 +1489,8 @@ module Host =
                 let args = HostServiceArgs()
                 args.Connection <- Input<AptConnectionArgs>.op_Implicit connection
                 args.Specification <- Input<string>.op_Implicit(FirewalldGuardUnit.specification (name + ".service") [])
+                // Recheck an earlier cold prerequisite in place, without requiring refresh.
+                args.Triggers <- Input<string>.op_Implicit "[\"cold-hook-proof-v1\"]"
                 Some(HostServiceResource(name, args, ProviderContract.resourceOptionsWithDependencies [ settings :> Resource ]) :> Resource)
             | _ -> None
 

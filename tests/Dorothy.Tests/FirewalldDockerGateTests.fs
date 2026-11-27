@@ -168,3 +168,46 @@ type FirewalldDockerGateTests() =
             setDaemonStateResult { ExitCode = 124; Stdout = ""; Stderr = "" }
             let suspended = Assert.Throws<Firewalld.BackendError>(fun () -> FirewalldDockerGate.verifyReadiness environment)
             Assert.That(suspended.Message, Does.Contain "may be suspended"))
+
+    [<TestCase("required", true); TestCase("cleared", false); TestCase("opaque", false)>]
+    [<TestCase("unrelated-error", false); TestCase("timeout", false); TestCase("unknown-search", false)>]
+    member _.``Cold admission needs a distinguishable native required-command witness``(observation: string, expected: bool) =
+        let root = Directory.CreateTempSubdirectory("dorothy-test-unit-path-")
+        try
+            let ownerDir = root.CreateSubdirectory("etc").FullName
+            let higher = root.CreateSubdirectory("control").FullName
+            let vendor = root.CreateSubdirectory("vendor").FullName
+            let reply = JsonObject()
+            reply["type"] <- JsonValue.Create "as"
+            let paths = JsonArray()
+            for path in [higher; ownerDir; vendor] do paths.Add(JsonValue.Create path)
+            reply["data"] <- paths
+            let ok text = { ExitCode = 0; Stdout = text; Stderr = "" }
+            let hook = Path.Combine(ownerDir, "docker.service.d", "90-dorothy-test.conf")
+            let bytes = System.Text.Encoding.UTF8.GetBytes("[Service]\nExecStartPre=/usr/bin/true\n")
+            let env =
+                { HostEnvironment.system with
+                    Run = fun exe args _ ->
+                        if exe = "/usr/bin/busctl" then
+                            ok (if observation = "unknown-search" then "{}" else reply.ToJsonString())
+                        elif exe = "/usr/bin/env" then
+                            let dirs =
+                                args |> List.find (fun s -> s.StartsWith("SYSTEMD_UNIT_PATH=", StringComparison.Ordinal))
+                                |> fun s -> s.Substring("SYSTEMD_UNIT_PATH=".Length).Split(':')
+                            // A stronger site directory must never be put behind our shadow.
+                            if dirs.Length <> 4 || dirs[0] <> higher || dirs[2] <> ownerDir || dirs[3] <> vendor then
+                                invalidOp "Incorrect unit search precedence."
+                            let probe = Path.Combine(dirs[1], "docker.service.d", Path.GetFileName hook)
+                            let text = File.ReadAllText probe
+                            if observation = "opaque" then { ExitCode = 1; Stdout = ""; Stderr = "unit cannot be checked" }
+                            elif not (text.Contains("must-not-exist", StringComparison.Ordinal)) || observation = "cleared" then ok ""
+                            elif observation = "timeout" then { ExitCode = 124; Stdout = ""; Stderr = "" }
+                            else
+                                let witness = text.TrimEnd('\n').Split('\n') |> Array.last |> fun line -> line.Substring("ExecStartPre=".Length)
+                                let reason = if observation = "required" then witness else "/unrelated"
+                                { ExitCode = 1; Stdout = ""; Stderr = "docker.service: Command " + reason + " is not executable: No such file or directory\n" }
+                        else invalidOp "No live systemd operation is allowed." }
+            Assert.That(Services.coldHookEffective env hook bytes, Is.EqualTo expected)
+            Assert.That(File.Exists hook, Is.False)
+        finally
+            root.Delete(true)
