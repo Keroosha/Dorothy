@@ -122,6 +122,17 @@ For a key without an exact getter, `runtimeObserved=false` and `runtimeInSync=fa
 
 The host lock coordinates Dorothy writers, not other administrators, NetworkManager, or the daemon's own runtime API. Native validation, selector observation and reload are separate operations. If attribution no longer holds, recovery retains its journal rather than erasing foreign state; no atomic transaction with arbitrary external writers is claimed.
 
+### Recovery decisions
+
+| Change or interruption | Recovery contract |
+|---|---|
+| Existing zone/policy with representable selector changes, or one non-expiring set member | Store the effective before **and after** object and the inverse operations before activation. Delete can restore a vendor or adopted postimage different from the departing declaration. Native selector recovery does not restart the daemon or reset foreign rich-rule timeouts. |
+| Structural edit of a definition that an active policy or zone consumes | Do not assume it is safe because the current SSH peer still passes. When no scoped inverse is available, migrate consumers to a separate definition first. A standalone definition can use a verified daemon-wide activation. |
+| Old permanent disk and loaded settings disagree | Do not reload an unrelated object across the discrepancy. Reconcile the specific setting out of band or through its owner. On rollback, do not reload again when the old loaded value can already be measured directly. |
+| Runtime-only repair interrupted before activation, then reboot | Boot can load the disk selector even though the interrupted process never activated it. Recover the prior working runtime from the first durable intent, not just transactions marked activation-started. |
+| Pending recovery executable unavailable at boot | Start native firewalld rather than making its startup require the failed helper. A separate systemd unit requests native panic containment. Restore the authenticated executable through the console and reboot; do not delete the pending journal to regain access. This mechanism requires a functioning native firewall daemon. |
+| Independently administered interfaces and expiring restrictions | Verify live Docker bridge identity against the local daemon and an active NM profile against its effective zone. Neither belongs in the permanent object. A timed ipset's empty userspace listing is not evidence of an empty kernel set. |
+
 ## Historical guest controls for reviewed revision `4cc02d5`
 
 These were collected on intermediate release candidates for that review. In particular the old mode-conflict refusal and old systemd dependency are not the current recovery contract.
