@@ -6,6 +6,7 @@
     <PublishAot>true</PublishAot>
     <OtherFlags>$(OtherFlags) --reflectionfree</OtherFlags>
     <IlcTreatWarningsAsErrors>true</IlcTreatWarningsAsErrors>
+    <TrimmerSingleWarn>false</TrimmerSingleWarn>
     <DefineConstants>$(DefineConstants);HOST_HELPER;TRAEFIK_MAINTENANCE</DefineConstants>
   </PropertyGroup>
   <ItemGroup>

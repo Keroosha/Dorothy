@@ -9,11 +9,11 @@ let main = function
         try
             Environment.SetEnvironmentVariable("PATH", "/usr/sbin:/usr/bin:/sbin:/bin")
             Traefik.maintainStopped owner digest
-            printfn "Journal archived; owned service remains stopped. Verify the next managed Apply and its real traffic."
+            Console.Out.WriteLine("Journal archived; owned service remains stopped. Verify the next managed Apply and its real traffic.")
             0
         with
-        | :? Traefik.BackendError as error -> eprintfn "%s" error.Message; 1
-        | _ -> eprintfn "Stopped maintenance failed. Preserve the journal and its archive."; 1
+        | :? Traefik.BackendError as error -> Console.Error.WriteLine(error.Message); 1
+        | _ -> Console.Error.WriteLine("Stopped maintenance failed. Preserve the journal and its archive."); 1
     | _ ->
         Console.Error.WriteLine("Usage: dorothy-traefik-maintenance recover-stopped OWNER JOURNAL_SHA256")
         2
