@@ -72,6 +72,94 @@ module private AptTestHelpers =
 
         root, environment
 
+    let dockerBootstrapVersion = "26.1.5+dfsg1-9+deb13u1+b1"
+
+    let dockerApplyRequest (desiredVersion: string option) (strictFlag: bool option) =
+        let versionJson =
+            match desiredVersion with
+            | Some version -> JsonSerializer.Serialize(version)
+            | None -> "null"
+
+        let strictJson =
+            match strictFlag with
+            | Some value -> ",\"strictDockerBootstrap\":" + value.ToString().ToLowerInvariant()
+            | None -> ""
+
+        parseRequest
+            (sprintf
+                """{"operation":"apply","ownerId":"owner","previousNames":[],"desiredVersions":{"docker.io":%s}%s}"""
+                versionJson
+                strictJson)
+
+    let private createDockerEnvironment (simulationBeforeUpdate: string) (simulationAfterUpdate: string) =
+        let root = Path.Combine(Path.GetTempPath(), "keroosha-apt-docker-test-" + Guid.NewGuid().ToString("N"))
+        Directory.CreateDirectory(root) |> ignore
+        let osRelease = Path.Combine(root, "etc", "os-release")
+        Directory.CreateDirectory(Path.GetDirectoryName(osRelease)) |> ignore
+        File.WriteAllText(osRelease, "ID=debian\n")
+        Directory.CreateDirectory(Path.Combine(root, "run", "lock")) |> ignore
+        let commands = ResizeArray<string * string list>()
+        let mutable indexesUpdated = false
+        let mutable dockerInstalled = false
+        let success stdout =
+            { ExitCode = 0
+              Stdout = stdout
+              Stderr = "" }
+        let failure stderr =
+            { ExitCode = 42
+              Stdout = ""
+              Stderr = stderr }
+        let run executable arguments _stdin =
+            commands.Add((executable, arguments))
+            match executable, arguments with
+            | "dpkg", [ "--print-architecture" ] -> success "amd64\n"
+            | "dpkg", [ "--compare-versions"; _; "lt"; _ ] -> { ExitCode = 1; Stdout = ""; Stderr = "" }
+            | "dpkg-query", _ ->
+                if dockerInstalled then
+                    success ("docker.io\tamd64\tii \t" + dockerBootstrapVersion + "\tno\tno\n")
+                else
+                    success ""
+            | "apt-get", args when List.contains "update" args ->
+                indexesUpdated <- true
+                success ""
+            | "apt-cache", [ "show"; name ] ->
+                let versions =
+                    if name = "docker.io" then
+                        if indexesUpdated then [ dockerBootstrapVersion; "26.1.5+dfsg1-9" ]
+                        else [ "26.1.5+dfsg1-9" ]
+                    else
+                        [ "1.0-1" ]
+
+                versions
+                |> List.map (fun version -> "Package: " + name + "\nVersion: " + version)
+                |> String.concat "\n\n"
+                |> success
+            | "apt-get", args when List.contains "-s" args ->
+                success (if indexesUpdated then simulationAfterUpdate else simulationBeforeUpdate)
+            | "apt-get", args when List.contains "-y" args ->
+                dockerInstalled <-
+                    args
+                    |> List.exists (fun argument ->
+                        argument = "docker.io"
+                        || argument.StartsWith("docker.io=", StringComparison.Ordinal))
+                success ""
+            | _ -> failure (sprintf "unexpected test command: %s %s" executable (String.concat " " arguments))
+        let environment =
+            { Root = root
+              Run = run
+              UtcNow = fun () -> DateTimeOffset.UtcNow }
+        root, environment, commands
+
+    let withDockerEnvironment simulationBeforeUpdate simulationAfterUpdate action =
+        let root, environment, commands =
+            createDockerEnvironment simulationBeforeUpdate simulationAfterUpdate
+
+        try
+            action environment commands
+        finally
+            if Directory.Exists(root) then
+                Directory.Delete(root, true)
+
 [<TestFixture>]
 type AptTests() =
     [<Test>]
@@ -315,3 +403,128 @@ type AptTests() =
             Assert.That(recovered["installedVersions"].AsObject(), Is.Empty)
         finally
             Directory.Delete(root, true)
+
+    [<Test>]
+    member _.``Strict cold Docker bootstrap pins the post-update solver selection``() =
+        let beforeUpdate = "Inst docker.io (26.1.5+dfsg1-9 Debian:12 [amd64])\n"
+        let afterUpdate = "Inst docker.io (26.1.5+dfsg1-9+deb13u1+b1 Debian:13 [amd64])\n"
+
+        AptTestHelpers.withDockerEnvironment beforeUpdate afterUpdate (fun environment commands ->
+            use request = AptTestHelpers.dockerApplyRequest None (Some true)
+            Apt.handle environment request.RootElement |> ignore
+
+            let entries = commands |> Seq.toArray
+            let updateIndex =
+                entries
+                |> Array.findIndex (fun (executable, arguments) ->
+                    executable = "apt-get" && List.contains "update" arguments)
+            let simulationIndex =
+                entries
+                |> Array.findIndex (fun (executable, arguments) ->
+                    executable = "apt-get" && List.contains "-s" arguments)
+            let installArguments =
+                entries
+                |> Array.find (fun (executable, arguments) ->
+                    executable = "apt-get" && List.contains "-y" arguments)
+                |> snd
+            let qualifiedArgument = "docker.io=" + AptTestHelpers.dockerBootstrapVersion
+
+            Assert.That(updateIndex < simulationIndex, Is.True)
+            Assert.That(installArguments |> List.contains qualifiedArgument, Is.True)
+            Assert.That(installArguments |> List.contains "docker.io", Is.False)
+            Assert.That(installArguments |> List.contains "--no-remove", Is.True))
+
+    [<Test>]
+    member _.``Strict cold Docker bootstrap preserves a matching explicit version``() =
+        let selected = "Inst docker.io (26.1.5+dfsg1-9+deb13u1+b1 Debian:13 [amd64])\n"
+
+        AptTestHelpers.withDockerEnvironment selected selected (fun environment commands ->
+            use request =
+                AptTestHelpers.dockerApplyRequest (Some AptTestHelpers.dockerBootstrapVersion) (Some true)
+            Apt.handle environment request.RootElement |> ignore
+
+            let installArguments =
+                commands
+                |> Seq.find (fun (executable, arguments) ->
+                    executable = "apt-get" && List.contains "-y" arguments)
+                |> snd
+            Assert.That(installArguments |> List.contains ("docker.io=" + AptTestHelpers.dockerBootstrapVersion), Is.True))
+
+    [<Test>]
+    member _.``Strict cold Docker bootstrap rejects unsupported or mismatched simulation selections before writes``() =
+        let unsupported =
+            "Inst docker.io (28.0.0-1 Debian:13 [amd64])\n"
+        let wrongArchitecture =
+            "Inst docker.io (26.1.5+dfsg1-9+deb13u1+b1 Debian:13 [arm64])\n"
+        let missing = "Inst unrelated-package (1.0-1 Debian:13 [amd64])\n"
+
+        for simulation in [ unsupported; wrongArchitecture; missing ] do
+            AptTestHelpers.withDockerEnvironment simulation simulation (fun environment commands ->
+                use request = AptTestHelpers.dockerApplyRequest None (Some true)
+                Assert.Throws<BackendError>(TestDelegate(fun () -> Apt.handle environment request.RootElement |> ignore))
+                |> ignore
+
+                Assert.That(
+                    commands
+                    |> Seq.exists (fun (executable, arguments) ->
+                        executable = "apt-get" && List.contains "-y" arguments),
+                    Is.False)
+                let journalDirectory = HostEnvironment.path environment "/var/lib/keroosha-iac/apt"
+                Assert.That(Directory.Exists(journalDirectory), Is.False))
+
+    [<Test>]
+    member _.``Strict cold Docker bootstrap refuses a solver version different from an explicit pin``() =
+        let selected = "Inst docker.io (26.1.5+dfsg1-9+deb13u1+b1 Debian:13 [amd64])\n"
+
+        AptTestHelpers.withDockerEnvironment selected selected (fun environment commands ->
+            use request = AptTestHelpers.dockerApplyRequest (Some "26.1.5+dfsg1-9") (Some true)
+            Assert.Throws<BackendError>(TestDelegate(fun () -> Apt.handle environment request.RootElement |> ignore))
+            |> ignore
+
+            Assert.That(
+                commands
+                |> Seq.exists (fun (executable, arguments) ->
+                    executable = "apt-get" && List.contains "-y" arguments),
+                Is.False)
+            let journalDirectory = HostEnvironment.path environment "/var/lib/keroosha-iac/apt"
+            Assert.That(Directory.Exists(journalDirectory), Is.False))
+
+    [<Test>]
+    member _.``Strict cold Docker bootstrap refuses indirect installation without direct ownership``() =
+        let simulation =
+            "Inst hello (1.0-1 Debian:13 [amd64])\n"
+            + "Inst docker.io (26.1.5+dfsg1-9+deb13u1+b1 Debian:13 [amd64])\n"
+
+        AptTestHelpers.withDockerEnvironment simulation simulation (fun environment commands ->
+            use request =
+                AptTestHelpers.parseRequest
+                    """{"operation":"apply","ownerId":"owner","previousNames":[],"desiredVersions":{"hello":null},"strictDockerBootstrap":true}"""
+            Assert.Throws<BackendError>(TestDelegate(fun () -> Apt.handle environment request.RootElement |> ignore))
+            |> ignore
+
+            Assert.That(
+                commands
+                |> Seq.exists (fun (executable, arguments) ->
+                    executable = "apt-get" && List.contains "-y" arguments),
+                Is.False)
+            let journalDirectory = HostEnvironment.path environment "/var/lib/keroosha-iac/apt"
+            Assert.That(Directory.Exists(journalDirectory), Is.False))
+
+    [<Test>]
+    member _.``Absent strict Docker bootstrap flag keeps unqualified APT install semantics``() =
+        let selected = "Inst docker.io (26.1.5+dfsg1-9+deb13u1+b1 Debian:13 [amd64])\n"
+
+        AptTestHelpers.withDockerEnvironment selected selected (fun environment commands ->
+            use request = AptTestHelpers.dockerApplyRequest None None
+            Apt.handle environment request.RootElement |> ignore
+
+            let installArguments =
+                commands
+                |> Seq.find (fun (executable, arguments) ->
+                    executable = "apt-get" && List.contains "-y" arguments)
+                |> snd
+            Assert.That(installArguments |> List.contains "docker.io", Is.True)
+            Assert.That(
+                installArguments
+                |> List.exists (fun argument -> argument.StartsWith("docker.io=", StringComparison.Ordinal)),
+                Is.False))

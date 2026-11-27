@@ -39,6 +39,8 @@ type AptPackageSetArgs() =
 
     [<Input("packages", true)>]
     member val Packages: InputMap<AptPackageArgs> = InputMap<AptPackageArgs>() with get, set
+    [<Input("strictDockerBootstrap")>]
+    member val StrictDockerBootstrap: Input<bool> = Unchecked.defaultof<_> with get, set
 
 
 /// A user-group declaration passed to the native users provider.
@@ -1411,7 +1413,7 @@ module Host =
             (name: string)
             (packageMap: Map<string, string option>)
             (dependencies: Resource list)
-            retainOnDelete
+            retainOnDelete strictDockerBootstrap
             =
             let packages = Dictionary<string, AptPackageArgs>()
 
@@ -1426,6 +1428,7 @@ module Host =
             let args = AptPackageSetArgs()
             args.Connection <- Input<AptConnectionArgs>.op_Implicit connection
             args.Packages <- InputMap<AptPackageArgs>.op_Implicit packages
+            if strictDockerBootstrap then args.StrictDockerBootstrap <- Input<bool>.op_Implicit true
 
             let options =
                 if List.isEmpty dependencies then
@@ -1456,7 +1459,7 @@ module Host =
             let declared = Map.tryFind "firewalld" host.Packages
             if host.Firewalld.IsSome || declared.IsSome then
                 // Owning firewall configuration does not grant authority to uninstall the daemon.
-                Some(createAptPackageSet (host.Name + "-firewalld-package") (Map.ofList [ "firewalld", Option.flatten declared ]) [] declared.IsNone)
+                Some(createAptPackageSet (host.Name + "-firewalld-package") (Map.ofList [ "firewalld", Option.flatten declared ]) [] declared.IsNone false)
             else None
         let firewalldSettingsResource =
             match host.Firewalld |> Option.bind _.StrictForwardPorts, firewalldPackage with
@@ -1490,7 +1493,7 @@ module Host =
                 args.Connection <- Input<AptConnectionArgs>.op_Implicit connection
                 args.Specification <- Input<string>.op_Implicit(FirewalldGuardUnit.specification (name + ".service") [])
                 // Recheck an earlier cold prerequisite in place, without requiring refresh.
-                args.Triggers <- Input<string>.op_Implicit "[\"cold-hook-proof-v2\"]"
+                args.Triggers <- Input<string>.op_Implicit "[\"cold-hook-proof-v3\"]"
                 Some(HostServiceResource(name, args, ProviderContract.resourceOptionsWithDependencies [ settings :> Resource ]) :> Resource)
             | _ -> None
 
@@ -1504,7 +1507,7 @@ module Host =
                    firewalldSettingsResource |> Option.map (fun resource -> resource :> Resource) |> Option.toList
                else [])
             @ Option.toList dockerBootstrap
-        let mainApt = createAptPackageSet host.Name mainPackages mainDependencies false
+        let mainApt = createAptPackageSet host.Name mainPackages mainDependencies false dockerBootstrap.IsSome
 
 
         let fail2banPackages =
@@ -1524,6 +1527,7 @@ module Host =
                                 (Map.ofList [ packageName, None ])
                                 [ mainApt :> Resource ]
                                 true
+                                false
                         ))
             else
                 []
@@ -1534,7 +1538,7 @@ module Host =
                     [ mainApt :> Resource ]
                     @ (firewalldPackage |> Option.map (fun resource -> resource :> Resource) |> Option.toList)
                     @ (firewalldSettingsResource |> Option.map (fun resource -> resource :> Resource) |> Option.toList)
-                Some(createAptPackageSet (host.Name + "-docker-package") (Map.ofList [ "docker.io", None ]) dependencies true)
+                Some(createAptPackageSet (host.Name + "-docker-package") (Map.ofList [ "docker.io", None ]) dependencies true dockerBootstrap.IsSome)
             else
                 None
         let usersResource =
@@ -1558,7 +1562,7 @@ module Host =
         let zstdPackage =
             if contentItems |> List.exists (fun item -> item.Format = Some TarZst) then
                 if Map.containsKey "zstd" host.Packages then None
-                else Some(createAptPackageSet (host.Name + "-content-zstd") (Map.ofList [ "zstd", None ]) [ mainApt :> Resource ] true)
+                else Some(createAptPackageSet (host.Name + "-content-zstd") (Map.ofList [ "zstd", None ]) [ mainApt :> Resource ] true false)
             else None
         let contentResources = Dictionary<HostContentItem, HostContentResource>()
         let hostContentDirectories = Dictionary<HostContentDirectory, Resource>()
@@ -1612,6 +1616,7 @@ module Host =
                             (Map.ofList [ "sudo", None ])
                             prerequisiteResources
                             true
+                            false
                 Some packageSet
 
         match host.Sudo, sudoPackage with
@@ -1636,6 +1641,7 @@ module Host =
                         (Map.ofList [ "util-linux", None ])
                         [ mainApt :> Resource ]
                         true
+                        false
                 )
             else
                 None
@@ -1694,6 +1700,7 @@ module Host =
                         (host.Name + "-ufw-package")
                         (Map.ofList [ "ufw", version ])
                         [ mainApt :> Resource ]
+                        false
                         false
                 )
             else

@@ -36,6 +36,24 @@ module Services =
             "systemd-system-update-generator", "a4530d6dc256d902786acb32372b678f196a4a760db135a0bbd68e35c4ce9824"
             "systemd-sysv-generator", "662f91830e6f76e08a47be605ba2480ae87add1eac44aa095629bc0a4484cb11"
             "systemd-tpm2-generator", "07dd5f254baa1f830c1ce97d9155b79fdde4e61a6ff84b0161439f63fc250f77" ]
+    // cat-config is the persisted view now, not proof of the files PID 1 read at boot.
+    // The live manager/PID1 environments are checked separately; qualification still
+    // assumes the trusted policy was present at boot and was not independently changed.
+
+    let private managerConfigurationMatches (environment: HostEnvironment) =
+        let result =
+            environment.Run "/usr/bin/systemd-analyze"
+                [ "--no-pager"; "--tldr"; "cat-config"; "systemd/system.conf" ] None
+        if result.ExitCode <> 0 || result.Stderr <> "" || isNull result.Stdout then false
+        else
+            let active =
+                result.Stdout.Split('\n')
+                |> Array.map (fun line ->
+                    if line.EndsWith("\r", StringComparison.Ordinal) then line.Substring(0, line.Length - 1)
+                    else line)
+                |> Array.filter (fun line -> not (String.IsNullOrWhiteSpace line) && not (line.StartsWith("#", StringComparison.Ordinal)))
+            active = [| "[Manager]"; "DefaultLimitCORE=0:infinity" |]
+
 
     let internal coldGeneratorProfile (environment: HostEnvironment) =
         let path = HostEnvironment.path environment
@@ -75,17 +93,16 @@ module Services =
             let manager = environment.Run "/usr/bin/systemctl" [ "show-environment" ] None
             let exe = path "/proc/1/exe"
             let pid1 = environment.Run "/usr/bin/sha256sum" [ "--"; exe ] None
-            let apt = environment.Run "/usr/bin/apt-cache" [ "policy"; "docker.io" ] None
-            let candidate = apt.Stdout.Split('\n') |> Array.filter (fun s -> s.TrimStart().StartsWith("Candidate:", StringComparison.Ordinal))
             File.ReadAllText(path "/etc/debian_version").Trim() = "13.8"
             && pid1.ExitCode = 0 && pid1.Stderr = ""
             && pid1.Stdout.TrimEnd('\n') = "799fd89964a716fb5f26c4506047190b6e842ac2745b473bd45351c4d8cbd929  " + exe
-            && apt.ExitCode = 0 && apt.Stderr = "" && candidate = [| "  Candidate: 26.1.5+dfsg1-9+deb13u1+b1" |]
             && ordinaryEnvironment '\000' (File.ReadAllText(path "/proc/1/environ"))
             && manager.ExitCode = 0 && manager.Stderr = "" && ordinaryEnvironment '\n' manager.Stdout
+            && managerConfigurationMatches environment
             && [ "/etc"; "/run"; "/usr/local/lib"; "/usr/lib" ]
                |> List.forall (fun p -> directory p "system-generators" && directory p "system-environment-generators")
         with _ -> false
+
 
     // A missing unit has no merged ExecStartPre in PID 1. Ask systemd's own
     // offline loader whether this exact drop-in slot would contribute a
@@ -148,7 +165,8 @@ module Services =
 
     let private hookReceipt hash = "# Dorothy docker.service per-start SHA-256: " + hash
 
-    let handle (environment: HostEnvironment) (request: JsonElement) : JsonNode =
+    let internal handleWithExecutable (executable: string) (environment: HostEnvironment) (request: JsonElement) : JsonNode =
+
         let operation = text request "operation"
         if not ([ "read"; "apply"; "delete" ] |> List.contains operation) then fail "Unsupported service operation."
         let name = unitName (text request "name")
@@ -159,7 +177,8 @@ module Services =
             | true, value ->
                 if not managed || suppliedConfiguration <> "" then fail "Invalid typed Docker firewall gate."
                 let fences = FirewalldGateModel.decodeService name (JsonNode.Parse(value.GetRawText()))
-                let commands = FirewalldDockerGate.startCommands Environment.ProcessPath fences
+                let commands = FirewalldDockerGate.startCommands executable fences
+
                 let body = Encoding.UTF8.GetBytes(FirewalldDockerGate.renderStartHook name commands)
                 let hash = Security.Cryptography.SHA256.HashData(body) |> Convert.ToHexString |> _.ToLowerInvariant()
                 let unit = FirewalldDockerGate.renderUnit commands + hookReceipt hash + "\n"
@@ -184,22 +203,63 @@ module Services =
             match hook with
             | None -> true
             | Some(p, body, _, commands) ->
-                let r = invoke [ "show"; "--property=LoadState,ExecStartPre,NeedDaemonReload"; "--"; "docker.service" ]
-                let lines = r.Stdout.Split('\n')
-                let absent = Array.contains "LoadState=not-found" lines
-                if absent then
-                    coldBootstrap <- true
-                    let supported = fences = Some [] && coldGeneratorProfile environment
-                    if operation = "apply" && fences = Some [] && not supported then
-                        fail "Cannot establish the supported Debian cold-install generator profile; refusing before Docker package installation."
-                    supported && (r.ExitCode = 0 || r.ExitCode = 4) && r.Stderr = ""
-                    && Array.contains "NeedDaemonReload=no" lines && coldHookEffective environment p body
-                else
-                    r.ExitCode = 0 && String.IsNullOrWhiteSpace r.Stderr
-                    && Array.contains "LoadState=loaded" lines && Array.contains "NeedDaemonReload=no" lines
-                    && (commands |> List.forall (fun c -> lines |> Array.exists (fun line ->
-                        line.StartsWith("ExecStartPre=", StringComparison.Ordinal)
-                        && line.Contains("path=" + Environment.ProcessPath + " ; argv[]=" + c + " ; ignore_errors=no ;", StringComparison.Ordinal))))
+                // systemctl omits an empty command list, even with --all,
+                // and emits a separate ExecStartPre property for each command.
+                let parseProperties (output: string) =
+                    let mutable load = None
+                    let mutable reload = None
+                    let hooks = ResizeArray<string>()
+                    let mutable valid = not (isNull output)
+                    if valid then
+                        for line in output.TrimEnd('\n').Split('\n') do
+                            if line.StartsWith("LoadState=", StringComparison.Ordinal) && load.IsNone then
+                                load <- Some(line.Substring("LoadState=".Length))
+                            elif line = "NeedDaemonReload=no" && reload.IsNone then reload <- Some false
+                            elif line = "NeedDaemonReload=yes" && reload.IsNone then reload <- Some true
+                            elif line.StartsWith("ExecStartPre=", StringComparison.Ordinal) then
+                                if line.Length > "ExecStartPre=".Length then hooks.Add line
+                            else valid <- false
+                    match valid, load, reload with
+                    | true, Some state, Some stale -> Some(state, stale, hooks)
+                    | _ -> None
+                let invalidObservation () =
+                    if operation = "apply" && fences = Some [] then
+                        fail "Cannot safely classify Docker's native systemd state before publishing its bootstrap admission gate."
+                    false
+                let queried =
+                    try Some(invoke [ "show"; "--property=LoadState,ExecStartPre,NeedDaemonReload"; "--"; "docker.service" ])
+                    with _ -> None
+                match queried with
+                | None -> invalidObservation ()
+                | Some r ->
+                    match parseProperties r.Stdout with
+                    | None -> invalidObservation ()
+                    | Some(state, stale, hooks) ->
+                        match state with
+                        | "not-found" when not stale && hooks.Count = 0 && (r.ExitCode = 0 || r.ExitCode = 4) && r.Stderr = "" ->
+                            coldBootstrap <- true
+                            let supported = fences = Some [] && coldGeneratorProfile environment
+                            if operation = "apply" && fences = Some [] && not supported then
+                                fail "Cannot establish the supported Debian cold-install generator profile; refusing before Docker package installation. This is an observed refusal, not recovery proof: restore the qualified manager policy and perform an ordinary controlled boot before retrying; daemon-reload does not re-establish the boot-time manager state."
+                            supported && coldHookEffective environment p body
+                        | "loaded" when r.ExitCode = 0 && r.Stderr = "" ->
+                            let packageKnown =
+                                if fences <> Some [] then true
+                                else
+                                    try
+                                        let result = environment.Run "/usr/bin/dpkg-query" [ "--show"; "--showformat=${Status}\\n"; "docker.io" ] None
+                                        result.ExitCode = 0 && result.Stderr = "" &&
+                                        match result.Stdout.Split(' ') with
+                                        | [| ("install" | "hold" | "deinstall" | "purge"); "ok"; "installed\n" |] -> true
+                                        | _ -> false
+                                    with _ -> false
+                            if not packageKnown then invalidObservation ()
+                            else
+                                not stale && commands |> List.forall (fun c ->
+                                    let wanted = "path=" + executable + " ; argv[]=" + c + " ; ignore_errors=no ;"
+                                    hooks |> Seq.exists (fun h -> h.Contains(wanted, StringComparison.Ordinal)))
+                        | _ -> invalidObservation ()
+
         let hookOnDisk =
             match hook with
             | None -> true
@@ -308,3 +368,5 @@ module Services =
         result["active"] <- JsonValue.Create(active state)
         result["enabled"] <- JsonValue.Create(enabled state)
         result :> JsonNode
+    let handle (environment: HostEnvironment) (request: JsonElement) : JsonNode =
+        handleWithExecutable Environment.ProcessPath environment request

@@ -50,6 +50,12 @@ module Apt =
     let private debianVersionPattern = Regex("\\A(?:[0-9]+:)?[0-9][A-Za-z0-9.+~-]*(?:-[A-Za-z0-9+.~]+)?\\z", RegexOptions.CultureInvariant)
     let private strictUtf8 = UTF8Encoding(false, true)
 
+    [<Literal>]
+    let private DockerBootstrapVersion = "26.1.5+dfsg1-9+deb13u1+b1"
+    let private dockerInstallLine = Regex(@"\AInst\s+docker\.io(?=[:\s]|\z)", RegexOptions.CultureInvariant)
+    let private dockerSimulationInstallPattern =
+        Regex("\\AInst\\s+(\\S+)\\s+\\((\\S+)\\s+.*\\[([A-Za-z0-9_-]+)\\]\\)\\s*\\z", RegexOptions.CultureInvariant)
+
     module private Unix =
         [<Struct; StructLayout(LayoutKind.Sequential, Size = 256)>]
         type private AptStatx =
@@ -347,6 +353,63 @@ module Apt =
           Arguments = arguments }
 
     let private canonicalSimulatedName (name: string) = name.Split(':')[0]
+
+    let private dockerSimulationSelections (output: string) =
+        output.Split('\n')
+        |> Array.choose (fun line ->
+            let trimmed = line.Trim()
+            if dockerInstallLine.IsMatch trimmed then
+                let matched = dockerSimulationInstallPattern.Match(trimmed)
+
+                if not matched.Success then
+                    fail "APT simulation did not report a supported docker.io package selection"
+
+                let packageName = matched.Groups[1].Value
+                let version = matched.Groups[2].Value
+                let architecture = matched.Groups[3].Value
+                let architectureSuffix = packageName.LastIndexOf(':')
+
+                if architectureSuffix >= 0
+                   && packageName.Substring(architectureSuffix + 1) <> architecture then
+                    fail "APT simulation reported inconsistent docker.io architectures"
+
+                Some(version, architecture)
+            else
+                None)
+
+    let private strictDockerInstallArgument
+        (state: PackageState)
+        (desiredVersions: Map<string, string option>)
+        (simulationOutput: string)
+        =
+        if packageRecord state "docker.io" |> Option.isSome then
+            None
+        else
+            let selections = dockerSimulationSelections simulationOutput
+            let directlyOwned = Map.tryFind "docker.io" desiredVersions
+
+            match selections with
+            | [||] ->
+                if directlyOwned.IsSome then
+                    fail "APT simulation did not select the requested cold-installed docker.io package"
+                else
+                    None
+            | _ when directlyOwned.IsNone ->
+                fail "APT simulation would cold-install docker.io without direct ownership"
+            | [| selectedVersion, architecture |] ->
+                match directlyOwned.Value with
+                | Some requestedVersion when requestedVersion <> selectedVersion ->
+                    fail "APT simulation selected a different version than the exact requested docker.io version"
+                | _ -> ()
+
+                if selectedVersion <> DockerBootstrapVersion then
+                    fail "APT simulation selected an unsupported docker.io bootstrap version"
+
+                if architecture <> "amd64" || architecture <> state.NativeArchitecture then
+                    fail "APT simulation selected docker.io for an unqualified or non-native architecture"
+
+                Some("docker.io=" + selectedVersion)
+            | _ -> fail "APT simulation selected docker.io more than once"
 
     let validateSimulation
         (versionIsLess: string -> string -> bool)
@@ -711,6 +774,12 @@ module Apt =
     let private jsonPropertyOrUndefined (request: JsonElement) (name: string) =
         let mutable value = Unchecked.defaultof<JsonElement>
         if request.TryGetProperty(name, &value) then value else Unchecked.defaultof<JsonElement>
+    let private strictDockerBootstrapFromRequest (request: JsonElement) =
+        match (jsonPropertyOrUndefined request "strictDockerBootstrap").ValueKind with
+        | JsonValueKind.Undefined
+        | JsonValueKind.False -> false
+        | JsonValueKind.True -> true
+        | _ -> fail "strictDockerBootstrap must be a boolean"
 
     let private ownerIdFromRequest (request: JsonElement) =
         let value = jsonPropertyOrUndefined request "ownerId"
@@ -816,6 +885,7 @@ module Apt =
         let ownerId = ownerIdFromRequest request
         let previousNames = packageNamesFromRequest request "previousNames" "apply request previousNames must be an array"
         let desired = desiredVersionsFromRequest request
+        let strictDockerBootstrap = strictDockerBootstrapFromRequest request
         requireDebian environment
         let logicalLockDirectory = Path.GetDirectoryName(HostLockPath)
         let lockDirectory = mappedPath environment logicalLockDirectory
@@ -832,7 +902,7 @@ module Apt =
             | :? TimeoutException -> fail "timed out waiting for the Dorothy APT serialization lock"
             | error -> fail ("cannot open APT serialization lock " + HostLockPath + ": " + error.Message)
 
-        let journalNames = loadJournal environment ownerId true
+        let journalNames = loadJournal environment ownerId (not strictDockerBootstrap)
         let effectiveOwned = Set.union (Set.ofList journalNames) (Set.ofList previousNames) |> Set.toList
         let before = readPackageState environment
         let plan = planTransaction effectiveOwned desired before
@@ -860,6 +930,32 @@ module Apt =
             else
                 let simulationArguments = [ "-s"; "install" ] @ plan.Arguments
                 let simulation = runCommand environment "apt-get" simulationArguments false true
+                let qualifiedDockerArgument =
+                    if strictDockerBootstrap then
+                        strictDockerInstallArgument before desired simulation.Stdout
+                    else
+                        None
+
+                let realPlanArguments =
+                    match qualifiedDockerArgument with
+                    | None -> plan.Arguments
+                    | Some qualifiedArgument ->
+                        let mutable foundDockerArgument = false
+
+                        let arguments =
+                            plan.Arguments
+                            |> List.map (fun argument ->
+                                if argument = "docker.io"
+                                   || argument.StartsWith("docker.io=", StringComparison.Ordinal) then
+                                    foundDockerArgument <- true
+                                    qualifiedArgument
+                                else
+                                    argument)
+
+                        if not foundDockerArgument then
+                            fail "APT plan did not contain the directly owned docker.io install"
+
+                        arguments
                 let allowDowngrades = validateSimulation (versionIsLess environment) simulation.Stdout plan.Removals desired
                 validateSimulatedProtection simulation.Stdout before
                 let attemptedOwnership =
@@ -874,8 +970,7 @@ module Apt =
 
                 if List.isEmpty plan.Removals then
                     realArguments <- realArguments @ [ "--no-remove" ]
-
-                realArguments <- realArguments @ [ "install" ] @ plan.Arguments
+                realArguments <- realArguments @ [ "install" ] @ realPlanArguments
                 runCommand environment "apt-get" realArguments false true |> ignore
                 let resultingState = readPackageState environment
                 verifyTransaction before resultingState desired plan.Removals

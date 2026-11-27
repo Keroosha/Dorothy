@@ -117,6 +117,48 @@ type FirewalldDeploymentTests() =
             let plan = Dorothy.HostHelper.Apt.planTransaction [ "docker.io" ] desired state
             Assert.That(plan.Removals, Is.Empty)
             Assert.That(plan.Installs, Is.Empty)
+        let aptArgs (key: string) = byName[key].Args :?> AptPackageSetArgs
+        let isStrictDockerBootstrap (args: AptPackageSetArgs) =
+            if isNull (box args.StrictDockerBootstrap) then
+                false
+            else
+                let output: Output<bool> = Input<bool>.op_Implicit args.StrictDockerBootstrap
+                OutputUtilities.GetValueAsync(output).Result
+        Assert.That(isStrictDockerBootstrap (main.Args :?> AptPackageSetArgs), Is.EqualTo(strict))
+        Assert.That(isStrictDockerBootstrap (aptArgs "ordered-firewalld-package"), Is.False)
+        if not explicitVersion then
+            Assert.That(isStrictDockerBootstrap (aptArgs "ordered-docker-package"), Is.EqualTo(strict))
+
+    [<Test>]
+    member _.``APT-only Docker declaration does not enable strict Docker bootstrap``() =
+        let host =
+            sshHost "apt-only-docker" {
+                Address "192.0.2.3"
+                User "root"
+                debian {
+                    apt {
+                        packageVersion "docker.io" "26.1.5+dfsg1-9"
+                        packageVersion "firewalld" "2.3.1-1+deb13u1"
+                    }
+                    firewalld {
+                        strictForwardPorts true
+                        zone "external" { services [ "ssh" ]; interfaces [ "eth0" ] }
+                    }
+                }
+            }
+
+        FirewalldDeploymentFixture.captured.Clear()
+        FirewalldDeploymentFixture.host <- Some host
+        Deployment.TestAsync<FirewalldDependencyStack>(FirewalldDeploymentFixture.Mocks(), TestOptions()).GetAwaiter().GetResult() |> ignore
+
+        let name (resource: Resource) = OutputUtilities.GetValueAsync(resource.Urn).Result.Split("::") |> Array.last
+        let captured = FirewalldDeploymentFixture.captured |> Seq.filter (fun args -> not (args.Resource :? Stack)) |> Seq.toArray
+        let byName = captured |> Array.map (fun args -> name args.Resource, args) |> Map.ofArray
+        let main = byName["apt-only-docker"].Args :?> AptPackageSetArgs
+
+        Assert.That(isNull (box main.StrictDockerBootstrap), Is.True)
+        Assert.That(byName.ContainsKey "apt-only-docker-docker-firewall-bootstrap", Is.False)
+        Assert.That(byName.ContainsKey "apt-only-docker-docker-package", Is.False)
 
     [<Test>]
     member _.``Compiled Firewalld catalogue resolves declared references and keeps typed consumer syntax``() =

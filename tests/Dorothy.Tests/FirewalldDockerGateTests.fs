@@ -3,6 +3,7 @@ namespace Dorothy.Tests
 open System
 open Dorothy.HostHelper
 open System.IO
+open System.Text.Json
 open System.Text.Json.Nodes
 open NUnit.Framework
 
@@ -89,11 +90,18 @@ type FirewalldDockerGateTests() =
           "/usr/local/lib/systemd/system-environment-generators"
           "/usr/lib/systemd/system-environment-generators" ]
 
-    let withGeneratorHost (action: HostEnvironment -> (string -> byte[] -> string) -> (CommandResult -> unit) -> unit) =
+    let stockManagerConfiguration =
+        "# /etc/systemd/system.conf\n\n# /usr/lib/systemd/system.conf.d/10-coredump-debian.conf\n[Manager]\nDefaultLimitCORE=0:infinity\n"
+
+    let withGeneratorHost (action: HostEnvironment -> (string -> byte[] -> string) -> (CommandResult -> unit) -> (CommandResult -> unit) -> unit) =
         let root = Directory.CreateTempSubdirectory("dorothy-generator-profile-")
         let mutable managerEnvironment =
             { ExitCode = 0
               Stdout = "PATH=/usr/sbin:/usr/bin:/sbin:/bin\n"
+              Stderr = "" }
+        let mutable managerConfiguration =
+            { ExitCode = 0
+              Stdout = stockManagerConfiguration
               Stderr = "" }
         let procExePath = Path.Combine(root.FullName, "proc", "1", "exe")
         let run executable arguments _ =
@@ -103,10 +111,7 @@ type FirewalldDockerGateTests() =
                 { ExitCode = 0
                   Stdout = "799fd89964a716fb5f26c4506047190b6e842ac2745b473bd45351c4d8cbd929  " + path + "\n"
                   Stderr = "" }
-            | "/usr/bin/apt-cache", [ "policy"; "docker.io" ] ->
-                { ExitCode = 0
-                  Stdout = "docker.io:\n  Installed: (none)\n  Candidate: 26.1.5+dfsg1-9+deb13u1+b1\n"
-                  Stderr = "" }
+            | "/usr/bin/systemd-analyze", [ "--no-pager"; "--tldr"; "cat-config"; "systemd/system.conf" ] -> managerConfiguration
             | "/usr/bin/stat", [ "-L"; "-c"; "%f"; "--"; path ] when File.Exists path ->
                 { ExitCode = 0; Stdout = "81ed\n"; Stderr = "" }
             | "/usr/bin/stat", [ "-L"; "-c"; "%f"; "--"; _ ] ->
@@ -123,9 +128,51 @@ type FirewalldDockerGateTests() =
             writeHostFile "/etc/debian_version" (encode "13.8\n") |> ignore
             writeHostFile "/proc/1/environ" (encode "HOME=/\000PATH=/usr/sbin:/usr/bin:/sbin:/bin\000") |> ignore
             writeHostFile "/proc/1/exe" (encode "mock systemd executable") |> ignore
-            action environment writeHostFile (fun result -> managerEnvironment <- result)
+            action environment writeHostFile (fun result -> managerEnvironment <- result) (fun result -> managerConfiguration <- result)
         finally
             if Directory.Exists root.FullName then root.Delete(true)
+
+    let bootstrapUnitName = "dorothy-docker-firewall-bootstrap.service"
+    let bootstrapHelperPath = "/var/cache/keroosha-iac/helper/linux-x64/" + String.replicate 64 "a"
+
+    let withBootstrapServiceHost (dockerResult: CommandResult) (packageResult: CommandResult) (action: HostEnvironment -> ResizeArray<string * string list> -> unit) =
+        let root = Directory.CreateTempSubdirectory("dorothy-bootstrap-preflight-")
+        let calls = ResizeArray<string * string list>()
+        let ok stdout = { ExitCode = 0; Stdout = stdout; Stderr = "" }
+        let run executable arguments _ =
+            calls.Add((executable, arguments))
+            match executable, arguments with
+            | "/usr/bin/systemctl", [ "show"; "--property=LoadState,ActiveState,UnitFileState"; "--"; name ] when name = bootstrapUnitName ->
+                ok "LoadState=not-found\nActiveState=inactive\nUnitFileState=disabled\n"
+            | "/usr/bin/systemctl", [ "show"; "--property=LoadState,ExecStartPre,NeedDaemonReload"; "--"; "docker.service" ] ->
+                dockerResult
+            | "/usr/bin/dpkg-query", [ "--show"; "--showformat=${Status}\\n"; "docker.io" ] -> packageResult
+            | "/usr/bin/systemctl", [ "show"; "--no-pager"; "--property=LoadState,ActiveState,SubState"; "--"; "firewalld.service" ] ->
+                ok "LoadState=not-found\nActiveState=inactive\nSubState=dead\n"
+            | _ -> invalidOp ("Unexpected bootstrap preflight command: " + executable + " " + String.concat " " arguments)
+        let environment: HostEnvironment = { HostEnvironment.system with Root = root.FullName; Run = run }
+        try action environment calls
+        finally
+            if Directory.Exists root.FullName then root.Delete(true)
+
+    let applyBootstrapGate (environment: HostEnvironment) =
+        use request =
+            JsonDocument.Parse(
+                """{"operation":"apply","name":"dorothy-docker-firewall-bootstrap.service","managed":true,"configuration":"","restart":false,"dockerFence":[]}""")
+        Services.handleWithExecutable bootstrapHelperPath environment request.RootElement |> ignore
+
+    let assertNoBootstrapPublication (environment: HostEnvironment) (calls: ResizeArray<string * string list>) =
+        let unitPath = HostEnvironment.path environment ("/etc/systemd/system/" + bootstrapUnitName)
+        let hookPath =
+            HostEnvironment.path environment
+                ("/etc/systemd/system/docker.service.d/90-dorothy-" + bootstrapUnitName + ".conf")
+        Assert.That(File.Exists unitPath, Is.False)
+        Assert.That(File.Exists hookPath, Is.False)
+        Assert.That(calls |> Seq.exists (fun (_, arguments) -> arguments = [ "daemon-reload" ]), Is.False)
+        Assert.That(
+            calls |> Seq.exists (fun (_, arguments) ->
+                not arguments.IsEmpty && List.contains arguments.Head [ "start"; "enable"; "reenable"; "restart" ]),
+            Is.False)
 
     let assertRejectedFromEmptyInventory (environment: HostEnvironment) (addUnsafeItem: unit -> unit) =
         Assert.That(Services.coldGeneratorProfile environment, Is.True, "The empty generator inventory must be a passing baseline.")
@@ -265,7 +312,7 @@ type FirewalldDockerGateTests() =
             root.Delete(true)
     [<Test>]
     member _.``Cold generator profile permits missing and empty generator directories``() =
-        withGeneratorHost (fun environment _ _ ->
+        withGeneratorHost (fun environment _ _ _ ->
             Assert.That(Services.coldGeneratorProfile environment, Is.True)
             for directory in generatorDirectories do
                 Directory.CreateDirectory(HostEnvironment.path environment directory) |> ignore
@@ -278,7 +325,7 @@ type FirewalldDockerGateTests() =
     [<TestCase("/run/systemd/system-environment-generators/untrusted")>]
     [<TestCase("/usr/local/lib/systemd/system-environment-generators/untrusted")>]
     member _.``Cold generator profile rejects site executables``(logicalPath: string) =
-        withGeneratorHost (fun environment writeHostFile _ ->
+        withGeneratorHost (fun environment writeHostFile _ _ ->
             assertRejectedFromEmptyInventory environment (fun () ->
                 let path = writeHostFile logicalPath (System.Text.Encoding.UTF8.GetBytes "#!/bin/sh\n")
                 File.SetUnixFileMode(path, enum<UnixFileMode> 0o755)))
@@ -290,7 +337,7 @@ type FirewalldDockerGateTests() =
     [<TestCase("/run/systemd/system-environment-generators")>]
     [<TestCase("/usr/local/lib/systemd/system-environment-generators")>]
     member _.``Cold generator profile rejects unknown site symlinks``(logicalDirectory: string) =
-        withGeneratorHost (fun environment _ _ ->
+        withGeneratorHost (fun environment _ _ _ ->
             assertRejectedFromEmptyInventory environment (fun () ->
                 let path = HostEnvironment.path environment (logicalDirectory + "/unknown-generator")
                 Directory.CreateDirectory(Path.GetDirectoryName path) |> ignore
@@ -298,7 +345,7 @@ type FirewalldDockerGateTests() =
 
     [<Test>]
     member _.``Cold generator profile rejects a vendor executable masquerading as a stock generator``() =
-        withGeneratorHost (fun environment writeHostFile _ ->
+        withGeneratorHost (fun environment writeHostFile _ _ ->
             assertRejectedFromEmptyInventory environment (fun () ->
                 let path =
                     writeHostFile
@@ -308,7 +355,7 @@ type FirewalldDockerGateTests() =
 
     [<Test>]
     member _.``Cold generator profile rejects vendor environment generators``() =
-        withGeneratorHost (fun environment writeHostFile _ ->
+        withGeneratorHost (fun environment writeHostFile _ _ ->
             assertRejectedFromEmptyInventory environment (fun () ->
                 let path =
                     writeHostFile
@@ -319,7 +366,7 @@ type FirewalldDockerGateTests() =
     [<TestCase("SYSTEMD_GENERATOR_PATH")>]
     [<TestCase("SYSTEMD_ENVIRONMENT_GENERATOR_PATH")>]
     member _.``Cold generator profile rejects PID1 generator path overrides``(variable: string) =
-        withGeneratorHost (fun environment writeHostFile _ ->
+        withGeneratorHost (fun environment writeHostFile _ _ ->
             assertRejectedFromEmptyInventory environment (fun () ->
                 let pid1Environment =
                     "HOME=/\000PATH=/usr/sbin:/usr/bin:/sbin:/bin\000"
@@ -329,16 +376,75 @@ type FirewalldDockerGateTests() =
     [<TestCase("SYSTEMD_GENERATOR_PATH")>]
     [<TestCase("SYSTEMD_ENVIRONMENT_GENERATOR_PATH")>]
     member _.``Cold generator profile rejects manager generator path overrides``(variable: string) =
-        withGeneratorHost (fun environment _ setManagerEnvironment ->
+        withGeneratorHost (fun environment _ setManagerEnvironment _ ->
             assertRejectedFromEmptyInventory environment (fun () ->
                 setManagerEnvironment
                     { ExitCode = 0
                       Stdout = "PATH=/usr/sbin:/usr/bin:/sbin:/bin\n" + variable + "=/opt/unapproved\n"
                       Stderr = "" }))
 
+
+    [<TestCase("ManagerEnvironment=")>]
+    [<TestCase("ManagerEnvironment=PATH=/usr/local/bin")>]
+    [<TestCase("UnknownManagerDirective=value")>]
+    member _.``Cold generator profile rejects manager environment and unknown active settings``(directive: string) =
+        withGeneratorHost (fun environment _ _ setManagerConfiguration ->
+            assertRejectedFromEmptyInventory environment (fun () ->
+                setManagerConfiguration
+                    { ExitCode = 0
+                      Stdout = stockManagerConfiguration + directive + "\n"
+                      Stderr = "" }))
+
+    [<Test>]
+    member _.``Cold generator profile rejects unavailable manager configuration``() =
+        withGeneratorHost (fun environment _ _ setManagerConfiguration ->
+            assertRejectedFromEmptyInventory environment (fun () ->
+                setManagerConfiguration { ExitCode = 1; Stdout = ""; Stderr = "systemd-analyze failed" }))
+
+    [<TestCase("masked")>]
+    [<TestCase("unrecognized")>]
+    [<TestCase("opaque")>]
+    [<TestCase("query-failure")>]
+    member _.``Bootstrap refuses unclassifiable Docker state before publishing its gate``(observation: string) =
+        let dockerResult =
+            match observation with
+            | "masked" ->
+                { ExitCode = 0; Stdout = "LoadState=masked\nExecStartPre=\nNeedDaemonReload=no\n"; Stderr = "" }
+            | "unrecognized" ->
+                { ExitCode = 0; Stdout = "LoadState=alien\nExecStartPre=\nNeedDaemonReload=no\n"; Stderr = "" }
+            | "opaque" ->
+                { ExitCode = 0; Stdout = "LoadState=loaded\nExecStartPre=\nNeedDaemonReload=no\nUnknown=value\n"; Stderr = "" }
+            | _ -> { ExitCode = 1; Stdout = ""; Stderr = "systemctl failed" }
+        withBootstrapServiceHost dockerResult { ExitCode = 1; Stdout = ""; Stderr = "package absent" } (fun environment calls ->
+            let error = Assert.Throws<Services.BackendError>(fun () -> applyBootstrapGate environment)
+            Assert.That(error.Message, Does.Contain "classify Docker")
+            Assert.That(calls |> Seq.exists (fun (executable, _) -> executable = "/usr/bin/dpkg-query"), Is.False)
+            assertNoBootstrapPublication environment calls)
+
+    [<Test>]
+    member _.``Bootstrap refuses a loaded site unit without installed docker.io before publishing``() =
+        let dockerResult =
+            { ExitCode = 0; Stdout = "LoadState=loaded\nExecStartPre=\nNeedDaemonReload=no\n"; Stderr = "" }
+        let packageResult = { ExitCode = 1; Stdout = ""; Stderr = "package absent" }
+        withBootstrapServiceHost dockerResult packageResult (fun environment calls ->
+            let error = Assert.Throws<Services.BackendError>(fun () -> applyBootstrapGate environment)
+            Assert.That(error.Message, Does.Contain "classify Docker")
+            Assert.That(calls |> Seq.exists (fun (executable, _) -> executable = "/usr/bin/dpkg-query"), Is.True)
+            assertNoBootstrapPublication environment calls)
+
+    [<Test>]
+    member _.``Healthy installed Docker reaches admission checks while its future hook is absent``() =
+        let dockerResult =
+            { ExitCode = 0; Stdout = "LoadState=loaded\nExecStartPre=\nNeedDaemonReload=no\n"; Stderr = "" }
+        let packageResult = { ExitCode = 0; Stdout = "install ok installed\n"; Stderr = "" }
+        withBootstrapServiceHost dockerResult packageResult (fun environment calls ->
+            let error = Assert.Throws<Firewalld.BackendError>(fun () -> applyBootstrapGate environment)
+            Assert.That(error.Message, Does.Contain "native firewalld systemd unit is not loaded")
+            Assert.That(calls |> Seq.exists (fun (executable, _) -> executable = "/usr/bin/dpkg-query"), Is.True)
+            assertNoBootstrapPublication environment calls)
     [<Test>]
     member _.``Cold generator profile requires explicit PID1 and manager environment data``() =
-        withGeneratorHost (fun environment writeHostFile setManagerEnvironment ->
+        withGeneratorHost (fun environment writeHostFile setManagerEnvironment _ ->
             assertRejectedFromEmptyInventory environment (fun () ->
                 File.Delete(HostEnvironment.path environment "/proc/1/environ"))
             // Restore PID1's environment before checking systemctl's independent evidence.
