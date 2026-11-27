@@ -2534,6 +2534,7 @@ module Traefik =
             tryDurationNanoseconds (if actual.ValueKind = JsonValueKind.String then actual.GetString() else null) = Some 10000000000M
         | "passiveHealthCheck" :: "loadBalancer" :: _, "maxFailedAttempts" -> isInteger 1L
         | "mirroring" :: _, "mirrorBody" -> actual.ValueKind = JsonValueKind.True
+        | [ "forwardAuth" ], "maxBodySize" when scope = HttpMiddleware -> isInteger -1L
         | "mirroring" :: _, "maxBodySize" -> isInteger -1L
         | "errors" :: "failover" :: _, "maxRequestBodyBytes" -> isInteger -1L
         | "observability" :: _, _ -> false
