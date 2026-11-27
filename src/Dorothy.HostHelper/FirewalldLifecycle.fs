@@ -328,6 +328,9 @@ module FirewalldLifecycle =
                 if interrupted then fail "A new recovery attempt cannot attest an interrupted inverse command."
                 let valid =
                     match last, next.InFlightStep with
+                    | None, None ->
+                        next.RemainingSteps = 0
+                        && (transaction.NativeProgress |> Option.exists (fun progress -> progress.CompletedSteps > 0))
                     | None, Some i -> i >= 0 && i < 4096 && next.RemainingSteps = i + 1
                     | Some prior, Some i -> prior.InFlightStep.IsNone && prior.RemainingSteps = next.RemainingSteps && i >= 0 && i = next.RemainingSteps - 1
                     | Some prior, None -> prior.InFlightStep = Some next.RemainingSteps && prior.RemainingSteps = next.RemainingSteps + 1
@@ -439,7 +442,13 @@ module FirewalldLifecycle =
                     fail "Firewalld permanent preimage changed before post-boot runtime recovery."
                 restoreRuntime transaction BootAfterFirewalld
             | BootAfterFirewalld -> fail "Post-boot recovery lacks the ordered preboot reservation."
-            | _ -> restoreRuntime transaction phase
+            | _ ->
+                let unstartedNativeRepair =
+                    transaction.NativeProgress
+                    |> Option.exists (fun progress -> progress.CompletedSteps = 0)
+                if phase = ActiveDaemon && transaction.AwaitingPostBoot && transaction.NativeUndo.IsNone && unstartedNativeRepair then
+                    fail "Ordered post-boot recovery must verify the native repair before active recovery can retire it."
+                restoreRuntime transaction phase
         if not (needsBootInverse && phase = BootBeforeFirewalld) then
             match journal with
             | Some value ->

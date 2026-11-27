@@ -426,7 +426,13 @@ type FirewalldRecoveryProofTests() =
             FirewalldRecoveryProof.activateRuntimeRepairWithProgress environment configuration proof report
             let repaired = FirewalldRuntime.inspectRuntime environment "zone" "quiet" |> Option.get
             Assert.That(repaired.Ports, Is.EquivalentTo [ "443/tcp" ])
-            restoreWithoutReload environment configuration None (Some proof) FirewalldLifecycle.ActiveDaemon (getProgress ())
+            let mutable inverseReceipt = None
+            FirewalldRecoveryProof.restoreRuntimeWithProgress environment configuration None (Some proof)
+                FirewalldLifecycle.ActiveDaemon (fun () -> Assert.Fail "A runtime inverse must not reload.") (getProgress ())
+                (Some
+                    { Previous = None
+                      Persist = fun receipt -> inverseReceipt <- Some receipt })
+            Assert.That(inverseReceipt.Value.RemainingSteps, Is.Zero)
             let rolledBack = FirewalldRuntime.inspectRuntime environment "zone" "quiet" |> Option.get
             Assert.That(rolledBack.Ports, Is.Empty)
             FirewalldRecoveryProof.activateRuntimeRepairWithProgress environment configuration proof report
@@ -437,6 +443,133 @@ type FirewalldRecoveryProofTests() =
             restoreWithoutReload environment configuration None (Some proof) FirewalldLifecycle.BootAfterFirewalld (getProgress ())
             let postbootRollback = FirewalldRuntime.inspectRuntime environment "zone" "quiet" |> Option.get
             Assert.That(postbootRollback.Ports, Is.Empty))
+
+    [<Test>]
+    member _.``Object delta retires an authenticated clean preimage exactly once``() =
+        let before = FirewalldModel.empty "zone" "quiet"
+        let after = { before with Services = [ "ssh" ] }
+        let beforeXml = Some(FieldRuntime.render before)
+        let beforeValues = selectorValues before
+        let afterValues = selectorValues after
+        withSelectorRuntimeProgress before beforeValues (fun environment calls current setCurrent report getProgress ->
+            let proof = FirewalldRecoveryProof.objectDeltaProof environment after beforeXml (Some(FieldRuntime.render after)) |> Option.get
+            FirewalldRecoveryProof.activateObjectDeltaWithProgress environment after beforeXml proof report
+            let forward = getProgress ()
+            setCurrent beforeValues
+            let mutable receipt = None
+            let mutable persisted = 0
+            let restore (previous: FirewalldLifecycle.NativeUndoProgress option) =
+                FirewalldRecoveryProof.restoreRuntimeWithProgress environment after beforeXml (Some proof)
+                    FirewalldLifecycle.ActiveDaemon (fun () -> Assert.Fail "A scoped inverse must not reload.") forward
+                    (Some
+                        { Previous = previous
+                          Persist = fun value ->
+                              persisted <- persisted + 1
+                              receipt <- Some value })
+            let removeCount () =
+                calls
+                |> Seq.filter (fun args -> args |> List.exists (fun value -> value.StartsWith("--remove-", StringComparison.Ordinal)))
+                |> Seq.length
+            restore None
+            let retired = receipt |> Option.defaultWith (fun () -> failwith "Expected durable preimage retirement")
+            Assert.That(retired.RemainingSteps, Is.Zero)
+            Assert.That(retired.InFlightStep, Is.EqualTo None)
+            Assert.That(persisted, Is.EqualTo 1)
+            Assert.That(removeCount (), Is.Zero)
+            setCurrent afterValues
+            restore (Some retired)
+            Assert.That(persisted, Is.EqualTo 1)
+            Assert.That(removeCount (), Is.Zero)
+            Assert.That(current (), Is.EqualTo(box afterValues)))
+
+    [<Test>]
+    member _.``Runtime delta retires an authenticated clean preimage exactly once``() =
+        let beforeValues = selectorValues configuration |> Map.map (fun _ _ -> [])
+        let afterValues = selectorValues configuration
+        withSelectorRuntimeProgress configuration beforeValues (fun environment calls current setCurrent report getProgress ->
+            let snapshot = FirewalldRuntime.inspectRuntime environment "zone" "quiet" |> Option.get
+            let proof = FirewalldRecoveryProof.runtimeRepairProof environment configuration snapshot
+            FirewalldRecoveryProof.activateRuntimeRepairWithProgress environment configuration proof report
+            let forward = getProgress ()
+            setCurrent beforeValues
+            let mutable receipt = None
+            let mutable persisted = 0
+            let restore (previous: FirewalldLifecycle.NativeUndoProgress option) =
+                FirewalldRecoveryProof.restoreRuntimeWithProgress environment configuration None (Some proof)
+                    FirewalldLifecycle.ActiveDaemon (fun () -> Assert.Fail "A runtime inverse must not reload.") forward
+                    (Some
+                        { Previous = previous
+                          Persist = fun value ->
+                              persisted <- persisted + 1
+                              receipt <- Some value })
+            let removeCount () =
+                calls
+                |> Seq.filter (fun args -> args |> List.exists (fun value -> value.StartsWith("--remove-", StringComparison.Ordinal)))
+                |> Seq.length
+            restore None
+            let retired = receipt |> Option.defaultWith (fun () -> failwith "Expected durable preimage retirement")
+            Assert.That(retired.RemainingSteps, Is.Zero)
+            Assert.That(retired.InFlightStep, Is.EqualTo None)
+            Assert.That(persisted, Is.EqualTo 1)
+            Assert.That(removeCount (), Is.Zero)
+            setCurrent afterValues
+            restore (Some retired)
+            Assert.That(persisted, Is.EqualTo 1)
+            Assert.That(removeCount (), Is.Zero)
+            Assert.That(current (), Is.EqualTo(box afterValues)))
+
+    [<TestCase(false)>]
+    [<TestCase(true)>]
+    member _.``A legacy forward checkpoint cannot authorize an inverse``(runtimeOnly: bool) =
+        let inverseCount (calls: ResizeArray<string list>) =
+            calls
+            |> Seq.filter (fun args -> args |> List.exists (fun value -> value.StartsWith("--remove-", StringComparison.Ordinal)))
+            |> Seq.length
+        if runtimeOnly then
+            let beforeValues = selectorValues configuration |> Map.map (fun _ _ -> [])
+            withSelectorRuntimeProgress configuration beforeValues (fun environment calls _ _ report getProgress ->
+                let snapshot = FirewalldRuntime.inspectRuntime environment "zone" "quiet" |> Option.get
+                let proof = FirewalldRecoveryProof.runtimeRepairProof environment configuration snapshot
+                FirewalldRecoveryProof.activateRuntimeRepairWithProgress environment configuration proof report
+                Assert.Throws<InvalidOperationException>(fun () ->
+                    FirewalldRecoveryProof.restoreRuntimeWithProgress environment configuration None (Some proof)
+                        FirewalldLifecycle.ActiveDaemon (fun () -> Assert.Fail "A runtime inverse must not reload.")
+                        (getProgress ()) None)
+                |> ignore
+                Assert.That(inverseCount calls, Is.Zero))
+        else
+            let before = FirewalldModel.empty "zone" "quiet"
+            let after = { before with Services = [ "ssh" ] }
+            let beforeXml = Some(FieldRuntime.render before)
+            withSelectorRuntimeProgress before (selectorValues before) (fun environment calls _ _ report getProgress ->
+                let proof = FirewalldRecoveryProof.objectDeltaProof environment after beforeXml (Some(FieldRuntime.render after)) |> Option.get
+                FirewalldRecoveryProof.activateObjectDeltaWithProgress environment after beforeXml proof report
+                Assert.Throws<InvalidOperationException>(fun () ->
+                    FirewalldRecoveryProof.restoreRuntimeWithProgress environment after beforeXml (Some proof)
+                        FirewalldLifecycle.ActiveDaemon (fun () -> Assert.Fail "A scoped inverse must not reload.")
+                        (getProgress ()) None)
+                |> ignore
+                Assert.That(inverseCount calls, Is.Zero))
+
+    [<Test>]
+    member _.``Awaiting postboot runtime delta is inverted from the loaded candidate despite pristine progress``() =
+        let beforeValues = selectorValues configuration |> Map.map (fun _ _ -> [])
+        withSelectorRuntimeProgress configuration beforeValues (fun environment calls current _ report _ ->
+            let snapshot = FirewalldRuntime.inspectRuntime environment "zone" "quiet" |> Option.get
+            let proof = FirewalldRecoveryProof.runtimeRepairProof environment configuration snapshot
+            FirewalldRecoveryProof.activateRuntimeRepairWithProgress environment configuration proof report
+            let mutable durable = None
+            let inverse: FirewalldLifecycle.NativeActivationProgress option = Some { CompletedSteps = 0; InFlightStep = None }
+            FirewalldRecoveryProof.restoreRuntimeWithProgress environment configuration None (Some proof)
+                FirewalldLifecycle.BootAfterFirewalld (fun () -> Assert.Fail "A runtime inverse must not reload.") inverse
+                (Some
+                    { Previous = None
+                      Persist = fun value -> durable <- Some value })
+            Assert.That(current (), Is.EqualTo(box beforeValues))
+            Assert.That(durable.Value.RemainingSteps, Is.Zero)
+            Assert.That(
+                calls |> Seq.exists (fun args -> args |> List.exists (fun value -> value.StartsWith("--remove-", StringComparison.Ordinal))),
+                Is.True))
 
     [<Test>]
     member _.``Runtime repair refuses multiple or foreign selector changes before mutation``() =

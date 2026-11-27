@@ -59,12 +59,20 @@ type FirewalldGuardTests() =
                   Run = fun executable arguments _ ->
                       match executable, arguments with
                       | "ss", [ "-H"; "-ltnp" ] -> { ExitCode = 0; Stdout = output; Stderr = "" }
-                      | "/usr/bin/readlink", [ "-f"; "/proc/321/exe" ] ->
+                      | "/usr/bin/readlink", [ "-e"; "/proc/321/exe" ] ->
                           { ExitCode = 0; Stdout = "/usr/sbin/sshd\n"; Stderr = "" }
-                      | "/usr/bin/readlink", [ "-f"; "/proc/322/exe" ] ->
+                      | "/usr/bin/readlink", [ "-e"; "/proc/322/exe" ] ->
                           { ExitCode = 1; Stdout = ""; Stderr = "unreadable" }
-                      | "/usr/bin/readlink", [ "-f"; "/proc/323/exe" ] ->
+                      | "/usr/bin/readlink", [ "-e"; "/proc/323/exe" ] ->
                           { ExitCode = 0; Stdout = "/opt/dorothy/app\n"; Stderr = "" }
+                      | "/usr/bin/readlink", [ "-e"; "/proc/324/exe" ] ->
+                          { ExitCode = 0; Stdout = "/usr/sbin/sshd (deleted)\n"; Stderr = "" }
+                      | "/usr/bin/readlink", [ "-e"; "/proc/325/exe" ] ->
+                          { ExitCode = 0; Stdout = "/opt/dorothy/app\n"; Stderr = "" }
+                      | "/usr/bin/test", [ "/proc/323/exe"; "-ef"; "/opt/dorothy/app" ] ->
+                          { ExitCode = 0; Stdout = ""; Stderr = "" }
+                      | "/usr/bin/test", [ "/proc/325/exe"; "-ef"; "/opt/dorothy/app" ] ->
+                          { ExitCode = 1; Stdout = ""; Stderr = "" }
                       | _ -> failwith "Unexpected listener inventory command."
                   UtcNow = fun () -> DateTimeOffset.UnixEpoch }
             let listeners =
@@ -72,10 +80,12 @@ type FirewalldGuardTests() =
                     [ "LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:((\"sshd\",pid=321,fd=3))"
                       "LISTEN 0 128 [::]:22 [::]:* users:((\"sshd\",pid=321,fd=4))"
                       "LISTEN 0 128 [::]:2222 [::]:* users:((\"custom-ssh-proxy\",pid=322,fd=3))"
+                      "LISTEN 0 128 [::]:2242 [::]:* users:((\"daemon\",pid=324,fd=3))"
+                      "LISTEN 0 128 [::]:2243 [::]:* users:((\"app\",pid=325,fd=3))"
                       "LISTEN 0 128 127.0.0.1:41821 127.0.0.1:* users:((\"app\",pid=323,fd=5))"
                       "LISTEN 0 128 127.0.0.1:41822 127.0.0.1:* users:((\"app\",pid=323,fd=6))" ]
             let ports = FirewalldRecoveryProof.managementServerPorts (environment listeners)
-            Assert.That(ports, Is.EqualTo(Some(set [22; 2222])))
+            Assert.That(ports, Is.EqualTo(Some(set [22; 2222; 2242; 2243])))
             let defs =
                 Map.ofList
                     [ "policy", Map.empty
@@ -86,6 +96,10 @@ type FirewalldGuardTests() =
                 FirewalldReferences.preservesManagement FirewalldGuardNative.parseXml
                     "service" "app" defs ports (port 41821) (port 41822),
                 Is.True)
+            Assert.That(
+                FirewalldReferences.preservesManagement FirewalldGuardNative.parseXml
+                    "service" "app" defs ports (port 2242) (port 41822),
+                Is.False)
             let noProcess = "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*"
             Assert.That(
                 FirewalldRecoveryProof.managementServerPorts (environment noProcess),
@@ -169,8 +183,9 @@ type FirewalldGuardTests() =
             Environment.SetEnvironmentVariable("SSH_CONNECTION", previous)
 
 
-    [<Test>]
-    member _.``Same-source admission unions services with explicit listener ports``() =
+    [<TestCase(false)>]
+    [<TestCase(true)>]
+    member _.``Acquiring a source or interface needs all management listeners or equivalent admission``(acquireInterface: bool) =
         let previous = Environment.GetEnvironmentVariable "SSH_CONNECTION"
         try
             Environment.SetEnvironmentVariable("SSH_CONNECTION", "192.0.2.1 49200 192.0.2.2 22")
@@ -182,8 +197,9 @@ type FirewalldGuardTests() =
             let candidate explicitPorts =
                 { FirewalldModel.empty "zone" "source" with
                     Services = [ "app" ]
-                    Ports = explicitPorts
-                    Elements = [ source ] }
+                    Ports = "53/udp" :: explicitPorts
+                    Interfaces = if acquireInterface then [ "enp6" ] else []
+                    Elements = if acquireInterface then [] else [ source ] }
             let zoneInfo =
                 String.concat "\n"
                     [ "public"
@@ -193,7 +209,7 @@ type FirewalldGuardTests() =
                       "  icmp-block-inversion: no"
                       "  sources:"
                       "  services:"
-                      "  ports:"
+                      "  ports: 22/tcp 2222/tcp"
                       "  protocols:"
                       "  forward: no"
                       "  masquerade: no"
@@ -204,7 +220,7 @@ type FirewalldGuardTests() =
             let serviceInfo =
                 String.concat "\n"
                     [ "app"
-                      "  ports: 22/tcp"
+                      "  ports: 22/tcp 53/udp"
                       "  protocols:"
                       "  source-ports:"
                       "  modules:"
@@ -215,15 +231,15 @@ type FirewalldGuardTests() =
                 String.concat "\n"
                     [ "LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:((\"sshd\",pid=321,fd=3))"
                       "LISTEN 0 128 [::]:2222 [::]:* users:((\"sshd\",pid=322,fd=3))" ]
-            let environment: HostEnvironment =
+            let environment inventory: HostEnvironment =
                 { Root = Path.GetTempPath()
                   Run = fun executable arguments _ ->
                       let result stdout = { ExitCode = 0; Stdout = stdout; Stderr = "" }
                       match executable, arguments with
-                      | "ss", [ "-H"; "-ltnp" ] -> result listenerOutput
-                      | "/usr/bin/readlink", [ "-f"; "/proc/321/exe" ] -> result "/usr/sbin/sshd"
-                      | "/usr/bin/readlink", [ "-f"; "/proc/322/exe" ] -> result "/usr/sbin/sshd"
-                      | "ip", [ "-j"; "link"; "show" ] -> result "[]"
+                      | "ss", [ "-H"; "-ltnp" ] -> result inventory
+                      | "/usr/bin/readlink", [ "-e"; "/proc/321/exe" ] -> result "/usr/sbin/sshd"
+                      | "/usr/bin/readlink", [ "-e"; "/proc/322/exe" ] -> result "/usr/sbin/sshd"
+                      | "ip", [ "-j"; "link"; "show" ] -> result """[{"ifname":"enp6"}]"""
                       | "firewall-cmd", [ "--get-zones" ] -> result "public source"
                       | "firewall-cmd", [ "--get-default-zone" ] -> result "public"
                       | "firewall-cmd", [ "--get-policies" ] -> result ""
@@ -236,12 +252,18 @@ type FirewalldGuardTests() =
                       | "firewall-cmd", [ "--permanent"; "--info-service=app" ] -> result serviceInfo
                       | _ -> failwith "Unexpected same-source proof command."
                   UtcNow = fun () -> DateTimeOffset.UnixEpoch }
-            let narrows explicitPorts =
+            let narrows inventory explicitPorts =
                 let value = candidate explicitPorts
+                let before =
+                    if acquireInterface then Some(FieldRuntime.render { (candidate []) with Interfaces = [] })
+                    else None
                 FirewalldRecoveryProof.objectTransitionMayNarrowManagement
-                    environment value None (Some(FieldRuntime.render value))
-            Assert.That(narrows [ "2222/tcp" ], Is.False)
-            Assert.That(narrows [], Is.True)
+                    (environment inventory) value before (Some(FieldRuntime.render value))
+            Assert.That(narrows listenerOutput [ "2222/tcp" ], Is.False)
+            Assert.That(narrows listenerOutput [], Is.True)
+            Assert.That(narrows listenerOutput [ "22/tcp" ], Is.True)
+            Assert.That(narrows "incomplete" [], Is.True)
+            Assert.That(narrows "incomplete" [ "2222/tcp" ], Is.True)
         finally
             Environment.SetEnvironmentVariable("SSH_CONNECTION", previous)
     [<Test>]

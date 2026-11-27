@@ -194,6 +194,37 @@ type FirewalldLifecycleTests() =
             Assert.Throws<InvalidOperationException>(fun () -> load () |> ignore) |> ignore)
 
     [<Test>]
+    member _.``An already-restored native checkpoint persists terminal inverse authority``() =
+        withHost (fun env root ->
+            let generation = Guid.NewGuid()
+            writeFile root "/proc/sys/kernel/random/boot_id" (string generation) 0o644
+            let record = pendingRecord 2 true false
+            record["version"] <- JsonValue.Create 4
+            record["nativeProgress"] <- JsonNode.Parse("""{"completedSteps":2,"inFlightStep":null}""")
+            record["nativeUndo"] <- null
+            savePendingRecord root record
+            let load () =
+                let reservation = FirewalldLifecycle.pending env |> Option.get
+                FirewalldLifecycle.undoJournal env reservation |> Option.get
+            (load ()).Persist { RemainingSteps = 0; InFlightStep = None }
+            use stored = JsonDocument.Parse(File.ReadAllText(physical root "/var/lib/keroosha-iac/firewalld/pending-transaction.json"))
+            let serialized = stored.RootElement
+            Assert.That(serialized.GetProperty("nativeProgress").GetProperty("completedSteps").GetInt32(), Is.EqualTo 2)
+            Assert.That(serialized.GetProperty("nativeUndo").GetProperty("remainingSteps").GetInt32(), Is.Zero)
+            Assert.That(serialized.GetProperty("nativeUndo").GetProperty("inFlightStep").ValueKind, Is.EqualTo JsonValueKind.Null)
+            let retired = load ()
+            Assert.That(retired.Previous.Value.RemainingSteps, Is.Zero)
+            Assert.Throws<InvalidOperationException>(fun () ->
+                retired.Persist { RemainingSteps = 1; InFlightStep = Some 0 }) |> ignore
+            let pristineRecord = pendingRecord 2 true false
+            pristineRecord["version"] <- JsonValue.Create 4
+            pristineRecord["nativeProgress"] <- JsonNode.Parse("""{"completedSteps":0,"inFlightStep":null}""")
+            pristineRecord["nativeUndo"] <- null
+            savePendingRecord root pristineRecord
+            Assert.Throws<InvalidOperationException>(fun () ->
+                (load ()).Persist { RemainingSteps = 0; InFlightStep = None }) |> ignore)
+
+    [<Test>]
     member _.``Fresh confirmation commits the journaled candidate``() =
         withHost (fun environment root ->
             writeFile root logicalPath before 0o644
@@ -342,6 +373,48 @@ type FirewalldLifecycleTests() =
             Assert.That(FirewalldLifecycle.pending environment, Is.EqualTo None)
             use finished = JsonDocument.Parse(File.ReadAllText(physical root journalPath))
             Assert.That(finished.RootElement.GetProperty("pending").ValueKind, Is.EqualTo JsonValueKind.Null))
+
+    [<TestCase(false); TestCase(true)>]
+    member _.``Active recovery quarantines pristine postboot repairs but preserves retry receipts``(hasRetryReceipt: bool) =
+        withHost (fun environment root ->
+            let journalPath = "/var/lib/keroosha-iac/firewalld/zone-lifecycle.json"
+            let generation = Guid.NewGuid()
+            writeFile root "/proc/sys/kernel/random/boot_id" (string generation) 0o644
+            let record = pendingRecord 2 true true
+            record["version"] <- JsonValue.Create 4
+            record["rollbackProof"].AsObject()["strategy"] <- JsonValue.Create "runtime-delta"
+            record["nativeProgress"] <- JsonNode.Parse("""{"completedSteps":0,"inFlightStep":null}""")
+            if hasRetryReceipt then
+                let undo = JsonObject()
+                undo["bootId"] <- JsonValue.Create(generation.ToString("D"))
+                undo["remainingSteps"] <- JsonValue.Create 1
+                undo["inFlightStep"] <- null
+                record["nativeUndo"] <- undo
+            else record["nativeUndo"] <- null
+            let value = journal owner (Some before) (Some after)
+            value["pending"] <- record.DeepClone()
+            writeFile root journalPath (value.ToJsonString()) 0o600
+            writeFile root logicalPath before 0o644
+            savePendingRecord root record
+            let mutable observedPhase = None
+            let mutable observedRemaining = None
+            let recover (transaction: FirewalldLifecycle.PendingTransaction) storedJournal =
+                let stored = storedJournal |> Option.defaultWith (fun () -> failwith "Expected owner journal")
+                FirewalldLifecycle.recoverPendingTransaction environment transaction.Configuration stored transaction.Path
+                    FirewalldLifecycle.ActiveDaemon readState (writeState root transaction.Path) (fun _ runtimePhase ->
+                        observedPhase <- Some runtimePhase
+                        if hasRetryReceipt then
+                            let inverse = FirewalldLifecycle.undoJournal environment transaction |> Option.get
+                            observedRemaining <- inverse.Previous |> Option.map (fun receipt -> receipt.RemainingSteps)
+                        invalidOp "postboot native repair remains pending")
+            Assert.Throws<InvalidOperationException>(fun () -> FirewalldLifecycle.recoverPending environment recover) |> ignore
+            if hasRetryReceipt then
+                Assert.That(observedPhase, Is.EqualTo(Some FirewalldLifecycle.ActiveDaemon))
+                Assert.That(observedRemaining, Is.EqualTo(Some 1))
+            else
+                Assert.That(observedPhase, Is.EqualTo None)
+            let waiting = FirewalldLifecycle.pending environment |> Option.defaultWith (fun () -> failwith "Expected retained native repair")
+            Assert.That(waiting.AwaitingPostBoot, Is.True))
 
     [<Test>]
     member _.``Legacy pending host records fail closed without changing disk or journal``() =
