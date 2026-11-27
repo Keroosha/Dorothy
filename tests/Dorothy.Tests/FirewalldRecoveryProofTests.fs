@@ -450,6 +450,18 @@ type FirewalldRecoveryProofTests() =
             Assert.That(restored["icmp-blocks"], Is.Empty))
 
     [<Test>]
+    member _.``Native reject zone spelling survives disk and loaded rollback comparison``() =
+        // 2.3.1 reports %%REJECT%% in both the vendor zone XML and --list-all.
+        let blocked = { configuration with Target = "%%REJECT%%" }
+        withSelectorRuntime blocked (selectorValues blocked) (fun environment _ _ _ ->
+            let xml = Some(FieldRuntime.render blocked)
+            let other = Some(FieldRuntime.render { blocked with Target = "ACCEPT" })
+            let proof = FirewalldRecoveryProof.reloadProof environment blocked xml other
+            Assert.That(proof["beforeFingerprint"].GetValue<string>(), Is.Not.EqualTo(proof["afterFingerprint"].GetValue<string>()))
+            Assert.Throws<InvalidOperationException>(fun () ->
+                FirewalldRecoveryProof.reloadProof environment blocked other xml |> ignore) |> ignore)
+
+    [<Test>]
     member _.``Loaded projection accepts only UUID-authorized NetworkManager interfaces``() =
         let configuration = { FirewalldModel.empty "zone" "quiet" with Services = [ "ssh" ] }
         let project (configuration: FirewalldModel.Configuration) =

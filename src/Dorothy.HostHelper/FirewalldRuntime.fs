@@ -867,7 +867,6 @@ module FirewalldRuntime =
         let ingress = combine "ingress-zone" "name" c.Ingress
         let egress = combine "egress-zone" "name" c.Egress
         let target = Map.tryFind "target" c.Attributes |> Option.defaultValue c.Target
-        let target = if target = "%%REJECT%%" then "REJECT" else target
         let rootPriority name fallback =
             Map.tryFind name c.Attributes |> Option.map canonicalInteger |> Option.defaultValue fallback
         let sourcePorts =
