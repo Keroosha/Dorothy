@@ -283,7 +283,7 @@ module internal FirewalldCreateReceipts =
         let recoveryTicket = importId receipt
         "Firewalld Create failed (" + safeFailureSummary receipt error + "); the remote outcome may be ambiguous. "
         + "Recovery ticket: " + recoveryTicket
-        + ". Recover only with `pulumi import --protect=false <type> <resource-name> " + recoveryTicket + "`."
+        + ". Recover only with `pulumi import --protect=false --generate-code=false <type> <resource-name> " + recoveryTicket + "`."
 
     let pathForTicket ticket = Path.Combine(receiptDirectory (), ticket + ".json")
 
