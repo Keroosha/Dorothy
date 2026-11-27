@@ -42,11 +42,12 @@ module Program =
                     nativeField "disableANSChecks" (nativeBoolean true)
                 })
             })
-        let acmeFields (caServer: string) (challenge: TraefikNativeField) =
+        let acmeFields shortRenewal (caServer: string) (challenge: TraefikNativeField) =
             nativeObject {
                 acmeEmail "ops@acceptance.test"
                 acmeCaServer caServer
                 acmeKeyType "EC256"
+                if shortRenewal then nativeField "profile" (nativeString "renewal")
                 challenge
                 nativeField "certificatesDuration" (nativeInteger 1)
                 nativeField "caSystemCertPool" (nativeBoolean true)
@@ -86,20 +87,20 @@ module Program =
                 staticCertificatesResolvers {
                     if phase = "rotate" || phase = "rollback" || phase = "withdraw-udp" || phase = "rollback-udp" then
                         staticCertificatesResolver (resolverName "acceptance-rotated") {
-                            yield acme (acmeFields "https://localhost:14001/dir" dnsChallenge)
+                            yield acme (acmeFields false "https://localhost:14001/dir" dnsChallenge)
                         }
                     else
                         staticCertificatesResolver (resolverName "acceptance") {
-                            yield acme (acmeFields "https://localhost:14000/dir" dnsChallenge)
+                            yield acme (acmeFields true "https://localhost:14000/dir" dnsChallenge)
                         }
                         staticCertificatesResolver (resolverName "acceptance-rotated") {
-                            yield acme (acmeFields "https://localhost:14001/dir" dnsChallenge)
+                            yield acme (acmeFields false "https://localhost:14001/dir" dnsChallenge)
                         }
                     staticCertificatesResolver (resolverName "http01") {
-                        yield acme (acmeFields "https://localhost:14000/dir" (acmeHttpChallengeStatic "http01"))
+                        yield acme (acmeFields false "https://localhost:14000/dir" (acmeHttpChallengeStatic "http01"))
                     }
                     staticCertificatesResolver (resolverName "tlsalpn") {
-                        yield acme (acmeFields "https://localhost:14000/dir" acmeTlsChallenge)
+                        yield acme (acmeFields false "https://localhost:14000/dir" acmeTlsChallenge)
                     }
                 }
                 staticLog (nativeObject {

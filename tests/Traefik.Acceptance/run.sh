@@ -1161,6 +1161,12 @@ boot_before=$(remote 'cat /proc/sys/kernel/random/boot_id')
 printf '%s\n' "$boot_before" > "$state_dir/logs/structured-boot-id-before.txt"
 chmod 600 "$state_dir/logs/structured-boot-id-before.txt"
 remote "wc -c < '$GUEST_ROOT/logs/otelcol.log' > '$GUEST_ROOT/logs/otel-before-reboot.bytes'"
+reboot_store_witness(){
+    remote 'set -euo pipefail; files=(/var/lib/keroosha-traefik/acme-*.json); [[ ${#files[@]} == 6 ]]; for f in "${files[@]}"; do test -s "$f"; sha256sum "$f"; jq -er "to_entries[].value.Certificates[].certificate" "$f" | while read -r cert; do printf %s "$cert" | base64 -d | openssl x509 -noout -serial -fingerprint -sha256 -issuer -enddate; done; done'
+}
+reboot_store_witness > "$state_dir/reboot-store-before.txt"
+remote "cat '$GUEST_ROOT/logs/acme-acceptance-serial-before.txt' '$GUEST_ROOT/logs/acme-acceptance-serial.txt'" > "$state_dir/dns-renewal-serials.txt"
+[[ $(sort -u "$state_dir/dns-renewal-serials.txt" | wc -l) == 2 ]]
 boot_after=$(reboot_guest "$boot_before")
 [[ -n "$boot_after" ]] || { printf 'The structured configuration reboot phase did not return a boot ID.\n' >&2; exit 1; }
 printf '%s\n' "$boot_after" > "$state_dir/logs/structured-boot-id-after.txt"
@@ -1173,6 +1179,8 @@ run_guest_client after-reboot > "$state_dir/logs/post-reboot-clients.log" 2>&1 |
     printf 'Post-reboot real client check failed; see %s/logs/post-reboot-clients.log\n' "$state_dir" >&2
     exit 1
 }
+reboot_store_witness > "$state_dir/reboot-store-after.txt"
+cmp "$state_dir/reboot-store-before.txt" "$state_dir/reboot-store-after.txt"
 post_reboot_journal_since=$(remote 'systemctl show --property=ActiveEnterTimestamp --value keroosha-traefik.service')
 post_reboot_journal_until=$(remote 'date --iso-8601=seconds')
 [[ -n "$post_reboot_journal_since" && -n "$post_reboot_journal_until" ]] || {

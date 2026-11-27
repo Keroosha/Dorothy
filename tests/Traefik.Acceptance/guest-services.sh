@@ -149,6 +149,10 @@ cat > "$root/config/pebble.json" <<EOF
     "keyAlgorithm": "ecdsa",
     "profiles": {
       "default": {
+        "description": "long lifecycle across issuer reboot",
+        "validityPeriod": 14400
+      },
+      "renewal": {
         "description": "short-lived isolated acceptance issuance",
         "validityPeriod": 1300
       }
@@ -169,7 +173,7 @@ cat > "$root/config/pebble-rotated.json" <<EOF
     "profiles": {
       "default": {
         "description": "rotated isolated acceptance issuance",
-        "validityPeriod": 1300
+        "validityPeriod": 14400
       }
     }
   }
