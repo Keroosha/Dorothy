@@ -177,6 +177,46 @@ type FirewalldLifecycleTests() =
     let savePendingRecord (root: string) (record: JsonObject) =
         writeFile root "/var/lib/keroosha-iac/firewalld/pending-transaction.json" (record.ToJsonString()) 0o600
 
+    let awaitingFixture root (beforeState: string option) (afterState: string option) includeUndo =
+        let record = nativeProgressRecord "object-delta" 1 true
+        let generation = Guid.NewGuid().ToString("D")
+        writeFile root "/proc/sys/kernel/random/boot_id" generation 0o644
+        record["version"] <- JsonValue.Create 5
+        record["before"] <- beforeState |> Option.map (fun s -> JsonValue.Create(s) :> JsonNode) |> Option.toObj
+        record["after"] <- afterState |> Option.map (fun s -> JsonValue.Create(s) :> JsonNode) |> Option.toObj
+        record["deleteOnConfirm"] <- JsonValue.Create afterState.IsNone
+        record["releaseOnRollback"] <- JsonValue.Create beforeState.IsNone
+        record["nativeUndo"] <-
+            if includeUndo then
+                JsonNode.Parse(sprintf """{"bootId":"%s","remainingSteps":0,"inFlightStep":null,"preimageVerified":false}""" generation)
+            else null
+        let stored = journal owner beforeState beforeState
+        stored["pending"] <- record.DeepClone()
+        writeFile root "/var/lib/keroosha-iac/firewalld/zone-lifecycle.json" (stored.ToJsonString()) 0o600
+        savePendingRecord root record
+        stored
+
+    let probeAwaiting environment phase restoreRuntime =
+        let recover (t: FirewalldLifecycle.PendingTransaction) stored =
+            FirewalldLifecycle.recoverPendingTransaction environment t.Configuration (Option.get stored) t.Path phase
+                readState (fun _ _ _ _ -> Assert.Fail "Preboot already consumed disk-write authority.") restoreRuntime
+        match phase with
+        | FirewalldLifecycle.ActiveDaemon -> FirewalldLifecycle.recoverPending environment recover
+        | FirewalldLifecycle.BootAfterFirewalld -> FirewalldLifecycle.recoverPendingPostBoot environment recover
+        | _ -> invalidArg (nameof phase) "Expected a retry or ordered postboot."
+
+    let fileSnapshot path =
+        if File.Exists path then Some(File.ReadAllBytes path, File.GetUnixFileMode path) else None
+
+    let reservationSnapshot root =
+        [ "pending-transaction.json"; "zone-lifecycle.json" ]
+        |> List.map (fun name -> fileSnapshot (physical root ("/var/lib/keroosha-iac/firewalld/" + name)))
+
+    let setTarget root contents mode =
+        match contents with
+        | Some text -> writeFile root logicalPath text mode
+        | None -> File.Delete(physical root logicalPath)
+
     [<Test>]
     member _.``Reverse receipts survive reload and cannot grow or be confirmed``() =
         withHost (fun env root ->
@@ -585,6 +625,61 @@ type FirewalldLifecycleTests() =
             let receipt = (FirewalldLifecycle.undoJournal environment retained |> Option.get).Previous.Value
             Assert.That(receipt.RemainingSteps, Is.Zero)
             Assert.That(receipt.PreimageVerified, Is.False))
+
+    [<TestCase(false, "old-after"); TestCase(true, "old-after")>]
+    [<TestCase(false, "later-delete"); TestCase(true, "later-delete")>]
+    [<TestCase(false, "reintroduced-override"); TestCase(true, "reintroduced-override")>]
+    [<TestCase(false, "wrong-mode"); TestCase(true, "wrong-mode")>]
+    member _.``Awaiting recovery preserves later disk state until independent reconciliation``(postboot: bool, change: string) =
+        let phase = if postboot then FirewalldLifecycle.BootAfterFirewalld else FirewalldLifecycle.ActiveDaemon
+        let expected, staged, later, laterMode =
+            match change with
+            | "old-after" -> Some before, Some after, Some after, 0o644
+            | "later-delete" -> Some before, None, None, 0o644
+            | "reintroduced-override" -> None, Some after, Some after, 0o644
+            | "wrong-mode" -> Some before, Some after, Some before, 0o600
+            | _ -> invalidArg (nameof change) "Unexpected disk state."
+        withHost (fun env root ->
+            awaitingFixture root expected staged true |> ignore
+            setTarget root later laterMode
+            let path = physical root logicalPath
+            let reservation = reservationSnapshot root
+            let foreign = fileSnapshot path
+            let mutable runtimeChecks = 0
+            let retry () = probeAwaiting env phase (fun _ _ -> runtimeChecks <- runtimeChecks + 1)
+            for _ in 1..2 do
+                Assert.Throws<InvalidOperationException>(TestDelegate retry) |> ignore
+                Assert.That(fileSnapshot path, Is.EqualTo(box foreign))
+                Assert.That(reservationSnapshot root, Is.EqualTo(box reservation))
+                Assert.That(runtimeChecks, Is.Zero)
+            setTarget root expected 0o644
+            let reconciled = fileSnapshot path
+            retry ()
+            Assert.That(fileSnapshot path, Is.EqualTo(box reconciled))
+            Assert.That(runtimeChecks, Is.EqualTo 1)
+            Assert.That(FirewalldLifecycle.pending env, Is.EqualTo None))
+
+    [<Test>]
+    member _.``Cleanup rechecks the preboot disk state after runtime verification``() =
+        withHost (fun env root ->
+            awaitingFixture root (Some before) (Some after) true |> ignore
+            setTarget root (Some before) 0o644
+            let prior = reservationSnapshot root
+            Assert.Throws<InvalidOperationException>(fun () ->
+                probeAwaiting env FirewalldLifecycle.BootAfterFirewalld (fun _ _ -> setTarget root (Some after) 0o644)) |> ignore
+            Assert.That(File.ReadAllText(physical root logicalPath), Is.EqualTo after)
+            Assert.That(reservationSnapshot root, Is.EqualTo(box prior)))
+
+    [<Test>]
+    member _.``Confirmation cannot commit an awaiting transaction even before its first reverse receipt``() =
+        withHost (fun env root ->
+            let stored = awaitingFixture root (Some before) (Some after) false
+            setTarget root (Some after) 0o644
+            let prior = reservationSnapshot root
+            Assert.Throws<InvalidOperationException>(fun () ->
+                FirewalldLifecycle.confirm env configuration stored (String.replicate 32 "a") readState) |> ignore
+            Assert.That(reservationSnapshot root, Is.EqualTo(box prior)))
+
 
     [<TestCase(false, 0); TestCase(false, 2); TestCase(false, 4096); TestCase(true, 0)>]
     member _.``Active recovery requires a same-boot postboot receipt at every forward count``(hasRetryReceipt: bool, completedSteps: int) =

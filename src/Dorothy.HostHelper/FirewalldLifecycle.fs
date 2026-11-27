@@ -417,17 +417,34 @@ module FirewalldLifecycle =
         (restoreRuntime: PendingTransaction -> RecoveryPhase -> unit)
         (phase: RecoveryPhase)
         =
-        let current, currentMode = readPath environment transaction.Path
-        let state = if transaction.SchemaVersion = 1 then current else readState transaction.Scope current
-        if state <> transaction.Before && state <> transaction.After then
-            fail "Firewalld configuration changed during an interrupted transaction; refusing recovery."
-        if state = transaction.Before then verifyMetadata environment transaction current currentMode transaction.BeforeMode
-        if state = transaction.After then verifyMetadata environment transaction current currentMode transaction.AfterMode
+        if phase = BootAfterFirewalld && not transaction.AwaitingPostBoot then
+            fail "Post-boot recovery lacks the ordered preboot reservation."
         if transaction.SchemaVersion < 2 && transaction.Status = "pending" then
             fail "Legacy firewalld transaction lacks a durable runtime rollback proof; refusing recovery."
-        let mode = if transaction.Scope.IsSome && current.IsSome && currentMode = 0o600 then currentMode else transaction.BeforeMode
-        if state <> transaction.Before || (current.IsSome && currentMode <> mode) then
-            writeState transaction.Scope state transaction.Before mode
+        let inspectDisk () =
+            let contents, mode = readPath environment transaction.Path
+            let state = if transaction.SchemaVersion = 1 then contents else readState transaction.Scope contents
+            contents, mode, state
+        let requirePrebootDisk (contents, mode, state) =
+            if state <> transaction.Before then
+                fail "Firewalld permanent preimage changed after preboot; refusing to overwrite independent disk state."
+            verifyMetadata environment transaction contents mode transaction.BeforeMode
+            if contents.IsSome then mode else transaction.BeforeMode
+        let mode =
+            let current, currentMode, state = inspectDisk ()
+            if transaction.AwaitingPostBoot then
+                // Preboot has already spent disk-write authority, including for
+                // an absent override. Matching After again is not provenance.
+                requirePrebootDisk (current, currentMode, state)
+            else
+                if state <> transaction.Before && state <> transaction.After then
+                    fail "Firewalld configuration changed during an interrupted transaction; refusing recovery."
+                if state = transaction.Before then verifyMetadata environment transaction current currentMode transaction.BeforeMode
+                if state = transaction.After then verifyMetadata environment transaction current currentMode transaction.AfterMode
+                let mode = if transaction.Scope.IsSome && current.IsSome && currentMode = 0o600 then currentMode else transaction.BeforeMode
+                if state <> transaction.Before || (current.IsSome && currentMode <> mode) then
+                    writeState transaction.Scope state transaction.Before mode
+                mode
         let rollbackStrategy =
             transaction.RollbackProof
             |> Option.bind (fun proof ->
@@ -462,11 +479,7 @@ module FirewalldLifecycle =
                     saveJournal environment transaction.Configuration value
                 | None when transaction.ReleaseOnRollback -> ()
                 | None -> fail "Firewalld owner journal is missing during boot recovery."
-            | BootAfterFirewalld when transaction.AwaitingPostBoot ->
-                if state <> transaction.Before then
-                    fail "Firewalld permanent preimage changed before post-boot runtime recovery."
-                restoreRuntime transaction BootAfterFirewalld
-            | BootAfterFirewalld -> fail "Post-boot recovery lacks the ordered preboot reservation."
+            | BootAfterFirewalld -> restoreRuntime transaction BootAfterFirewalld
             | _ ->
                 let hasNativeRepair =
                     transaction.NativeProgress.IsSome
@@ -488,6 +501,9 @@ module FirewalldLifecycle =
                 else
                     restoreRuntime transaction phase
         if not (needsBootInverse && phase = BootBeforeFirewalld) then
+            // Runtime verification can take time. Do not release the reservation
+            // if the disk changed while it ran; this second check is read-only.
+            let mode = if transaction.AwaitingPostBoot then requirePrebootDisk (inspectDisk ()) else mode
             match journal with
             | Some value ->
                 if transaction.ReleaseOnRollback then removeJournal environment transaction.Configuration transaction.OwnerId
@@ -976,7 +992,8 @@ module FirewalldLifecycle =
         | Some transaction ->
             validateIdentity c journal transaction
             if transaction.Nonce <> nonce then fail "Firewalld transaction confirmation nonce does not match."
-            if transaction.NativeUndo.IsSome then fail "Cannot confirm a transaction whose native inverse has already begun."
+            if transaction.AwaitingPostBoot || transaction.NativeUndo.IsSome then
+                fail "Cannot confirm a transaction whose rollback has already begun."
             let current, currentMode = readPath environment transaction.Path
             let currentState = if transaction.SchemaVersion = 1 then current else readState transaction.Scope current
             verifyMetadata environment transaction current currentMode transaction.AfterMode

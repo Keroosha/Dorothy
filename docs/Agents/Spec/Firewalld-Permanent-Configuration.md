@@ -129,6 +129,8 @@ The host lock coordinates Dorothy writers, not other administrators, NetworkMana
 
 For scoped object and runtime-only changes, the writer asks two separate questions: **may it issue another native inverse?** and **has it verified the working preimage so it may finish owner cleanup?** A zero cursor answers only the first. The global reservation carries both receipts, scoped to one boot; live state is not a lock on other controllers.
 
+A successful preboot consumes the transaction's right to write the permanent target. While awaiting postboot, **both** active recovery and the ordered postboot entry check the saved disk preimage before runtime verification, and again before releasing the reservation. A later write of the exact old candidate is still independent. For XML this includes file presence and compatible owner/mode: do not recreate a missing override or delete a reintroduced one. Settings retain their key-scoped comparison. On mismatch, leave the target and reservation alone; its owner must reconcile the disk even if the live policy already matches. The old confirmation nonce cannot commit an awaiting rollback.
+
 | Recovery phase and evidence (first applicable row) | Native operation | When may owner cleanup proceed? |
 |---|---|---|
 | Preboot | Restore only the reserved disk preimage and record that postboot verification is pending. A new boot invalidates the previous boot's inverse receipt. | Never in this phase when runtime recovery is needed. |
