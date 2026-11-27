@@ -1907,6 +1907,7 @@ module Firewalld =
         =
         let effectiveCurrent = effective environment c.Kind c.Name
         FirewalldRecoveryProof.restoreRuntimeWithProgress environment c effectiveCurrent transaction.RollbackProof phase preReload transaction.NativeProgress
+            (FirewalldLifecycle.undoJournal environment transaction)
 
     let private recover environment (c: FirewalldModel.Configuration) (journal: JsonObject) (preReload: unit -> unit) =
         let logical = objectPath "/etc/firewalld" c.Kind c.Name
@@ -2027,7 +2028,7 @@ module Firewalld =
                             |> List.map (fun kind -> kind, definitionInventory environment kind)
                             |> Map.ofList
                         if FirewalldReferences.usedByPacketFilter parseXml c.Kind c.Name definitions &&
-                           not (FirewalldReferences.preservesManagement parseXml c.Kind c.Name definitions (FirewalldRecoveryProof.managementServerPort()) effectiveBefore effectiveAfter) then
+                           not (FirewalldReferences.preservesManagement parseXml c.Kind c.Name definitions (FirewalldRecoveryProof.managementServerPorts environment) effectiveBefore effectiveAfter) then
                             refuseManagementNarrowing ()
                     if FirewalldRecoveryProof.objectTransitionMayNarrowManagement environment c effectiveBefore effectiveAfter then
                         refuseManagementNarrowing ()
@@ -3110,15 +3111,18 @@ module Firewalld =
             true
         with _ -> false
 
+    let private validateDefaultZoneSwitch environment proposed =
+        let before = runtimeSettingValue environment "DefaultZone"
+        let after = effectiveSettingValue "DefaultZone" proposed
+        match before, after with
+        | Some oldZone, Some newZone when FirewalldRecoveryProof.equivalentDefaultZones environment oldZone newZone -> ()
+        | _ -> fail "DefaultZone could reclassify an alternate management path without a non-flushing inverse. Align admission for every SSH listener and zone-specific HOST/steering policies before switching the default."
+
     let private validateSettingsCandidate (environment: HostEnvironment) (c: FirewalldModel.Configuration) key proposed =
         proposed |> Option.iter (fun contents -> settingValue contents key |> ignore)
         guardMutation environment c proposed
         if key = "DefaultZone" then
-            let before = runtimeSettingValue environment key
-            let after = effectiveSettingValue key proposed
-            match before, after with
-            | Some oldZone, Some newZone when FirewalldRecoveryProof.equivalentDefaultZones environment oldZone newZone -> ()
-            | _ -> fail "DefaultZone could reclassify an alternate management path without a non-flushing inverse. Align the two zones' SSH admission and zone-specific HOST/steering policies before switching the default."
+            validateDefaultZoneSwitch environment proposed
         elif key = "IPv6_rpfilter" then
             let inputStrength = function
                 | Some ("strict" | "yes" | "true") -> Some 2
@@ -3153,6 +3157,7 @@ module Firewalld =
             FirewalldRuntime.withVerifiedDockerBindings environment (fun () ->
                 // The pre-stage inventory cannot vouch for a timed ban that
                 // appeared since the check. Recheck immediately before flushing.
+                if key = "DefaultZone" then validateDefaultZoneSwitch environment (readSettingsFile environment strictConfigPath)
                 requireReloadProof environment
                 if key = "FirewallBackend" then command environment "/usr/bin/systemctl" [ "restart"; "firewalld" ] |> ignore
                 else firewall environment [ "--reload" ] |> ignore)

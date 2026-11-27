@@ -68,12 +68,12 @@ module internal FirewalldReferences =
         seq { for k in [ "zone"; "policy" ] do for KeyValue(_, xml) in objects[k] -> k, xml }
         |> usedFrom parse kind name objects
 
-    /// Only discard selectors proved disjoint for every possible SSH peer,
-    /// not just the peer that happens to stage the request. An output policy
-    /// can see an arbitrary client port as its destination.
-    let preservesManagement (parse: string -> string -> XElement) kind name objects serverPort before after =
+    /// Only discard TCP port selectors proved disjoint from every attributable SSH
+    /// listener. With an unknown inventory no TCP port change is assumed safe.
+    let preservesManagement (parse: string -> string -> XElement) kind name objects (serverPorts: Set<int> option) before after =
         match before, after with
         | Some original, Some candidate ->
+            // HOST egress policies can observe arbitrary client destination ports.
             let outputConsumer =
                 kind = "service" &&
                 (objects |> Map.find "policy" |> Map.toSeq |> Seq.choose (fun (_, xml) ->
@@ -81,12 +81,13 @@ module internal FirewalldReferences =
                     if policy.Elements(XName.Get "ingress-zone") |> Seq.exists (fun e -> attribute "name" e = Some "HOST") then Some("policy", xml)
                     else None)
                  |> usedFrom parse kind name objects)
-            let excludesServerPort value =
-                match serverPort, value with
-                | Some port, Some(range: string) ->
+            let excludesServerPorts value =
+                match serverPorts, value with
+                | Some ports, Some(range: string) ->
                     let parts = range.Split('-')
                     match Int32.TryParse parts[0], Int32.TryParse parts[parts.Length-1] with
-                    | (true, low), (true, high) when parts.Length <= 2 && low > 0 && high >= low && high <= 65535 -> port < low || port > high
+                    | (true, low), (true, high) when parts.Length <= 2 && low > 0 && high >= low && high <= 65535 ->
+                        ports |> Set.forall (fun port -> port < low || port > high)
                     | _ -> false
                 | _ -> false
             let project xml =
@@ -98,7 +99,7 @@ module internal FirewalldReferences =
                         else
                             match attribute "protocol" child with
                             | Some ("udp" | "sctp" | "dccp") -> true
-                            | Some "tcp" when tag = "port" && not outputConsumer -> excludesServerPort (attribute "port" child)
+                            | Some "tcp" when tag = "port" && not outputConsumer -> excludesServerPorts (attribute "port" child)
                             | _ -> false
                     if disjoint || tag = "short" || tag = "description" then child.Remove()
                 root

@@ -29,10 +29,255 @@ type FirewalldGuardTests() =
                         "service", Map.ofList ["parent", "<service><include service='app'/></service>"]]
         let port n = Some(sprintf "<service><port protocol='tcp' port='%d'/></service>" n)
         let safe consumers oldPort newPort =
-            FirewalldReferences.preservesManagement FirewalldGuardNative.parseXml "service" "app" (defs consumers) (Some 2222) (port oldPort) (port newPort)
+            FirewalldReferences.preservesManagement FirewalldGuardNative.parseXml "service" "app" (defs consumers) (Some(set [2222])) (port oldPort) (port newPort)
         Assert.That(safe false 8080 8081, Is.True)
         Assert.That(safe false 2222 8081, Is.False)
         Assert.That(safe true 8080 8081, Is.False)
+
+
+    [<Test>]
+    member _.``Shared definitions account for every management listener and unknown inventories compare all TCP ports``() =
+        let defs =
+            Map.ofList
+                [ "policy", Map.empty
+                  "zone", Map.ofList ["work", "<zone><service name='parent'/></zone>"]
+                  "service", Map.ofList ["parent", "<service><include service='app'/></service>"] ]
+        let port n = Some(sprintf "<service><port protocol='tcp' port='%d'/></service>" n)
+        let compare listeners oldPort newPort =
+            FirewalldReferences.preservesManagement FirewalldGuardNative.parseXml "service" "app" defs listeners (port oldPort) (port newPort)
+        Assert.That(compare (Some(set [22; 2222])) 8080 8081, Is.True)
+        Assert.That(compare (Some(set [22; 2222])) 2222 8081, Is.False)
+        Assert.That(compare None 8080 8081, Is.False)
+
+    [<Test>]
+    member _.``Listener attribution retains SSH and unknown owners but excludes authenticated app executables``() =
+        let previous = Environment.GetEnvironmentVariable "SSH_CONNECTION"
+        try
+            Environment.SetEnvironmentVariable("SSH_CONNECTION", "192.0.2.1 49200 192.0.2.2 22")
+            let environment output =
+                { Root = Path.GetTempPath()
+                  Run = fun executable arguments _ ->
+                      match executable, arguments with
+                      | "ss", [ "-H"; "-ltnp" ] -> { ExitCode = 0; Stdout = output; Stderr = "" }
+                      | "/usr/bin/readlink", [ "-f"; "/proc/321/exe" ] ->
+                          { ExitCode = 0; Stdout = "/usr/sbin/sshd\n"; Stderr = "" }
+                      | "/usr/bin/readlink", [ "-f"; "/proc/322/exe" ] ->
+                          { ExitCode = 1; Stdout = ""; Stderr = "unreadable" }
+                      | "/usr/bin/readlink", [ "-f"; "/proc/323/exe" ] ->
+                          { ExitCode = 0; Stdout = "/opt/dorothy/app\n"; Stderr = "" }
+                      | _ -> failwith "Unexpected listener inventory command."
+                  UtcNow = fun () -> DateTimeOffset.UnixEpoch }
+            let listeners =
+                String.concat "\n"
+                    [ "LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:((\"sshd\",pid=321,fd=3))"
+                      "LISTEN 0 128 [::]:22 [::]:* users:((\"sshd\",pid=321,fd=4))"
+                      "LISTEN 0 128 [::]:2222 [::]:* users:((\"custom-ssh-proxy\",pid=322,fd=3))"
+                      "LISTEN 0 128 127.0.0.1:41821 127.0.0.1:* users:((\"app\",pid=323,fd=5))"
+                      "LISTEN 0 128 127.0.0.1:41822 127.0.0.1:* users:((\"app\",pid=323,fd=6))" ]
+            let ports = FirewalldRecoveryProof.managementServerPorts (environment listeners)
+            Assert.That(ports, Is.EqualTo(Some(set [22; 2222])))
+            let defs =
+                Map.ofList
+                    [ "policy", Map.empty
+                      "zone", Map.ofList ["work", "<zone><service name='parent'/></zone>"]
+                      "service", Map.ofList ["parent", "<service><include service='app'/></service>"] ]
+            let port n = Some(sprintf "<service><port protocol='tcp' port='%d'/></service>" n)
+            Assert.That(
+                FirewalldReferences.preservesManagement FirewalldGuardNative.parseXml
+                    "service" "app" defs ports (port 41821) (port 41822),
+                Is.True)
+            let noProcess = "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*"
+            Assert.That(
+                FirewalldRecoveryProof.managementServerPorts (environment noProcess),
+                Is.EqualTo(Some(set [22])))
+            let activated = "LISTEN 0 128 0.0.0.0:2222 0.0.0.0:* users:((\"systemd\",pid=1,fd=3))"
+            Assert.That(
+                FirewalldRecoveryProof.managementServerPorts (environment (noProcess + "\n" + activated)),
+                Is.EqualTo(Some(set [22; 2222])))
+            Assert.That(FirewalldRecoveryProof.managementServerPorts (environment activated), Is.EqualTo(None))
+            Assert.That(
+                FirewalldRecoveryProof.managementServerPorts (environment ""),
+                Is.EqualTo(None))
+        finally
+            Environment.SetEnvironmentVariable("SSH_CONNECTION", previous)
+
+    [<Test>]
+    member _.``DefaultZone equivalence compares all known listeners and falls back to exact all-port admission``() =
+        let previous = Environment.GetEnvironmentVariable "SSH_CONNECTION"
+        try
+            Environment.SetEnvironmentVariable("SSH_CONNECTION", "192.0.2.1 49200 192.0.2.2 22")
+            let listeners =
+                String.concat "\n"
+                    [ "LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:((\"sshd\",pid=321,fd=3))"
+                      "LISTEN 0 128 [::]:2222 [::]:* users:((\"sshd\",pid=322,fd=3))"
+                      "LISTEN 0 128 127.0.0.1:3306 127.0.0.1:* users:((\"systemd\",pid=1,fd=9))"
+                      "LISTEN 0 128 127.0.0.1:41821 127.0.0.1:* users:((\"app\",pid=323,fd=5))"
+                      "LISTEN 0 128 127.0.0.1:41822 127.0.0.1:* users:((\"app\",pid=323,fd=6))" ]
+            let info name ports =
+                String.concat "\n"
+                    [ name
+                      "  target: default"
+                      "  ingress-priority: 0"
+                      "  egress-priority: 0"
+                      "  icmp-block-inversion: no"
+                      "  interfaces:"
+                      "  sources:"
+                      "  services:"
+                      "  ports: " + ports
+                      "  protocols:"
+                      "  forward: no"
+                      "  masquerade: no"
+                      "  forward-ports:"
+                      "  source-ports:"
+                      "  icmp-blocks:"
+                      "  rich rules:" ]
+            let environment listenerOutput candidatePorts =
+                { Root = Path.GetTempPath()
+                  Run = fun executable arguments _ ->
+                      let result stdout = { ExitCode = 0; Stdout = stdout; Stderr = "" }
+                      match executable, arguments with
+                      | "ss", [ "-H"; "-ltn" ] -> result listenerOutput
+                      | "firewall-cmd", [ "--get-policies" ] -> result ""
+                      | "firewall-cmd", args when List.contains "--list-interfaces" args -> result ""
+                      | "firewall-cmd", args when List.contains "--list-all" args ->
+                          let name =
+                              args |> List.tryPick (fun arg ->
+                                  if arg.StartsWith("--zone=", StringComparison.Ordinal) then Some(arg.Substring(7)) else None)
+                              |> Option.defaultValue ""
+                          result (info name (if name = "public" then "22/tcp" else candidatePorts))
+                      | _ -> failwith "Unexpected DefaultZone equivalence command."
+                  UtcNow = fun () -> DateTimeOffset.UnixEpoch }
+            Assert.That(
+                FirewalldRecoveryProof.equivalentDefaultZones (environment listeners "22/tcp") "public" "work",
+                Is.True)
+            Assert.That(
+                FirewalldRecoveryProof.equivalentDefaultZones (environment listeners "22/tcp 8080/tcp") "public" "work",
+                Is.True)
+            Assert.That(
+                FirewalldRecoveryProof.equivalentDefaultZones (environment listeners "22/tcp 41821/tcp") "public" "work",
+                Is.False)
+            Assert.That(
+                FirewalldRecoveryProof.equivalentDefaultZones (environment listeners "22/tcp 2222/tcp") "public" "work",
+                Is.False)
+            Assert.That(
+                FirewalldRecoveryProof.equivalentDefaultZones (environment "invalid listener output" "22/tcp") "public" "work",
+                Is.True)
+            Assert.That(
+                FirewalldRecoveryProof.equivalentDefaultZones (environment "invalid listener output" "22/tcp 2222/tcp") "public" "work",
+                Is.False)
+        finally
+            Environment.SetEnvironmentVariable("SSH_CONNECTION", previous)
+
+
+    [<Test>]
+    member _.``Same-source admission unions services with explicit listener ports``() =
+        let previous = Environment.GetEnvironmentVariable "SSH_CONNECTION"
+        try
+            Environment.SetEnvironmentVariable("SSH_CONNECTION", "192.0.2.1 49200 192.0.2.2 22")
+            let source: FirewalldModel.Element =
+                { Name = "source"
+                  Attributes = Map.ofList [ "address", "192.0.2.0/24" ]
+                  Text = None
+                  Children = [] }
+            let candidate explicitPorts =
+                { FirewalldModel.empty "zone" "source" with
+                    Services = [ "app" ]
+                    Ports = explicitPorts
+                    Elements = [ source ] }
+            let zoneInfo =
+                String.concat "\n"
+                    [ "public"
+                      "  target: default"
+                      "  ingress-priority: 0"
+                      "  egress-priority: 0"
+                      "  icmp-block-inversion: no"
+                      "  sources:"
+                      "  services:"
+                      "  ports:"
+                      "  protocols:"
+                      "  forward: no"
+                      "  masquerade: no"
+                      "  forward-ports:"
+                      "  source-ports:"
+                      "  icmp-blocks:"
+                      "  rich rules:" ]
+            let serviceInfo =
+                String.concat "\n"
+                    [ "app"
+                      "  ports: 22/tcp"
+                      "  protocols:"
+                      "  source-ports:"
+                      "  modules:"
+                      "  destination:"
+                      "  includes:"
+                      "  helpers:" ]
+            let listenerOutput =
+                String.concat "\n"
+                    [ "LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:((\"sshd\",pid=321,fd=3))"
+                      "LISTEN 0 128 [::]:2222 [::]:* users:((\"sshd\",pid=322,fd=3))" ]
+            let environment: HostEnvironment =
+                { Root = Path.GetTempPath()
+                  Run = fun executable arguments _ ->
+                      let result stdout = { ExitCode = 0; Stdout = stdout; Stderr = "" }
+                      match executable, arguments with
+                      | "ss", [ "-H"; "-ltnp" ] -> result listenerOutput
+                      | "/usr/bin/readlink", [ "-f"; "/proc/321/exe" ] -> result "/usr/sbin/sshd"
+                      | "/usr/bin/readlink", [ "-f"; "/proc/322/exe" ] -> result "/usr/sbin/sshd"
+                      | "ip", [ "-j"; "link"; "show" ] -> result "[]"
+                      | "firewall-cmd", [ "--get-zones" ] -> result "public source"
+                      | "firewall-cmd", [ "--get-default-zone" ] -> result "public"
+                      | "firewall-cmd", [ "--get-policies" ] -> result ""
+                      | "firewall-cmd", [ "--zone=source"; "--list-interfaces" ] -> result ""
+                      | "firewall-cmd", [ "--zone=public"; "--list-interfaces" ]
+                      | "firewall-cmd", [ "--permanent"; "--zone=public"; "--list-interfaces" ] -> result ""
+                      | "firewall-cmd", [ "--zone=public"; "--list-all" ]
+                      | "firewall-cmd", [ "--permanent"; "--zone=public"; "--list-all" ] -> result zoneInfo
+                      | "firewall-cmd", [ "--info-service=app" ]
+                      | "firewall-cmd", [ "--permanent"; "--info-service=app" ] -> result serviceInfo
+                      | _ -> failwith "Unexpected same-source proof command."
+                  UtcNow = fun () -> DateTimeOffset.UnixEpoch }
+            let narrows explicitPorts =
+                let value = candidate explicitPorts
+                FirewalldRecoveryProof.objectTransitionMayNarrowManagement
+                    environment value None (Some(FieldRuntime.render value))
+            Assert.That(narrows [ "2222/tcp" ], Is.False)
+            Assert.That(narrows [], Is.True)
+        finally
+            Environment.SetEnvironmentVariable("SSH_CONNECTION", previous)
+    [<Test>]
+    member _.``Structural policy narrowing considers every listener or every TCP port when inventory is unknown``() =
+        let previous = Environment.GetEnvironmentVariable "SSH_CONNECTION"
+        try
+            Environment.SetEnvironmentVariable("SSH_CONNECTION", "192.0.2.1 49200 192.0.2.2 22")
+            let listeners =
+                String.concat "\n"
+                    [ "LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:((\"sshd\",pid=321,fd=3))"
+                      "LISTEN 0 128 [::]:2222 [::]:* users:((\"sshd\",pid=322,fd=3))" ]
+            let environment output =
+                { Root = Path.GetTempPath()
+                  Run = fun executable arguments _ ->
+                      match executable, arguments with
+                      | "ss", [ "-H"; "-ltnp" ] -> { ExitCode = 0; Stdout = output; Stderr = "" }
+                      | _ -> failwith "Unexpected structural management command."
+                  UtcNow = fun () -> DateTimeOffset.UnixEpoch }
+            let policy port =
+                { FirewalldModel.empty "policy" "host-policy" with
+                    Ingress = [ "ANY" ]
+                    Egress = [ "HOST" ]
+                    Ports = [ port + "/tcp" ] }
+            let removedHostEndpoint (before: FirewalldModel.Configuration) =
+                { before with Egress = [] }
+            let transition output port =
+                let before = policy port
+                FirewalldRecoveryProof.objectTransitionMayNarrowManagement
+                    (environment output) (removedHostEndpoint before)
+                    (Some(FieldRuntime.render before))
+                    (Some(FieldRuntime.render (removedHostEndpoint before)))
+            Assert.That(transition listeners "2222", Is.True)
+            Assert.That(transition listeners "8080", Is.False)
+            Assert.That(transition "" "8080", Is.True)
+        finally
+            Environment.SetEnvironmentVariable("SSH_CONNECTION", previous)
 
     [<Test>]
     member _.``Guard matches peer and local ports and proves disjoint family and source port``() =

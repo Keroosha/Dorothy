@@ -8,6 +8,8 @@ open System.Xml.Linq
 /// the simulated daemon until activation. The Debian guest tests exercise the daemon itself.
 module internal FirewalldCommandFixture =
     let commands (root: string) =
+        let kernel = Directory.CreateDirectory(Path.Combine(root, "proc/sys/kernel/random"))
+        File.WriteAllText(Path.Combine(kernel.FullName, "boot_id"), "12345678-1234-4234-8234-123456789012")
         let directories = [ "usr/lib/firewalld"; "etc/firewalld" ]
         let inventory category =
             directories |> List.fold (fun files directory ->

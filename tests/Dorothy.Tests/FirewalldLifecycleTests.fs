@@ -166,6 +166,34 @@ type FirewalldLifecycleTests() =
         writeFile root "/var/lib/keroosha-iac/firewalld/pending-transaction.json" (record.ToJsonString()) 0o600
 
     [<Test>]
+    member _.``Reverse receipts survive reload and cannot grow or be confirmed``() =
+        withHost (fun env root ->
+            let generation = Guid.NewGuid()
+            writeFile root "/proc/sys/kernel/random/boot_id" (string generation) 0o644
+            let record = pendingRecord 2 true false
+            record["version"] <- JsonValue.Create 4
+            record["nativeProgress"] <- JsonNode.Parse("""{"completedSteps":2,"inFlightStep":null}""")
+            record["nativeUndo"] <- null
+            savePendingRecord root record
+            let load () =
+                let reservation = FirewalldLifecycle.pending env |> Option.get
+                FirewalldLifecycle.undoJournal env reservation |> Option.get
+            let first = load ()
+            first.Persist { RemainingSteps = 2; InFlightStep = Some 1 }
+            let interrupted = load ()
+            Assert.That(interrupted.Previous.Value.InFlightStep, Is.EqualTo(Some 1))
+            Assert.Throws<InvalidOperationException>(fun () -> interrupted.Persist { RemainingSteps = 2; InFlightStep = Some 1 }) |> ignore
+            first.Persist { RemainingSteps = 1; InFlightStep = None }
+            let resumed = load ()
+            Assert.That(resumed.Previous.Value.RemainingSteps, Is.EqualTo 1)
+            Assert.Throws<InvalidOperationException>(fun () -> resumed.Persist { RemainingSteps = 2; InFlightStep = Some 1 }) |> ignore
+            let stored = journal owner (Some before) (Some after)
+            Assert.Throws<InvalidOperationException>(fun () ->
+                FirewalldLifecycle.confirm env configuration stored (String.replicate 32 "a") readState) |> ignore
+            writeFile root "/proc/sys/kernel/random/boot_id" (string (Guid.NewGuid())) 0o644
+            Assert.Throws<InvalidOperationException>(fun () -> load () |> ignore) |> ignore)
+
+    [<Test>]
     member _.``Fresh confirmation commits the journaled candidate``() =
         withHost (fun environment root ->
             writeFile root logicalPath before 0o644

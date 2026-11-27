@@ -250,6 +250,9 @@ type FirewalldTests() =
                       | "stat", _ ->
                           let mode = File.GetUnixFileMode(List.last arguments) |> int |> fun value -> Convert.ToString(value, 8)
                           "0:" + mode
+                      | "ss", [ "-H"; "-ltnp" ] -> "LISTEN 0 128 0.0.0.0:22 0.0.0.0:* users:((\"sshd\",pid=321,fd=3))"
+                      | "ss", [ "-H"; "-ltn" ] -> "LISTEN 0 128 0.0.0.0:22 0.0.0.0:*"
+                      | "/usr/bin/readlink", [ "-f"; "/proc/321/exe" ] -> "/usr/sbin/sshd"
                       | "ip", [ "-j"; "link"; "show" ] -> """[{"ifname":"lo","link_type":"loopback","operstate":"UNKNOWN"},{"ifname":"eth0","link_type":"ether","operstate":"UP"}]"""
                       | "ip", _ -> "[{\"dev\":\"eth0\"}]"
                       | "firewall-cmd", [ "--state" ] -> "running"

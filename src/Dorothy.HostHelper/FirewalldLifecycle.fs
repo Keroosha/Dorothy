@@ -16,6 +16,14 @@ module FirewalldLifecycle =
         { CompletedSteps: int
           InFlightStep: int option }
 
+    type NativeUndoProgress =
+        { RemainingSteps: int
+          InFlightStep: int option }
+
+    type UndoJournal =
+        { Previous: NativeUndoProgress option
+          Persist: NativeUndoProgress -> unit }
+
     type PendingTransaction =
         { SchemaVersion: int
           Nonce: string
@@ -31,6 +39,7 @@ module FirewalldLifecycle =
           ManagedAfter: string option
           RollbackProof: JsonObject option
           NativeProgress: NativeActivationProgress option
+          NativeUndo: (Guid * NativeUndoProgress) option
           ActivationStarted: bool
           AwaitingPostBoot: bool
           ReleaseOnRollback: bool
@@ -156,6 +165,14 @@ module FirewalldLifecycle =
                 value["inFlightStep"] <- (match p.InFlightStep with Some i -> JsonValue.Create i :> JsonNode | None -> null)
                 value)
             setOptionalObject node "nativeProgress" progress
+        if pending.SchemaVersion >= 4 then
+            let undo = pending.NativeUndo |> Option.map (fun (boot: Guid, p) ->
+                let value = JsonObject()
+                value["bootId"] <- JsonValue.Create(boot.ToString("D"))
+                value["remainingSteps"] <- JsonValue.Create p.RemainingSteps
+                value["inFlightStep"] <- (match p.InFlightStep with Some i -> JsonValue.Create i :> JsonNode | None -> null)
+                value)
+            setOptionalObject node "nativeUndo" undo
         node["nonce"] <- JsonValue.Create pending.Nonce
         node["ownerId"] <- JsonValue.Create pending.OwnerId
         node["configuration"] <- JsonValue.Create(FirewalldModel.toJson pending.Configuration)
@@ -182,10 +199,12 @@ module FirewalldLifecycle =
             Set.union fieldsV1 (set [ "scope"; "rollbackProof"; "activationStarted"; "awaitingPostBoot" ])
         let actual = node |> Seq.map (fun pair -> pair.Key) |> Set.ofSeq
         let version = getInt node "version"
-        if (version <> 1 && version <> 2 && version <> 3)
+        let fieldsV3 = Set.add "nativeProgress" fieldsV2
+        if (version < 1 || version > 4)
            || (version = 1 && actual <> fieldsV1)
            || (version = 2 && actual <> fieldsV2)
-           || (version = 3 && actual <> Set.add "nativeProgress" fieldsV2) then
+           || (version = 3 && actual <> fieldsV3)
+           || (version = 4 && actual <> Set.add "nativeUndo" fieldsV3) then
             fail "Invalid firewalld transaction record."
         let nonce = getString node "nonce"
         if not (Regex.IsMatch(nonce, "^[0-9a-f]{32}$", RegexOptions.CultureInvariant)) then fail "Invalid firewalld transaction nonce."
@@ -210,6 +229,17 @@ module FirewalldLifecycle =
                 let inFlight = match value["inFlightStep"] with null -> None | step -> Some(step.GetValue<int>())
                 if doneCount < 0 || doneCount > 4096 || (inFlight |> Option.exists ((<>) doneCount)) then fail "Invalid firewalld native progress."
                 { CompletedSteps = doneCount; InFlightStep = inFlight })
+        let nativeUndo =
+            if version < 4 then None
+            else getOptionalObject node "nativeUndo" |> Option.map (fun value ->
+                if (value |> Seq.map _.Key |> Set.ofSeq) <> set [ "bootId"; "remainingSteps"; "inFlightStep" ] || nativeProgress.IsNone || status <> "pending" then
+                    fail "Invalid firewalld native inverse receipt."
+                let remaining = getInt value "remainingSteps"
+                let inFlight = match value["inFlightStep"] with null -> None | step -> Some(step.GetValue<int>())
+                if remaining < 0 || remaining > 4096 || (not awaitingPostBoot && remaining > nativeProgress.Value.CompletedSteps) ||
+                   (inFlight |> Option.exists (fun i -> i < 0 || i <> remaining - 1)) then
+                    fail "Invalid firewalld native inverse checkpoint."
+                Guid.ParseExact(getString value "bootId", "D"), { RemainingSteps = remaining; InFlightStep = inFlight })
         if version >= 2 && c.Kind = "settings" && scope.IsNone then fail "Invalid firewalld settings transaction scope."
         if activationStarted && rollbackProof.IsNone then fail "Firewalld transaction lacks required runtime rollback proof."
         if awaitingPostBoot && rollbackProof.IsNone then fail "Post-boot recovery lacks a durable inverse."
@@ -227,6 +257,7 @@ module FirewalldLifecycle =
           ManagedAfter = getOptionalString node "managedAfter"
           RollbackProof = rollbackProof
           NativeProgress = nativeProgress
+          NativeUndo = nativeUndo
           ActivationStarted = activationStarted
           AwaitingPostBoot = awaitingPostBoot
           ReleaseOnRollback = getBool node "releaseOnRollback"
@@ -278,6 +309,33 @@ module FirewalldLifecycle =
         checkPrivateDirectory environment |> ignore
         let destination = regularPath environment pendingPath
         HostFiles.atomicWrite destination (strictUtf8.GetBytes((pendingNode transaction).ToJsonString())) privateFileMode
+
+    let private bootId environment =
+        Guid.ParseExact(File.ReadAllText(logicalPath environment "/proc/sys/kernel/random/boot_id").Trim(), "D")
+
+    /// The caller holds the native writer lock. Only the global intent supplies
+    /// authority; the per-owner record is a projection and can lag a crash.
+    let undoJournal environment transaction =
+        if transaction.SchemaVersion < 4 || transaction.NativeProgress.IsNone then None
+        else
+            let boot = lazy (bootId environment)
+            let previous = transaction.NativeUndo |> Option.map (fun (generation, receipt) ->
+                if generation <> boot.Value then fail "Native inverse receipt belongs to a different boot; ordered boot recovery is required."
+                receipt)
+            let mutable last = previous
+            let interrupted = previous |> Option.exists (fun p -> p.InFlightStep.IsSome)
+            let persist (next: NativeUndoProgress) =
+                if interrupted then fail "A new recovery attempt cannot attest an interrupted inverse command."
+                let valid =
+                    match last, next.InFlightStep with
+                    | None, Some i -> i >= 0 && i < 4096 && next.RemainingSteps = i + 1
+                    | Some prior, Some i -> prior.InFlightStep.IsNone && prior.RemainingSteps = next.RemainingSteps && i >= 0 && i = next.RemainingSteps - 1
+                    | Some prior, None -> prior.InFlightStep = Some next.RemainingSteps && prior.RemainingSteps = next.RemainingSteps + 1
+                    | _ -> false
+                if not valid then fail "Invalid transition of durable native inverse authority."
+                savePending environment { transaction with NativeUndo = Some(boot.Value, next) }
+                last <- Some next
+            Some { Previous = previous; Persist = persist }
 
     let private clearPending (environment: HostEnvironment) =
         let destination = regularPath environment pendingPath
@@ -355,7 +413,20 @@ module FirewalldLifecycle =
         if transaction.ActivationStarted || transaction.AwaitingPostBoot || (phase <> ActiveDaemon && needsBootInverse) then
             match phase with
             | BootBeforeFirewalld ->
-                let waiting = { transaction with AwaitingPostBoot = true }
+                // Only a new kernel boot may reset reverse progress: firewalld
+                // will start anew from the restored disk. Re-entering this unit
+                // in the same boot must never replenish consumed authority.
+                let undo = transaction.NativeUndo |> Option.filter (fun (generation, _) -> generation = bootId environment)
+                // A legacy forward-only record cannot authorize an active
+                // inverse. Upgrade a v3 repair only at a verified stopped
+                // daemon boundary, where the next daemon will load the disk.
+                let version =
+                    if transaction.SchemaVersion = 3 && startupLoadsDisk && transaction.NativeProgress.IsSome then
+                        match environment.Run "/usr/bin/systemctl" [ "show"; "--property=ActiveState"; "--value"; "firewalld.service" ] None with
+                        | { ExitCode = 0; Stdout = state } when state.Trim() = "inactive" -> 4
+                        | _ -> fail "Legacy native repair needs a stopped firewalld before boot-phase migration."
+                    else transaction.SchemaVersion
+                let waiting = { transaction with SchemaVersion = version; AwaitingPostBoot = true; NativeUndo = undo }
                 savePending environment waiting
                 match journal with
                 | Some value ->
@@ -367,6 +438,7 @@ module FirewalldLifecycle =
                 if state <> transaction.Before then
                     fail "Firewalld permanent preimage changed before post-boot runtime recovery."
                 restoreRuntime transaction BootAfterFirewalld
+            | BootAfterFirewalld -> fail "Post-boot recovery lacks the ordered preboot reservation."
             | _ -> restoreRuntime transaction phase
         if not (needsBootInverse && phase = BootBeforeFirewalld) then
             match journal with
@@ -670,7 +742,7 @@ module FirewalldLifecycle =
         =
         if path <> expectedPath c then fail "Firewalld transaction path does not match its declared object."
         let owner = journalOwner journal
-        { SchemaVersion = 3
+        { SchemaVersion = 4
           Nonce = Guid.NewGuid().ToString("N")
           OwnerId = owner
           Configuration = c
@@ -688,6 +760,7 @@ module FirewalldLifecycle =
               | Some strategy when List.contains (strategy.GetValue<string>()) [ "object-delta"; "runtime-delta" ] ->
                   Some { CompletedSteps = 0; InFlightStep = None }
               | _ -> None
+          NativeUndo = None
           ActivationStarted = false
           AwaitingPostBoot = false
           ReleaseOnRollback = releaseOnRollback
@@ -856,6 +929,7 @@ module FirewalldLifecycle =
         | Some transaction ->
             validateIdentity c journal transaction
             if transaction.Nonce <> nonce then fail "Firewalld transaction confirmation nonce does not match."
+            if transaction.NativeUndo.IsSome then fail "Cannot confirm a transaction whose native inverse has already begun."
             let current, currentMode = readPath environment transaction.Path
             let currentState = if transaction.SchemaVersion = 1 then current else readState transaction.Scope current
             verifyMetadata environment transaction current currentMode transaction.AfterMode

@@ -11,9 +11,12 @@ type FirewalldRecoveryProofTests() =
     let commandResult (stdout: string) : CommandResult =
         { ExitCode = 0; Stdout = stdout; Stderr = "" }
 
+    let freshUndo () : FirewalldLifecycle.UndoJournal option = Some { Previous = None; Persist = ignore }
+
     let restoreWithoutReload environment configuration xml proof phase progress =
         FirewalldRecoveryProof.restoreRuntimeWithProgress environment configuration xml proof phase
             (fun () -> Assert.Fail "A scoped inverse must not reload the daemon.") progress
+            (freshUndo ())
 
     let configuration =
         { FirewalldModel.empty "zone" "quiet" with
@@ -393,6 +396,7 @@ type FirewalldRecoveryProofTests() =
                         (fun () ->
                             checkedSafety <- true
                             raise (InvalidOperationException("blocked by reload safety preflight")))
+                        None
                         None
                     |> ignore)
             Assert.That(error.Message, Is.EqualTo "blocked by reload safety preflight")
@@ -873,6 +877,87 @@ type FirewalldRecoveryProofTests() =
                 calls |> Seq.exists (fun args -> args |> List.exists (fun value -> value.StartsWith("--remove-", StringComparison.Ordinal))),
                 Is.False))
 
+    [<TestCase(false, false); TestCase(false, true); TestCase(true, false); TestCase(true, true)>]
+    member _.``An interrupted inverse never consumes a later owner's identical restriction``(runtimeOnly: bool, completionStored: bool) =
+        let before = FirewalldModel.empty "zone" "quiet"
+        let after =
+            { before with Elements = [element "rule" ["family", "ipv4"] [
+                                          element "port" ["port", "8443"; "protocol", "tcp"] []
+                                          element "drop" [] [] ]] }
+        let baseline = if runtimeOnly then after else before
+        let xml = Some(FieldRuntime.render baseline)
+        withSelectorRuntimeProgress baseline (selectorValues before) (fun env calls current setCurrent report forward ->
+            let proof =
+                if runtimeOnly then
+                    let snapshot = FirewalldRuntime.inspectRuntime env "zone" "quiet" |> Option.get
+                    FirewalldRecoveryProof.runtimeRepairProof env after snapshot
+                else FirewalldRecoveryProof.objectDeltaProof env after xml (Some(FieldRuntime.render after)) |> Option.get
+            if runtimeOnly then FirewalldRecoveryProof.activateRuntimeRepairWithProgress env after proof report
+            else FirewalldRecoveryProof.activateObjectDeltaWithProgress env after xml proof report
+            let mutable saved: FirewalldLifecycle.NativeUndoProgress option = None
+            let restore (journal: FirewalldLifecycle.UndoJournal) =
+                FirewalldRecoveryProof.restoreRuntimeWithProgress env after xml (Some proof) FirewalldLifecycle.ActiveDaemon
+                    (fun () -> Assert.Fail "Scoped inverse must not reload.") (forward ()) (Some journal)
+            let record (receipt: FirewalldLifecycle.NativeUndoProgress) =
+                if receipt.InFlightStep.IsSome then saved <- Some receipt
+                else
+                    if completionStored then saved <- Some receipt
+                    raise (IOException "interrupted before finalization")
+            Assert.Throws<IOException>(fun () -> restore { Previous = None; Persist = record }) |> ignore
+            Assert.That((current ())["rich rules"], Is.Empty)
+            setCurrent (selectorValues after)
+            let writes () = calls |> Seq.filter (List.exists (fun arg -> arg.StartsWith("--remove-rich-rule="))) |> Seq.length
+            let beforeRetry = writes ()
+            let retry () = restore { Previous = saved; Persist = fun _ -> Assert.Fail "A retry spent authority already relinquished." }
+            if completionStored then retry ()
+            else Assert.Throws<InvalidOperationException>(TestDelegate retry) |> ignore
+            Assert.That(writes (), Is.EqualTo beforeRetry)
+            Assert.That((current ())["rich rules"], Is.EquivalentTo((selectorValues after)["rich rules"])))
+
+    [<Test>]
+    member _.``A partial inverse resumes only from its durable reverse frontier``() =
+        let before = FirewalldModel.empty "zone" "quiet"
+        let drop port =
+            element "rule" ["family","ipv4"] [element "port" ["port",port;"protocol","tcp"] []; element "drop" [] []]
+        let after = { before with Elements = [drop "8443"; drop "8444"] }
+        let xml = Some(FieldRuntime.render before)
+        withSelectorRuntimeProgress before (selectorValues before) (fun env _ current setCurrent report forward ->
+            let proof = FirewalldRecoveryProof.objectDeltaProof env after xml (Some(FieldRuntime.render after)) |> Option.get
+            FirewalldRecoveryProof.activateObjectDeltaWithProgress env after xml proof report
+            let mutable durable: FirewalldLifecycle.NativeUndoProgress option = None
+            let undo persist =
+                FirewalldRecoveryProof.restoreRuntimeWithProgress env after xml (Some proof) FirewalldLifecycle.ActiveDaemon
+                    (fun () -> Assert.Fail "Unexpected reload") (forward ()) (Some { Previous = durable; Persist = persist })
+            Assert.Throws<IOException>(fun () -> undo (fun receipt ->
+                durable <- Some receipt
+                if receipt.RemainingSteps = 1 && receipt.InFlightStep.IsNone then raise (IOException "interrupted between inverse commands"))) |> ignore
+            let midpoint = current ()
+            Assert.That(midpoint["rich rules"], Has.Length.EqualTo 1)
+            setCurrent (selectorValues after)
+            Assert.Throws<InvalidOperationException>(fun () -> undo (fun _ -> Assert.Fail "Cannot replenish the original forward receipt.")) |> ignore
+            Assert.That((current ())["rich rules"], Is.EquivalentTo((selectorValues after)["rich rules"]))
+            // Independent owner releases its selector. The original remaining
+            // step is still ours; the relinquished one must not be reissued.
+            setCurrent midpoint
+            undo (Some >> fun receipt -> durable <- receipt)
+            Assert.That((current ())["rich rules"], Is.Empty)
+            Assert.That(durable.Value.RemainingSteps, Is.Zero))
+
+    [<Test>]
+    member _.``Standalone LOG and NFLOG are nonterminal and can be replaced then released``() =
+        let rule logger attrs =
+            element "rule" ["family", "ipv4"] [element "port" ["port","8443";"protocol","tcp"] []; element logger attrs []]
+        let before = { FirewalldModel.empty "zone" "quiet" with Elements = [rule "log" ["prefix","app-log"]] }
+        let after = { before with Elements = [rule "nflog" ["group","7";"prefix","app-nf"]] }
+        let xml = Some(FieldRuntime.render before)
+        withSelectorRuntimeProgress before (selectorValues before) (fun env _ current _ report getProgress ->
+            let plan = FirewalldRecoveryProof.objectDeltaProof env after xml (Some(FieldRuntime.render after)) |> Option.get
+            for delta in plan["deltas"].AsArray() do Assert.That(delta["effect"].GetValue<string>(), Is.EqualTo "observe")
+            FirewalldRecoveryProof.activateObjectDeltaWithProgress env after xml plan report
+            Assert.That((current ())["rich rules"], Is.EquivalentTo((selectorValues after)["rich rules"]))
+            restoreWithoutReload env after xml (Some plan) FirewalldLifecycle.ActiveDaemon (getProgress ())
+            Assert.That((current ())["rich rules"], Is.EquivalentTo((selectorValues before)["rich rules"])))
+
     [<Test>]
     member _.``A foreign zone interface does not block an attributable restrictive inverse``() =
         let before = FirewalldModel.empty "zone" "quiet"
@@ -944,10 +1029,7 @@ type FirewalldRecoveryProofTests() =
             Assert.That(proof["deltas"].AsArray().Count, Is.EqualTo 2)
             FirewalldRecoveryProof.activateObjectDeltaWithProgress environment after beforeXml proof report
             Assert.That(current (), Is.EquivalentTo afterEntries)
-            FirewalldRecoveryProof.restoreRuntimeWithProgress environment after beforeXml (Some proof)
-                FirewalldLifecycle.ActiveDaemon
-                (fun () -> Assert.Fail "A scoped inverse must not reload the daemon.")
-                (getProgress ())
+            restoreWithoutReload environment after beforeXml (Some proof) FirewalldLifecycle.ActiveDaemon (getProgress ())
             Assert.That(current (), Is.EquivalentTo beforeEntries)
             Assert.That(calls, Does.Contain [ "firewall-cmd"; "--ipset=peer-set"; "--add-entry=192.0.2.2" ])
             Assert.That(calls, Does.Contain [ "firewall-cmd"; "--ipset=peer-set"; "--remove-entry=192.0.2.2" ])

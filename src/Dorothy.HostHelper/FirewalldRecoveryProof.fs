@@ -11,6 +11,7 @@ module FirewalldRecoveryProof =
     type private RepairEffect =
         | Grants
         | Restricts
+        | Observes
         | Steers
 
     type private RuntimeDelta =
@@ -431,6 +432,9 @@ module FirewalldRecoveryProof =
         | [ action ] when action.Name = "accept" -> Grants
         | [ action ] when action.Name = "forward-port" || action.Name = "masquerade"
                           || action.Name = "mark" || action.Name = "tcp-mss-clamp" -> Steers
+        | [] when rule.Children |> List.exists (fun child -> child.Name = "log" || child.Name = "nflog") ->
+            // LOG/NFLOG alone produces a record, not a packet verdict.
+            Observes
         | _ -> fail "A rich rule has no single reversible monotone action; refusing runtime-only repair."
 
     let private deltaEffect (configuration: FirewalldModel.Configuration) field value =
@@ -450,7 +454,7 @@ module FirewalldRecoveryProof =
             [ "services", 0; "ports", 1; "source-ports", 2; "protocols", 3
               "forward-ports", 4; "icmp-blocks", 5; "rich rules", 6; "sources", 7; "entries", 8 ]
 
-    let private effectOrder = function Restricts -> 0 | Steers -> 1 | Grants -> 2
+    let private effectOrder = function Restricts -> 0 | Steers | Observes -> 1 | Grants -> 2
 
     let private sortDeltas (deltas: RuntimeDelta list) =
         deltas
@@ -634,7 +638,7 @@ module FirewalldRecoveryProof =
     let unchangedProof (configuration: FirewalldModel.Configuration) =
         proofBase configuration "unchanged"
 
-    let private effectName = function Grants -> "grant" | Restricts -> "restrict" | Steers -> "steer"
+    let private effectName = function Grants -> "grant" | Restricts -> "restrict" | Steers -> "steer" | Observes -> "observe"
 
     let private objectSelectorFields kind =
         if kind = "ipset" then [ "entries" ]
@@ -675,6 +679,7 @@ module FirewalldRecoveryProof =
         | Grants -> Restricts
         | Restricts -> Grants
         | Steers -> Steers
+        | Observes -> Observes
 
     let private objectDeltaEffect (beforeConfiguration: FirewalldModel.Configuration) (afterConfiguration: FirewalldModel.Configuration) field value add =
         if field = "entries" || field = "sources" then Steers
@@ -1006,27 +1011,159 @@ module FirewalldRecoveryProof =
         (authorizeSetBatch: unit -> bool)
         =
         objectDeltaProofCore environment configuration effectiveBefore effectiveAfter authorizeSetBatch
-    let managementServerPort () =
+    let private parseListenerPort (endpoint: string) =
+        let separator = endpoint.LastIndexOf(':')
+        if separator < 0 || separator = endpoint.Length - 1 then None
+        else
+            match Int32.TryParse(endpoint.Substring(separator + 1)) with
+            | true, port when port > 0 && port <= 65535 -> Some port
+            | _ -> None
+
+    let private listeningProcessOwners (value: string) =
+        let prefix = "users:(("
+        if not (value.StartsWith(prefix, StringComparison.Ordinal) && value.EndsWith("))", StringComparison.Ordinal)) then None
+        else
+            let body = value.Substring(prefix.Length, value.Length - prefix.Length - 2)
+            let entries = Regex.Split(body, @"\),\(")
+            let parseEntry (entry: string) =
+                match entry.Split(',') with
+                | [| quotedName; pid; fd |]
+                    when quotedName.Length >= 2 && quotedName[0] = '"' && quotedName[quotedName.Length - 1] = '"'
+                         && pid.StartsWith("pid=", StringComparison.Ordinal)
+                         && fd.StartsWith("fd=", StringComparison.Ordinal) ->
+                    let mutable processId = 0
+                    let mutable descriptor = 0
+                    if Int32.TryParse(pid.Substring(4), &processId) && processId > 0
+                       && Int32.TryParse(fd.Substring(3), &descriptor) && descriptor >= 0 then
+                        Some(quotedName.Substring(1, quotedName.Length - 2), processId)
+                    else None
+                | _ -> None
+            let owners = entries |> Array.map parseEntry
+            if owners.Length = 0 || (owners |> Array.exists Option.isNone) then None
+            else owners |> Array.choose id |> Array.toList |> Some
+
+    let private listeningTcpSockets (environment: HostEnvironment) includeProcessInfo =
+        try
+            let arguments = if includeProcessInfo then [ "-H"; "-ltnp" ] else [ "-H"; "-ltn" ]
+            let result = environment.Run "ss" arguments None
+            if result.ExitCode <> 0 || not (String.IsNullOrWhiteSpace result.Stderr) then None
+            else
+                let sockets = ResizeArray<int * (string * int) list option>()
+                let mutable complete = true
+                for line in result.Stdout.Split([| '\r'; '\n' |], StringSplitOptions.RemoveEmptyEntries) do
+                    let fields = line.Split([| ' '; '\t' |], StringSplitOptions.RemoveEmptyEntries)
+                    if fields.Length < 5 || fields[0] <> "LISTEN" then
+                        complete <- false
+                    else
+                        match parseListenerPort fields[3] with
+                        | None -> complete <- false
+                        | Some port ->
+                            let owners =
+                                if not includeProcessInfo then Some []
+                                elif fields.Length < 6 then None
+                                else listeningProcessOwners(String.concat " " fields[5..])
+                            sockets.Add((port, owners))
+                if complete then Some(List.ofSeq sockets) else None
+        with _ -> None
+
+    let private listenerExecutable (environment: HostEnvironment) (processId: int) =
+        try
+            let path = "/proc/" + processId.ToString(System.Globalization.CultureInfo.InvariantCulture) + "/exe"
+            let result = environment.Run "/usr/bin/readlink" [ "-f"; path ] None
+            if result.ExitCode = 0 && String.IsNullOrWhiteSpace result.Stderr
+               && not (String.IsNullOrWhiteSpace result.Stdout) then Some(result.Stdout.Trim())
+            else None
+        with _ -> None
+
+    let private isNativeSshExecutable (path: string) =
+        List.contains path
+            [ "/usr/sbin/sshd"; "/usr/sbin/dropbear"; "/usr/bin/dropbear"
+              "/usr/sbin/dropbearmulti"; "/usr/bin/dropbearmulti" ]
+
+    let private sshConnectionPort () =
         match Environment.GetEnvironmentVariable "SSH_CONNECTION" with
         | null -> None
         | text ->
             match text.Split([| ' '; '\t' |], StringSplitOptions.RemoveEmptyEntries) with
-            | [| _; _; _; value |] -> match Int32.TryParse value with true, n when n > 0 && n <= 65535 -> Some n | _ -> None
+            | [| _; _; _; value |] ->
+                match Int32.TryParse value with
+                | true, port when port > 0 && port <= 65535 -> Some port
+                | _ -> None
             | _ -> None
 
-    let private relevantPorts port ports =
-        match port with
+    /// Returns ports attributable to Debian's native OpenSSH or Dropbear, plus
+    /// systemd-owned and unidentifiable listeners conservatively. Executables are
+    /// authenticated through /proc/PID/exe; comm alone never rules a listener out.
+    /// Arbitrary SSH embedded or proxied by another executable is outside this boundary.
+    let managementServerPorts (environment: HostEnvironment) =
+        let connectionPort = sshConnectionPort ()
+        match listeningTcpSockets environment true with
+        | None -> None
+        | Some sockets ->
+            let ports = Collections.Generic.HashSet<int>()
+            let executableCache = Collections.Generic.Dictionary<int, string option>()
+            let mayBeSsh (name, processId) =
+                if processId = 1 || name = "systemd" then true
+                else
+                    let executable =
+                        match executableCache.TryGetValue processId with
+                        | true, path -> path
+                        | _ ->
+                            let path = listenerExecutable environment processId
+                            executableCache[processId] <- path
+                            path
+                    match executable with
+                    | None -> true
+                    | Some path -> isNativeSshExecutable path
+            for port, owners in sockets do
+                let possibleManagement =
+                    match owners with
+                    | None -> true
+                    | Some processes -> processes |> List.exists mayBeSsh
+                if possibleManagement then ports.Add port |> ignore
+            match connectionPort with
+            | Some port when not (sockets |> List.exists (fst >> (=) port)) -> None
+            | Some port ->
+                ports.Add port |> ignore
+                Some(Set.ofSeq ports)
+            | None -> Some(Set.ofSeq ports)
+
+    /// DefaultZone equivalence compares admission at every listening TCP port,
+    /// independent of owner. An incomplete inventory falls back to all-port equivalence.
+    let listeningTcpPorts (environment: HostEnvironment) =
+        match listeningTcpSockets environment false with
+        | None -> None
+        | Some sockets ->
+            let ports = sockets |> List.map fst |> Set.ofList
+            match sshConnectionPort () with
+            | Some port when not (Set.contains port ports) -> None
+            | _ when ports.IsEmpty -> None
+            | _ -> Some ports
+
+
+    let private relevantPorts managementPorts ports =
+        match managementPorts with
         | None -> Set.ofList ports
-        | Some server ->
-            ports |> List.filter (fun (value: string) ->
+        | Some servers ->
+            let containsServerPort (value: string) =
                 match value.Split('/') with
                 | [| range; "tcp" |] ->
-                    let ends = range.Split('-')
-                    Int32.Parse(ends[0]) <= server && Int32.Parse(ends[ends.Length - 1]) >= server
-                | _ -> false) |> Set.ofList
+                    match range.Split('-') with
+                    | [| first |] ->
+                        match Int32.TryParse first with
+                        | true, port -> Set.contains port servers
+                        | _ -> false
+                    | [| first; last |] ->
+                        match Int32.TryParse first, Int32.TryParse last with
+                        | (true, low), (true, high) when low > 0 && high >= low && high <= 65535 ->
+                            servers |> Set.exists (fun port -> low <= port && port <= high)
+                        | _ -> false
+                    | _ -> false
+                | _ -> false
+            ports |> List.filter containsServerPort |> Set.ofList
 
-    let private admissionSignature port (s: FirewalldRuntime.RuntimeSnapshot) =
-        s.Target, Set.ofList s.Services, relevantPorts port s.Ports, Set.ofList s.Protocols,
+    let private admissionSignature managementPorts (s: FirewalldRuntime.RuntimeSnapshot) =
+        s.Target, Set.ofList s.Services, relevantPorts managementPorts s.Ports, Set.ofList s.Protocols,
         Set.ofList s.SourcePorts, Set.ofList s.ForwardPorts, Set.ofList s.RichRules,
         Set.ofList s.IcmpBlocks, s.IcmpBlockInversion
 
@@ -1044,50 +1181,65 @@ module FirewalldRecoveryProof =
                 (not (List.exists (fun z -> Set.contains z affected) endpoints) ||
                  (not (List.contains "HOST" endpoints) && not (steersPackets policy)))))
 
-    let private defaultAdmission environment port (cache: Collections.Generic.Dictionary<string, bool option>) (zone: FirewalldRuntime.RuntimeSnapshot) =
+    // Service getters retain native fields; unlike zone/policy list-all, they do
+    // not populate the zone-specific Ports/Protocols/SourcePorts projections.
+    let private nativeWords field (s: FirewalldRuntime.RuntimeSnapshot) =
+        Map.tryFind field s.NativeFields |> Option.defaultValue []
+        |> List.collect (fun line -> line.Split([| ' '; '\t' |], StringSplitOptions.RemoveEmptyEntries) |> Array.toList)
+
+    let private grantsAt servers protocols ports =
+        if List.contains "tcp" protocols then servers
+        else servers |> Set.filter (fun port -> not (Set.isEmpty (relevantPorts (Some(Set.singleton port)) ports)))
+
+    let private defaultAdmission environment managementPorts (cache: Collections.Generic.Dictionary<string, Set<int> option>) (zone: FirewalldRuntime.RuntimeSnapshot) =
         let simple (s: FirewalldRuntime.RuntimeSnapshot) =
-            snapshotComplete s && s.SourcePorts.IsEmpty &&
+            snapshotComplete s && (nativeWords "source-ports" s).IsEmpty &&
             List.forall (fun field ->
                 Map.tryFind field s.NativeFields |> Option.forall (List.forall String.IsNullOrWhiteSpace))
                 [ "includes"; "destination"; "modules"; "helpers" ]
-            && List.forall (fun p -> List.contains p ["tcp"; "udp"; "sctp"; "dccp"]) s.Protocols
-        let mutable granted = not (Set.isEmpty (relevantPorts port zone.Ports)) || List.contains "tcp" zone.Protocols
-        let residual = zone.Services |> List.filter (fun name ->
-            let effect =
-                match cache.TryGetValue name with
-                | true, result -> result
-                | _ ->
-                    let permits (s: FirewalldRuntime.RuntimeSnapshot) = List.contains "tcp" s.Protocols || not (Set.isEmpty (relevantPorts port s.Ports))
-                    let result =
-                        match FirewalldRuntime.inspectPermanent environment "service" name, FirewalldRuntime.inspectRuntime environment "service" name with
-                        | Some a, Some b when simple a && simple b && permits a = permits b -> Some(permits a)
-                        | _ -> None
-                    cache[name] <- result
-                    result
-            match effect with
-            | None -> true
-            | Some permits -> granted <- granted || permits; false)
-        admissionSignature port { zone with Services = residual; Ports = []; Protocols = zone.Protocols |> List.filter ((<>) "tcp") },
-        granted, zone.IngressPriority, zone.EgressPriority, zone.Masquerade, zone.Forward
+            && List.forall (fun p -> List.contains p ["tcp"; "udp"; "sctp"; "dccp"]) (nativeWords "protocols" s)
+            && List.forall (fun (p: string) -> System.Text.RegularExpressions.Regex.IsMatch(p, @"^\d+(-\d+)?/(tcp|udp|sctp|dccp)$")) (nativeWords "ports" s)
+        match managementPorts with
+        | None ->
+            admissionSignature None zone, Set.empty, zone.IngressPriority, zone.EgressPriority, zone.Masquerade, zone.Forward
+        | Some servers ->
+            let grants s = grantsAt servers (nativeWords "protocols" s) (nativeWords "ports" s)
+            let mutable granted = grantsAt servers zone.Protocols zone.Ports
+            let residual = zone.Services |> List.filter (fun name ->
+                let effect =
+                    match cache.TryGetValue name with
+                    | true, result -> result
+                    | _ ->
+                        let result =
+                            match FirewalldRuntime.inspectPermanent environment "service" name, FirewalldRuntime.inspectRuntime environment "service" name with
+                            | Some a, Some b when simple a && simple b && grants a = grants b -> Some(grants a)
+                            | _ -> None
+                        cache[name] <- result
+                        result
+                match effect with
+                | None -> true
+                | Some permits -> granted <- Set.union granted permits; false)
+            admissionSignature managementPorts { zone with Services = residual; Ports = []; Protocols = zone.Protocols |> List.filter ((<>) "tcp") },
+            granted, zone.IngressPriority, zone.EgressPriority, zone.Masquerade, zone.Forward
 
     let equivalentDefaultZones environment original candidate =
         if original = candidate then true
         else
             try
-                let port = managementServerPort ()
+                let managementPorts = listeningTcpPorts environment
                 let snapshots = [ for name in [ original; candidate ] do
                                       yield FirewalldRuntime.inspectRuntime environment "zone" name |> Option.get
                                       yield FirewalldRuntime.inspectPermanent environment "zone" name |> Option.get ]
-                let cache = Collections.Generic.Dictionary<string, bool option>(StringComparer.Ordinal)
-                port.IsSome && List.forall snapshotComplete snapshots
-                && (let baseline = defaultAdmission environment port cache snapshots.Head
-                    snapshots.Tail |> List.forall (fun zone -> defaultAdmission environment port cache zone = baseline))
+                let cache = Collections.Generic.Dictionary<string, Set<int> option>(StringComparer.Ordinal)
+                List.forall snapshotComplete snapshots
+                && (let baseline = defaultAdmission environment managementPorts cache snapshots.Head
+                    snapshots.Tail |> List.forall (fun zone -> defaultAdmission environment managementPorts cache zone = baseline))
                 && noDispatchDifference environment (set [ original; candidate ])
             with _ -> false
 
     let private equivalentZoneAdmission environment name (before: FirewalldRuntime.RuntimeSnapshot option) (after: FirewalldRuntime.RuntimeSnapshot option) (candidate: FirewalldModel.Configuration) =
-        let port = managementServerPort ()
-        let signature = admissionSignature port
+        let managementPorts = managementServerPorts environment
+        let signature = admissionSignature managementPorts
         let candidates = [before; after] |> List.choose id
         let sameShape first snapshots = snapshots |> List.forall (fun x -> signature x = signature first)
         match candidates with
@@ -1100,24 +1252,28 @@ module FirewalldRecoveryProof =
                 let zones = FirewalldRuntime.listRuntime environment "zone" |> Option.get
                 let sourceChange = (before |> Option.map _.SourcesRaw) <> (after |> Option.map _.SourcesRaw)
                 // Adding a literal IPv4 source cannot affect IPv6 NDP. If its new
-                // zone unconditionally grants management TCP, a stricter default
-                // target for *other* ports does not imply an SSH narrowing.
+                // zone unconditionally grants every attributed management TCP
+                // listener, a stricter default target for *other* ports is harmless.
                 let safeNewSource =
-                    match before, after, port with
-                    | None, Some z, Some server when z.Interfaces.IsEmpty && not z.SourcesRaw.IsEmpty ->
+                    match before, after, managementPorts with
+                    | None, Some z, Some servers when not servers.IsEmpty && z.Interfaces.IsEmpty && not z.SourcesRaw.IsEmpty ->
                         let exclusivelyIPv4 = z.SourcesRaw |> List.forall (fun source ->
                             match Net.IPAddress.TryParse(source.Split('/')[0]) with true, ip -> ip.AddressFamily = Net.Sockets.AddressFamily.InterNetwork | _ -> false)
-                        let unconditionalService service =
-                            [ FirewalldRuntime.inspectPermanent environment "service" service
-                              FirewalldRuntime.inspectRuntime environment "service" service ]
-                            |> List.forall (function
-                                | Some s when snapshotComplete s && (Map.tryFind "destination" s.NativeFields |> Option.forall (List.forall String.IsNullOrWhiteSpace)) ->
-                                    not (Set.isEmpty (relevantPorts (Some server) s.Ports))
-                                | _ -> false)
+                        let serviceListenerPorts service =
+                            match FirewalldRuntime.inspectPermanent environment "service" service,
+                                  FirewalldRuntime.inspectRuntime environment "service" service with
+                            | Some permanent, Some runtime
+                                when snapshotComplete permanent
+                                     && snapshotComplete runtime
+                                     && (Map.tryFind "destination" permanent.NativeFields |> Option.forall (List.forall String.IsNullOrWhiteSpace))
+                                     && (Map.tryFind "destination" runtime.NativeFields |> Option.forall (List.forall String.IsNullOrWhiteSpace)) ->
+                                let permits s = grantsAt servers (nativeWords "protocols" s) (nativeWords "ports" s)
+                                Some(Set.intersect (permits permanent) (permits runtime))
+                            | _ -> None
                         let disjointPort (el: FirewalldModel.Element) =
                             match Map.tryFind "protocol" el.Attributes, Map.tryFind "port" el.Attributes with
                             | Some ("udp" | "sctp" | "dccp"), _ -> true
-                            | Some "tcp", Some range -> Set.isEmpty (relevantPorts port [ range + "/tcp" ])
+                            | Some "tcp", Some range -> Set.isEmpty (relevantPorts managementPorts [ range + "/tcp" ])
                             | _ -> false
                         let cannotIntercept (el: FirewalldModel.Element) =
                             match el.Name with
@@ -1129,8 +1285,20 @@ module FirewalldRecoveryProof =
                                     List.contains child.Name [ "icmp-type"; "icmp-block" ] ||
                                     (List.contains child.Name [ "port"; "forward-port" ] && disjointPort child)))
                             | _ -> true
+                        let directGrant =
+                            if List.contains "tcp" z.Protocols then servers
+                            else servers |> Set.filter (fun port ->
+                                not (Set.isEmpty (relevantPorts (Some(Set.singleton port)) z.Ports)))
+                        let allGranted =
+                            z.Services
+                            |> List.fold (fun granted service ->
+                                serviceListenerPorts service
+                                |> Option.map (Set.union granted)
+                                |> Option.defaultValue granted)
+                                directGrant
+                            |> fun granted -> Set.isSubset servers granted
                         exclusivelyIPv4 && not z.Masquerade && List.forall cannotIntercept candidate.Elements
-                        && (not (Set.isEmpty (relevantPorts port z.Ports)) || List.contains "tcp" z.Protocols || List.exists unconditionalService z.Services)
+                        && allGranted
                     | _ -> false
                 let dz = environment.Run "firewall-cmd" ["--get-default-zone"] None
                 if dz.ExitCode <> 0 || not (List.contains (dz.Stdout.Trim()) zones) then false
@@ -1187,13 +1355,13 @@ module FirewalldRecoveryProof =
                     effectiveAfter
                     |> Option.map (parseObjectConfiguration configuration.Kind configuration.Name)
                     |> Option.defaultValue (FirewalldModel.empty configuration.Kind configuration.Name)
-                let managementPort = managementServerPort ()
+                let managementPorts = managementServerPorts environment
                 let steeringCanMatch (c: FirewalldModel.Configuration) =
                     let mayMatch (e: FirewalldModel.Element) =
                         match Map.tryFind "protocol" e.Attributes, Map.tryFind "port" e.Attributes with
                         | Some ("udp" | "sctp" | "dccp"), _ -> false
                         | Some "tcp", Some range when not (List.contains "HOST" c.Ingress) ->
-                            not (Set.isEmpty (relevantPorts managementPort [ range + "/tcp" ]))
+                            not (Set.isEmpty (relevantPorts managementPorts [ range + "/tcp" ]))
                         | _ -> true
                     c.Masquerade || (c.Elements |> List.exists (fun e ->
                         match e.Name with
@@ -1279,32 +1447,17 @@ module FirewalldRecoveryProof =
                         deriveObjectDeltas beforeSnapshot afterSnapshot beforeConfiguration afterConfiguration
                     let selectorNarrowed =
                         selectorDeltas |> List.exists (fun delta -> delta.Effect = Restricts || delta.Effect = Steers)
-                    // Source/destination addresses are not a stable identity for a
-                    // rebounding peer; the server's TCP port is the useful discriminator.
+                    // Every actual management listener can be reached by the peer
+                    // regardless of its source address; unknown inventories require
+                    // conservative consideration of every TCP port.
                     let hasManagementGrant (snapshot: FirewalldRuntime.RuntimeSnapshot) =
-                        let ports =
-                            match managementPort with
-                            | None -> false
-                            | Some port ->
-                                snapshot.Ports
-                                |> List.exists (fun value ->
-                                    match value.Split('/') with
-                                    | [| range; "tcp" |] ->
-                                        let bounds = range.Split('-')
-                                        match bounds with
-                                        | [| one |] ->
-                                            match Int32.TryParse one with
-                                            | true, candidate -> candidate = port
-                                            | _ -> false
-                                        | [| first; last |] ->
-                                            match Int32.TryParse first, Int32.TryParse last with
-                                            | (true, low), (true, high) -> low <= port && port <= high
-                                            | _ -> false
-                                        | _ -> false
-                                    | _ -> false)
-                        targetRank snapshot.Target = 2
-                        || List.contains "ssh" snapshot.Services
-                        || ports
+                        match managementPorts with
+                        | Some servers when servers.IsEmpty -> false
+                        | _ ->
+                            targetRank snapshot.Target = 2
+                            || List.contains "ssh" snapshot.Services
+                            || List.contains "tcp" snapshot.Protocols
+                            || not (Set.isEmpty (relevantPorts managementPorts snapshot.Ports))
                     let hasBlockingSemantics (snapshot: FirewalldRuntime.RuntimeSnapshot) =
                         targetRank snapshot.Target = 0
                         || (snapshot.RichRules |> List.exists FirewalldRuntime.isRestrictiveRichRule)
@@ -1851,9 +2004,26 @@ module FirewalldRecoveryProof =
                 fail "Invalid in-flight firewalld native activation progress."
             | Some index when currentIndex > index ->
                 fail "The live firewalld selector may include a command without a confirmed native success."
-            | Some _ when currentIndex <= value.CompletedSteps -> currentIndex
-            | None when currentIndex <= value.CompletedSteps -> currentIndex
-            | _ -> fail "The live firewalld selector is beyond its durably attributed native commands."
+            | _ when currentIndex = value.CompletedSteps -> currentIndex
+            | _ -> fail "The live firewalld selector differs from the last durably attributed native checkpoint."
+
+    let private remainingUndo (tracking: FirewalldLifecycle.UndoJournal option) current maximum initial =
+        match tracking with
+        | Some { Previous = Some receipt } ->
+            if receipt.InFlightStep.IsSome then
+                fail "The previous firewalld inverse command has no confirmed outcome; refusing to issue it again."
+            if receipt.RemainingSteps <> current || receipt.RemainingSteps > maximum then
+                fail "The live firewalld checkpoint differs from the durable inverse cursor; independent changes are not ours."
+            receipt.RemainingSteps
+        | Some _ -> initial ()
+        | None when current = 0 -> 0
+        | None -> fail "Legacy firewalld progress cannot identify a previous inverse; refusing a native write."
+
+    let private undoStep (tracking: FirewalldLifecycle.UndoJournal option) index commandAndVerify =
+        let journal = tracking |> Option.defaultWith (fun () -> fail "A durable inverse journal is required.")
+        journal.Persist { RemainingSteps = index + 1; InFlightStep = Some index }
+        commandAndVerify ()
+        journal.Persist { RemainingSteps = index; InFlightStep = None }
 
     let private objectRepairStateIndex (repair: ObjectRepair) (snapshot: FirewalldRuntime.RuntimeSnapshot) =
         let values = objectSelectorValues snapshot |> Map.map (fun _ items -> Set.ofList items)
@@ -1976,6 +2146,7 @@ module FirewalldRecoveryProof =
         (phase: FirewalldLifecycle.RecoveryPhase)
         (preReload: unit -> unit)
         (progress: FirewalldLifecycle.NativeActivationProgress option)
+        (tracking: FirewalldLifecycle.UndoJournal option)
         =
         let strategy, node = readProof configuration proof
         if strategy = "reload-before" || strategy = "object-delta" then
@@ -2001,7 +2172,13 @@ module FirewalldRecoveryProof =
         | FirewalldLifecycle.ActiveDaemon | FirewalldLifecycle.BootAfterFirewalld ->
             match strategy with
             | "unchanged" -> ()
+            | ("object-delta" | "runtime-delta") when
+                    tracking |> Option.bind _.Previous |> Option.exists (fun p -> p.RemainingSteps = 0 && p.InFlightStep.IsNone) ->
+                // Authority is exhausted even if a foreign writer subsequently
+                // introduced an identical selector.
+                ()
             | ("object-delta" | "runtime-delta") when phase = FirewalldLifecycle.ActiveDaemon &&
+                    (tracking |> Option.bind _.Previous).IsNone &&
                     progress |> Option.exists (fun p -> p.CompletedSteps = 0 && p.InFlightStep.IsNone) ->
                 // No native command was ever begun. The restored file is ours;
                 // any new live membership belongs entirely to another writer.
@@ -2044,9 +2221,9 @@ module FirewalldRecoveryProof =
                 if phase = FirewalldLifecycle.BootAfterFirewalld && currentIndex <> 0 then
                     fail "Post-boot firewalld did not load the restored scoped object preimage."
                 let inverseCount =
-                    if phase = FirewalldLifecycle.ActiveDaemon && currentIndex > 0 then
-                        attributableStepCount progress currentIndex repair.Deltas.Length
-                    else 0
+                    if phase <> FirewalldLifecycle.ActiveDaemon then 0
+                    else remainingUndo tracking currentIndex repair.Deltas.Length (fun () ->
+                        if currentIndex = 0 then 0 else attributableStepCount progress currentIndex repair.Deltas.Length)
                 if inverseCount > 0 then
                     for index in inverseCount - 1 .. -1 .. 0 do
                         if objectRepairStateIndex repair current <> Some(index + 1)
@@ -2054,13 +2231,13 @@ module FirewalldRecoveryProof =
                             fail "Runtime selectors changed before their durably attributed scoped inverse."
                         let delta = repair.Deltas[index]
                         let runtimeDelta = { Field = delta.Field; Value = delta.Value; Effect = delta.Effect }
-                        checkedCommand environment
-                            (selectorArguments configuration runtimeDelta (if delta.Add then "remove" else "add"))
-                        current <- inspect environment configuration
-                        ensureCompleteSnapshot configuration current
-                        if objectRepairStateIndex repair current <> Some index
-                           || not (objectRuntimeRollbackStructureMatches environment repair.Before current allowForeignInterfaces) then
-                            fail "firewalld did not restore the recorded scoped object checkpoint."
+                        undoStep tracking index (fun () ->
+                            activationCommand environment (selectorArguments configuration runtimeDelta (if delta.Add then "remove" else "add"))
+                            current <- inspect environment configuration
+                            ensureCompleteSnapshot configuration current
+                            if objectRepairStateIndex repair current <> Some index
+                               || not (objectRuntimeRollbackStructureMatches environment repair.Before current allowForeignInterfaces) then
+                                fail "firewalld did not restore the recorded scoped object checkpoint.")
                 let returnedToPreimage =
                     if allowForeignInterfaces then objectRuntimeMatchesPreimageForRollback environment repair current
                     else objectRuntimeMatchesPreimage environment repair.Before current
@@ -2078,24 +2255,23 @@ module FirewalldRecoveryProof =
                         states
                         |> List.tryFindIndex ((=) hash)
                         |> Option.defaultWith (fun () -> fail "Runtime owned selectors are outside the recorded repair checkpoints.")
-                if phase = FirewalldLifecycle.BootAfterFirewalld && currentIndex <> lastIndex then
+                if phase = FirewalldLifecycle.BootAfterFirewalld && (tracking |> Option.bind _.Previous).IsNone && currentIndex <> lastIndex then
                     fail "Post-boot firewalld did not load the staged permanent candidate; refusing an unproved inverse."
                 observeAdjusted environment configuration current
                 let inverseCount =
-                    if phase = FirewalldLifecycle.BootAfterFirewalld then
-                        // The freshly started daemon, not an unverifiable active
-                        // writer, just loaded the authenticated permanent projection.
-                        currentIndex
-                    elif currentIndex > 0 then attributableStepCount progress currentIndex repair.Deltas.Length
-                    else 0
+                    remainingUndo tracking currentIndex lastIndex (fun () ->
+                        if phase = FirewalldLifecycle.BootAfterFirewalld then currentIndex
+                        elif currentIndex > 0 then attributableStepCount progress currentIndex lastIndex
+                        else 0)
                 if inverseCount > 0 then
                     for index = inverseCount - 1 downto 0 do
                         if ownedFingerprintForRepair environment configuration repair current <> states[index + 1] then
                             fail "Runtime selector membership changed before its durably attributed inverse."
-                        checkedCommand environment (selectorArguments configuration repair.Deltas[index] "remove")
-                        current <- inspect environment configuration
-                        ensureCompleteSnapshot configuration current
-                        if ownedFingerprintForRepair environment configuration repair current <> states[index] then
-                            fail "firewalld did not restore the recorded selector checkpoint."
-                        observeAdjusted environment configuration current
+                        undoStep tracking index (fun () ->
+                            activationCommand environment (selectorArguments configuration repair.Deltas[index] "remove")
+                            current <- inspect environment configuration
+                            ensureCompleteSnapshot configuration current
+                            if ownedFingerprintForRepair environment configuration repair current <> states[index] then
+                                fail "firewalld did not restore the recorded selector checkpoint."
+                            observeAdjusted environment configuration current)
             | _ -> fail "Invalid firewalld recovery strategy."
