@@ -1598,7 +1598,9 @@ type TraefikBackendTests() =
         let env = TestSupport.fakeHostEnvironment "/" (fun cmd args _ ->
             let text =
                 if cmd = "systemctl" then "InvocationID=" + id + "\nMainPID=0"
-                elif List.contains "JOB_ID=123" args && completed then "{\"JOB_RESULT\":\"done\",\"JOB_TYPE\":\"start\",\"INVOCATION_ID\":\"" + id + "\"}"
+                elif List.contains "JOB_ID=123" args then
+                    if completed then "{\"MESSAGE_ID\":\"39f53479d3a045ac8e11786248231fbf\",\"JOB_RESULT\":\"done\",\"JOB_TYPE\":\"start\",\"INVOCATION_ID\":\"" + id + "\"}"
+                    else "{\"MESSAGE_ID\":\"9d1aaa27d60140bd96365438aad20286\",\"JOB_RESULT\":\"done\",\"JOB_TYPE\":\"restart\",\"INVOCATION_ID\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}"
                 elif List.contains ("INVOCATION_ID=" + id) args && exited then "{\"UNIT_RESULT\":\"exit-code\"}"
                 else ""
             { ExitCode=0; Stdout=text; Stderr="" }) (fun () -> DateTimeOffset.UtcNow)

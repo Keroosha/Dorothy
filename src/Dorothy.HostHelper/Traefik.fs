@@ -1961,14 +1961,14 @@ module Traefik =
         parsed.Groups[1].Value
 
     let private managedJobInvocation environment job =
-        let reply = run environment "journalctl" [ "--boot"; "--no-pager"; "--output=json"; "--lines=1"; "_PID=1"; "UNIT=" + ServiceName; "JOB_RESULT=done"; "JOB_ID=" + job ]
+        let reply = run environment "journalctl" [ "--boot"; "--no-pager"; "--output=json"; "--lines=1"; "_PID=1"; "UNIT=" + ServiceName; "MESSAGE_ID=39f53479d3a045ac8e11786248231fbf"; "JOB_TYPE=start"; "JOB_RESULT=done"; "JOB_ID=" + job ]
         if reply.ExitCode <> 0 then None
         else
             try
                 use record = JsonDocument.Parse(reply.Stdout.Trim())
                 let mutable property = Unchecked.defaultof<JsonElement>
                 let id = if record.RootElement.TryGetProperty("INVOCATION_ID", &property) && property.ValueKind = JsonValueKind.String then property.GetString() else ""
-                let completedStart = record.RootElement.TryGetProperty("JOB_TYPE", &property) && (property.GetString() = "start" || property.GetString() = "restart")
+                let completedStart = record.RootElement.TryGetProperty("JOB_TYPE", &property) && property.GetString() = "start"
                 if completedStart && id.Length = 32 && Seq.forall Uri.IsHexDigit id && (showUnit environment [ "InvocationID" ] |> Option.bind (Map.tryFind "InvocationID")) = Some id then Some id else None
             with :? JsonException -> None
 
@@ -4593,7 +4593,7 @@ module Traefik =
                 managerRecord environment [ "JOB_ID=" + job ]
                 |> Option.bind (fun entry ->
                     match tryString entry "JOB_RESULT", tryString entry "JOB_TYPE" with
-                    | "done", ("start" | "restart") ->
+                    | "done", "start" when tryString entry "MESSAGE_ID" = "39f53479d3a045ac8e11786248231fbf" ->
                         let id = tryString entry "INVOCATION_ID"
                         if id.Length = 32 && Seq.forall Uri.IsHexDigit id then Some id else None
                     | ("dependency" | "failed" | "timeout" | "canceled" | "skipped" | "assert" | "unsupported" | "collected") as result, _ ->
