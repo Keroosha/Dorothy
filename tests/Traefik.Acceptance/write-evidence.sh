@@ -276,6 +276,8 @@ transaction_metrics=$(jq -n \
     --slurpfile unverifiedRollback "$state_dir/review-transactions-unverified-rollback.json" \
     --slurpfile unverifiedRepair "$state_dir/review-transactions-unverified-repair.json" \
     --slurpfile journalV2 "$state_dir/review-transactions-journal-v2.json" \
+    --slurpfile healthyBefore "$state_dir/healthy-disk-before.json" --slurpfile healthyAfter "$state_dir/healthy-disk-after.json" \
+    --slurpfile sickBefore "$state_dir/unhealthy-disk-before.json" --slurpfile sickAfter "$state_dir/unhealthy-disk-after.json" \
     '{
         udpLiveBefore:$udpBefore[0],
         udpWithdrawnAfter:$udpAfter[0],
@@ -285,6 +287,8 @@ transaction_metrics=$(jq -n \
         staticRecovered:$staticRecovered[0],
         binaryStageInjected:$binaryStageInjected[0],
         binaryStageClean:$binaryStageClean[0],
+        healthyLiveRefusal:{before:$healthyBefore[0],after:$healthyAfter[0]},
+        alreadyUnhealthyRollback:{before:$sickBefore[0],after:$sickAfter[0]},
         unverifiedDrift:$unverifiedDrift[0],
         unverifiedRollback:$unverifiedRollback[0],
         unverifiedRepair:$unverifiedRepair[0],

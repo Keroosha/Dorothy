@@ -1323,6 +1323,12 @@ run_guest_client udp-drift > "$state_dir/logs/udp-rollback-client.log" 2>&1 || {
     printf 'UDP rollback did not retain the withdrawn route state; see %s/logs/udp-rollback-client.log\n' "$state_dir" >&2
     exit 1
 }
+remote "bash '$GUEST_ROOT/review-transactions.sh' healthy-disk-inject '$GUEST_ROOT'"
+expect_pulumi_failure rollback-udp healthy-disk-refusal.log up --stack acceptance --yes --non-interactive --skip-preview --parallel 1
+grep -Fq 'Apply refused: cannot establish that the dynamic rollback file represents the running graph' "$state_dir/logs/healthy-disk-refusal.log"
+remote "bash '$GUEST_ROOT/review-transactions.sh' healthy-disk-refused '$GUEST_ROOT'"
+remote "bash '$GUEST_ROOT/review-transactions.sh' healthy-disk-reconcile '$GUEST_ROOT'"
+run_pulumi withdraw-udp reconciled-graph-up.log up --stack acceptance --refresh --yes --non-interactive --parallel 1
 remote "bash '$GUEST_ROOT/review-transactions.sh' unverified-drift-inject '$GUEST_ROOT'" \
     > "$state_dir/logs/unverified-drift-inject.log" 2>&1
 expect_pulumi_failure rollback-udp unverified-rollback-up.log up --stack acceptance --yes --non-interactive --skip-preview --parallel 1
@@ -1335,6 +1341,9 @@ remote "bash '$GUEST_ROOT/review-transactions.sh' unverified-rollback-assert '$G
 run_pulumi rotate unverified-repair-up.log up --stack acceptance --yes --non-interactive --parallel 1
 remote "bash '$GUEST_ROOT/review-transactions.sh' unverified-repair-assert '$GUEST_ROOT'" \
     > "$state_dir/logs/unverified-repair-assert.log" 2>&1
+for witness in healthy-disk-before healthy-disk-after unhealthy-disk-before unhealthy-disk-after; do
+    copy_from_guest "$GUEST_ROOT/logs/$witness.json" "$state_dir/$witness.json" "$state_dir/logs/$witness-copy.log"
+done
 export_checkpoint "$state_dir/after-udp-restore-checkpoint.json"
 assert_checkpoint "$state_dir/after-udp-restore-checkpoint.json" "Recovered UDP route graph" true
 assert_read_checkpoint "$state_dir/after-udp-restore-checkpoint.json" true "Recovered UDP route graph"
@@ -1463,15 +1472,12 @@ run_pulumi delete delete-up.log up --stack acceptance --yes --non-interactive --
 export_checkpoint "$state_dir/deleted-checkpoint.json"
 deleted_count=$(jq "$traefik_query | length" "$state_dir/deleted-checkpoint.json")
 [[ "$deleted_count" == 0 ]] || { printf 'Pulumi did not delete the Traefik resource.\n' >&2; exit 1; }
-if ! remote_systemctl_is_active; then
-    printf 'Could not positively query Traefik service activity after Delete; SSH or systemctl failed.\n' >&2
-    exit 1
-fi
-[[ "$REMOTE_SYSTEMCTL_STATE" == inactive && "$REMOTE_SYSTEMCTL_EXIT" == 3 \
-   || "$REMOTE_SYSTEMCTL_STATE" == unknown && "$REMOTE_SYSTEMCTL_EXIT" == 4 ]] || {
-    printf 'Traefik service remained active after Delete.\n' >&2
-    exit 1
+[[ $(remote 'systemctl show -p LoadState --value keroosha-traefik.service') == not-found ]] || {
+    printf 'Deleted Traefik unit remains loadable.\n' >&2; exit 1
 }
+remote 'test ! -e /etc/keroosha-iac/traefik/static.yml && test ! -e /etc/keroosha-iac/traefik/dynamic/current.yml && test ! -e /etc/keroosha-iac/traefik/dns-credentials.env'
+REMOTE_SYSTEMCTL_STATE=not-found
+REMOTE_SYSTEMCTL_EXIT=0
 printf '%s %s\n' "$REMOTE_SYSTEMCTL_STATE" "$REMOTE_SYSTEMCTL_EXIT" \
     > "$state_dir/logs/deleted-service-active.log"
 chmod 600 "$state_dir/logs/deleted-service-active.log"

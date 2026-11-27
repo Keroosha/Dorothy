@@ -4872,11 +4872,35 @@ module Traefik =
             fsyncDirectory paths.CertificateDir
         with _ -> fail "cannot remove obsolete Traefik certificate material"
 
+    /// Compare the recoverable file graph, not desired inputs or route health. In
+    /// particular an empty backend that is actually loaded is not a healthy backend.
+    let internal loadedRollbackGraph (api: ApiConfiguration option) (disk: byte[] option) =
+        match api, disk with
+        | Some observed, Some bytes when apiVersionMatches observed ->
+            try
+                use document = JsonDocument.Parse(bytes)
+                jsonHasUniqueProperties document.RootElement
+                && apiDynamicMatches observed None document.RootElement true
+            with :? JsonException -> false
+        | _ -> false
+
     let private apply (environment: HostEnvironment) (requestElement: JsonElement) (activationTimeout: float) : JsonObject =
         let request = validateRequest requestElement
         if request.Operation <> "apply" then fail "apply requires an apply operation"
         let paths = pathsFor environment
         validateCertificateMaterial request
+        // A running file watcher may still serve its last good graph after rejecting
+        // external bytes. Do not use those bytes as an undo log or repair them by fiat.
+        if not (assertRegular environment paths.RollbackPath "activation rollback journal")
+           && (safeUnitStatus environment paths.UnitPath request.OwnerId).IsSome
+           && isActive environment then
+            let previousStatic = readOptional environment (Path.Combine(paths.ConfigDir, "static.yml"))
+            let disk = readOptional environment (Path.Combine(paths.DynamicDir, "current.yml"))
+            let observed =
+                adminPortFromStatic previousStatic
+                |> Option.bind (fun port -> (readApi port).GetAwaiter().GetResult())
+            if not (loadedRollbackGraph observed disk) then
+                fail "Apply refused: cannot establish that the dynamic rollback file represents the running graph. Preserve the external change, reconcile the file with the running configuration, then retry Apply."
         cleanupStaleTraefikTemporaryFiles environment paths request.OwnerId
         let configStatus, stateStatus, installStatus, initialUnit = validateActualOwner environment paths request.OwnerId
         if initialUnit.IsSome then ensureEffectiveUnit environment paths

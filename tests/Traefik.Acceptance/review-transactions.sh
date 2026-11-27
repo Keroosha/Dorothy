@@ -12,6 +12,7 @@ mode=$1
 guest_root=$2
 shift 2
 case "$mode" in
+    healthy-disk-inject|healthy-disk-refused|healthy-disk-reconcile) [[ $# == 0 ]] || usage ;;
     udp-drift-inject|udp-live-witness|udp-withdrawn-witness|binary-stage-inject|binary-stage-assert-clean|unverified-drift-inject|unverified-rollback-assert|unverified-repair-assert|restart-interrupt-install|restart-interrupt-remove|restart-interrupt-downgrade-v2) [[ $# == 0 ]] || usage ;;
     restart-interrupt-assert-staged) [[ $# == 3 ]] || usage ;;
     restart-interrupt-assert-restarted) [[ $# == 2 ]] || usage ;;
@@ -310,6 +311,62 @@ udp_withdrawn_witness() {
         > "$root/logs/review-transactions-udp-after.json"
     chmod 600 "$root/logs/review-transactions-udp-after.json"
 }
+catalog_observation() {
+    local expected=$1 output=$2 nonce status raw leaf cursor record body
+    nonce="/items/rollback-$(cat /proc/sys/kernel/random/uuid)"
+    body="$root/logs/rollback-control.body"
+    raw="$root/logs/rollback-control-api.json"
+    for _ in $(seq 1 40); do
+        curl -fsS --max-time 2 http://127.0.0.1:19080/api/rawdata > "$raw" &&
+            jq -e --argjson expected "$expected" '
+                .routers["catalog@file"].status=="enabled" and
+                (.services["catalog@file"] | type=="object") and
+                ((.services["catalog@file"].loadBalancer.servers // [] | map(.url)) ==
+                 (if $expected==200 then ["http://127.0.0.1:8080"] else [] end))' "$raw" >/dev/null && break
+        sleep .25
+    done
+    cursor=$(journalctl -u keroosha-traefik.service -n 1 --show-cursor --no-pager | sed -n 's/^-- cursor: //p')
+    [[ -n "$cursor" ]] || fail 'missing pre-request journal cursor'
+    status=$(curl --noproxy '*' --max-time 4 -sS -H 'Host: shop.acceptance.test' -o "$body" -w '%{http_code}' "http://127.0.0.1:18081$nonce")
+    [[ "$status" == "$expected" ]] || fail "catalog returned $status instead of $expected"
+    if [[ "$expected" == 200 ]]; then
+        [[ $(<"$body") == "http-backend:$nonce;forwarded:127.0.0.1" ]] || fail 'wrong backend response'
+    fi
+    record=$(journalctl -u keroosha-traefik.service --after-cursor="$cursor" --no-pager -o cat |
+        jq -Rsc --arg p "$nonce" '[split("\n")[]|fromjson?|select(.RequestPath==$p)|{status:.DownstreamStatus,backend:(.ServiceURL//null)}]|last')
+    jq -e --argjson s "$expected" '.status==$s and .backend==(if $s==200 then "http://127.0.0.1:8080" else null end)' <<<"$record" >/dev/null || fail 'missing or wrong access-log upstream'
+    leaf=$(timeout 6 openssl s_client -connect 127.0.0.2:18449 -servername sni-proof.acceptance.test -verify_hostname sni-proof.acceptance.test -verify_return_error -CAfile "$root/certs/sni-proof.pem" </dev/null 2>/dev/null | openssl x509 -outform DER | sha256sum | cut -d' ' -f1)
+    jq -ce --argjson status "$expected" --argjson request "$record" --arg leaf "$leaf" --arg pid "$(main_pid)" --arg file "$(digest_file "$dynamic_file")" --argjson pending "$(test -e "$journal_file" && echo true || echo false)" '
+        (.services["catalog@file"].loadBalancer.servers//[]|map(.url)) as $servers |
+        select(.routers["catalog@file"].status=="enabled" and $servers==(if $status==200 then ["http://127.0.0.1:8080"] else [] end)) |
+        {servers:$servers,request:$request,leaf:$leaf,pid:$pid,diskSha256:$file,pending:$pending}' "$raw" > "$output" || fail 'live API control failed'
+}
+
+healthy_disk_control() {
+    verify_owned_service >/dev/null
+    local backup="$root/healthy-disk.original" before="$root/logs/healthy-disk-before.json" after="$root/logs/healthy-disk-after.json"
+    case "$mode" in
+        healthy-disk-inject)
+            [[ ! -e "$backup" && ! -e "$journal_file" ]] || fail 'unsafe healthy control starting state'
+            cp -p -- "$dynamic_file" "$backup"
+            local cursor temp
+            cursor=$(journalctl -u keroosha-traefik.service -n 1 --show-cursor --no-pager | sed -n 's/^-- cursor: //p')
+            temp=$(mktemp "${dynamic_file}.fixture.XXXXXXXX")
+            printf '{"http":[' > "$temp"; chmod --reference="$dynamic_file" "$temp"; chown --reference="$dynamic_file" "$temp"; mv -T "$temp" "$dynamic_file"
+            for _ in $(seq 1 40); do
+                journalctl -u keroosha-traefik.service --after-cursor="$cursor" --no-pager -o cat | grep -F 'collecting file configs' >/dev/null && break
+                sleep .25
+            done
+            journalctl -u keroosha-traefik.service --after-cursor="$cursor" --no-pager -o cat | grep -F 'collecting file configs' >/dev/null || fail 'watcher did not reject the damaged file'
+            catalog_observation 200 "$before" ;;
+        healthy-disk-refused)
+            catalog_observation 200 "$after"; cmp -s "$before" "$after" && [[ ! -e "$journal_file" ]] || fail 'refusal altered live state, drift bytes or journal' ;;
+        healthy-disk-reconcile)
+            [[ "$(digest_file "$dynamic_file")" == "$(jq -er .diskSha256 "$before")" ]] || fail 'fixture no longer owns this edit'
+            cp -p -- "$backup" "${backup}.restore"; mv -T "${backup}.restore" "$dynamic_file" ;;
+    esac
+}
+
 unverified_drift_inject() {
     local owner metadata mode uid gid temporary pid
     owner=$(verify_owned_service)
@@ -329,11 +386,11 @@ unverified_drift_inject() {
     metadata=$(stat -c '%a %u %g' "$dynamic_file")
     read -r mode uid gid <<< "$metadata"
     temporary=$(mktemp "${dynamic_file}.review-transactions.XXXXXX")
-    if ! jq '.http.services.catalog.loadBalancer.servers = "invalid"' "$dynamic_file" > "$temporary"; then
+    if ! jq 'del(.http.services.catalog.loadBalancer.servers)' "$dynamic_file" > "$temporary"; then
         rm -f -- "$temporary"
         fail 'could not stage invalid dynamic drift'
     fi
-    jq -e '.http.services.catalog.loadBalancer.servers == "invalid"' "$temporary" >/dev/null \
+    jq -e '.http.services.catalog.loadBalancer | has("servers") | not' "$temporary" >/dev/null \
         || { rm -f -- "$temporary"; fail 'staged dynamic drift has an unexpected malformed field'; }
     chown "$uid:$gid" "$temporary"
     chmod "$mode" "$temporary"
@@ -341,11 +398,11 @@ unverified_drift_inject() {
     digest_file "$dynamic_file" > "$root/logs/unverified-dynamic-drift.sha256"
     chmod 600 "$root/logs/unverified-dynamic-drift.sha256"
     [[ "$(main_pid)" == "$pid" ]] || fail 'external dynamic drift unexpectedly restarted Traefik'
-    assert_http_control
+    catalog_observation 503 "$root/logs/unhealthy-disk-before.json"
     jq -n --arg case "unverifiable-dynamic-baseline-injected" --arg mainPid "$pid" \
         --arg dynamicSha256 "$(<"$root/logs/unverified-dynamic-drift.sha256")" \
         --arg staticSha256 "$(<"$root/logs/unverified-static-original.sha256")" \
-        --argjson liveProcessUnchanged true --argjson httpControlStatus 200 \
+        --argjson liveProcessUnchanged true --argjson httpControlStatus 503 \
         '{case:$case,mainPid:$mainPid,dynamicSha256:$dynamicSha256,staticSha256:$staticSha256,liveProcessUnchanged:$liveProcessUnchanged,httpControlStatus:$httpControlStatus}' \
         > "$root/logs/review-transactions-unverified-drift.json"
     chmod 600 "$root/logs/review-transactions-unverified-drift.json"
@@ -365,11 +422,11 @@ unverified_rollback_assert() {
     [[ "$journal_mode" == '600 0' ]] || fail 'unverifiable rollback journal is not private root-owned mode 0600'
     jq -e --arg owner "$owner" '.version == 3 and .owner == $owner and .restartRequired == false' "$journal_file" >/dev/null \
         || fail 'unverifiable rollback journal lost its owner or restart intent'
-    assert_http_control
+    catalog_observation 503 "$root/logs/unhealthy-disk-after.json"
     jq -n --arg case "unverifiable-rollback-retained" --arg mainPid "$pid" \
         --arg dynamicSha256 "$(<"$root/logs/unverified-dynamic-drift.sha256")" \
         --argjson journalVersion 3 --argjson rollbackVerified false --argjson journalPresent true \
-        --arg journalMode "0600" --argjson ownerDigestMatched true --argjson httpControlStatus 200 \
+        --arg journalMode "0600" --argjson ownerDigestMatched true --argjson httpControlStatus 503 \
         '{case:$case,mainPid:$mainPid,dynamicSha256:$dynamicSha256,journalVersion:$journalVersion,rollbackVerified:$rollbackVerified,journalPresent:$journalPresent,journalMode:$journalMode,ownerDigestMatched:$ownerDigestMatched,httpControlStatus:$httpControlStatus}' \
         > "$root/logs/review-transactions-unverified-rollback.json"
     chmod 600 "$root/logs/review-transactions-unverified-rollback.json"
@@ -641,6 +698,7 @@ restart_interrupt_assert_static_restarted() {
 
 
 case "$mode" in
+    healthy-disk-inject|healthy-disk-refused|healthy-disk-reconcile) healthy_disk_control ;;
     binary-stage-inject) binary_stage_inject ;;
     binary-stage-assert-clean) binary_stage_assert_clean ;;
     udp-drift-inject) udp_drift_inject ;;

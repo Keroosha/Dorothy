@@ -1408,6 +1408,11 @@ type TraefikBackendTests() =
                 (Some(Encoding.UTF8.GetBytes(dynamic)))
 
         Assert.That(matches rawData, Is.True)
+        let recoverable (disk: string) =
+            Traefik.loadedRollbackGraph (Some(apiFor rawData)) (Some(Encoding.UTF8.GetBytes(disk)))
+        Assert.That(recoverable dynamic, Is.True)
+        Assert.That(recoverable "{\"http\":[", Is.False, "Serving a good graph cannot make malformed disk bytes recoverable.")
+        Assert.That(recoverable (dynamic.Replace("127.0.0.1:19001", "127.0.0.1:19002")), Is.False, "A different live backend is not the disk preimage.")
 
         let priorityDrift = JsonNode.Parse(rawData) :?> JsonObject
         let routers = priorityDrift["routers"] :?> JsonObject
