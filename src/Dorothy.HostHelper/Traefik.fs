@@ -43,6 +43,12 @@ module private TraefikNativeInterop =
     [<DllImport("libc", EntryPoint = "open", SetLastError = true)>]
     extern int nativeOpen(string path, int flags, int mode)
 
+    [<DllImport("libc", EntryPoint = "linkat", SetLastError = true)>]
+    extern int nativeLinkAt(int oldDirectory, string oldPath, int newDirectory, string newPath, int flags)
+
+    [<DllImport("libc", EntryPoint = "rename", SetLastError = true)>]
+    extern int nativeRename(string oldPath, string newPath)
+
     [<DllImport("libc", EntryPoint = "fchmod", SetLastError = true)>]
     extern int nativeFchmod(int descriptor, uint32 mode)
 
@@ -771,7 +777,7 @@ module Traefik =
         sink.FlushFinalBlock()
         Convert.ToHexStringLower(hash.Hash)
 
-    let private renderDynamic (normalized: Request) (paths: RuntimePaths) =
+    let private renderDynamicFormat markLegacy (normalized: Request) (paths: RuntimePaths) =
         let mergedDynamic =
             normalized.MergedDynamic
             |> Option.defaultWith (fun () -> fail "lowered Traefik dynamic configuration is unavailable")
@@ -824,7 +830,7 @@ module Traefik =
         tlsRoot["certificates"] <- certificates
         dynamicConfig["tls"] <- tlsRoot
 
-        if normalized.Configuration.IsSome then
+        if markLegacy || normalized.Configuration.IsSome then
             let http = dynamicConfig["http"] :?> JsonObject
             let routers = http["routers"] :?> JsonObject
             let admin = routers["keroosha-admin"] :?> JsonObject
@@ -845,7 +851,10 @@ module Traefik =
         // JSON is valid YAML. Keep literal braces in legacy URL paths from becoming Go templates.
         (jsonText dynamicConfig).Replace("{{", "\\u007b\\u007b", StringComparison.Ordinal)
 
+    let private renderDynamic request paths = renderDynamicFormat true request paths
+
     let renderDynamicConfig request paths = renderDynamic (validateRequest request) paths
+    let internal renderHistoricalDynamicConfig request paths = renderDynamicFormat false (validateRequest request) paths
     let private udpGraphEntryPoints (dynamicData: byte[] option) : Set<string> option =
         match dynamicData with
         | None -> Some Set.empty
@@ -1794,7 +1803,20 @@ module Traefik =
             | Some path -> try File.Delete path with _ -> ()
             | None -> ()
 
-    let private ensureInstalledBinary (environment: HostEnvironment) (paths: RuntimePaths) (ownerId: string) : bool =
+    let private pinnedReleaseMatches environment (paths: RuntimePaths) ownerId arch (hash: string option) =
+        try
+            use doc = JsonDocument.Parse(readBytes environment (Path.Combine(paths.InstallDir, ".keroosha-release.json")))
+            let release = doc.RootElement
+            let field name expected = tryProperty release name |> Option.exists (fun v -> v.ValueKind = JsonValueKind.String && v.GetString() = expected)
+            match hash with
+            | Some digest -> release.ValueKind = JsonValueKind.Object && release.EnumerateObject() |> Seq.length = 5
+                             && field "owner" (ownerDigest ownerId) && field "version" Version && field "architecture" arch
+                             && field "archiveSha256" archiveChecksums[arch] && field "binarySha256" digest
+                             && binaryVersion environment paths.BinaryPath
+            | None -> false
+        with _ -> false
+
+    let private ensureInstalledBinary (environment: HostEnvironment) (paths: RuntimePaths) (ownerId: string) allowReplacement : bool =
         let arch = architecture ()
         checkDirectoryOwnership environment paths.InstallDir ownerId "installation directory" |> ignore
         let _, rootGid = hostOwner environment
@@ -1803,33 +1825,17 @@ module Traefik =
             if assertDirectory environment (Path.GetDirectoryName(paths.BinaryPath)) "binary version directory" then
                 ensureDirectory environment (Path.GetDirectoryName(paths.BinaryPath)) 0o755 (Some rootGid)
             let markerPath = Path.Combine(paths.InstallDir, ".keroosha-release.json")
-            let marker, binaryHash =
-                try
-                    use document = JsonDocument.Parse(readBytes environment markerPath)
-                    let hash = binarySha256 environment paths.BinaryPath
-                    Some(document.RootElement.Clone()), Some hash
-                with _ -> None, None
-            let matches =
-                match marker, binaryHash with
-                | Some release, Some hash ->
-                    release.ValueKind = JsonValueKind.Object
-                    && ((release.EnumerateObject() |> Seq.map (fun property -> property.Name) |> Set.ofSeq) = set [ "owner"; "version"; "architecture"; "archiveSha256"; "binarySha256" ])
-                    && (tryProperty release "owner" |> Option.exists (fun value -> value.ValueKind = JsonValueKind.String && value.GetString() = ownerDigest ownerId))
-                    && (tryProperty release "version" |> Option.exists (fun value -> value.ValueKind = JsonValueKind.String && value.GetString() = Version))
-                    && (tryProperty release "architecture" |> Option.exists (fun value -> value.ValueKind = JsonValueKind.String && value.GetString() = arch))
-                    && (tryProperty release "archiveSha256" |> Option.exists (fun value -> value.ValueKind = JsonValueKind.String && value.GetString() = archiveChecksums[arch]))
-                    && (tryProperty release "binarySha256" |> Option.exists (fun value -> value.ValueKind = JsonValueKind.String && value.GetString() = hash))
-                    && assertRegular environment paths.BinaryPath "Traefik binary"
-                    && binaryVersion environment paths.BinaryPath
-                | _ -> false
+            let matches = pinnedReleaseMatches environment paths ownerId arch (if assertRegular environment paths.BinaryPath "Traefik binary" then Some(binarySha256 environment paths.BinaryPath) else None)
             if matches then
                 chmod environment paths.BinaryPath 0o755
                 chown environment paths.BinaryPath (fst (hostOwner environment)) rootGid
                 chmod environment markerPath 0o644
                 chown environment markerPath (fst (hostOwner environment)) rootGid
                 false
-            else installBinary environment paths ownerId arch
-        else installBinary environment paths ownerId arch
+            elif allowReplacement then installBinary environment paths ownerId arch
+            else fail "running service release changed during admission; refusing binary replacement"
+        elif allowReplacement then installBinary environment paths ownerId arch
+        else fail "running service installation disappeared"
 
     let rec private ensureEffectiveUnit (environment: HostEnvironment) (paths: RuntimePaths) =
         if unitMatches environment paths then ()
@@ -1945,25 +1951,25 @@ module Traefik =
 
     let private daemonReload environment = systemctl environment [ "daemon-reload" ] true |> ignore
     let private enableService environment = systemctl environment [ "enable"; ServiceName ] true |> ignore
-    let private startService environment = systemctl environment [ "start"; ServiceName ] true |> ignore
-    let private restartService environment = systemctl environment [ "restart"; ServiceName ] true |> ignore
     // StartUnit returns the manager's job path, unlike a later PID/InvocationID
     // lookup which cannot distinguish our start from an independent restart.
-    let private enqueueRollbackStart environment =
-        let reply = run environment "busctl" [ "--system"; "--timeout=10s"; "call"; "org.freedesktop.systemd1"; "/org/freedesktop/systemd1"; "org.freedesktop.systemd1.Manager"; "StartUnit"; "ss"; ServiceName; "fail" ]
+    let private enqueueServiceJob environment restart =
+        let methodName = if restart then "RestartUnit" else "StartUnit"
+        let reply = run environment "busctl" [ "--system"; "--timeout=10s"; "call"; "org.freedesktop.systemd1"; "/org/freedesktop/systemd1"; "org.freedesktop.systemd1.Manager"; methodName; "ss"; ServiceName; "fail" ]
         let parsed = Regex.Match(reply.Stdout.Trim(), "^o \"/org/freedesktop/systemd1/job/([1-9][0-9]{0,9})\"$")
         if reply.ExitCode <> 0 || not parsed.Success then fail "cannot identify the systemd rollback start job"
         parsed.Groups[1].Value
 
-    let private rollbackJobInvocation environment job =
-        let reply = run environment "journalctl" [ "--boot"; "--no-pager"; "--output=json"; "--lines=1"; "_PID=1"; "UNIT=" + ServiceName; "JOB_TYPE=start"; "JOB_RESULT=done"; "JOB_ID=" + job ]
+    let private managedJobInvocation environment job =
+        let reply = run environment "journalctl" [ "--boot"; "--no-pager"; "--output=json"; "--lines=1"; "_PID=1"; "UNIT=" + ServiceName; "JOB_RESULT=done"; "JOB_ID=" + job ]
         if reply.ExitCode <> 0 then None
         else
             try
                 use record = JsonDocument.Parse(reply.Stdout.Trim())
                 let mutable property = Unchecked.defaultof<JsonElement>
                 let id = if record.RootElement.TryGetProperty("INVOCATION_ID", &property) && property.ValueKind = JsonValueKind.String then property.GetString() else ""
-                if id.Length = 32 && Seq.forall Uri.IsHexDigit id && (showUnit environment [ "InvocationID" ] |> Option.bind (Map.tryFind "InvocationID")) = Some id then Some id else None
+                let completedStart = record.RootElement.TryGetProperty("JOB_TYPE", &property) && (property.GetString() = "start" || property.GetString() = "restart")
+                if completedStart && id.Length = 32 && Seq.forall Uri.IsHexDigit id && (showUnit environment [ "InvocationID" ] |> Option.bind (Map.tryFind "InvocationID")) = Some id then Some id else None
             with :? JsonException -> None
 
     let private stopService environment = systemctl environment [ "stop"; ServiceName ] true |> ignore
@@ -1991,32 +1997,6 @@ module Traefik =
         let configStatus, stateStatus, installStatus, unitData = checkLayoutCollisions environment paths ownerId
         if unitData.IsSome && configStatus <> "owned" then fail "Traefik service unit has no matching owned configuration"
         configStatus, stateStatus, installStatus, unitData
-    let private cleanupTemporaryFiles (environment: HostEnvironment) (directory: string) (filenamePattern: Regex) : unit =
-        let uid = runOk environment "cannot inspect Traefik temporary file owner" "id" [ "-u" ] |> fun result -> Int32.Parse(result.Stdout.Trim(), CultureInfo.InvariantCulture)
-        let mutable removed = false
-        for filename in entries directory do
-            if filenamePattern.IsMatch(filename) then
-                let path = Path.Combine(directory, filename)
-                match tryStat environment path with
-                | Some item when item.Kind = "regular file" && item.Uid = uid ->
-                    File.Delete(path)
-                    removed <- true
-                | _ -> fail "Traefik temporary file is unsafe"
-        if removed then HostFiles.syncDirectory directory
-
-    let private cleanupOwnedTemporaryFiles (environment: HostEnvironment) (directory: string) (ownerId: string) (filenamePattern: Regex) : unit =
-        if markerStatus environment directory ownerId = "owned" then
-            cleanupTemporaryFiles environment directory filenamePattern
-
-    let private cleanupStaleTraefikTemporaryFiles (environment: HostEnvironment) (paths: RuntimePaths) (ownerId: string) : unit =
-        let atomicTemporaryPattern = Regex("^\\.(?:keroosha-traefik-write|keroosha-iac)-[0-9a-f]{32}$", RegexOptions.CultureInvariant)
-        let binaryTemporaryPattern = Regex("^\\.traefik-install-[0-9a-f]{32}$", RegexOptions.CultureInvariant)
-        for directory in [ paths.ConfigDir; paths.DynamicDir; paths.CertificateDir; paths.InstallDir ] do
-            cleanupOwnedTemporaryFiles environment directory ownerId atomicTemporaryPattern
-        if markerStatus environment paths.InstallDir ownerId = "owned" then
-            let versionDirectory = Path.GetDirectoryName(paths.BinaryPath)
-            if assertDirectory environment versionDirectory "Traefik binary directory" then
-                cleanupTemporaryFiles environment versionDirectory binaryTemporaryPattern
 
     let private ensureGroupedAtomicWrite environment path data mode groupId = writeAtomic environment path data mode (Some groupId)
 
@@ -2527,10 +2507,10 @@ module Traefik =
                         | Some wanted, Some found -> wanted = found
                         | _ -> false
                     | _, Some found -> jsonConfigMatches propertyPath property.Value found
-                    | _, None when property.Value.ValueKind = JsonValueKind.False
-                                   && path <> [ "observability" ]
-                                   && not (Set.contains property.Name defaultTrueBooleanFields) -> true
-                    | _, None when property.Value.ValueKind = JsonValueKind.Null -> true
+                    // Do not treat an arbitrary absent field as a native zero
+                    // value: Traefik may have rejected this entire file.
+                    | ("secure" | "httpOnly"), None when property.Value.ValueKind = JsonValueKind.False
+                                                         && (path = [ "cookie"; "sticky"; "loadBalancer" ] || path = [ "cookie"; "sticky"; "weighted" ]) -> true
                     | _ -> false)
             let unexpectedPropertiesMatch =
                 actual.EnumerateObject()
@@ -2539,6 +2519,10 @@ module Traefik =
                     elif path = []
                          && Set.contains property.Name serviceApiMetadataFields then
                         true
+                    elif path = [] && property.Name = "error"
+                         && (tryString actual "status" = "disabled" || tryString actual "status" = "warning")
+                         && property.Value.ValueKind = JsonValueKind.Array then
+                        property.Value.EnumerateArray() |> Seq.forall (fun message -> message.ValueKind = JsonValueKind.String)
                     else
                         defaultValueForMissingExpected path property.Name property.Value)
             mapKeysMatch && expectedPropertiesMatch && unexpectedPropertiesMatch
@@ -2599,7 +2583,7 @@ module Traefik =
                     | Some value -> jsonConfigMatches [ property.Name ] property.Value value
                     | None ->
                         property.Value.ValueKind = JsonValueKind.False
-                        && not (Set.contains property.Name defaultTrueBooleanFields))
+                        && property.Name = "passthrough")
             let unexpectedPropertiesMatch =
                 found.EnumerateObject()
                 |> Seq.forall (fun property ->
@@ -4565,7 +4549,16 @@ module Traefik =
         let paths = pathsFor environment
         let expectedStaticData =
             Encoding.UTF8.GetBytes(renderStaticWithPrevious request paths listenHost (existingStaticSnapshot environment paths))
-        let expectedDynamicData = Encoding.UTF8.GetBytes(renderDynamic request paths)
+        let expectedDynamicData =
+            if request.Configuration.IsSome then Encoding.UTF8.GetBytes(renderDynamic request paths)
+            else
+                // A historical Read may recognize the exact former representation;
+                // this byte comparison is not rollback authority for masked TLS.
+                let historical = Encoding.UTF8.GetBytes(renderDynamicFormat false request paths)
+                let historicalOnDisk =
+                    try readBytes environment (Path.Combine(paths.DynamicDir, "current.yml")) = historical
+                    with _ -> false
+                if historicalOnDisk then historical else Encoding.UTF8.GetBytes(renderDynamic request paths)
         use staticDocument = JsonDocument.Parse(expectedStaticData)
         use dynamicDocument = JsonDocument.Parse(expectedDynamicData)
         let generationMatches = generationRuleMatches dynamicDocument.RootElement
@@ -4583,7 +4576,8 @@ module Traefik =
             true
             None
 
-    let private waitForActivation (environment: HostEnvironment) (requestElement: JsonElement) (paths: RuntimePaths) (timeoutSeconds: float) : JsonObject =
+    let private waitForActivation (environment: HostEnvironment) (requestElement: JsonElement) (paths: RuntimePaths) (timeoutSeconds: float) job : JsonObject =
+        let jobMatches () = job |> Option.forall (fun id -> (managedJobInvocation environment id).IsSome)
         let request = validateRequest requestElement
         let certificateMaterialDigests = request.Certificates |> Map.map (fun _ certificate -> materialDigest certificate)
         let expectedStaticData =
@@ -4611,6 +4605,7 @@ module Traefik =
             let now = Stopwatch.GetTimestamp()
             let fullVerificationAttempted =
                 candidate["inSync"].GetValue<bool>()
+                && jobMatches ()
                 && (lastFullVerification = 0L || now - lastFullVerification >= fullVerificationIntervalTicks)
             if fullVerificationAttempted then
                 latest <-
@@ -4619,7 +4614,7 @@ module Traefik =
                         staticDocument.RootElement dynamicDocument.RootElement generationMatches
                         true true None
                 lastFullVerification <- Stopwatch.GetTimestamp()
-                if latest["inSync"].GetValue<bool>() then complete <- true
+                if latest["inSync"].GetValue<bool>() && jobMatches () then complete <- true
             else
                 latest <- candidate
                 if candidate["inSync"].GetValue<bool>() then
@@ -4631,6 +4626,7 @@ module Traefik =
                             environment request certificateMaterialDigests paths expectedStaticData expectedDynamicData
                             staticDocument.RootElement dynamicDocument.RootElement generationMatches
                             true true None
+                if not (jobMatches ()) then latest["inSync"] <- JsonValue.Create(false)
                 complete <- true
             elif not complete then
                 Thread.Sleep(ActivationPollMilliseconds)
@@ -4712,13 +4708,58 @@ module Traefik =
                 Some bytes
             with _ -> fail "Traefik rollback journal is invalid"
 
+    let private recoveryDirectory environment (paths: RuntimePaths) =
+        let parent = Path.GetDirectoryName(paths.ConfigDir)
+        let dir = Path.Combine(parent, ".dorothy-traefik-recovery")
+        let uid, gid = hostOwner environment
+        match tryStat environment parent with
+        | Some p when p.Kind = "directory" && p.Uid = uid && (p.Mode &&& 0o022) = 0 -> ()
+        | _ -> fail "recovery directory parent is not private to the administrator"
+        Directory.CreateDirectory(dir, unixMode 0o700) |> ignore
+        if not (metadataMatches environment dir "directory" 0o700 uid gid) then fail "unsafe recovery directory"
+        fsyncDirectory parent
+        dir
+
+    // SIGKILL during write leaves no name. After linkat only a complete,
+    // content-addressed inode exists in the root-only administrative directory.
+    // No filename wildcard or sweep is a source of deletion authority.
+    let private writeRecoveryFile environment paths generation (path: string) (data: byte[]) mode gid replace check =
+        let dir = recoveryDirectory environment paths
+        let uid, _ = hostOwner environment
+        let stage =
+            if replace then Path.Combine(dir, "stage-" + sha256Text (generation + "\n" + path + "\n" + sha256Bytes data))
+            else path
+        let verifyStage () =
+            if not (metadataMatches environment stage "file" mode uid gid) || readOptional environment stage <> Some data then
+                fail "recovery staging collision; preserving existing file"
+        match tryStat environment stage with
+        | Some _ -> verifyStage (); fsyncDirectory dir
+        | None ->
+            // O_TMPFILE | O_RDWR | O_CLOEXEC | O_NOFOLLOW
+            let fd = nativeOpen(dir, 0x410000 ||| 2 ||| 0x80000 ||| 0x20000, 0o600)
+            if fd < 0 then fail "recovery requires a filesystem supporting anonymous tmpfiles"
+            use handle = new SafeFileHandle(nativeint fd, true)
+            use stream = new FileStream(handle, FileAccess.Write)
+            stream.Write(data.AsSpan())
+            stream.Flush(true)
+            if nativeFchown(fd, uint32 uid, uint32 gid) <> 0 || nativeFchmod(fd, uint32 mode) <> 0 || nativeFsync(fd) <> 0 then fail "cannot secure recovery output"
+            check ()
+            if nativeLinkAt(fd, "", -100, stage, 0x1000) <> 0 then fail "cannot publish recovery output without overwrite"
+            fsyncDirectory dir
+        if replace then
+            verifyStage ()
+            check ()
+            if nativeRename(stage, path) <> 0 then fail "cannot atomically commit recovery output; paths must share a filesystem"
+            fsyncDirectory (Path.GetDirectoryName(path))
+            fsyncDirectory dir
+
     let private transactionPreimage (journal: JsonObject) =
         let prior = journal.DeepClone().AsObject()
         prior.Remove("recovery") |> ignore
         prior["version"] <- JsonValue.Create(3)
         sha256Text (jsonText prior)
 
-    let private persistRecovery environment (paths: RuntimePaths) (expected: byte[]) witness =
+    let private persistRecovery environment (paths: RuntimePaths) (expected: byte[]) witness verify =
         let uid, gid = hostOwner environment
         if not (metadataMatches environment paths.RollbackPath "file" 0o600 uid gid) || readOptional environment paths.RollbackPath <> Some expected then
             fail "recovery journal changed; refusing to advance its phase"
@@ -4732,7 +4773,9 @@ module Traefik =
         root["recovery"] <- phase
         root["version"] <- JsonValue.Create(4)
         let bytes = Encoding.UTF8.GetBytes(jsonText root)
-        writeAtomic environment paths.RollbackPath bytes 0o600 None
+        writeRecoveryFile environment paths witness.Preimage paths.RollbackPath bytes 0o600 gid true (fun () ->
+            verify ()
+            if readOptional environment paths.RollbackPath <> Some expected then fail "recovery journal changed before commit")
         bytes
 
     let private loadPendingTransaction (environment: HostEnvironment) (paths: RuntimePaths) (ownerId: string) : PendingTransaction option =
@@ -4870,16 +4913,49 @@ module Traefik =
     let private recordManagedStart environment (paths: RuntimePaths) owner bytes invocation =
         match invocation with
         | Some expected when staticReceipt environment owner bytes = Some expected && readOptional environment (Path.Combine(paths.ConfigDir, "static.yml")) = Some bytes ->
-            writeAtomic environment paths.StaticReceipt expected 0o600 None
+            writeRecoveryFile environment paths (sha256Bytes expected) paths.StaticReceipt expected 0o600 (snd (hostOwner environment)) true (fun () ->
+                if staticReceipt environment owner bytes <> Some expected || readOptional environment (Path.Combine(paths.ConfigDir,"static.yml")) <> Some bytes then fail "managed start changed before receipt commit")
         | _ -> fail "cannot attest the managed Traefik invocation and static file after activation"
 
-    let private recoverPendingTransaction (environment: HostEnvironment) (paths: RuntimePaths) (ownerId: string) (request: JsonElement) (groupId: int) (activationTimeout: float) : PendingTransaction option =
+    let private receiptForJob environment owner (bytes: byte[]) job =
+        let id = managedJobInvocation environment job |> Option.defaultWith (fun () -> fail "running Traefik invocation does not belong to the managed systemd job")
+        Some(Encoding.UTF8.GetBytes(String.concat "\n" [ owner; id; Convert.ToHexString(SHA256.HashData bytes) ]))
+
+    /// Compare the recoverable file graph, not desired inputs or route health. In
+    /// particular an empty backend that is actually loaded is not a healthy backend.
+    let internal loadedRollbackGraph (api: ApiConfiguration option) (disk: byte[] option) =
+        match api, disk with
+        | Some observed, Some bytes when apiVersionMatches observed ->
+            try
+                use document = JsonDocument.Parse(bytes)
+                let root = document.RootElement
+                let rule = root.GetProperty("http").GetProperty("routers").GetProperty("keroosha-admin").GetProperty("rule").GetString()
+                let opaqueConfirmed =
+                    if rule = TraefikHttpGraphModel.adminRuleBase then
+                        let noTransport key = tryProperty root key |> Option.bind (fun section -> tryProperty section "serversTransports") |> Option.isNone
+                        let emptyTls =
+                            match tryProperty root "tls" with
+                            | None -> true
+                            | Some tls when tls.ValueKind = JsonValueKind.Object ->
+                                tls.EnumerateObject() |> Seq.forall (fun p -> p.Name = "certificates" && p.Value.ValueKind = JsonValueKind.Array && p.Value.GetArrayLength() = 0)
+                            | _ -> false
+                        noTransport "http" && noTransport "tcp" && emptyTls
+                    else
+                        generationRuleMatches root
+                        || (TraefikHttpGraphModel.isGeneratedAdminRule rule
+                            && rule.EndsWith(opaqueDigest (JsonNode.Parse(bytes).AsObject()) + "`)", StringComparison.Ordinal))
+                jsonHasUniqueProperties root && opaqueConfirmed
+                && apiDynamicMatches Attribution observed None root true
+            with :? JsonException | :? KeyNotFoundException | :? InvalidOperationException -> false
+        | _ -> false
+    let private recoverPendingTransaction (environment: HostEnvironment) (paths: RuntimePaths) (ownerId: string) (request: JsonElement) (activationTimeout: float) : PendingTransaction option =
         match loadPendingTransaction environment paths ownerId with
         | None -> None
         | Some journal when journal.Recovery.IsSome -> fail "pending recovery start requires scoped dynamic repair"
         | Some journal ->
             let currentUnit = safeUnitStatus environment paths.UnitPath ownerId
-            if currentUnit.IsSome then ensureEffectiveUnit environment paths
+            if currentUnit.IsSome then
+                if not (unitMatches environment paths) then fail "interrupted transaction has a different effective unit"
             elif isActive environment || isEnabled environment then fail "interrupted Traefik service has no owned unit"
             let oldStatic = journal.Static
             let oldDynamic = journal.Dynamic
@@ -4912,6 +4988,8 @@ module Traefik =
                 && readOptional environment (Path.Combine(paths.InstallDir, ".keroosha-release.json")) = journal.ReleaseMarker
                 && priorCertificateFiles = Set.ofList journal.CertificateFiles
             if currentSync then
+                if not journal.WasActive || not (attestedStatic environment paths ownerId oldStatic) then
+                    fail "interrupted activation cannot establish the previous invocation; use offline maintenance"
                 let restartRequired =
                     journal.RestartRequired
                     || not journal.CredentialsKnown
@@ -4921,69 +4999,25 @@ module Traefik =
                     let desired = Encoding.UTF8.GetBytes(renderStaticWithPrevious requestState paths "" oldStatic)
                     if currentStatic <> Some desired || not (attestedStatic environment paths ownerId oldStatic) then
                         fail "interrupted restart refused: the previous invocation or staged static bytes are not confirmed; preserve the journal and reconcile the service"
-                    restartService environment
-                    let invocation = staticReceipt environment ownerId desired
-                    let result = waitForActivation environment request paths activationTimeout
+                    let job = enqueueServiceJob environment true
+                    let result = waitForActivation environment request paths activationTimeout (Some job)
                     if not (result["inSync"].GetValue<bool>()) then fail "interrupted Traefik restart intent did not recover"
-                    recordManagedStart environment paths ownerId desired invocation
+                    recordManagedStart environment paths ownerId desired (receiptForJob environment ownerId desired job)
                 removePendingTransaction environment paths ownerId
                 None
             elif priorFilesRestored then
+                if journal.WasActive then
+                    let port = adminPortFromStatic oldStatic |> Option.defaultWith (fun () -> fail "missing static preimage")
+                    let api = (readApi port).GetAwaiter().GetResult()
+                    if not (attestedStatic environment paths ownerId oldStatic && apiMatchesStatic api oldStatic && loadedRollbackGraph api oldDynamic) then
+                        fail "restored files do not establish the running transaction preimage; use offline maintenance"
                 match issuerFailure with
                 | Some message -> fail message
                 | None -> Some journal
             else
-                let currentActive = isActive environment
-                let restartRequired =
-                    currentStatic <> oldStatic
-                    || (journal.CredentialsKnown && currentCredentials <> oldCredentials)
-                    || currentUnit <> oldUnit
-                    || currentBinaryHash <> journal.BinarySha256
-                    || udpWithdrawalRequiresRestart currentDynamic oldDynamic oldStatic
-                if currentUnit.IsSome && currentActive && (restartRequired || not journal.WasActive) then
-                    stopOwnedService environment paths ownerId
-                elif currentUnit.IsNone && currentActive then
-                    fail "interrupted Traefik service has no owned unit"
-                if currentStatic <> oldStatic then
-                    restoreFile environment (Path.Combine(paths.ConfigDir, "static.yml")) oldStatic 0o640 (Some groupId)
-                if currentDynamic <> oldDynamic then
-                    restoreFile environment (Path.Combine(paths.DynamicDir, "current.yml")) oldDynamic 0o640 (Some groupId)
-                let rollbackCredentials = if journal.CredentialsKnown then oldCredentials else currentCredentials
-                if journal.CredentialsKnown && currentCredentials <> oldCredentials then
-                    restoreFile environment paths.CredentialsPath oldCredentials 0o600 None
-                if currentUnit <> oldUnit then restoreFile environment paths.UnitPath oldUnit 0o644 None
-                let releaseMarkerPath = Path.Combine(paths.InstallDir, ".keroosha-release.json")
-                if not journal.BinaryPresent then
-                    if currentBinaryExists then
-                        File.Delete(paths.BinaryPath)
-                        fsyncDirectory (Path.GetDirectoryName(paths.BinaryPath))
-                    if readOptional environment releaseMarkerPath <> journal.ReleaseMarker then
-                        restoreFile environment releaseMarkerPath journal.ReleaseMarker 0o644 None
-                elif currentBinaryHash = journal.BinarySha256 && readOptional environment releaseMarkerPath <> journal.ReleaseMarker then
-                    restoreFile environment releaseMarkerPath journal.ReleaseMarker 0o644 None
-                removeExtraCertificateFiles environment paths (Set.ofList journal.CertificateFiles) "cannot remove interrupted Traefik certificate material"
-                if currentUnit <> oldUnit then daemonReload environment
-                if oldUnit.IsSome then ensureEffectiveUnit environment paths
-                if isEnabled environment <> journal.WasEnabled then
-                    if journal.WasEnabled then enableService environment else disableService environment
-                if isEnabled environment <> journal.WasEnabled then fail "cannot restore interrupted Traefik enablement state"
-                let rollbackVerified =
-                    if journal.WasActive then
-                        if not (isActive environment) then startService environment
-                        elif restartRequired then restartService environment
-                        waitForRollback environment paths activationTimeout oldStatic oldDynamic rollbackCredentials
-                    else not (isActive environment)
-                if isActive environment <> journal.WasActive && journal.WasActive then
-                    fail "cannot restore interrupted Traefik service state"
-                if rollbackVerified then
-                    removePendingTransaction environment paths ownerId
-                    match issuerFailure with
-                    | Some message -> fail message
-                    | None -> None
-                else
-                    match issuerFailure with
-                    | Some message -> fail message
-                    | None -> Some journal
+                // v1–v3 do not bind every staged byte to a specific candidate
+                // and systemd job. A third file or invocation is not ours to undo.
+                fail "interrupted transaction has no attributable preimage or verified target; no restart or restore attempted"
 
     let private removeUnusedCertificates (environment: HostEnvironment) (paths: RuntimePaths) (request: Request) : unit =
         let wanted =
@@ -4999,23 +5033,6 @@ module Traefik =
             fsyncDirectory paths.CertificateDir
         with _ -> fail "cannot remove obsolete Traefik certificate material"
 
-    /// Compare the recoverable file graph, not desired inputs or route health. In
-    /// particular an empty backend that is actually loaded is not a healthy backend.
-    let internal loadedRollbackGraph (api: ApiConfiguration option) (disk: byte[] option) =
-        match api, disk with
-        | Some observed, Some bytes when apiVersionMatches observed ->
-            try
-                use document = JsonDocument.Parse(bytes)
-                let root = document.RootElement
-                let rule = root.GetProperty("http").GetProperty("routers").GetProperty("keroosha-admin").GetProperty("rule").GetString()
-                let opaqueConfirmed =
-                    generationRuleMatches root
-                    || (TraefikHttpGraphModel.isGeneratedAdminRule rule
-                        && rule.EndsWith(opaqueDigest (JsonNode.Parse(bytes).AsObject()) + "`)", StringComparison.Ordinal))
-                jsonHasUniqueProperties root && opaqueConfirmed
-                && apiDynamicMatches Attribution observed None root true
-            with :? JsonException -> false
-        | _ -> false
 
     let private applyTransaction (environment: HostEnvironment) (requestElement: JsonElement) (activationTimeout: float) : JsonObject =
         let request = validateRequest requestElement
@@ -5027,19 +5044,21 @@ module Traefik =
         let staticPath = Path.Combine(paths.ConfigDir, "static.yml")
         let dynamicPath = Path.Combine(paths.DynamicDir, "current.yml")
         let hasPending = assertRegular environment paths.RollbackPath "activation rollback journal"
+        let pending = recoverPendingTransaction environment paths request.OwnerId requestElement activationTimeout
         let capture () = struct (readOptional environment staticPath, readOptional environment dynamicPath)
-        let initial = if hasPending then ValueNone else ValueSome(capture ())
+        let initial = capture ()
         match initial with
-        | ValueSome(struct (previousStatic, disk)) when (safeUnitStatus environment paths.UnitPath request.OwnerId).IsSome && isActive environment ->
+        | struct (previousStatic, disk) when (safeUnitStatus environment paths.UnitPath request.OwnerId).IsSome && isActive environment ->
             let port = adminPortFromStatic previousStatic |> Option.defaultWith (fun () -> fail "Apply refused: missing or invalid static rollback file; preserve the file and reconcile it with the running process.")
             let observed = (readApi port).GetAwaiter().GetResult()
             if observed.IsNone then fail "Apply refused: private API unavailable at the captured admin address; verify service readiness and static configuration, then retry."
             if not (apiMatchesStatic observed previousStatic) then fail "Apply refused: static listener configuration on disk differs from the running process; preserve external changes, reconcile the file and process, then retry."
+            if previousStatic <> Some(Encoding.UTF8.GetBytes(renderStaticWithPrevious request paths "" previousStatic)) && not (attestedStatic environment paths request.OwnerId previousStatic) then
+                fail "Apply refused: restart requires a confirmed static file for this service invocation; reconcile during a maintenance window"
             if disk.IsNone then fail "Apply refused: missing dynamic rollback file; restore a confirmed copy of the loaded file before retrying."
             if not (loadedRollbackGraph observed disk) then
                 fail "Apply refused: cannot establish that the dynamic rollback file represents the running graph. Preserve the external change, reconcile the file with the running configuration, then retry Apply."
         | _ -> ()
-        cleanupStaleTraefikTemporaryFiles environment paths request.OwnerId
         let configStatus, stateStatus, installStatus, initialUnit = validateActualOwner environment paths request.OwnerId
         if initialUnit.IsSome then ensureEffectiveUnit environment paths
         let initiallyActive = isActive environment
@@ -5047,17 +5066,15 @@ module Traefik =
         if initialUnit.IsNone && (initiallyActive || initiallyEnabled) then fail "Traefik service name collides with an unowned systemd unit"
         let existingOwned = configStatus = "owned" || stateStatus = "owned" || installStatus = "owned"
         let _, serviceGroup = ensureLayout environment paths request.OwnerId existingOwned
-        let pending = recoverPendingTransaction environment paths request.OwnerId requestElement serviceGroup activationTimeout
         let configStatus, stateStatus, installStatus, currentUnit = validateActualOwner environment paths request.OwnerId
         if currentUnit.IsSome then ensureEffectiveUnit environment paths
         if currentUnit.IsNone && (isActive environment || isEnabled environment) then fail "Traefik service name collides with an unowned systemd unit"
         let wasActive = pending |> Option.map (fun transaction -> transaction.WasActive) |> Option.defaultWith (fun () -> isActive environment)
         let wasEnabled = pending |> Option.map (fun transaction -> transaction.WasEnabled) |> Option.defaultWith (fun () -> isEnabled environment)
         let struct (oldStatic, oldDynamic) =
-            match pending, initial with
-            | Some transaction, _ -> struct (transaction.Static, transaction.Dynamic)
-            | None, ValueSome checkedBytes -> checkedBytes
-            | None, ValueNone -> capture ()
+            match pending with
+            | Some transaction -> struct (transaction.Static, transaction.Dynamic)
+            | None -> initial
         let oldCredentials =
             match pending with
             | Some transaction when transaction.CredentialsKnown -> transaction.Credentials
@@ -5096,6 +5113,8 @@ module Traefik =
             else false
         let rootUid, rootGid = hostOwner environment
         let unitChanged = oldUnitBytes <> Some currentUnitText || not (metadataMatches environment paths.UnitPath "file" 0o644 rootUid rootGid)
+        if wasActive && not (pinnedReleaseMatches environment paths request.OwnerId (architecture ()) actualBinaryHash) then
+            fail "Apply refused: running service binary or release marker is not confirmed; reconcile the pinned release during maintenance"
         ensureAcmeIssuerTransitionSafe environment paths oldStatic request
         let restartRequired =
             (pending |> Option.exists (fun transaction -> transaction.RestartRequired))
@@ -5118,10 +5137,8 @@ module Traefik =
             | Some transaction -> Set.ofList transaction.CertificateFiles
             | None -> entries paths.CertificateDir |> Set.ofArray
         let confirmUnchanged () =
-            match initial with
-            | ValueSome expected when capture () <> expected ->
+            if capture () <> initial then
                 fail "Apply refused: rollback files changed after inspection; preserve concurrent edits and retry with a reconciled configuration."
-            | _ -> ()
         confirmUnchanged ()
         savePendingTransaction environment paths request.OwnerId oldStatic oldDynamic oldCredentials oldUnitBytes oldReleaseMarker oldBinaryExists oldBinaryHash wasActive wasEnabled restartRequired (Set.toList oldCertificateFiles)
         let stagedJournal = readBytes environment paths.RollbackPath
@@ -5133,8 +5150,9 @@ module Traefik =
             raise error
         let mutable binaryChanged = false
         let mutable restartAttempted = false
+        let mutable candidateJob = None
         try
-            binaryChanged <- ensureInstalledBinary environment paths request.OwnerId
+            binaryChanged <- ensureInstalledBinary environment paths request.OwnerId (not wasActive)
             writeCredentialFile environment paths request.Configuration
             writeCertificateFiles environment paths request serviceGroup
             confirmUnchanged ()
@@ -5145,17 +5163,18 @@ module Traefik =
                 daemonReload environment
             if not (isEnabled environment) then enableService environment
             let needsStart = not (isActive environment)
+            if (needsStart || restartRequired || binaryChanged) &&
+               (capture () <> struct (Some staticData, Some dynamicData) || readCredentialSnapshot environment paths <> desiredCredentials ||
+                safeUnitStatus environment paths.UnitPath request.OwnerId <> Some currentUnitText) then fail "candidate changed before managed start"
             if needsStart then
                 if wasActive then restartAttempted <- true
-                startService environment
+                candidateJob <- Some(enqueueServiceJob environment false)
             elif binaryChanged || restartRequired then
                 restartAttempted <- true
-                restartService environment
-            let managedStart = needsStart || restartAttempted
-            let invocation = if managedStart then staticReceipt environment request.OwnerId staticData else None
-            let result = waitForActivation environment requestElement paths activationTimeout
+                candidateJob <- Some(enqueueServiceJob environment true)
+            let result = waitForActivation environment requestElement paths activationTimeout candidateJob
             if not (result["inSync"].GetValue<bool>()) then fail "Traefik activation did not satisfy the bounded readiness checks"
-            if managedStart then recordStart staticData invocation
+            candidateJob |> Option.iter (fun job -> recordStart staticData (receiptForJob environment request.OwnerId staticData job))
             removePendingTransaction environment paths request.OwnerId
             try removeUnusedCertificates environment paths request with :? BackendError -> ()
             result["actualConfigHash"] <- JsonValue.Create(actualConfigHash environment paths)
@@ -5167,6 +5186,8 @@ module Traefik =
                 | _ -> error.GetType().Name
             let rollbackFailure =
                 try
+                    if isActive environment && (candidateJob |> Option.exists (fun job -> (managedJobInvocation environment job).IsNone)) then
+                        fail "active invocation does not belong to the candidate job; rollback refused before stopping or writing"
                     let currentOwnedUnit = safeUnitStatus environment paths.UnitPath request.OwnerId
                     let currentStatic = readOptional environment (Path.Combine(paths.ConfigDir, "static.yml"))
                     let currentDynamic = readOptional environment (Path.Combine(paths.DynamicDir, "current.yml"))
@@ -5175,6 +5196,9 @@ module Traefik =
                         fail "rollback stopped before overwriting an externally changed configuration file; preserve the files and reconcile the pending transaction"
                     let currentCredentials = readCredentialSnapshot environment paths
                     let currentUnitData = readOptional environment paths.UnitPath
+                    if (currentCredentials <> oldCredentials && currentCredentials <> desiredCredentials)
+                       || (currentUnitData <> oldUnitBytes && currentUnitData <> Some currentUnitText) then
+                        fail "rollback refused to overwrite an externally changed credential or unit"
                     let currentBinaryExists = assertRegular environment paths.BinaryPath "Traefik binary"
                     let currentBinaryHash = if currentBinaryExists then Some(binarySha256 environment paths.BinaryPath) else None
                     let rollbackUdpWithdrawal = udpWithdrawalRequiresRestart currentDynamic oldDynamic oldStatic
@@ -5217,22 +5241,25 @@ module Traefik =
                                 if readOptional environment staticPath <> oldStatic || readOptional environment dynamicPath <> oldDynamic
                                    || readCredentialSnapshot environment paths <> oldCredentials || safeUnitStatus environment paths.UnitPath request.OwnerId <> oldUnitBytes
                                    || (oldBinaryExists && Some(binarySha256 environment paths.BinaryPath) <> oldBinaryHash) then fail "rollback preimage changed before managed start"
-                                Some(enqueueRollbackStart environment)
+                                Some(enqueueServiceJob environment false)
                             else None
                         if not (waitForRollback environment paths activationTimeout oldStatic oldDynamic oldCredentials) then
                             match rollbackJob, priorReceipt, oldStatic with
-                            | Some job, Some prior, Some bytes when readOptional environment staticPath = Some bytes && readOptional environment dynamicPath = oldDynamic ->
+                            | Some job, Some prior, Some bytes when not restartRequired && readOptional environment staticPath = Some bytes && readOptional environment dynamicPath = oldDynamic ->
                                 let api = (readApi request.AdminPort).GetAwaiter().GetResult()
-                                match rollbackJobInvocation environment job with
+                                match managedJobInvocation environment job with
                                 | Some id when apiMatchesStatic api oldStatic && loadedRollbackGraph api oldDynamic
                                                && (readOptional environment paths.StaticReceipt |> Option.map sha256Bytes) = Some prior ->
                                     let generation = transactionPreimage (JsonNode.Parse(stagedJournal).AsObject())
-                                    persistRecovery environment paths stagedJournal { Job = job; Invocation = id; PriorReceipt = prior; Preimage = generation; Target = None } |> ignore
+                                    persistRecovery environment paths stagedJournal { Job = job; Invocation = id; PriorReceipt = prior; Preimage = generation; Target = None } (fun () ->
+                                        if managedJobInvocation environment job <> Some id || readOptional environment staticPath <> oldStatic ||
+                                           readOptional environment dynamicPath <> oldDynamic || readCredentialSnapshot environment paths <> oldCredentials then
+                                            fail "rollback start or preimage changed before committing recovery witness") |> ignore
                                 | _ -> ()
                             | _ -> ()
                             fail "previous Traefik configuration could not be verified"
                         if rollbackStarts && previouslyAttested then
-                            let id = rollbackJob |> Option.bind (rollbackJobInvocation environment) |> Option.defaultWith (fun () -> fail "rollback readiness passed but its systemd start job cannot be attributed")
+                            let id = rollbackJob |> Option.bind (managedJobInvocation environment) |> Option.defaultWith (fun () -> fail "rollback readiness passed but its systemd start job cannot be attributed")
                             match oldStatic with
                             | Some bytes -> recordStart bytes (Some(Encoding.UTF8.GetBytes(String.concat "\n" [ request.OwnerId; id; Convert.ToHexString(SHA256.HashData bytes) ])))
                             | None -> fail "verified static rollback bytes are missing"
@@ -5275,14 +5302,14 @@ module Traefik =
         let _, group = serviceAccountOwner environment
         let verifyBindings staged =
             if not (metadataMatches environment paths.RollbackPath "file" 0o600 uid gid) || readBytes environment paths.RollbackPath <> staged then refuse "journal generation changed"
-            if rollbackJobInvocation environment phase.Job <> Some phase.Invocation then refuse "rollback start is no longer the running invocation"
+            if managedJobInvocation environment phase.Job <> Some phase.Invocation then refuse "rollback start is no longer the running invocation"
             let current = readOptional environment file
             let prior = readOptional environment paths.StaticReceipt
             if not (metadataMatches environment paths.StaticReceipt "file" 0o600 uid gid)
                || ((prior |> Option.map sha256Bytes) <> Some phase.PriorReceipt && not (phase.Target = Some target && current = Some desired && prior = Some receipt)) then refuse "previous static confirmation changed"
             let config, state, install, unit = validateActualOwner environment paths request.OwnerId
             if config <> "owned" || state <> "owned" || install <> "owned" || unit <> journal.Unit then refuse "owner or systemd unit changed"
-            ensureEffectiveUnit environment paths
+            if not (unitMatches environment paths) then refuse "effective systemd unit changed"
             if readOptional environment (Path.Combine(paths.ConfigDir,"static.yml")) <> journal.Static then refuse "static file changed"
             if readCredentialSnapshot environment paths <> journal.Credentials then refuse "credential file changed"
             if not journal.BinaryPresent || Some(binarySha256 environment paths.BinaryPath) <> journal.BinarySha256
@@ -5306,11 +5333,33 @@ module Traefik =
         if not (recoveryDiskAccepted phase.Target target (current = journal.Dynamic) (current = Some desired)) then refuse "external dynamic bytes do not belong to this step"
         if current = journal.Dynamic then
             if not (loadedRollbackGraph api current) then refuse "restored dynamic preimage no longer matches the live graph"
-        if phase.Target.IsNone then staged <- persistRecovery environment paths staged { phase with Target = Some target }
+        if phase.Target.IsNone then
+            staged <- persistRecovery environment paths staged { phase with Target = Some target } (fun () ->
+                if verifyBindings staged <> current then refuse "bindings changed before target claim")
         if verifyBindings staged <> current then refuse "preimage changed during admission"
-        if current <> Some desired then ensureGroupedAtomicWrite environment file desired 0o640 group
-        let result = waitForActivation environment requestElement paths timeout
-        if not (result["inSync"].GetValue<bool>()) then refuse "bound target failed readiness; journal retained"
+        if current <> Some desired then
+            writeRecoveryFile environment paths phase.Preimage file desired 0o640 group true (fun () ->
+                if verifyBindings staged <> current then refuse "preimage changed before target rename")
+        let result = waitForActivation environment requestElement paths timeout None
+        if not (result["inSync"].GetValue<bool>()) then
+            let verifyUndo () =
+                if verifyBindings staged <> Some desired then refuse "failed target changed; retain journal for offline maintenance"
+                let observed = (readApi request.AdminPort).GetAwaiter().GetResult()
+                if not (apiMatchesStatic observed journal.Static && (loadedRollbackGraph observed (Some desired) || loadedRollbackGraph observed journal.Dynamic)) then
+                    refuse "failed target is not attributable; use offline maintenance"
+            match journal.Dynamic with
+            | Some old when not (udpWithdrawalRequiresRestart (Some desired) journal.Dynamic journal.Static) ->
+                verifyUndo ()
+                writeRecoveryFile environment paths phase.Preimage file old 0o640 group true verifyUndo
+                let deadline = Stopwatch.StartNew()
+                let mutable restored = false
+                while not restored && deadline.Elapsed.TotalSeconds < timeout do
+                    let observed = (readApi request.AdminPort).GetAwaiter().GetResult()
+                    restored <- verifyBindings staged = journal.Dynamic && apiMatchesStatic observed journal.Static && loadedRollbackGraph observed journal.Dynamic
+                    if not restored then Thread.Sleep(ActivationPollMilliseconds)
+                if restored then refuse "failed target restored to its attributed preimage, not certified healthy; use offline maintenance to change target"
+                else refuse "dynamic preimage was restored on disk but not verified live; use offline maintenance"
+            | _ -> refuse "bound target failed readiness; safe withdrawal requires a restart; use offline maintenance"
         if verifyBindings staged <> Some desired then refuse "target changed during readiness"
         recordManagedStart environment paths request.OwnerId staticBytes (Some receipt)
         removePendingTransaction environment paths request.OwnerId
@@ -5349,7 +5398,6 @@ module Traefik =
         let request = validateRequest requestElement
         if request.Operation <> "delete" then fail "delete requires a delete operation"
         let paths = pathsFor environment
-        cleanupStaleTraefikTemporaryFiles environment paths request.OwnerId
         let configStatus, stateStatus, installStatus, _ = checkLayoutCollisions environment paths request.OwnerId
         let unitData = safeUnitStatus environment paths.UnitPath request.OwnerId
         if configStatus = "absent" && stateStatus = "absent" && installStatus = "absent" && unitData.IsNone then JsonObject()
@@ -5373,6 +5421,72 @@ module Traefik =
     let private rootRequired (environment: HostEnvironment) : unit =
         let result = run environment "id" [ "-u" ]
         if result.ExitCode <> 0 || result.Stdout.Trim() <> "0" then fail "Traefik host operations require root privileges"
+
+#if TRAEFIK_MAINTENANCE
+    /// Compiled only into the standalone administrator binary. Never dispatch
+    /// through the deployment helper (which may itself have passwordless sudo).
+    let maintainStopped owner (expected: string) =
+        let environment = HostEnvironment.system
+        let paths = pathsFor environment
+        rootRequired environment
+        let ownerHash = ownerDigest owner
+        if not (fingerprintPattern.IsMatch(expected)) then fail "expected full lowercase journal SHA-256"
+        use guard = HostFiles.lockFile "/run/lock/keroosha-iac-traefik.lock"
+        let uid, gid = hostOwner environment
+        let _, serviceGroup = serviceAccountOwner environment
+        let verifyStopped () =
+            if not (isStopped environment) || not (unitMatches environment paths) then fail "operator must stop the owned unit and wait for all jobs"
+        verifyStopped ()
+        let archiveDir = Path.Combine(Path.GetDirectoryName(paths.ConfigDir), ".dorothy-traefik-recovery")
+        let archive = Path.Combine(archiveDir, ownerHash + "-" + expected + ".journal")
+        let verifiedArchive () =
+            metadataMatches environment archiveDir "directory" 0o700 uid gid &&
+            metadataMatches environment archive "file" 0o600 uid gid &&
+            sha256Bytes (readBytes environment archive) = expected
+        match loadPendingTransaction environment paths owner with
+        | None when verifiedArchive () -> fsyncDirectory paths.ConfigDir
+        | None -> fail "no pending journal or matching completed archival handoff"
+        | Some journal ->
+            if journal.JournalSha256 <> expected || not journal.CredentialsKnown || not journal.BinaryPresent then fail "journal hash mismatch or incomplete protected preimage"
+            let dynamicPath = Path.Combine(paths.DynamicDir, "current.yml")
+            let old = journal.Dynamic |> Option.defaultWith (fun () -> fail "missing dynamic preimage")
+            let verify () =
+                verifyStopped ()
+                if not (metadataMatches environment paths.RollbackPath "file" 0o600 uid gid) || sha256Bytes (readBytes environment paths.RollbackPath) <> expected then fail "journal changed during maintenance"
+                let c,s,i,unit = validateActualOwner environment paths owner
+                if (c,s,i) <> ("owned","owned","owned") || unit <> journal.Unit || unit.IsNone || not (filesystemMetadataMatches environment paths) then fail "ownership, metadata or unit differs"
+                if readOptional environment (Path.Combine(paths.ConfigDir,"static.yml")) <> journal.Static || journal.Static.IsNone ||
+                   readCredentialSnapshot environment paths <> journal.Credentials || Some(binarySha256 environment paths.BinaryPath) <> journal.BinarySha256 ||
+                   readOptional environment (Path.Combine(paths.InstallDir,".keroosha-release.json")) <> journal.ReleaseMarker then fail "protected preimage differs; no automatic overwrite"
+                let files = Set.ofArray(entries paths.CertificateDir)
+                if files <> Set.ofList journal.CertificateFiles || markerStatus environment paths.CertificateDir owner <> "owned" then fail "certificate inventory differs"
+                for filename in files do
+                    if filename <> ".keroosha-owner" then
+                        let stem = Path.GetFileNameWithoutExtension(filename)
+                        let crt = Path.Combine(paths.CertificateDir, stem + ".crt")
+                        let key = Path.Combine(paths.CertificateDir, stem + ".key")
+                        if not (metadataMatches environment crt "file" 0o640 uid serviceGroup && metadataMatches environment key "file" 0o640 uid serviceGroup) then fail "unattributable certificate pair"
+                        if filename.EndsWith(".crt", StringComparison.Ordinal) then
+                            use hash = IncrementalHash.CreateHash(HashAlgorithmName.SHA256)
+                            hash.AppendData(readBytes environment crt)
+                            hash.AppendData([|0uy|])
+                            hash.AppendData(readBytes environment key)
+                            if Convert.ToHexStringLower(hash.GetHashAndReset()) <> stem then fail "certificate contents differ"
+                let current = readBytes environment dynamicPath
+                if current <> old && (journal.Recovery |> Option.bind (fun w -> w.Target)) <> Some(sha256Bytes current) then fail "dynamic file is neither preimage nor transaction target"
+                current
+            let current = verify ()
+            let unchanged () = if verify () <> current then fail "preimage changed before maintenance commit"
+            let journalBytes = readBytes environment paths.RollbackPath
+            if sha256Bytes journalBytes <> expected then fail "journal changed before archival"
+            writeRecoveryFile environment paths expected archive journalBytes 0o600 gid false unchanged
+            let archived () = unchanged (); if not (verifiedArchive ()) then fail "archive integrity lost"
+            archived ()
+            if current <> old then writeRecoveryFile environment paths expected dynamicPath old 0o640 serviceGroup true archived
+            if verify () <> old || not (verifiedArchive ()) then fail "restored preimage or archive not verified"
+            File.Delete(paths.RollbackPath)
+            fsyncDirectory paths.ConfigDir
+#endif
 
     let handle (environment: HostEnvironment) (request: JsonElement) : JsonNode =
         try

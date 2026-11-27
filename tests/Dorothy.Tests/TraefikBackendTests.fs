@@ -450,7 +450,7 @@ type TraefikBackendTests() =
   }
 }"""
         let expected = expectedTemplate.Replace("@SERVICE@", serviceName, StringComparison.Ordinal) + "\n"
-        let actual = Traefik.renderDynamicConfig request.RootElement paths
+        let actual = Traefik.renderHistoricalDynamicConfig request.RootElement paths
         let actualBytes = Encoding.UTF8.GetBytes(actual)
         let expectedBytes = Encoding.UTF8.GetBytes(expected)
         Assert.That(actualBytes, Is.EqualTo(expectedBytes :> obj))
@@ -683,7 +683,7 @@ type TraefikBackendTests() =
           "routers":{"site":{"host":"site.example.test","entryPoint":"web","backend":"http://127.0.0.1:9000","excludedPathSubtree":"/admin","tls":{"kind":"acme","name":"le"}}},
           "certificates":{},"adminPort":19080
         }""")
-        let dynamicBytes = Encoding.UTF8.GetBytes(Traefik.renderDynamicConfig request.RootElement paths)
+        let dynamicBytes = Encoding.UTF8.GetBytes(Traefik.renderHistoricalDynamicConfig request.RootElement paths)
         let serviceName = "keroosha-backend-" + digest "http://127.0.0.1:9000"
         let siteRule = "Host(`site.example.test`) && !PathRegexp(`^(/|%2[fF])+admin($|/|%2[fF])`)"
         use routers = JsonDocument.Parse($"""[
@@ -1140,7 +1140,7 @@ type TraefikBackendTests() =
           "routers":{"site":{"host":"redirect.example.test","entryPoint":"web","redirect":{"kind":"permanentToOrigin","origin":"https://destination.example.test"},"tls":{"kind":"none","name":""}}},
           "certificates":{},"adminPort":19080
         }""")
-        let dynamicBytes = Encoding.UTF8.GetBytes(Traefik.renderDynamicConfig request.RootElement paths)
+        let dynamicBytes = Encoding.UTF8.GetBytes(Traefik.renderHistoricalDynamicConfig request.RootElement paths)
         let middlewareName = "keroosha-redirect-" + digest "site\nhttps://destination.example.test"
         let regex = "^https?://[^/?#]+(.*)$"
         let replacement = "https://destination.example.test${1}"
@@ -1415,6 +1415,10 @@ type TraefikBackendTests() =
         Assert.That(recoverable dynamic, Is.True)
         Assert.That(recoverable "{\"http\":[", Is.False, "Serving a good graph cannot make malformed disk bytes recoverable.")
         Assert.That(recoverable (dynamic.Replace("127.0.0.1:19001", "127.0.0.1:19002")), Is.False, "A different live backend is not the disk preimage.")
+        for value in [ "false"; "null" ] do
+            let changed = JsonNode.Parse(dynamic)
+            changed["http"].["services"].["app"].["loadBalancer"].AsObject().Add("unknownNativeKey", JsonNode.Parse(value))
+            Assert.That(recoverable (changed.ToJsonString()), Is.False, $"Unobserved field {value} must not attribute the file.")
         for status in [ "warning"; "disabled" ] do
             let live = JsonNode.Parse(rawData)
             let route = live["routers"].["a-app@file"]
@@ -1423,6 +1427,13 @@ type TraefikBackendTests() =
             let raw = live.ToJsonString()
             Assert.That(matches raw, Is.False, "Unhealthy is never successful activation.")
             Assert.That(Traefik.loadedRollbackGraph (Some(apiFor raw)) (Some(Encoding.UTF8.GetBytes(dynamic))), Is.True)
+            let services = JsonNode.Parse(rawData)
+            let service = services["services"].["app@file"]
+            service["status"] <- JsonValue.Create(status)
+            service["error"] <- JsonNode.Parse("""["service middleware unavailable"]""")
+            let serviceRaw = services.ToJsonString()
+            Assert.That(matches serviceRaw, Is.False)
+            Assert.That(Traefik.loadedRollbackGraph (Some(apiFor serviceRaw)) (Some(Encoding.UTF8.GetBytes(dynamic))), Is.True)
 
         let priorityDrift = JsonNode.Parse(rawData) :?> JsonObject
         let routers = priorityDrift["routers"] :?> JsonObject

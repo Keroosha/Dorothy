@@ -337,8 +337,12 @@ cmp "$state_dir/acme-store-hashes-before-delete.txt" "$state_dir/acme-store-hash
 [[ $(wc -l < "$state_dir/acme-store-hashes-after-delete.txt") -eq 6 ]]
 cmp "$state_dir/expected-issued-stores.txt" "$state_dir/acme-stores-after-delete.txt"
 cmp "$state_dir/legacy-refusal-before.txt" "$state_dir/legacy-refusal-after.txt"
-for kind in tls transport; do cmp "$state_dir/opaque-$kind-before.json" "$state_dir/opaque-$kind-after.json"; done
+for kind in tls transport false null; do cmp "$state_dir/opaque-$kind-before.json" "$state_dir/opaque-$kind-after.json"; done
+cmp "$state_dir/partial-third-before.txt" "$state_dir/partial-third-after.txt"
 artifact_digests=$(jq -n \
+    --arg maintenance "$(<"$state_dir/maintenance.sha256")" \
+    --arg denyPcap "$(file_sha256 "$state_dir/middleware-deny.pcap")" --arg denyLine "$(file_sha256 "$state_dir/middleware-deny.json")" \
+    --arg thirdStatic "$(file_sha256 "$state_dir/partial-third-after.txt")" \
     --arg manifests "$(file_sha256 "$state_dir/acme-store-hashes-after-delete.txt")" \
     --arg historyHelper "$(file_sha256 "$state_dir/legacy-provider/helper/linux-x64/keroosha-iac-helper")" \
     --arg refusedStatic "$(file_sha256 "$state_dir/legacy-refusal-after.txt")" \
@@ -365,6 +369,9 @@ artifact_digests=$(jq -n \
     --arg reviewClientIdentityAcceptedLogSha256 "$review_identity_accepted_sha" \
     --arg reviewTlsMetricsSha256 "$review_tls_sha" \
     '{
+      standaloneMaintenanceSha256:$maintenance,
+      tcpDenial:{pcapSha256:$denyPcap,journalRecordSha256:$denyLine},
+      interruptedForeignStaticWitnessSha256:$thirdStatic,
       retainedStores:{count:6,identicalBeforeAndAfterManifestSha256:$manifests},
       historicalFixtureHelperSha256:$historyHelper,
       legacyRefusalWitnessSha256:$refusedStatic,

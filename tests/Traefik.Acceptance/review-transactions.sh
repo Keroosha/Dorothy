@@ -13,8 +13,10 @@ guest_root=$2
 shift 2
 case "$mode" in
     recovery-tamper|recovery-restore) [[ $# == 1 && $1 =~ ^(static|credentials|unit|binary)$ ]] || usage ;;
-    recovery-interrupt) [[ $# == 1 && $1 =~ ^(bound|written)$ ]] || usage ;;
+    recovery-interrupt) [[ $# == 1 && $1 =~ ^(bound|anonymous|linked|written)$ ]] || usage ;;
     recovery-assert-bound|recovery-negative-inject|recovery-stale-assert|recovery-historical) [[ $# == 0 ]] || usage ;;
+    legacy-certificate-inject|legacy-tls-inject|legacy-opaque-restore) [[ $# == 0 ]] || usage ;;
+    job-substitute-install|service-error-inject|opaque-false-inject|opaque-null-inject) [[ $# == 0 ]] || usage ;;
     legacy-static-inject|legacy-static-reconcile|legacy-witness|maintenance-stop|verify-receipt|stale-receipt|opaque-tls-inject|opaque-transport-inject|opaque-witness|opaque-reconcile|disabled-rollback) [[ $# == 0 ]] || usage ;;
     disabled-inject|disabled-repaired) [[ $# == 0 ]] || usage ;;
     healthy-disk-inject|healthy-disk-refused|healthy-disk-reconcile) [[ $# == 0 ]] || usage ;;
@@ -110,13 +112,14 @@ binary_stage_assert_clean() {
     filename=$(<"$root/logs/binary-stage-file")
     [[ "$filename" =~ ^\.traefik-install-[a-f0-9]{32}$ ]] || fail 'staging filename evidence is malformed'
     stage="$binary_dir/$filename"
-    [[ ! -e "$stage" && ! -L "$stage" ]] || fail 'Apply left the stale owner-matched binary staging file behind'
+    [[ ! -L "$stage" && -f "$stage" && $(<"$stage") == 'incomplete disposable staging file' ]] || fail 'refusal changed an unattributed staging file'
+    rm -- "$stage"  # Only the fixture that created and verified these bytes removes them.
     shopt -s nullglob
     staging_files=("$binary_dir"/.traefik-install-*)
     shopt -u nullglob
     ((${#staging_files[@]} == 0)) || fail 'Apply left a Traefik binary staging file in the pinned directory'
-    jq -n --arg case "owned-binary-stage-removed" --arg filename "$filename" --argjson removed true --argjson ownerDigestMatched true \
-        '{case:$case,filename:$filename,removed:$removed,ownerDigestMatched:$ownerDigestMatched}' \
+    jq -n --arg case "foreign-binary-stage-preserved" --arg filename "$filename" --argjson removed true --argjson ownerDigestMatched true \
+        '{case:$case,filename:$filename,removed:$removed,removedByFixture:true,preservedByHelper:true,ownerDigestMatched:$ownerDigestMatched}' \
         > "$root/logs/review-transactions-binary-stage-clean.json"
     chmod 600 "$root/logs/review-transactions-binary-stage-clean.json"
 }
@@ -501,6 +504,7 @@ restart_interrupt_install() {
         || fail 'refusing to replace existing /usr/local/sbin/systemctl'
     [[ ! -e /usr/local/bin/systemctl && ! -L /usr/local/bin/systemctl ]] \
         || fail 'refusing to replace existing /usr/local/bin/systemctl'
+    for path in /usr/local/{bin,sbin}/busctl; do [[ ! -e $path && ! -L $path ]] || fail 'foreign busctl interposer'; done
     [[ ! -e "$root/systemctl-interposer.sh" && ! -L "$root/systemctl-interposer.sh" ]] || fail 'interposer script already exists in the private fixture'
     [[ ! -e "$root/.restart-interrupt-pending" && ! -L "$root/.restart-interrupt-pending" ]] || fail 'an earlier interruption marker remains'
     [[ ! -e "$root/.systemctl-interposer.sha256" && ! -L "$root/.systemctl-interposer.sha256" ]] || fail 'an earlier interposer digest remains'
@@ -524,14 +528,33 @@ if [[ -f "\$root/.recovery-interrupt" && "\${1:-}" == show ]]; then
     j=/etc/keroosha-iac/traefik/.keroosha-rollback.json
     target=\$(jq -er '.recovery.target // empty' "\$j" 2>/dev/null || :)
     phase=\$(cat "\$root/.recovery-interrupt")
-    if [[ \$target =~ ^[a-f0-9]{64}$ && ( "\$phase" == bound || "\$(sha256sum /etc/keroosha-iac/traefik/dynamic/current.yml | cut -d' ' -f1)" == "\$target" ) ]]; then
+    spool=/etc/keroosha-iac/.dorothy-traefik-recovery
+    point=false
+    case "\$phase" in
+        bound) point=true ;;
+        anonymous) for fd in /proc/\$PPID/fd/*; do link=\$(readlink "\$fd" || :); if [[ \$link == "\$spool"/\\#*' (deleted)' && -s \$fd ]]; then point=true; break; fi; done ;;
+        linked) compgen -G "\$spool/stage-*" >/dev/null && point=true ;;
+        written) [[ "\$(sha256sum /etc/keroosha-iac/traefik/dynamic/current.yml | cut -d' ' -f1)" == "\$target" ]] && point=true ;;
+    esac
+    if [[ \$target =~ ^[a-f0-9]{64}$ && \$point == true ]]; then
         rm -- "\$root/.recovery-interrupt"
         printf '%s\\n' "\$phase" > "\$root/logs/recovery-interrupted"
         kill -KILL "\$PPID"
         exit 137
     fi
 fi
-if [[ "\${1:-}" == restart && "\${2:-}" == keroosha-traefik.service && -e "\$root/.restart-interrupt-pending" ]]; then
+if [[ \${0##*/} == busctl && " \$* " == *' RestartUnit ss keroosha-traefik.service fail '* && -e "\$root/.job-substitute" ]]; then
+    /usr/bin/busctl "\$@" > "\$root/job-original.reply"
+    job=\$(sed -n 's,^o "/org/freedesktop/systemd1/job/\\([0-9]*\\)"$,\\1,p' "\$root/job-original.reply")
+    [[ -n \$job ]]
+    for _ in {1..60}; do
+        /usr/bin/journalctl -b _PID=1 UNIT=keroosha-traefik.service JOB_ID="\$job" JOB_RESULT=done -n1 -o json --no-pager | jq -e .INVOCATION_ID >/dev/null && break
+        sleep .1
+    done
+    /usr/bin/systemctl restart keroosha-traefik.service
+    rm -- "\$root/.job-substitute"; cat "\$root/job-original.reply"; exit 0
+fi
+if [[ \${0##*/} == busctl && " \$* " == *' RestartUnit ss keroosha-traefik.service fail '* && -e "\$root/.restart-interrupt-pending" ]]; then
     rm -f -- "\$root/.restart-interrupt-pending"
     printf '%s\\n' "\$PPID" > "\$root/logs/restart-interrupted-helper.pid"
     printf 'fired\\n' > "\$root/logs/restart-interrupted"
@@ -539,12 +562,13 @@ if [[ "\${1:-}" == restart && "\${2:-}" == keroosha-traefik.service && -e "\$roo
     kill -KILL "\$PPID" 2>/dev/null || true
     exit 137
 fi
-exec /usr/bin/systemctl "\$@"
+exec "/usr/bin/\${0##*/}" "\$@"
 EOF
     chmod 700 "$shim"
     sha=$(digest_file "$shim")
     install -o root -g root -m 0755 -- "$shim" /usr/local/sbin/systemctl
     install -o root -g root -m 0755 -- "$shim" /usr/local/bin/systemctl
+    for path in /usr/local/{bin,sbin}/busctl; do install -o root -g root -m0755 "$shim" "$path"; done
     printf '%s\n' "$sha" > "$root/.systemctl-interposer.sha256"
     chmod 600 "$root/.systemctl-interposer.sha256"
     : > "$root/.restart-interrupt-pending"
@@ -655,11 +679,11 @@ restart_interrupt_remove() {
         || fail 'interposer ownership digest is missing'
     expected_sha=$(<"$root/.systemctl-interposer.sha256")
     [[ "$expected_sha" =~ ^[a-f0-9]{64}$ ]] || fail 'interposer ownership digest is malformed'
-    for path in /usr/local/sbin/systemctl /usr/local/bin/systemctl; do
+    for path in /usr/local/{sbin,bin}/{systemctl,busctl}; do
         [[ -f "$path" && ! -L "$path" && "$(digest_file "$path")" == "$expected_sha" ]] \
             || fail 'refusing to remove a changed or foreign systemctl interposer'
     done
-    rm -- /usr/local/sbin/systemctl /usr/local/bin/systemctl
+    rm -- /usr/local/{sbin,bin}/{systemctl,busctl}
     rm -f -- "$root/.restart-interrupt-pending" "$root/.systemctl-interposer.sha256" "$root/systemctl-interposer.sh"
     hash -r
     [[ "$(command -v systemctl)" == /usr/bin/systemctl || "$(command -v systemctl)" == /bin/systemctl ]] \
@@ -743,7 +767,7 @@ case "$mode" in
     recovery-assert-bound)
         [[ ! -e "$root/.recovery-interrupt" && -s "$root/logs/recovery-interrupted" ]]
         jq -e '.version == 4 and (.recovery.target | test("^[a-f0-9]{64}$"))' "$journal_file" >/dev/null
-        if [[ $(<"$root/logs/recovery-interrupted") == bound ]]; then
+        if [[ $(<"$root/logs/recovery-interrupted") != written ]]; then
             cmp "$dynamic_file" <(jq -er .dynamic "$journal_file" | base64 -d)
         else
             [[ $(digest_file "$dynamic_file") == "$(jq -r .recovery.target "$journal_file")" ]]
@@ -766,6 +790,35 @@ case "$mode" in
         tmp=$(mktemp "$config_dir/.historical.XXXXXXXX")
         jq 'select(.version==4) | del(.recovery) | .version=3' "$journal_file" > "$tmp"
         [[ -s "$tmp" ]]; chmod 600 "$tmp"; mv -T "$tmp" "$journal_file" ;;
+    job-substitute-install)
+        restart_interrupt_install; : > "$root/.job-substitute" ;;
+    service-error-inject)
+        verify_owned_service >/dev/null
+        tmp=$(mktemp "${dynamic_file}.fixture.XXXXXXXX")
+        jq '.http.services.catalog.middlewares += ["review-service-missing"]' "$dynamic_file" > "$tmp"
+        chown --reference="$dynamic_file" "$tmp"; chmod --reference="$dynamic_file" "$tmp"; mv -T "$tmp" "$dynamic_file"
+        for _ in {1..60}; do
+            if curl -fsS --max-time 2 http://127.0.0.1:19080/api/rawdata | jq -ec '.services["catalog@file"] | select((.status=="warning" or .status=="disabled") and any(.error[]?; contains("review-service-missing"))) | {status,errorCount:(.error|length)}' > "$root/logs/service-error.json"; then break; fi
+            sleep .25
+        done
+        [[ -s "$root/logs/service-error.json" ]] || fail 'service-level middleware error not observed'
+        rc=$(curl -sS --max-time 3 -o /dev/null -w '%{http_code}' -H 'Host: shop.acceptance.test' http://127.0.0.1:18081/items/service-error)
+        [[ $rc =~ ^[45][0-9][0-9]$ ]] || fail 'missing service middleware did not cause a traffic failure' ;;
+    legacy-certificate-inject|legacy-tls-inject)
+        verify_owned_service >/dev/null
+        [[ ! -e "$root/legacy-opaque.original" && ! -e "$journal_file" ]]
+        cp -p "$dynamic_file" "$root/legacy-opaque.original"
+        tmp=$(mktemp "${dynamic_file}.fixture.XXXXXXXX")
+        if [[ $mode == legacy-certificate-inject ]]; then
+            jq -e 'select(.tls.certificates[0].certFile != null) | .tls.certificates[0].unrecognized=false' "$dynamic_file" > "$tmp"
+        else
+            jq '.tls.unrecognized=null' "$dynamic_file" > "$tmp"
+        fi
+        chown --reference="$dynamic_file" "$tmp"; chmod --reference="$dynamic_file" "$tmp"; mv -T "$tmp" "$dynamic_file"
+        digest_file "$dynamic_file" > "$root/legacy-opaque.injected" ;;
+    legacy-opaque-restore)
+        [[ $(digest_file "$dynamic_file") == "$(<"$root/legacy-opaque.injected")" ]]
+        mv -T "$root/legacy-opaque.original" "$dynamic_file" ;;
     maintenance-stop)
         verify_owned_service >/dev/null
         [[ ! -e "$journal_file" ]] || fail 'maintenance transition refuses a pending transaction'
@@ -800,13 +853,15 @@ case "$mode" in
         sha256sum "$static_file" "$dynamic_file"
         body=$(curl -kfsS --max-time 4 --noproxy '*' --resolve example.org:443:127.0.0.1 https://example.org/)
         [[ $body == 'http-backend:/;forwarded:127.0.0.1' ]]; printf '%s\n' "$body" ;;
-    opaque-tls-inject|opaque-transport-inject)
+    opaque-tls-inject|opaque-transport-inject|opaque-false-inject|opaque-null-inject)
         verify_owned_service >/dev/null
         [[ ! -e "$root/opaque-original" && ! -e "$journal_file" ]]
         cp -p "$dynamic_file" "$root/opaque-original"
         tmp=$(mktemp "${dynamic_file}.fixture.XXXXXXXX")
         if [[ $mode == opaque-tls-inject ]]; then
             jq '.tls.options["opaque-review"].notAValidOption = true' "$dynamic_file" > "$tmp"
+        elif [[ $mode == opaque-false-inject || $mode == opaque-null-inject ]]; then
+            value=${mode#opaque-}; jq --argjson value "${value%-inject}" '.http.services.catalog.loadBalancer.notAField=$value' "$dynamic_file" > "$tmp"
         else
             jq '.http.serversTransports["opaque-review"].notAValidTransportField = true' "$dynamic_file" > "$tmp"
         fi

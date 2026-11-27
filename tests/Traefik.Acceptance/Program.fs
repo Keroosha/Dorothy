@@ -309,7 +309,7 @@ module Program =
                 }
                 udpConfiguration {
                     udpRouters {
-                        if phase <> "withdraw-udp" then
+                        if phase <> "withdraw-udp" && not (phase = "rollback-udp" && environment "TRAEFIK_ACCEPTANCE_RETAIN_WITHDRAWAL" "" = "1") then
                             udpRouter "echo" {
                                 udpRouterEntryPoints [ udpEntryPoint "udp" ]
                                 udpRouterService (udpServiceRef "echo")

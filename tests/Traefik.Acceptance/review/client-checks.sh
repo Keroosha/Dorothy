@@ -295,7 +295,7 @@ case "$mode" in
             [[ $peer =~ ^127\.0\.0\.2:[0-9]+$ ]] || fail 'unexpected connected peer'
             journalctl --sync
             journalctl -u keroosha-traefik.service --after-cursor="$cursor" -o cat --no-pager |
-                jq -Rse --arg peer "$peer" 'any(split("\n")[] | fromjson?; .middlewareName=="review-tcp-loopback-only@file" and .middlewareType=="IPAllowListerTCP" and .error==("\""+$peer+"\" matched none of the trusted IPs"))' >/dev/null || fail 'missing fresh tuple-specific deny'
+                jq -Rsce --arg peer "$peer" '[split("\n")[] | fromjson? | select(.middlewareName=="review-tcp-loopback-only@file" and .middlewareType=="IPAllowListerTCP" and .error==("\""+$peer+"\" matched none of the trusted IPs")) | {middlewareName,middlewareType,error}] | select(length>0)' > "$root/logs/middleware-deny.json" || fail 'missing fresh tuple-specific deny'
             sleep 1
             kill -INT "$pid"; wait "$pid"; trap - EXIT
             grep -Fxq '0 packets dropped by kernel' "$stats" || fail 'incomplete backend capture'

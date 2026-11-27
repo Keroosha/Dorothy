@@ -173,7 +173,7 @@ export DOROTHY_ACCEPTANCE_DNS_TOKEN_FILES="$DNS_TSIG_SECRET_FILE:$state_dir/dns-
 export DOROTHY_ACCEPTANCE_SSH_AUDIT_FILE="$ssh_argv_audit_file"
 export PATH="$state_dir/bin:$PATH"
 mkdir -m 700 -p "$candidate_source"
-git -C "$repo_root" archive "$(<"$state_dir/git-head-before.txt")" -- src/Dorothy.DSL tests/Traefik.Acceptance \
+git -C "$repo_root" archive "$(<"$state_dir/git-head-before.txt")" -- src/Dorothy.DSL src/Dorothy.HostHelper src/Dorothy.DSL.Providers src/Dorothy.TraefikMaintenance tests/Traefik.Acceptance \
     | tar -x -C "$candidate_source"
 printf '%s\n' dorothy-traefik-candidate-source-v1 > "$candidate_source/.owner"
 chmod 600 "$candidate_source/.owner"
@@ -782,9 +782,11 @@ run_transaction_review() {
     remote "bash '$GUEST_ROOT/review-transactions.sh' binary-stage-inject '$GUEST_ROOT'" \
         > "$state_dir/logs/binary-stage-inject.log" 2>&1
     restore_pid_before=$(remote_service_pid)
-    run_pulumi rotate credential-fixture-restore-up.log up --stack acceptance --yes --non-interactive --parallel 1
+    expect_pulumi_failure rotate foreign-binary-stage-up.log up --stack acceptance --yes --non-interactive --skip-preview --parallel 1
+    grep -Fq 'binary directory contains unknown files' "$state_dir/logs/foreign-binary-stage-up.log"
     remote "bash '$GUEST_ROOT/review-transactions.sh' binary-stage-assert-clean '$GUEST_ROOT'" \
         > "$state_dir/logs/binary-stage-clean.log" 2>&1
+    run_pulumi rotate credential-fixture-restore-up.log up --stack acceptance --yes --non-interactive --parallel 1
     restore_pid_after=$(remote_service_pid)
     [[ "$restore_pid_after" != "$restore_pid_before" ]] || {
         printf 'Restoring the private DNS credential fixture did not restart Traefik.\n' >&2
@@ -938,6 +940,16 @@ apply_sni_proof_only() {
 copy_to_guest "$script_dir/review-transactions.sh" "$GUEST_ROOT/review-transactions.sh" "$state_dir/logs/transaction-controls-copy.log"
 tx_control(){ remote "bash '$GUEST_ROOT/review-transactions.sh' '$1' '$GUEST_ROOT'"; }
 legacy_id=$(<"$state_dir/legacy-resource-id.txt")
+if [[ $run_mode == full ]]; then
+    maintenance_binary=${TRAEFIK_ACCEPTANCE_MAINTENANCE_BIN:?standalone maintenance binary required}
+    copy_to_guest "$maintenance_binary" "$GUEST_ROOT/maintenance-bin" "$state_dir/logs/maintenance-copy.log"
+    copy_to_guest "$script_dir/offline-handoff.sh" "$GUEST_ROOT/offline-handoff.sh" "$state_dir/logs/handoff-copy.log"
+    copy_to_guest "$state_dir/legacy-resource-id.txt" "$GUEST_ROOT/maintenance-owner" "$state_dir/logs/handoff-owner-copy.log"
+    maintenance_digest=$(sha256sum "$maintenance_binary" | cut -d' ' -f1)
+    remote "printf '%s\\n' '$maintenance_digest' > '$GUEST_ROOT/maintenance-sha'; printf '%s\\n' '$actual_helper_sha' > '$GUEST_ROOT/product-helper-sha'"
+    printf '%s\n' "$maintenance_digest" > "$state_dir/maintenance.sha256"
+fi
+handoff(){ remote "bash '$GUEST_ROOT/offline-handoff.sh' '$1' '$GUEST_ROOT'"; }
 legacy_urn=$(resource_urn "$state_dir/legacy-checkpoint.json")
 [[ -n "$legacy_urn" ]] || { printf 'Frozen-base checkpoint has no sandbox Traefik URN.\n' >&2; exit 1; }
 if [[ "$run_mode" == sni-proof-only ]]; then
@@ -1057,6 +1069,8 @@ if ! bash "$script_dir/review/run-suite.sh" "$state_dir" "$provider_dir" \
     printf 'Reviewed route/client scenario suite failed; see %s/logs/review-suite-runner.log\n' "$state_dir" >&2
     exit 1
 fi
+copy_from_guest "$GUEST_ROOT/logs/middleware-backend.pcap" "$state_dir/middleware-deny.pcap" "$state_dir/logs/middleware-deny-copy.log"
+copy_from_guest "$GUEST_ROOT/logs/middleware-deny.json" "$state_dir/middleware-deny.json" "$state_dir/logs/middleware-journal-copy.log"
 [[ -f "$pulumi_project/Pulumi.yaml" \
    && $(<"$pulumi_project/Pulumi.yaml") == *"$state_dir/candidate-program/Traefik.Acceptance.dll"* ]] || {
     printf 'Reviewed suite did not restore the original candidate program manifest.\n' >&2
@@ -1341,7 +1355,7 @@ run_guest_client udp-drift > "$state_dir/logs/udp-rollback-client.log" 2>&1 || {
     exit 1
 }
 tx_control verify-receipt
-for opaque in tls transport; do
+for opaque in tls transport false null; do
     tx_control "opaque-$opaque-inject"
     tx_control opaque-witness > "$state_dir/opaque-$opaque-before.json"
     expect_pulumi_failure rollback-udp "opaque-$opaque-refusal.log" up --stack acceptance --yes --non-interactive --skip-preview --parallel 1
@@ -1373,7 +1387,8 @@ for binding in static credentials unit binary; do
 done
 expect_pulumi_failure rollback unverified-static-request.log up --stack acceptance --yes --skip-preview --non-interactive --parallel 1
 grep -Fq 'requires more than a dynamic file update' "$state_dir/logs/unverified-static-request.log"
-for point in bound written; do
+remote 'set -eu; f=/etc/keroosha-iac/.dorothy-traefik-recovery/.keroosha-traefik-write-00000000000000000000000000000000; test ! -e "$f"; printf "unrelated fixture\\n" > "$f"; chmod 600 "$f"'
+for point in bound anonymous linked written; do
     remote "bash '$GUEST_ROOT/review-transactions.sh' recovery-interrupt '$GUEST_ROOT' '$point'"
     expect_pulumi_failure rotate "repair-interrupted-$point.log" up --stack acceptance --yes --skip-preview --non-interactive --parallel 1
     tx_control restart-interrupt-remove
@@ -1385,6 +1400,7 @@ run_pulumi rotate unverified-repair-up.log up --stack acceptance --yes --non-int
 remote "bash '$GUEST_ROOT/review-transactions.sh' unverified-repair-assert '$GUEST_ROOT'" \
     > "$state_dir/logs/unverified-repair-assert.log" 2>&1
 tx_control verify-receipt
+remote 'grep -Fxq "unrelated fixture" /etc/keroosha-iac/.dorothy-traefik-recovery/.keroosha-traefik-write-00000000000000000000000000000000'
 copy_from_guest "$GUEST_ROOT/logs/healthy-recovery-after.json" "$state_dir/healthy-recovery-after.json" "$state_dir/logs/healthy-recovery-after-copy.log"
 remote "bash '$GUEST_ROOT/review-transactions.sh' disabled-inject '$GUEST_ROOT'"
 expect_pulumi_failure rollback-udp disabled-rollback.log up --stack acceptance --yes --non-interactive --skip-preview --parallel 1
@@ -1395,6 +1411,12 @@ remote "bash '$GUEST_ROOT/review-transactions.sh' disabled-repaired '$GUEST_ROOT
 for witness in disabled-before disabled-repaired; do
     copy_from_guest "$GUEST_ROOT/logs/$witness.json" "$state_dir/$witness.json" "$state_dir/logs/$witness-copy.log"
 done
+tx_control service-error-inject
+run_pulumi rotate service-error-refresh.log refresh --stack acceptance --yes --non-interactive
+export_checkpoint "$state_dir/service-error-checkpoint.json"
+assert_read_checkpoint "$state_dir/service-error-checkpoint.json" false "Loaded service middleware error"
+run_pulumi rotate service-error-repair-up.log up --stack acceptance --yes --non-interactive --parallel 1
+tx_control disabled-repaired
 for witness in healthy-disk-before healthy-disk-after unhealthy-disk-before unhealthy-disk-after; do
     copy_from_guest "$GUEST_ROOT/logs/$witness.json" "$state_dir/$witness.json" "$state_dir/logs/$witness-copy.log"
 done
@@ -1524,21 +1546,47 @@ jq -n \
         systemctlExit: $systemctlExit
     }' > "$state_dir/foreign-owner-delete-metrics.json"
 chmod 600 "$state_dir/foreign-owner-delete-metrics.json"
-# A real second rollback, not a transplanted witness. No positive repair or
-# claim of health follows either of these final rejection controls.
+# A failed bound target must have a supported exit without deleting this host.
 run_pulumi withdraw-udp before-stale-recovery.log up --stack acceptance --yes --non-interactive --parallel 1
 tx_control recovery-negative-inject
 expect_pulumi_failure rollback-udp before-stale-recovery-rollback.log up --stack acceptance --yes --skip-preview --non-interactive --parallel 1
 grep -Fq 'prior configuration could not be verified' "$state_dir/logs/before-stale-recovery-rollback.log"
+handoff install
+TRAEFIK_ACCEPTANCE_RETAIN_WITHDRAWAL=1 expect_pulumi_failure rollback-udp failed-bound-up.log up --stack acceptance --yes --skip-preview --non-interactive --parallel 1
+grep -Fq 'failed target restored to its attributed preimage, not certified healthy' "$state_dir/logs/failed-bound-up.log"
+remote 'set -eu; j=/etc/keroosha-iac/traefik/.keroosha-rollback.json; cmp /etc/keroosha-iac/traefik/dynamic/current.yml <(jq -er .dynamic "$j" | base64 -d); test "$(sed -n 2p /etc/keroosha-iac/traefik/.keroosha-static-receipt)" != "$(jq -r .recovery.invocation "$j")"'
+handoff stop; handoff negatives; handoff interrupt; handoff finish
+run_pulumi rotate failed-bound-maintenance-up.log up --refresh --stack acceptance --yes --non-interactive --parallel 1
+tx_control verify-receipt; tx_control disabled-repaired
+run_pulumi withdraw-udp stale-bound-setup.log up --stack acceptance --yes --non-interactive --parallel 1
+tx_control recovery-negative-inject
+expect_pulumi_failure rollback-udp stale-bound-prime.log up --stack acceptance --yes --skip-preview --non-interactive --parallel 1
+grep -Fq 'prior configuration could not be verified' "$state_dir/logs/stale-bound-prime.log"
+expect_pulumi_failure rollback-udp stale-bound-fail.log up --stack acceptance --yes --skip-preview --non-interactive --parallel 1
+grep -Fq 'safe withdrawal requires a restart; use offline maintenance' "$state_dir/logs/stale-bound-fail.log"
 remote 'j=/etc/keroosha-iac/traefik/.keroosha-rollback.json; test "$(jq -er .recovery.invocation "$j")" = "$(systemctl show keroosha-traefik.service -p InvocationID --value)" && systemctl restart keroosha-traefik.service'
-expect_pulumi_failure rotate stale-recovery-invocation.log up --stack acceptance --yes --skip-preview --non-interactive --parallel 1
+expect_pulumi_failure rollback-udp stale-recovery-invocation.log up --stack acceptance --yes --skip-preview --non-interactive --parallel 1
 grep -Fq 'rollback start is no longer the running invocation' "$state_dir/logs/stale-recovery-invocation.log"
-tx_control recovery-stale-assert
-tx_control recovery-historical
-historical_before=$(remote 'sha256sum /etc/keroosha-iac/traefik/.keroosha-rollback.json')
-expect_pulumi_failure rotate historical-recovery-refusal.log up --stack acceptance --yes --skip-preview --non-interactive --parallel 1
-grep -Fq 'restart requires a confirmed static file' "$state_dir/logs/historical-recovery-refusal.log"
-[[ $(remote 'sha256sum /etc/keroosha-iac/traefik/.keroosha-rollback.json') == "$historical_before" ]]
+handoff stop; handoff negatives; handoff interrupt; handoff finish
+run_pulumi rotate stale-witness-maintenance-up.log up --refresh --stack acceptance --yes --non-interactive --parallel 1
+tx_control verify-receipt; tx_control disabled-repaired
+tx_control job-substitute-install
+TRAEFIK_ACCEPTANCE_LOG_LEVEL=INFO expect_pulumi_failure rotate replaced-job.log up --stack acceptance --yes --skip-preview --non-interactive --parallel 1
+tx_control restart-interrupt-remove
+grep -Fq 'active invocation does not belong to the candidate job' "$state_dir/logs/replaced-job.log"
+remote "set -eu; c=/etc/keroosha-iac/traefik; jq '.log.level=\"WARN\"' \"\$c/static.yml\" > '$GUEST_ROOT/third-static'; cat '$GUEST_ROOT/third-static' > \"\$c/static.yml\""
+third_witness(){ remote 'systemctl show keroosha-traefik.service -p MainPID -p InvocationID; sha256sum /etc/keroosha-iac/traefik/{static.yml,.keroosha-rollback.json,.keroosha-static-receipt}'; }
+third_witness > "$state_dir/partial-third-before.txt"
+TRAEFIK_ACCEPTANCE_LOG_LEVEL=INFO expect_pulumi_failure rotate third-static-refusal.log up --stack acceptance --yes --skip-preview --non-interactive --parallel 1
+grep -Fq 'no attributable preimage or verified target' "$state_dir/logs/third-static-refusal.log"
+third_witness > "$state_dir/partial-third-after.txt"; cmp "$state_dir/partial-third-before.txt" "$state_dir/partial-third-after.txt"
+handoff stop
+remote "set -eu; c=/etc/keroosha-iac/traefik; cmp \"\$c/static.yml\" '$GUEST_ROOT/third-static'; jq -er .static \"\$c/.keroosha-rollback.json\" | base64 -d > \"\$c/static.yml\""
+handoff finish
+run_pulumi rotate historical-maintenance-up.log up --refresh --stack acceptance --yes --non-interactive --parallel 1
+tx_control verify-receipt; tx_control disabled-repaired
+export_checkpoint "$state_dir/after-maintenance-checkpoint.json"
+[[ $(resource_urn "$state_dir/after-maintenance-checkpoint.json") == "$legacy_urn" && $(resource_id "$state_dir/after-maintenance-checkpoint.json") == "$legacy_id" ]]
 remote 'find /var/lib/keroosha-traefik -maxdepth 1 -type f -name "acme-*.json" -size +0c -print | sort' \
     > "$state_dir/acme-stores-before-delete.txt"
 while read -r name port; do
