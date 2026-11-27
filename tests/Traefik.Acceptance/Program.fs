@@ -47,7 +47,7 @@ module Program =
                 acmeEmail "ops@acceptance.test"
                 acmeCaServer caServer
                 acmeKeyType "EC256"
-                if shortRenewal then nativeField "profile" (nativeString "renewal")
+                nativeField "profile" (nativeString (if shortRenewal then "renewal" else "default"))
                 challenge
                 nativeField "certificatesDuration" (nativeInteger 1)
                 nativeField "caSystemCertPool" (nativeBoolean true)

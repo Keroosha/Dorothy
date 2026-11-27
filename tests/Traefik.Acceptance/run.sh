@@ -1165,6 +1165,7 @@ reboot_store_witness(){
     remote 'set -euo pipefail; files=(/var/lib/keroosha-traefik/acme-*.json); [[ ${#files[@]} == 6 ]]; for f in "${files[@]}"; do test -s "$f"; sha256sum "$f"; jq -er "to_entries[].value.Certificates[].certificate" "$f" | while read -r cert; do printf %s "$cert" | base64 -d | openssl x509 -noout -serial -fingerprint -sha256 -issuer -enddate; done; done'
 }
 reboot_store_witness > "$state_dir/reboot-store-before.txt"
+remote 'set -euo pipefail; for f in /var/lib/keroosha-traefik/acme-*.json; do resolver=$(jq -er "keys|select(length==1)|first" "$f"); jq -er "to_entries[].value.Certificates[].certificate" "$f" | while read -r cert; do dates=$(printf %s "$cert"|base64 -d|openssl x509 -noout -dates); start=$(date -d "$(sed -n "s/^notBefore=//p" <<< "$dates")" +%s); end=$(date -d "$(sed -n "s/^notAfter=//p" <<< "$dates")" +%s); span=$((end-start)); if [[ $resolver == acceptance-v2 ]]; then ((span>=1290 && span<=1310)); else ((span>=14390 && span<=14410)); fi || exit 1; done; done'
 remote "cat '$GUEST_ROOT/logs/acme-acceptance-serial-before.txt' '$GUEST_ROOT/logs/acme-acceptance-serial.txt'" > "$state_dir/dns-renewal-serials.txt"
 [[ $(sort -u "$state_dir/dns-renewal-serials.txt" | wc -l) == 2 ]]
 boot_after=$(reboot_guest "$boot_before")
