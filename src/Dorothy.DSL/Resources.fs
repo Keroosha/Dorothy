@@ -1479,6 +1479,19 @@ module Host =
             | None, _ -> None
 
 
+        // Debian's docker.io maintainer script can start dockerd before its
+        // Engine resource runs. Put recovery/panic admission ahead of the APT
+        // owner; the final policy may refer to the zone created by that start.
+        let dockerBootstrap =
+            match host.Docker, host.Firewalld |> Option.bind _.StrictForwardPorts, firewalldSettingsResource with
+            | Some _, Some true, Some settings ->
+                let name = host.Name + "-docker-firewall-bootstrap"
+                let args = HostServiceArgs()
+                args.Connection <- Input<AptConnectionArgs>.op_Implicit connection
+                args.Specification <- Input<string>.op_Implicit(FirewalldGuardUnit.specification (name + ".service") [])
+                Some(HostServiceResource(name, args, ProviderContract.resourceOptionsWithDependencies [ settings :> Resource ]) :> Resource)
+            | _ -> None
+
         // Keep explicitly declared docker.io in its original main APT owner. Ordering
         // the whole owner after firewalld avoids both first-start races and package removal.
         let mainDependencies =
@@ -1488,6 +1501,7 @@ module Host =
             @ (if host.Docker.IsSome then
                    firewalldSettingsResource |> Option.map (fun resource -> resource :> Resource) |> Option.toList
                else [])
+            @ Option.toList dockerBootstrap
         let mainApt = createAptPackageSet host.Name mainPackages mainDependencies false
 
 
@@ -1809,7 +1823,7 @@ module Host =
                     args.Triggers <-
                         Input<string>.op_Implicit(
                             System.Text.Json.JsonSerializer.Serialize(
-                                guardPolicies |> List.map _.Configuration |> List.toArray))
+                                "per-engine-start-v1" :: (guardPolicies |> List.map _.Configuration) |> List.toArray))
                     args.RestartOnChange <- Input<bool>.op_Implicit true
                     let dependencies =
                         [ engine :> Resource ]

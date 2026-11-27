@@ -7,11 +7,11 @@
 - Each container's Pulumi `DependsOn` contains only its mount/`usesDirectory` directory resources, declared container dependencies, explicitly selected firewalld policy resources, and the strict-host boot guard service when opted in.
 - `DockerBuilders.dependsOnFirewalld` is a typed policy dependency. The host builder rejects undeclared/non-policy references and never infers a dependency from all Docker-egress policies, preserving non-opted-in graphs.
 - `Firewalld.strictForwardPorts true` owns only the `StrictForwardPorts` key through a journaled `FirewalldSettings` resource. Strict Docker hosts require each container to select a negative-priority `DROP` policy with Docker egress.
-- A strict host's managed oneshot guard is installed only after Docker, the global setting, and those policies exist. Its `Requires=firewalld.service`, `After=firewalld.service`, `Before=docker.service`, and `RequiredBy=docker.service` make Docker startup fail closed without introducing a Docker-zone dependency cycle.
+- With a declared strict engine, a recovery/panic readiness check precedes the package owner that may first start Docker. The full policy guard follows Docker and its declared fence policies; it does not require a Docker-created zone to exist before initial installation. Each installs a scoped `docker.service` pre-start check that runs on every systemd invocation, including socket activation. See the [ownership and recovery runbook](Firewalld-Permanent-Configuration.md#operator-recovery-without-adopting-someone-elses-rules).
 
 ## Implementation
 
-- Docker directory, policy, boot-guard, and container-to-container dependencies remain distinct typed edges; the guard is downstream of Docker and declared policies, avoiding a cycle with Docker's zone.
+- Docker directory, policy, admission, and container-to-container dependencies remain distinct typed edges. The early readiness prerequisite does not call Docker; the final guard depends on the engine and declared policies. Firewalld without a declared engine registers neither guard.
 - Generic tests assert Pulumi resource dependencies, reject undeclared mount/policy references and nonnegative-priority strict guards, and leave non-opted-in host graphs independent.
 - Firewalld uses unique Create-generation owners and create-before-delete replacement. A same-object replacement fails closed against the old journal owner; settings restore only the inherited `StrictForwardPorts` value/absence while preserving unrelated edits during apply, rollback, and delete.
 - No `Compose`, global file/container dependency, resource rename, or change to non-opted-in Docker host graphs.

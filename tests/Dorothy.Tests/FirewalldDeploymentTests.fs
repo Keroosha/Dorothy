@@ -43,8 +43,8 @@ type FirewalldDependencyStack() =
 
 [<TestFixture; NonParallelizable>]
 type FirewalldDeploymentTests() =
-    [<TestCase(false); TestCase(true)>]
-    member _.``Docker ordering preserves explicit package ownership when adding firewalld``(explicitVersion: bool) =
+    [<TestCase(false, false); TestCase(true, false); TestCase(false, true); TestCase(true, true)>]
+    member _.``Docker ordering preserves explicit package ownership when adding firewalld``(explicitVersion: bool, strict: bool) =
         let host =
             sshHost "ordered" {
                 Address "192.0.2.2"
@@ -56,6 +56,7 @@ type FirewalldDeploymentTests() =
                     }
                     docker { }
                     firewalld {
+                        if strict then strictForwardPorts true
                         zone "external" { services [ "ssh" ]; interfaces [ "eth0" ] }
                         policy "docker-block" {
                             ingressZones [ "external" ]; egressZones [ "docker" ]
@@ -86,6 +87,13 @@ type FirewalldDeploymentTests() =
             InputList<Resource>.op_Implicit byName["ordered-firewalld-policy-docker-block"].Options.DependsOn
         Assert.That(OutputUtilities.GetValueAsync(policyDependencies).Result, Does.Contain engine.Resource)
         let main = captured |> Array.find (fun a -> a.Args :? AptPackageSetArgs && name a.Resource = "ordered")
+        let mainDeps: Output<ImmutableArray<Resource>> = InputList<Resource>.op_Implicit main.Options.DependsOn
+        let bootstrap = "ordered-docker-firewall-bootstrap"
+        Assert.That(byName.ContainsKey bootstrap, Is.EqualTo strict)
+        if strict then
+            Assert.That(OutputUtilities.GetValueAsync(mainDeps).Result |> Seq.map name, Does.Contain bootstrap)
+            Assert.That(dependencies bootstrap, Does.Contain "ordered-firewalld-strict-forward-ports")
+            Assert.That(dependencies bootstrap, Does.Not.Contain "ordered-firewalld-policy-docker-block")
         let packages = (main.Args :?> AptPackageSetArgs).Packages
         let packageOutput: Output<ImmutableDictionary<string, AptPackageArgs>> = InputMap<AptPackageArgs>.op_Implicit packages
         let resolvedPackages = OutputUtilities.GetValueAsync(packageOutput).Result
@@ -431,6 +439,7 @@ type FirewalldDeploymentTests() =
         let apiService = Defined.service "api" { includes [ "base"; "vendor-base" ] }
         let firewall =
             firewalld {
+                strictForwardPorts true
                 apiService
                 zone "public" {
                     services [ "api" ]
@@ -454,6 +463,7 @@ type FirewalldDeploymentTests() =
         Deployment.TestAsync<FirewalldDependencyStack>(FirewalldDeploymentFixture.Mocks(), TestOptions()).GetAwaiter().GetResult() |> ignore
         let name (resource: Resource) = OutputUtilities.GetValueAsync(resource.Urn).Result.Split("::") |> Array.last
         let captured = FirewalldDeploymentFixture.captured |> Seq.filter (fun args -> not (args.Resource :? Stack)) |> Seq.toArray
+        Assert.That(captured |> Array.exists (fun r -> r.Args :? DockerEngineArgs || r.Args :? HostServiceArgs), Is.False)
         let firewalldResource resourceName =
             captured |> Array.find (fun args -> args.Args :? FirewalldArgs && name args.Resource = resourceName)
         let dependencies (args: ResourceTransformationArgs) =

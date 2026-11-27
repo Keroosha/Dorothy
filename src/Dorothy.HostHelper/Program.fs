@@ -44,7 +44,7 @@ module private FirewalldNftTable =
 
 module Program =
     let private usage () =
-        Console.Error.WriteLine("Usage: keroosha-iac-helper apt|ufw|firewalld|firewalld-recover|firewalld-recover-boot|firewalld-recover-postboot|firewalld-docker-gate NAME PRIORITY INGRESS EGRESS|traefik|docker|docker-job|sshd|fail2ban|users|sudo|content|service|swapfile|--version")
+        Console.Error.WriteLine("Usage: keroosha-iac-helper apt|ufw|firewalld|firewalld-recover|firewalld-recover-boot|firewalld-recover-postboot|firewalld-docker-ready|firewalld-docker-gate NAME PRIORITY INGRESS EGRESS|traefik|docker|docker-job|sshd|fail2ban|users|sudo|content|service|swapfile|--version")
         64
 
     // A disconnected provider must not leave an external command holding the
@@ -161,10 +161,19 @@ module Program =
             try FirewalldNftTable.printTable ()
             with
             | :? DllNotFoundException | :? EntryPointNotFoundException -> 1
+        elif arguments.Length = 1 && arguments[0] = "firewalld-docker-ready" then
+            try
+                FirewalldDockerGate.verifyReadiness firewalldEnvironment
+                Console.Out.WriteLine("Docker bootstrap admission passed: recovery settled and native panic is off.")
+                0
+            with error ->
+                reportFailure error
+                1
         elif arguments.Length = 5 && arguments[0] = "firewalld-docker-gate" then
             try
                 let fence = FirewalldGateModel.parseArguments arguments[1] arguments[2] arguments[3] arguments[4]
                 FirewalldDockerGate.verify firewalldEnvironment [ fence ]
+                Console.Out.WriteLine("Docker start admission passed for live fence " + fence.Name + ".")
                 0
             with error ->
                 reportFailure error

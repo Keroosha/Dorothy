@@ -60,6 +60,10 @@ module FirewalldLifecycle =
     let private bootServiceName = "keroosha-iac-firewalld-boot-recovery.service"
     let private containmentName = "keroosha-iac-firewalld-boot-containment.service"
     let private containmentPath = "/etc/systemd/system/" + containmentName
+    // Docker admission must be ordered after the same recovery decisions that
+    // gate firewalld startup and the network-pre barrier.
+    let internal dockerBootDecisionUnits = [ bootServiceName; postBootServiceName; containmentName ]
+    let internal dockerRollbackServiceName = serviceName
     let private ownerMarker = "# Dorothy firewalld transaction recovery"
     let private timerText =
         String.concat "\n"

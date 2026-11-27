@@ -75,9 +75,9 @@ module private HostResourceInputs =
             let managed = node["managed"].GetValue<bool>()
             let config = jsonText node "configuration"
             if node.ContainsKey "dockerFence" then
-                if node.Count <> 4 || not managed || config <> "" || not (name.EndsWith("-docker-firewall-guard.service", StringComparison.Ordinal)) then
-                    invalidOp "Expected a managed, typed Docker firewall gate without a user-supplied unit."
-                FirewalldGateModel.decode node["dockerFence"] |> ignore
+                if node.Count <> 4 || not managed || config <> "" then
+                    invalidOp "Expected a managed, typed Docker gate without a user-supplied unit."
+                FirewalldGateModel.decodeService name node["dockerFence"] |> ignore
             else
                 if managed && (String.IsNullOrWhiteSpace config || not (config.Contains "ExecStart=")) then invalidOp "A managed service requires ExecStart."
                 if not managed && config <> "" then invalidOp "A package service cannot own configuration."

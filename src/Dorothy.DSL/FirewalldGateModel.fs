@@ -66,3 +66,12 @@ module FirewalldGateModel =
             let names (key: string) = row[key].AsArray() |> Seq.map (fun x -> x.GetValue<string>()) |> Seq.toList
             create (row["name"].GetValue<string>()) (row["priority"].GetValue<int>()) (names "ingress") (names "egress"))
         |> Seq.toList
+
+    // The early prerequisite owns no fence or Docker zone. An empty list is
+    // never a valid final guard, including when upgrading an existing stack.
+    let decodeService (name: string) (node: JsonNode) =
+        if name.EndsWith("-docker-firewall-bootstrap.service", StringComparison.Ordinal) then
+            if isNull node || node.AsArray().Count <> 0 then invalidArg "dockerFence" "Bootstrap takes no policies."
+            []
+        elif name.EndsWith("-docker-firewall-guard.service", StringComparison.Ordinal) then decode node
+        else invalidArg "dockerFence" "Unexpected Docker admission service name."
