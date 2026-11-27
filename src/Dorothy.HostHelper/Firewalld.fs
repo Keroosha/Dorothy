@@ -1862,16 +1862,33 @@ module Firewalld =
         (environment: HostEnvironment)
         (c: FirewalldModel.Configuration)
         =
-        let disk = FirewalldRuntime.snapshotFromXml c.Kind c.Name (effective environment c.Kind c.Name)
-        match disk, FirewalldRuntime.queryPermanent environment c.Kind c.Name, FirewalldRuntime.queryRuntime environment c.Kind c.Name with
-        | Ok None, Ok None, Ok None -> ()
-        | Ok(Some expected), Ok(Some permanent), Ok(Some live)
-            when FirewalldRecoveryProof.matchesLoadedProjection environment expected permanent
-              && FirewalldRecoveryProof.matchesLoadedProjectionPreservingRestrictions environment expected live -> ()
-        | Error reason, _, _ -> fail ("Unable to prove restored firewalld XML: " + reason)
-        | _, Error reason, _ -> fail ("Unable to prove restored permanent firewalld object: " + reason)
-        | _, _, Error reason -> fail ("Unable to prove restored runtime firewalld object: " + reason)
-        | _ -> fail "The deleted firewalld object is not absent or loaded at its restored baseline."
+        let expected () =
+            match FirewalldRuntime.snapshotFromXml c.Kind c.Name (effective environment c.Kind c.Name) with
+            | Ok value -> value
+            | Error reason -> fail ("Unable to prove restored firewalld XML: " + reason)
+        let disk = expected ()
+        let matches compare snapshot =
+            match disk, snapshot with
+            | None, None -> true
+            | Some baseline, Some actual -> compare environment baseline actual
+            | _ -> false
+        // A scoped inverse updates the runtime directly. The daemon's separate
+        // permanent D-Bus view is refreshed by its file watcher, not by that API.
+        // Do not flush foreign rules just to synchronize this read-side cache.
+        let elapsed = System.Diagnostics.Stopwatch.StartNew()
+        let rec observePermanent () =
+            match FirewalldRuntime.queryPermanent environment c.Kind c.Name with
+            | Error reason -> fail ("Unable to prove restored permanent firewalld object: " + reason)
+            | Ok state when matches FirewalldRecoveryProof.matchesLoadedProjection state -> ()
+            | Ok _ when elapsed.Elapsed.TotalSeconds < 10.0 ->
+                System.Threading.Thread.Sleep 250
+                observePermanent ()
+            | Ok _ -> fail "The permanent firewalld view did not converge to the restored baseline."
+        observePermanent ()
+        match FirewalldRuntime.queryRuntime environment c.Kind c.Name with
+        | Ok state when expected () = disk && matches FirewalldRecoveryProof.matchesLoadedProjectionPreservingRestrictions state -> ()
+        | Ok _ -> fail "The loaded firewalld object did not match the restored baseline."
+        | Error reason -> fail ("Unable to prove restored runtime firewalld object: " + reason)
 
     let private restoreObjectRuntime
         (environment: HostEnvironment)
