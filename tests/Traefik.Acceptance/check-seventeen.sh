@@ -39,7 +39,9 @@ install_provider "$candidate"; refresh; detected=$(snapshot)
 jq -e '.summary.legacyProbesAttempted==17 and .summary.nativeProbesAttempted==0 and .summary.truncated==0' <<< "$healthy" >/dev/null
 jq -e '(.inSync|not) and .routers==17 and .legacyOnly and .summary.legacyProbesAttempted==17 and .summary.truncated==0' <<< "$detected" >/dev/null
 control assert-drift
+remote "bash '$GUEST_ROOT/review-transactions.sh' maintenance-stop '$GUEST_ROOT'"
 p up --target "$urn" --stack acceptance --yes --non-interactive >>"$log" 2>&1; control assert-positive
+remote "bash '$GUEST_ROOT/review-transactions.sh' verify-receipt '$GUEST_ROOT'"
 recovery=false; repaired=$(snapshot); jq -e '.inSync and .routers==17 and .legacyOnly' <<< "$repaired" >/dev/null
 # The historical limit was shared; verify the non-legacy half of the summary against a distinct
 # population too. Never use a static router count as the observed handshake count.

@@ -908,6 +908,7 @@ run_sni_drift() {
     assert_read_checkpoint "$state_dir/sni-drift-checkpoint.json" false "SNI drift Read"
     remote "bash '$GUEST_ROOT/sni-drift.sh' assert-drift '$GUEST_ROOT'" > "$state_dir/logs/sni-drift-after-refresh.log" 2>&1
     run_pulumi sni-proof-only sni-repair-preview.log preview --stack acceptance --diff --non-interactive --color=never
+    tx_control maintenance-stop
     run_pulumi sni-proof-only sni-repair-up.log up --stack acceptance --yes --non-interactive --parallel 1
     export_checkpoint "$state_dir/sni-repaired-checkpoint.json"
     assert_checkpoint "$state_dir/sni-repaired-checkpoint.json" "SNI repair" true
@@ -934,6 +935,8 @@ apply_sni_proof_only() {
     run_sni_drift
 }
 
+copy_to_guest "$script_dir/review-transactions.sh" "$GUEST_ROOT/review-transactions.sh" "$state_dir/logs/transaction-controls-copy.log"
+tx_control(){ remote "bash '$GUEST_ROOT/review-transactions.sh' '$1' '$GUEST_ROOT'"; }
 legacy_id=$(<"$state_dir/legacy-resource-id.txt")
 legacy_urn=$(resource_urn "$state_dir/legacy-checkpoint.json")
 [[ -n "$legacy_urn" ]] || { printf 'Frozen-base checkpoint has no sandbox Traefik URN.\n' >&2; exit 1; }
@@ -1039,6 +1042,10 @@ jq -e "$traefik_query[0].inputs | (has(\"configuration\") | not)" \
     printf 'Full acceptance SNI proof must start from the frozen legacy resource.\n' >&2
     exit 1
 }
+tx_control stale-receipt
+expect_pulumi_failure sni-proof-only legacy-reboot-refusal.log up --stack acceptance --yes --non-interactive --skip-preview --parallel 1
+grep -Fq 'restart requires a confirmed static file' "$state_dir/logs/legacy-reboot-refusal.log"
+tx_control maintenance-stop
 apply_sni_proof_only
 apply_full_configuration \
     "$state_dir/sni-proof-only-checkpoint.json" \
@@ -1183,6 +1190,10 @@ jq -n \
 chmod 600 "$state_dir/post-reboot-journal-window.json"
 assert_guest_secret_isolation present
 
+tx_control stale-receipt
+tx_control maintenance-stop
+run_pulumi rotate reboot-baseline-up.log up --refresh --stack acceptance --yes --non-interactive --parallel 1
+tx_control verify-receipt
 copy_to_guest "$script_dir/drift.sh" "$GUEST_ROOT/drift.sh" "$state_dir/logs/drift-script-copy.log"
 remote "chmod 700 '$GUEST_ROOT/drift.sh'; bash '$GUEST_ROOT/drift.sh' '$GUEST_ROOT'" \
     > "$state_dir/logs/drift-injection.log" 2>&1
@@ -1329,6 +1340,16 @@ run_guest_client udp-drift > "$state_dir/logs/udp-rollback-client.log" 2>&1 || {
     printf 'UDP rollback did not retain the withdrawn route state; see %s/logs/udp-rollback-client.log\n' "$state_dir" >&2
     exit 1
 }
+tx_control verify-receipt
+for opaque in tls transport; do
+    tx_control "opaque-$opaque-inject"
+    tx_control opaque-witness > "$state_dir/opaque-$opaque-before.json"
+    expect_pulumi_failure rollback-udp "opaque-$opaque-refusal.log" up --stack acceptance --yes --non-interactive --skip-preview --parallel 1
+    grep -Fq 'cannot establish that the dynamic rollback file represents the running graph' "$state_dir/logs/opaque-$opaque-refusal.log"
+    tx_control opaque-witness > "$state_dir/opaque-$opaque-after.json"
+    cmp "$state_dir/opaque-$opaque-before.json" "$state_dir/opaque-$opaque-after.json"
+    tx_control opaque-reconcile
+done
 remote "bash '$GUEST_ROOT/review-transactions.sh' healthy-disk-inject '$GUEST_ROOT'"
 expect_pulumi_failure rollback-udp healthy-disk-refusal.log up --stack acceptance --yes --non-interactive --skip-preview --parallel 1
 grep -Fq 'Apply refused: cannot establish that the dynamic rollback file represents the running graph' "$state_dir/logs/healthy-disk-refusal.log"
@@ -1350,6 +1371,7 @@ remote "bash '$GUEST_ROOT/review-transactions.sh' unverified-repair-assert '$GUE
 remote "bash '$GUEST_ROOT/review-transactions.sh' disabled-inject '$GUEST_ROOT'"
 expect_pulumi_failure rollback-udp disabled-rollback.log up --stack acceptance --yes --non-interactive --skip-preview --parallel 1
 grep -Fq 'prior configuration could not be verified' "$state_dir/logs/disabled-rollback.log"
+tx_control disabled-rollback
 run_pulumi rotate disabled-repair.log up --stack acceptance --refresh --yes --non-interactive --parallel 1
 remote "bash '$GUEST_ROOT/review-transactions.sh' disabled-repaired '$GUEST_ROOT'"
 for witness in disabled-before disabled-repaired; do
@@ -1426,6 +1448,17 @@ run_guest_client after-reboot > "$state_dir/logs/post-rollback-clients.log" 2>&1
     printf 'Prior configuration was not restored after rejection; see %s/logs/post-rollback-clients.log\n' "$state_dir" >&2
     exit 1
 }
+tx_control verify-receipt
+run_pulumi withdraw-udp after-rollback-managed-up.log up --stack acceptance --yes --non-interactive --parallel 1
+tx_control verify-receipt
+run_pulumi rotate after-rollback-managed-restore.log up --stack acceptance --yes --non-interactive --parallel 1
+remote 'systemctl restart keroosha-traefik.service'
+tx_control stale-receipt
+expect_pulumi_failure withdraw-udp external-invocation-refusal.log up --stack acceptance --yes --non-interactive --skip-preview --parallel 1
+grep -Fq 'restart requires a confirmed static file' "$state_dir/logs/external-invocation-refusal.log"
+tx_control maintenance-stop
+run_pulumi rotate external-invocation-reestablish.log up --refresh --stack acceptance --yes --non-interactive --parallel 1
+tx_control verify-receipt
 
 export_checkpoint "$state_dir/before-foreign-owner-delete-checkpoint.json"
 assert_checkpoint "$state_dir/before-foreign-owner-delete-checkpoint.json" "Foreign-owner Delete baseline" true
@@ -1475,7 +1508,18 @@ jq -n \
 chmod 600 "$state_dir/foreign-owner-delete-metrics.json"
 remote 'find /var/lib/keroosha-traefik -maxdepth 1 -type f -name "acme-*.json" -size +0c -print | sort' \
     > "$state_dir/acme-stores-before-delete.txt"
-[[ -s "$state_dir/acme-stores-before-delete.txt" ]] || { printf 'No issued ACME storage files exist before Delete.\\n' >&2; exit 1; }
+while read -r name port; do
+    id=$(printf '%s\nhttps://localhost:%s/dir' "$name" "$port" | sha256sum | cut -d' ' -f1)
+    printf '/var/lib/keroosha-traefik/acme-%s.json\n' "$id"
+done <<STORES | LC_ALL=C sort > "$state_dir/expected-issued-stores.txt"
+acceptance-$resolver_epoch 14000
+acceptance-rotated-$resolver_epoch 14001
+http01-$resolver_epoch 14000
+tlsalpn-$resolver_epoch 14000
+review-acme 14000
+review-acme 14001
+STORES
+cmp "$state_dir/expected-issued-stores.txt" "$state_dir/acme-stores-before-delete.txt" || { echo 'Delete refused: six expected issuer-specific stores not present' >&2; exit 1; }
 remote 'find /var/lib/keroosha-traefik -maxdepth 1 -type f -name "acme-*.json" -size +0c -print | sort | xargs -r sha256sum' \
     > "$state_dir/acme-store-hashes-before-delete.txt"
 [[ -s "$state_dir/acme-store-hashes-before-delete.txt" ]] || { printf 'ACME storage hash manifest is empty before Delete.\\n' >&2; exit 1; }
@@ -1490,6 +1534,7 @@ deleted_count=$(jq "$traefik_query | length" "$state_dir/deleted-checkpoint.json
     printf 'Deleted Traefik unit remains loadable.\n' >&2; exit 1
 }
 remote 'test ! -e /etc/keroosha-iac/traefik/static.yml && test ! -e /etc/keroosha-iac/traefik/dynamic/current.yml && test ! -e /etc/keroosha-iac/traefik/dns-credentials.env'
+remote 'test ! -e /etc/keroosha-iac/traefik/.keroosha-static-receipt && test ! -e /etc/keroosha-iac/traefik/.keroosha-rollback.json'
 REMOTE_SYSTEMCTL_STATE=not-found
 REMOTE_SYSTEMCTL_EXIT=0
 printf '%s %s\n' "$REMOTE_SYSTEMCTL_STATE" "$REMOTE_SYSTEMCTL_EXIT" \

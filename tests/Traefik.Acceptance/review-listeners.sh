@@ -25,7 +25,7 @@ fail() {
 [[ $# == 2 ]] || usage
 mode=$1
 case "$mode" in
-    reconcile-forwarded|reconcile-proxy) ;;
+    reconcile-forwarded|reconcile-proxy|maintenance-stop) ;;
     prepare|inject-forwarded|assert-forwarded-drift|restore-forwarded|assert-forwarded-restored|assert-forwarded-repaired|inject-proxy|assert-proxy-drift|restore-proxy|assert-proxy-restored|assert-proxy-repaired|assert-otlp-current|restore) ;;
     *) usage ;;
 esac
@@ -361,6 +361,7 @@ case "$mode" in
         [[ "$(service_pid)" == "$(<"$FIXTURE/forwarded-injected.pid")" ]] \
             || fail 'restoring desired forwarded-header bytes unexpectedly restarted Traefik'
         ;;
+    maintenance-stop) bash "$root/review-transactions.sh" maintenance-stop "$root" ;;
     reconcile-forwarded|reconcile-proxy)
         load_fixture
         kind=${mode#reconcile-}

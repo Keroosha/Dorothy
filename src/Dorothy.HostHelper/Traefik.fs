@@ -4792,6 +4792,18 @@ module Traefik =
             fsyncDirectory paths.CertificateDir
         with _ -> fail errorMessage
 
+    let private attestedStatic environment (paths: RuntimePaths) owner bytes =
+        let uid, gid = hostOwner environment
+        match bytes |> Option.bind (staticReceipt environment owner) with
+        | Some expected -> metadataMatches environment paths.StaticReceipt "file" 0o600 uid gid && readOptional environment paths.StaticReceipt = Some expected
+        | None -> false
+
+    let private recordManagedStart environment (paths: RuntimePaths) owner bytes invocation =
+        match invocation with
+        | Some expected when staticReceipt environment owner bytes = Some expected && readOptional environment (Path.Combine(paths.ConfigDir, "static.yml")) = Some bytes ->
+            writeAtomic environment paths.StaticReceipt expected 0o600 None
+        | _ -> fail "cannot attest the managed Traefik invocation and static file after activation"
+
     let private recoverPendingTransaction (environment: HostEnvironment) (paths: RuntimePaths) (ownerId: string) (request: JsonElement) (groupId: int) (activationTimeout: float) : PendingTransaction option =
         match loadPendingTransaction environment paths ownerId with
         | None -> None
@@ -4836,9 +4848,14 @@ module Traefik =
                     || currentBinaryHash <> journal.BinarySha256
                     || udpWithdrawalRequiresRestart oldDynamic currentDynamic currentStatic
                 if restartRequired then
+                    let desired = Encoding.UTF8.GetBytes(renderStaticWithPrevious requestState paths "" oldStatic)
+                    if currentStatic <> Some desired || not (attestedStatic environment paths ownerId oldStatic) then
+                        fail "interrupted restart refused: the previous invocation or staged static bytes are not confirmed; preserve the journal and reconcile the service"
                     restartService environment
+                    let invocation = staticReceipt environment ownerId desired
                     let result = waitForActivation environment request paths activationTimeout
                     if not (result["inSync"].GetValue<bool>()) then fail "interrupted Traefik restart intent did not recover"
+                    recordManagedStart environment paths ownerId desired invocation
                 removePendingTransaction environment paths ownerId
                 None
             elif priorFilesRestored then
@@ -5019,16 +5036,8 @@ module Traefik =
                     || not liveStaticMatches
                     || udpWithdrawalRestart
                     || actualBinaryHash <> oldBinaryHash))
-        let receiptMatches () =
-            match oldStatic |> Option.bind (staticReceipt environment request.OwnerId) with
-            | Some expected -> metadataMatches environment paths.StaticReceipt "file" 0o600 rootUid rootGid && readOptional environment paths.StaticReceipt = Some expected
-            | None -> false
-        let recordStart bytes invocation =
-            match invocation with
-            | Some expected when staticReceipt environment request.OwnerId bytes = Some expected && readOptional environment staticPath = Some bytes ->
-                writeAtomic environment paths.StaticReceipt expected 0o600 None
-            | _ -> fail "cannot attest the managed Traefik invocation and static file after activation"
-        let previouslyAttested = wasActive && receiptMatches ()
+        let recordStart = recordManagedStart environment paths request.OwnerId
+        let previouslyAttested = wasActive && attestedStatic environment paths request.OwnerId oldStatic
         if wasActive && not previouslyAttested && (restartRequired || udpWithdrawalRequiresRestart (Some dynamicData) oldDynamic oldStatic) then
             fail "Apply refused: restart requires a confirmed static file for this service invocation. Back up configuration, reconcile its source, then stop the owned service in a maintenance window for a managed Apply."
         let oldCertificateFiles =

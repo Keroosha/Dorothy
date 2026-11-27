@@ -332,7 +332,18 @@ process_snapshot_sha=$(file_sha256 "$state_dir/logs/guest-traefik-process-snapsh
 ssh_argv_audit_sha=$(file_sha256 "$state_dir/ssh-argv-audit-full.counts")
 barrier_receipt_sha=$(file_sha256 "$state_dir/barrier-receipt.json")
 barrier_authorization_sha=$(file_sha256 "$state_dir/barrier-authorization.json")
+cmp "$state_dir/acme-store-hashes-before-delete.txt" "$state_dir/acme-store-hashes-after-delete.txt"
+[[ $(wc -l < "$state_dir/acme-store-hashes-after-delete.txt") -eq 6 ]]
+cmp "$state_dir/expected-issued-stores.txt" "$state_dir/acme-stores-after-delete.txt"
+cmp "$state_dir/legacy-refusal-before.txt" "$state_dir/legacy-refusal-after.txt"
+for kind in tls transport; do cmp "$state_dir/opaque-$kind-before.json" "$state_dir/opaque-$kind-after.json"; done
 artifact_digests=$(jq -n \
+    --arg manifests "$(file_sha256 "$state_dir/acme-store-hashes-after-delete.txt")" \
+    --arg historyHelper "$(file_sha256 "$state_dir/legacy-provider/helper/linux-x64/keroosha-iac-helper")" \
+    --arg refusedStatic "$(file_sha256 "$state_dir/legacy-refusal-after.txt")" \
+    --arg tlsOpaque "$(file_sha256 "$state_dir/opaque-tls-after.json")" \
+    --arg transportOpaque "$(file_sha256 "$state_dir/opaque-transport-after.json")" \
+    --arg disabledRepair "$(file_sha256 "$state_dir/disabled-repaired.json")" \
     --arg candidateSourceSha256 "$source_sha" \
     --arg candidateProgramTreeSha256 "$program_sha" \
     --arg candidateProviderTreeSha256 "$provider_sha" \
@@ -353,6 +364,12 @@ artifact_digests=$(jq -n \
     --arg reviewClientIdentityAcceptedLogSha256 "$review_identity_accepted_sha" \
     --arg reviewTlsMetricsSha256 "$review_tls_sha" \
     '{
+      retainedStores:{count:6,identicalBeforeAndAfterManifestSha256:$manifests},
+      historicalFixtureHelperSha256:$historyHelper,
+      legacyRefusalWitnessSha256:$refusedStatic,
+      rejectedOpaqueTlsWitnessSha256:$tlsOpaque,
+      rejectedOpaqueTransportWitnessSha256:$transportOpaque,
+      disabledRepairWitnessSha256:$disabledRepair,
       candidateSourceTreeSha256:$candidateSourceSha256,
       candidateProgramTreeSha256:$candidateProgramTreeSha256,
       candidateProviderTreeSha256:$candidateProviderTreeSha256,

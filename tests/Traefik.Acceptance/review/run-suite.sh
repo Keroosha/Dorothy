@@ -257,9 +257,12 @@ assert_input_hash "forwarded-policy Read" "$structured_inputs_hash"
 run_phase structured preview --diff
 assert_preview_updates_one_resource "Forwarded-policy drift"
 if run_phase structured up --yes --skip-preview --parallel 1; then echo 'Unexpected activation over unknown static preimage' >&2; exit 1; fi
-mv "$state_dir/logs/review-suite-structured-up.log" "$state_dir/logs/review-forwarded-refusal.log"
+cp "$state_dir/logs/review-structured-up.log" "$state_dir/logs/review-forwarded-refusal.log"
 grep -Fq 'static listener configuration on disk differs' "$state_dir/logs/review-forwarded-refusal.log"
 run_listener_stage reconcile-forwarded
+if run_phase structured up --yes --skip-preview --parallel 1; then echo 'External forwarded-policy start incorrectly inherited receipt' >&2; exit 1; fi
+grep -Fq 'restart requires a confirmed static file' "$state_dir/logs/review-structured-up.log"
+run_listener_stage maintenance-stop
 run_phase structured up --yes --skip-preview --parallel 1
 export_checkpoint "$state_dir/review-forwarded-repair-checkpoint.json"
 assert_read_checkpoint "$state_dir/review-forwarded-repair-checkpoint.json" true "Forwarded-policy repair"
@@ -281,9 +284,12 @@ assert_input_hash "proxy-policy Read" "$structured_inputs_hash"
 run_phase structured preview --diff
 assert_preview_updates_one_resource "Proxy-policy drift"
 if run_phase structured up --yes --skip-preview --parallel 1; then echo 'Unexpected activation over unknown static preimage' >&2; exit 1; fi
-mv "$state_dir/logs/review-suite-structured-up.log" "$state_dir/logs/review-proxy-refusal.log"
+cp "$state_dir/logs/review-structured-up.log" "$state_dir/logs/review-proxy-refusal.log"
 grep -Fq 'static listener configuration on disk differs' "$state_dir/logs/review-proxy-refusal.log"
 run_listener_stage reconcile-proxy
+if run_phase structured up --yes --skip-preview --parallel 1; then echo 'External PROXY-policy start incorrectly inherited receipt' >&2; exit 1; fi
+grep -Fq 'restart requires a confirmed static file' "$state_dir/logs/review-structured-up.log"
+run_listener_stage maintenance-stop
 run_phase structured up --yes --skip-preview --parallel 1
 export_checkpoint "$state_dir/review-proxy-repair-checkpoint.json"
 assert_read_checkpoint "$state_dir/review-proxy-repair-checkpoint.json" true "Proxy-policy repair"

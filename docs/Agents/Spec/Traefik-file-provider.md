@@ -49,6 +49,12 @@ If the private API cannot be reached, check the daemon and admin address. If a f
 
 The transaction uses the captured bytes, not a later reread as a replacement preimage. Byte comparisons detect intervening changes; they do not lock out an unrelated writer or provide filesystem-wide compare-and-swap. Coordinate external writers. Rawdata omits root TLS and named transport bodies: the current structured renderer commits those separately inside the loaded private generation rule. This is not independent proof that a remote TLS peer is healthy or that an external file reference still has the same contents.
 
+### First restart on an existing host
+
+The private API cannot identify every static field (for example `log.level`). Before an Apply that may restart Traefik, including a restart needed only by rollback, the helper requires a root-owned `0600` receipt for the owner, current systemd `InvocationID`, and SHA-256 of the exact static file. It records this only after verifying a managed start. The receipt is not Pulumi state or a backup. An external restart, reboot, or external change to the file invalidates it. Matching listener addresses, a healthy request, and a successful Read do not establish it.
+
+Upgrading the provider, preview, refresh, and an unchanged deployment do not stop the service or adopt a historical configuration. The **first restart-requiring change** without a valid receipt needs a maintenance window: back up the owned files (including credentials, privately), preserve unrelated edits and pending journals, reconcile the desired configuration with its authoritative source, and explicitly stop the owned service. Run a normal Apply with refresh, then verify backend-specific responses and the expected TLS leaf. Normal verified helper starts refresh the receipt; do not fabricate one, delete a pending journal, or use an external restart as a substitute. A restorable but already broken dynamic graph does not promise healthy traffic: inspect the activation and rollback diagnoses separately.
+
 ### Reviewed baseline at `2da8bc4`
 
 The isolated producer run completed on one commit/helper. It distinguished a healthy backend-specific 200 across a pre-stage refusal from an already-loaded empty backend returning 503 before and after a failed candidate. The latter was repaired by a subsequent Apply, not by rollback. Delete preserved six nonempty stores by name and SHA-256. This run did **not** exercise a disabled router repair or establish attribution for rejected changes confined to opaque fields.

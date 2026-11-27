@@ -30,6 +30,20 @@ install_provider "$candidate"; refresh; current=$(snapshot)
 jq -e '.legacyInputs and .inSync and .listeners==101' <<< "$current" >/dev/null
 p preview --target "$urn" --stack acceptance --refresh=false --expect-no-changes --non-interactive >>"$log" 2>&1
 export TRAEFIK_ACCEPTANCE_PHASE=legacy
+[[ "$GUEST_ROOT" =~ ^/var/tmp/dorothy-traefik-acceptance\.[[:alnum:]]+$ ]]
+control(){ /usr/bin/ssh -F "$SSH_CONFIG" -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "bash '$GUEST_ROOT/review-transactions.sh' '$1' '$GUEST_ROOT'"; }
+control legacy-static-inject
+control legacy-witness > "$state/legacy-refusal-before.txt"
+if p up --target "$urn" --stack acceptance --skip-preview --yes --non-interactive > "$state/logs/legacy-static-refusal.log" 2>&1; then
+    echo "Unknown historical static preimage was overwritten" >&2; exit 1
+fi
+grep -Fq 'restart requires a confirmed static file' "$state/logs/legacy-static-refusal.log"
+control legacy-witness > "$state/legacy-refusal-after.txt"
+cmp "$state/legacy-refusal-before.txt" "$state/legacy-refusal-after.txt"
+control legacy-static-reconcile
+# Keep the historical writer through its final multi-SNI fixture. No trusted
+# static receipt exists until the explicit stopped-service transition.
+install_provider "$state/legacy-provider"
 p up --target "$urn" --stack acceptance --yes --non-interactive >>"$log" 2>&1
 trap - EXIT
 jq -n --argjson before "$old" --argjson after "$current" --argjson apiPages "$pages" '{baseline:$before,candidate:$after,observedNativePageSizes:$apiPages}' > "$state/pagination-evidence.json"

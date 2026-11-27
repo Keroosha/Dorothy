@@ -12,6 +12,7 @@ mode=$1
 guest_root=$2
 shift 2
 case "$mode" in
+    legacy-static-inject|legacy-static-reconcile|legacy-witness|maintenance-stop|verify-receipt|stale-receipt|opaque-tls-inject|opaque-transport-inject|opaque-witness|opaque-reconcile|disabled-rollback) [[ $# == 0 ]] || usage ;;
     disabled-inject|disabled-repaired) [[ $# == 0 ]] || usage ;;
     healthy-disk-inject|healthy-disk-refused|healthy-disk-reconcile) [[ $# == 0 ]] || usage ;;
     udp-drift-inject|udp-live-witness|udp-withdrawn-witness|binary-stage-inject|binary-stage-assert-clean|unverified-drift-inject|unverified-rollback-assert|unverified-repair-assert|restart-interrupt-install|restart-interrupt-remove|restart-interrupt-downgrade-v2) [[ $# == 0 ]] || usage ;;
@@ -423,6 +424,8 @@ unverified_rollback_assert() {
     [[ "$journal_mode" == '600 0' ]] || fail 'unverifiable rollback journal is not private root-owned mode 0600'
     jq -e --arg owner "$owner" '.version == 3 and .owner == $owner and .restartRequired == false' "$journal_file" >/dev/null \
         || fail 'unverifiable rollback journal lost its owner or restart intent'
+    cmp "$static_file" <(jq -er .static "$journal_file" | base64 -d) || fail 'journal static preimage differs'
+    cmp "$dynamic_file" <(jq -er .dynamic "$journal_file" | base64 -d) || fail 'journal dynamic preimage differs'
     catalog_observation 503 "$root/logs/unhealthy-disk-after.json"
     jq -n --arg case "unverifiable-rollback-retained" --arg mainPid "$pid" \
         --arg dynamicSha256 "$(<"$root/logs/unverified-dynamic-drift.sha256")" \
@@ -699,12 +702,77 @@ restart_interrupt_assert_static_restarted() {
 
 
 case "$mode" in
+    maintenance-stop)
+        verify_owned_service >/dev/null
+        [[ ! -e "$journal_file" ]] || fail 'maintenance transition refuses a pending transaction'
+        backup=$(mktemp -d "$root/maintenance.XXXXXXXX")
+        cp -a -- "$config_dir/." "$backup/"
+        systemctl stop keroosha-traefik.service
+        [[ $(systemctl show keroosha-traefik.service -p ActiveState --value) == inactive ]] ;;
+    verify-receipt|stale-receipt)
+        verify_owned_service >/dev/null
+        r="$config_dir/.keroosha-static-receipt"
+        [[ -f "$r" && ! -L "$r" && $(stat -c '%a %u %g' "$r") == '600 0 0' ]]
+        [[ $(sed -n 3p "$r") == "$(digest_file "$static_file" | tr a-f A-F)" ]]
+        invocation=$(systemctl show keroosha-traefik.service -p InvocationID --value)
+        [[ $invocation =~ ^[0-9a-f]{32}$ ]]
+        if [[ $mode == verify-receipt ]]; then [[ $(sed -n 2p "$r") == "$invocation" ]]; else [[ $(sed -n 2p "$r") != "$invocation" ]]; fi ;;
+    legacy-static-inject)
+        verify_owned_service >/dev/null
+        [[ ! -e "$config_dir/.keroosha-static-receipt" && ! -e "$journal_file" && ! -e "$root/legacy-static-before" ]]
+        cp -p "$static_file" "$root/legacy-static-before"
+        tmp=$(mktemp "$config_dir/static.fixture.XXXXXXXX")
+        jq '.log.level = (if .log.level=="WARN" then "INFO" else "WARN" end)' "$static_file" > "$tmp"
+        chown --reference="$static_file" "$tmp"; chmod --reference="$static_file" "$tmp"; mv -T "$tmp" "$static_file"
+        digest_file "$static_file" > "$root/legacy-static-injected.sha256" ;;
+    legacy-static-reconcile)
+        [[ $(digest_file "$static_file") == "$(<"$root/legacy-static-injected.sha256")" ]]
+        cp -p "$root/legacy-static-before" "$static_file" ;;
+    legacy-witness)
+        verify_owned_service >/dev/null
+        [[ ! -e "$journal_file" && ! -e "$config_dir/.keroosha-static-receipt" ]]
+        systemctl show keroosha-traefik.service -p InvocationID -p MainPID
+        stat -c '%i %y %z %s' "$static_file" "$dynamic_file"
+        sha256sum "$static_file" "$dynamic_file"
+        body=$(curl -kfsS --max-time 4 --noproxy '*' --resolve example.org:443:127.0.0.1 https://example.org/)
+        [[ $body == 'http-backend:/;forwarded:127.0.0.1' ]]; printf '%s\n' "$body" ;;
+    opaque-tls-inject|opaque-transport-inject)
+        verify_owned_service >/dev/null
+        [[ ! -e "$root/opaque-original" && ! -e "$journal_file" ]]
+        cp -p "$dynamic_file" "$root/opaque-original"
+        tmp=$(mktemp "${dynamic_file}.fixture.XXXXXXXX")
+        if [[ $mode == opaque-tls-inject ]]; then
+            jq '.tls.options["opaque-review"].notAValidOption = true' "$dynamic_file" > "$tmp"
+        else
+            jq '.http.serversTransports["opaque-review"].notAValidTransportField = true' "$dynamic_file" > "$tmp"
+        fi
+        cursor=$(journalctl -u keroosha-traefik.service -n 1 --show-cursor --no-pager | sed -n 's/^-- cursor: //p')
+        [[ -n $cursor ]]
+        chown --reference="$dynamic_file" "$tmp"; chmod --reference="$dynamic_file" "$tmp"; mv -T "$tmp" "$dynamic_file"
+        digest_file "$dynamic_file" > "$root/opaque-injected.sha256"
+        for _ in $(seq 1 40); do
+            journalctl -u keroosha-traefik.service --after-cursor="$cursor" -o cat --no-pager | grep -F 'collecting file configs' >/dev/null && break
+            sleep .25
+        done
+        journalctl -u keroosha-traefik.service --after-cursor="$cursor" -o cat --no-pager | grep -F 'collecting file configs' >/dev/null ;;
+    opaque-witness)
+        [[ ! -e "$journal_file" && $(digest_file "$dynamic_file") == "$(<"$root/opaque-injected.sha256")" ]]
+        catalog_observation 200 "$root/logs/opaque-witness.json"; cat "$root/logs/opaque-witness.json" ;;
+    opaque-reconcile)
+        [[ $(digest_file "$dynamic_file") == "$(<"$root/opaque-injected.sha256")" ]]
+        mv -T "$root/opaque-original" "$dynamic_file" ;;
+    disabled-rollback)
+        cmp "$dynamic_file" <(jq -er .dynamic "$journal_file" | base64 -d)
+        cmp "$static_file" <(jq -er .static "$journal_file" | base64 -d)
+        [[ $(digest_file "$dynamic_file") == "$(<"$root/disabled-before.sha256")" ]]
+        curl -fsS --max-time 4 http://127.0.0.1:19080/api/rawdata | jq -e '.routers["catalog@file"].status | .=="disabled" or .=="warning"' >/dev/null ;;
     disabled-inject|disabled-repaired)
         verify_owned_service >/dev/null
         if [[ $mode == disabled-inject ]]; then
             tmp=$(mktemp "${dynamic_file}.fixture.XXXXXXXX")
             jq '.http.routers.catalog.middlewares += ["missing-review-middleware"]' "$dynamic_file" > "$tmp"
             chmod --reference="$dynamic_file" "$tmp"; chown --reference="$dynamic_file" "$tmp"; mv -T "$tmp" "$dynamic_file"
+            digest_file "$dynamic_file" > "$root/disabled-before.sha256"
             for _ in $(seq 1 60); do
                 curl -fsS http://127.0.0.1:19080/api/rawdata > "$root/logs/disabled-raw.json" &&
                     jq -e '.routers["catalog@file"] | .status=="disabled" or .status=="warning"' "$root/logs/disabled-raw.json" >/dev/null && break
