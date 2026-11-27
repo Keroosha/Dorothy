@@ -62,7 +62,8 @@ command_line=$(tr '\0' ' ' < "/proc/$pid/cmdline")
 [[ "$command_line" == *qemu-system-x86_64* && "$command_line" == *"$state_dir/guest.qcow2"* ]] || fail 'QEMU pid does not own the private acceptance guest image'
 
 expected_sums=${ready[1]}
-mapfile -t packages < <(awk -F '\t' '$1 == "package" && $2 != "archive" { print $4 }' "$bundle/manifest.tsv")
+# Stage ICU but leave its actual installation to the provider prerequisite under test.
+mapfile -t packages < <(awk -F '\t' '$1 == "package" && $2 != "archive" && $4 != "libicu76" { print $4 }' "$bundle/manifest.tsv")
 ((${#packages[@]} > 0)) || fail 'offline dependency manifest contains no package closure'
 for package in "${packages[@]}"; do
     [[ "$package" =~ ^[a-z0-9][a-z0-9+.-]*$ ]] || fail 'offline dependency manifest contains an unsafe package name'
@@ -152,7 +153,7 @@ while IFS=$'\t' read -r kind archive pool_path package version architecture size
         "$control" "$local_filename" "$size" "$expected_sha" >> "$packages_index"
     manifest_package_count=$((manifest_package_count + 1))
 done < "$repository/manifest.tsv"
-((manifest_package_count == 108))
+((manifest_package_count == 109))
 chmod 644 "$packages_index"
 mv -- "$packages_index" "$repository/repo/Packages"
 chmod 644 "$repository/repo/Packages"

@@ -133,7 +133,7 @@ while IFS=$'\t' read -r kind field1 field2 field3 field4 field5 field6 field7 fi
         *) fail "unexpected offline manifest record: $kind" ;;
     esac
 done < "$manifest"
-(( image_count == 1 && bootstrap_count == 1 && package_count == 108 && ${#seen_releases[@]} == 2 )) || fail 'offline dependency manifest is incomplete'
+(( image_count == 1 && bootstrap_count == 1 && package_count == 109 && ${#seen_releases[@]} == 2 )) || fail 'offline dependency manifest is incomplete'
 for package in bind9 bind9-utils ca-certificates curl dnsutils jq nginx openssl socat netcat-openbsd iproute2 tcpdump coreutils perl; do
     if [[ -z "${seen_packages[$package]+x}" ]]; then
         [[ "$package" == dnsutils && -n "${seen_packages[bind9-dnsutils]+x}" ]] || fail "dependency manifest omitted requested package: $package"

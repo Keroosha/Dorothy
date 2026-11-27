@@ -56,6 +56,7 @@ package	debian	pool/main/g/gmp/libgmp10_6.3.0%2bdfsg-3_amd64.deb	libgmp10	2:6.3.
 package	debian	pool/main/g/gnutls28/libgnutls30t64_3.8.9-3%2bdeb13u4_amd64.deb	libgnutls30t64	3.8.9-3+deb13u4	amd64	1469024	18a8bdfd91c7e3bcb01719d55a2b56849c7160b34f1f52b1c4fdfdd41bf1352b	libgnutls30t64_3.8.9-3+deb13u4_amd64.deb
 package	debian-security	pool/updates/main/k/krb5/libgssapi-krb5-2_1.21.3-5%2bdeb13u2_amd64.deb	libgssapi-krb5-2	1.21.3-5+deb13u2	amd64	139256	92e4d11b61d702ae5bcb4293c9af69625ea1cd62aac0d87db9b0344217d749be	libgssapi-krb5-2_1.21.3-5+deb13u2_amd64.deb
 package	debian	pool/main/n/nettle/libhogweed6t64_3.10.1-1_amd64.deb	libhogweed6t64	3.10.1-1	amd64	335240	b059ed155115ac09da295322de48ee1ed58ef5fa45edcc9e12ff0e94636ef25f	libhogweed6t64_3.10.1-1_amd64.deb
+package	debian	pool/main/i/icu/libicu76_76.1-4_amd64.deb	libicu76	76.1-4	amd64	9722072	c1bf762996de9ecba9b9d871e4928a8090f023a3e9e7fa3240b3d90f892a01dc	libicu76_76.1-4_amd64.deb
 package	debian	pool/main/libi/libidn2/libidn2-0_2.3.8-2_amd64.deb	libidn2-0	2.3.8-2	amd64	109096	90b039bcdc4578f8e1c4935adf8dbb525e36a164deefdbbb8c45bac347d48278	libidn2-0_2.3.8-2_amd64.deb
 package	debian	pool/main/j/jemalloc/libjemalloc2_5.3.0-3_amd64.deb	libjemalloc2	5.3.0-3	amd64	274324	e7d64919e620e8ea46960104efe1e9c977d751e5b610a5d89b0b51aeae9530d7	libjemalloc2_5.3.0-3_amd64.deb
 package	debian	pool/main/j/jq/libjq1_1.7.1-6%2bdeb13u4_amd64.deb	libjq1	1.7.1-6+deb13u4	amd64	167808	70bb2cbd66d5ada4349067ae9f61d0560b3b359d4203f2c051ca5773153ae0ba	libjq1_1.7.1-6+deb13u4_amd64.deb
