@@ -43,6 +43,9 @@ module private TraefikNativeInterop =
     [<DllImport("libc", EntryPoint = "open", SetLastError = true)>]
     extern int nativeOpen(string path, int flags, int mode)
 
+    [<DllImport("libc", EntryPoint = "openat", SetLastError = true)>]
+    extern int nativeOpenAt(int parent, string component, int flags)
+
     [<DllImport("libc", EntryPoint = "linkat", SetLastError = true)>]
     extern int nativeLinkAt(int oldDirectory, string oldPath, int newDirectory, string newPath, int flags)
 
@@ -1688,33 +1691,64 @@ module Traefik =
             return total
         }
 
+    let private cachedArchive arch =
+        let flags = 0x80000 ||| noFollowFlag ||| 0x800
+        let rec openEntry parent components =
+            match components with
+            | [] -> fail "invalid cache path"
+            | name :: rest ->
+                let fd = nativeOpenAt(parent, name, flags ||| (if rest.IsEmpty then 0 else directoryFlag))
+                if fd < 0 then
+                    if Marshal.GetLastWin32Error() = 2 then None else fail "unsafe or inaccessible pinned archive cache"
+                else
+                    let handle = new SafeFileHandle(nativeint fd, true)
+                    try
+                        let info = statDescriptor fd
+                        if info.Uid <> 0 || (info.Mode &&& 0o022) <> 0 then fail "untrusted pinned archive cache permissions"
+                        if rest.IsEmpty then
+                            if info.Kind <> "regular file" then fail "pinned archive cache entry is not a regular file"
+                            Some(new FileStream(handle, FileAccess.Read))
+                        else
+                            use directory = handle
+                            if info.Kind <> "directory" then fail "invalid archive cache parent"
+                            openEntry fd rest
+                    with _ -> handle.Dispose(); reraise()
+        let root = nativeOpen("/", flags ||| directoryFlag, 0)
+        if root < 0 then fail "cannot open archive cache root"
+        use rootHandle = new SafeFileHandle(nativeint root,true)
+        let info = statDescriptor root
+        if info.Uid <> 0 || (info.Mode &&& 0o022) <> 0 then fail "unsafe archive cache root"
+        openEntry root [ "var"; "cache"; "keroosha-iac"; "traefik"; archiveChecksums[arch] + ".tar.gz" ]
+
+    let private verifyArchive arch (input: Stream) (output: FileStream) token =
+        task {
+            let size = if arch = "amd64" then 51045831L else 45507286L
+            use timeout = CancellationTokenSource.CreateLinkedTokenSource(token: CancellationToken)
+            let! count = copyVerifiedArchive input output size archiveChecksums[arch] timeout
+            if count <> size then fail "pinned archive compressed size mismatch"
+            output.Flush(true)
+            output.Position <- 0L
+        }
+
     let private downloadArchive (architecture: string) (cancellationToken: CancellationToken) : Task<FileStream> =
         task {
             let output = createTemporaryFile ()
 
             try
-                use client = new HttpClient(Timeout = TimeSpan.FromSeconds(30.0))
-                use request = new HttpRequestMessage(HttpMethod.Get, releaseUrl architecture)
-                request.Headers.UserAgent.ParseAdd("keroosha-iac-traefik/1")
-                use! response =
-                    client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
-                        .ConfigureAwait(false)
-
-                if not response.IsSuccessStatusCode then
-                    fail "cannot download the pinned Traefik release archive"
-
-                if response.Content.Headers.ContentLength.HasValue
-                   && response.Content.Headers.ContentLength.Value > int64 MaximumArchiveBytes then
-                    fail "pinned Traefik release archive exceeds the size limit"
-
-                use! stream = response.Content.ReadAsStreamAsync(cancellationToken).ConfigureAwait(false)
-                use readTimeout = CancellationTokenSource.CreateLinkedTokenSource(cancellationToken)
-                let! _ =
-                    (copyVerifiedArchive stream output (int64 MaximumArchiveBytes) archiveChecksums[architecture] readTimeout)
-                        .ConfigureAwait(false)
-                output.Flush(true)
-                output.Position <- 0L
-                return output
+                match cachedArchive architecture with
+                | Some archive ->
+                    use input = archive
+                    do! verifyArchive architecture input output cancellationToken
+                    return output
+                | None ->
+                    use client = new HttpClient(Timeout = TimeSpan.FromSeconds(30.0))
+                    use request = new HttpRequestMessage(HttpMethod.Get, releaseUrl architecture)
+                    request.Headers.UserAgent.ParseAdd("keroosha-iac-helper/1")
+                    use! response = client.SendAsync(request, HttpCompletionOption.ResponseHeadersRead, cancellationToken)
+                    if not response.IsSuccessStatusCode then fail "cannot download the pinned Traefik release archive"
+                    use! stream = response.Content.ReadAsStreamAsync(cancellationToken)
+                    do! verifyArchive architecture stream output cancellationToken
+                    return output
             with
             | :? BackendError as error ->
                 output.Dispose()
@@ -1810,12 +1844,8 @@ module Traefik =
         with _ -> false
 
 
-    let private installBinary (environment: HostEnvironment) (paths: RuntimePaths) (ownerId: string) (architecture: string) : bool =
-        let archive =
-            downloadArchive architecture CancellationToken.None
-            |> fun work -> work.GetAwaiter().GetResult()
-
-        use archive = archive
+    let private installBinary (environment: HostEnvironment) (paths: RuntimePaths) (ownerId: string) (architecture: string) (prepared: FileStream) : bool =
+        use archive = if isNull prepared then (downloadArchive architecture CancellationToken.None).GetAwaiter().GetResult() else prepared
         use temporaryBinary = createTemporaryFile ()
         let _, binaryHash = extractBinary archive temporaryBinary
         temporaryBinary.Flush(true)
@@ -1849,7 +1879,7 @@ module Traefik =
             | None -> false
         with _ -> false
 
-    let private ensureInstalledBinary (environment: HostEnvironment) (paths: RuntimePaths) (ownerId: string) allowReplacement : bool =
+    let private ensureInstalledBinary (environment: HostEnvironment) (paths: RuntimePaths) (ownerId: string) allowReplacement prepared : bool =
         let arch = architecture ()
         checkDirectoryOwnership environment paths.InstallDir ownerId "installation directory" |> ignore
         let _, rootGid = hostOwner environment
@@ -1865,9 +1895,9 @@ module Traefik =
                 chmod environment markerPath 0o644
                 chown environment markerPath (fst (hostOwner environment)) rootGid
                 false
-            elif allowReplacement then installBinary environment paths ownerId arch
+            elif allowReplacement then installBinary environment paths ownerId arch prepared
             else fail "running service release changed during admission; refusing binary replacement"
-        elif allowReplacement then installBinary environment paths ownerId arch
+        elif allowReplacement then installBinary environment paths ownerId arch prepared
         else fail "running service installation disappeared"
 
     let rec private ensureEffectiveUnit (environment: HostEnvironment) (paths: RuntimePaths) =
@@ -2619,7 +2649,7 @@ module Traefik =
 
     let private jsonConfigMatches path expected actual = scopedConfigMatches Other path expected actual
 
-    let private tlsRouterMatches (expected: JsonElement option) (actual: JsonElement option) : bool =
+    let private tlsRouterMatches tcp (expected: JsonElement option) (actual: JsonElement option) : bool =
         match expected, actual with
         | None, None -> true
         | None, Some value when value.ValueKind = JsonValueKind.Null -> true
@@ -2651,14 +2681,13 @@ module Traefik =
                     | Some value -> jsonConfigMatches [ property.Name ] property.Value value
                     | None ->
                         property.Value.ValueKind = JsonValueKind.False
-                        && property.Name = "passthrough")
+                        && tcp && property.Name = "passthrough")
             let unexpectedPropertiesMatch =
                 found.EnumerateObject()
                 |> Seq.forall (fun property ->
                     Set.contains property.Name expectedNames
                     || (property.Name = "options" && jsonStringIs "default" property.Value)
-                    || (property.Value.ValueKind = JsonValueKind.False
-                        && not (Set.contains property.Name defaultTrueBooleanFields)))
+                    || (tcp && property.Name = "passthrough" && property.Value.ValueKind = JsonValueKind.False))
             resolverMatches && optionsMatches && otherPropertiesMatch && unexpectedPropertiesMatch
         | _ -> false
 
@@ -2771,7 +2800,7 @@ module Traefik =
         let tlsMatches =
             match protocol with
             | UdpProtocol -> Option.isNone (tryProperty expected "tls") && Option.isNone (tryProperty actual "tls")
-            | _ -> tlsRouterMatches (tryProperty expected "tls") (tryProperty actual "tls")
+            | _ -> tlsRouterMatches (protocol = TcpProtocol) (tryProperty expected "tls") (tryProperty actual "tls")
         let priorityMatches =
             match protocol with
             | UdpProtocol ->
@@ -5127,6 +5156,11 @@ module Traefik =
         let initiallyEnabled = isEnabled environment
         if initialUnit.IsNone && (initiallyActive || initiallyEnabled) then fail "Traefik service name collides with an unowned systemd unit"
         let existingOwned = configStatus = "owned" || stateStatus = "owned" || installStatus = "owned"
+        // Reject an invalid acquisition before creating a service user, owner markers or journal.
+        use prepared =
+            if not initiallyActive && not (assertRegular environment paths.BinaryPath "Traefik binary") then
+                (downloadArchive (architecture ()) CancellationToken.None).GetAwaiter().GetResult()
+            else null
         let _, serviceGroup = ensureLayout environment paths request.OwnerId existingOwned
         let configStatus, stateStatus, installStatus, currentUnit = validateActualOwner environment paths request.OwnerId
         if currentUnit.IsSome then ensureEffectiveUnit environment paths
@@ -5217,7 +5251,7 @@ module Traefik =
         let mutable restartAttempted = false
         let mutable candidateJob = None
         try
-            binaryChanged <- ensureInstalledBinary environment paths request.OwnerId (not wasActive)
+            binaryChanged <- ensureInstalledBinary environment paths request.OwnerId (not wasActive) prepared
             writeCredentialFile environment paths request.Configuration
             writeCertificateFiles environment paths request serviceGroup
             confirmUnchanged ()
@@ -5228,12 +5262,12 @@ module Traefik =
                 daemonReload environment
             if not (isEnabled environment) then enableService environment
             verifyInvocation ()
-            let needsStart = not (isActive environment)
+            let needsStart = admitted.IsNone
             if (needsStart || restartRequired || binaryChanged) &&
                (capture () <> struct (Some staticData, Some dynamicData) || readCredentialSnapshot environment paths <> desiredCredentials ||
                 safeUnitStatus environment paths.UnitPath request.OwnerId <> Some currentUnitText) then fail "candidate changed before managed start"
             if needsStart then
-                if wasActive then restartAttempted <- true
+                verifyInvocation ()
                 candidateJob <- Some(enqueueServiceJob environment false)
             elif binaryChanged || restartRequired then
                 restartAttempted <- true

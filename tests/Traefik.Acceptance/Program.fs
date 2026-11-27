@@ -287,7 +287,7 @@ module Program =
                             tcpRule (tcpHostSniRule "sni-proof.acceptance.test")
                             tcpRouterEntryPoints [ tcpEntryPoint "tcp" ]
                             tcpRouterService (tcpServiceRef "echo")
-                            tcpRouterTls (nativeObject {})
+                            tcpRouterTls (nativeObject { tcpTlsPassthrough false })
                         }
                         tcpRouter "tls-passthrough" {
                             tcpRule (tcpHostSniRule "backend.acceptance.test")
