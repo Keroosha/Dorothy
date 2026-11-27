@@ -38,6 +38,12 @@ jobs:
       # CLI fixtures resolve their provider and program from Release output paths.
       - name: Run tests
         run: dotnet test tests/Dorothy.Tests --configuration Release
+      - name: Verify explicit local issuers in compiled acceptance configuration
+        run: |
+          review="$PWD/tests/Traefik.Acceptance/review/bin/Release/net10.0"
+          dotnet fsi --nologo -I:"$review" -r:Pulumi.dll -r:Dorothy.DSL.dll -r:Traefik.Review.Acceptance.dll \
+            -r:"$PWD/src/Dorothy.HostHelper/bin/Release/net10.0/keroosha-iac-helper.dll" \
+            tests/Traefik.Acceptance/review/check-issuers.fsx
 
   native-aot:
     name: Clean Native AOT publish (linux-x64)

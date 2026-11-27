@@ -753,6 +753,22 @@ module Traefik =
                 let digest = materialDigest certificate
                 Path.Combine(paths.CertificateDir, digest + ".crt"), Path.Combine(paths.CertificateDir, digest + ".key"))
         let dynamicConfig = TraefikTlsSettings.dynamicSettings material mergedDynamic
+        // paerser rejects a standalone empty resource map (e.g. tcp.middlewares after
+        // withdrawing its last member). Empty maps mean no resource; named empty objects
+        // such as a router's tls:{} still have semantics and must remain untouched.
+        let omitEmptyMaps (name: string) =
+            match dynamicConfig[name] with
+            | :? JsonObject as section ->
+                for index = section.Count - 1 downto 0 do
+                    match section.GetAt(index).Value with
+                    | :? JsonObject as resources when resources.Count = 0 -> section.RemoveAt(index)
+                    | _ -> ()
+                if section.Count = 0 then dynamicConfig.Remove(name) |> ignore
+            | _ -> ()
+        omitEmptyMaps "http"
+        omitEmptyMaps "tcp"
+        omitEmptyMaps "udp"
+        omitEmptyMaps "tls"
         let tlsRoot =
             match dynamicConfig["tls"] with
             | null -> JsonObject()
@@ -4092,6 +4108,19 @@ module Traefik =
                 | _ -> ()
         | None -> ()
         let allBinds = entryPointBinds |> Map.toSeq |> Seq.map snd |> Set.ofSeq
+        let entryPointTlsModels =
+            match tryNativeObjectProperty staticRoot "entryPoints" with
+            | Some entryPoints ->
+                entryPoints
+                |> Seq.choose (fun (KeyValue(name, value)) ->
+                    match value with
+                    | :? JsonObject as settings ->
+                        tryNativeObjectProperty settings "http"
+                        |> Option.bind (fun http -> tryNativeObjectProperty http "tls")
+                        |> Option.map (fun tls -> name, tls)
+                    | _ -> None)
+                |> Map.ofSeq
+            | None -> Map.empty
 
         let portsForRouter (router: JsonObject) =
             match tryNativeNodeProperty router "entryPoints" with
@@ -4101,6 +4130,26 @@ module Traefik =
                 |> Seq.choose (fun name -> Map.tryFind name entryPointBinds)
                 |> Set.ofSeq
             | _ -> allBinds
+        // Pinned v3.7.16 applies an entrypoint TLS model only when a root router has no TLS object;
+        // it splits that router by modeled entrypoint and does not inherit entrypoints to parentRefs children.
+        let httpTlsBindings (router: JsonObject) =
+            let hasParents = tryNativeNodeProperty router "parentRefs" |> Option.isSome
+            match tryNativeNodeProperty router "tls" with
+            | Some (:? JsonObject as tls) -> [ tls, portsForRouter router ]
+            | Some _ -> []
+            | None when hasParents -> []
+            | None ->
+                let entryPointNames =
+                    match tryNativeNodeProperty router "entryPoints" with
+                    | Some (:? JsonArray as names) when names.Count > 0 ->
+                        names |> Seq.choose tryNativeString |> Seq.toList
+                    | _ -> entryPointTlsModels |> Map.toSeq |> Seq.map fst |> Seq.toList
+                entryPointNames
+                |> Seq.choose (fun name ->
+                    match Map.tryFind name entryPointTlsModels, Map.tryFind name entryPointBinds with
+                    | Some tls, Some bind -> Some(tls, Set.singleton bind)
+                    | _ -> None)
+                |> Seq.toList
 
         let hostsInDomains (tls: JsonObject) =
             let result = HashSet<string>(StringComparer.Ordinal)
@@ -4139,6 +4188,27 @@ module Traefik =
             | true, (oldResolvers, oldAuthTypes, oldLocal) ->
                 candidates[key] <- Set.union oldResolvers resolvers, Set.union oldAuthTypes authTypes, oldLocal && bindIsLocal
             | _ -> candidates.Add(key, (resolvers, authTypes, bindIsLocal))
+        let collectTlsBinding (isTcp: bool) (router: JsonObject) (tls: JsonObject) (ports: Set<string * int * bool>) =
+            let passthrough =
+                isTcp
+                && (tryNativeNodeProperty tls "passthrough" |> Option.bind tryNativeBool = Some true)
+            if passthrough then opaqueRoutes <- opaqueRoutes + 1
+            else
+                let hosts = HashSet<string>(StringComparer.Ordinal)
+                for host in hostsInDomains tls do hosts.Add(host) |> ignore
+                match tryNativeStringProperty router "rule" with
+                | Some rule ->
+                    for host in probeHostsFromRule isTcp rule do hosts.Add(host) |> ignore
+                | None -> ()
+                if hosts.Count = 0 || ports.IsEmpty then opaqueRoutes <- opaqueRoutes + 1
+                else
+                    let resolverName =
+                        tryNativeStringProperty tls "certResolver"
+                        |> Option.filter (String.IsNullOrEmpty >> not)
+                    let authType = clientAuthType (tryNativeStringProperty tls "options")
+                    for host in hosts |> Seq.sortWith (fun left right -> StringComparer.Ordinal.Compare(left, right)) do
+                        for bindAddress, port, local in ports do
+                            addCandidate host bindAddress port local resolverName authType
 
         let collectRouters (sectionName: string) (isTcp: bool) =
             match tryNativeObjectProperty dynamicRoot sectionName with
@@ -4149,31 +4219,13 @@ module Traefik =
                 | Some routers ->
                     for routerEntry in routers do
                         match routerEntry.Value with
-                        | :? JsonObject as router ->
+                        | :? JsonObject as router when isTcp ->
                             match tryNativeObjectProperty router "tls" with
+                            | Some tls -> collectTlsBinding true router tls (portsForRouter router)
                             | None -> ()
-                            | Some tls ->
-                                let passthrough =
-                                    isTcp
-                                    && (tryNativeNodeProperty tls "passthrough" |> Option.bind tryNativeBool = Some true)
-                                if passthrough then opaqueRoutes <- opaqueRoutes + 1
-                                else
-                                    let hosts = HashSet<string>(StringComparer.Ordinal)
-                                    for host in hostsInDomains tls do hosts.Add(host) |> ignore
-                                    match tryNativeStringProperty router "rule" with
-                                    | Some rule ->
-                                        for host in probeHostsFromRule isTcp rule do hosts.Add(host) |> ignore
-                                    | None -> ()
-                                    let ports = portsForRouter router
-                                    if hosts.Count = 0 || ports.IsEmpty then opaqueRoutes <- opaqueRoutes + 1
-                                    else
-                                        let resolverName =
-                                            tryNativeStringProperty tls "certResolver"
-                                            |> Option.filter (String.IsNullOrEmpty >> not)
-                                        let authType = clientAuthType (tryNativeStringProperty tls "options")
-                                        for host in hosts |> Seq.sortWith (fun left right -> StringComparer.Ordinal.Compare(left, right)) do
-                                            for bindAddress, port, local in ports do
-                                                addCandidate host bindAddress port local resolverName authType
+                        | :? JsonObject as router ->
+                            for tls, ports in httpTlsBindings router do
+                                collectTlsBinding false router tls ports
                         | _ -> opaqueRoutes <- opaqueRoutes + 1
 
         collectRouters "http" false

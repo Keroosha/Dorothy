@@ -33,7 +33,7 @@ module ReviewTls =
                 acmeEmail "ops@acceptance.test"
                 acmeCaServer caServer
                 acmeKeyType "EC256"
-                yield dnsChallenge
+                dnsChallenge
                 nativeField "certificatesDuration" (nativeInteger 1)
                 nativeField "caSystemCertPool" (nativeBoolean true)
             }
