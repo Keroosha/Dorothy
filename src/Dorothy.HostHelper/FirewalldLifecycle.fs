@@ -428,12 +428,15 @@ module FirewalldLifecycle =
         let mode = if transaction.Scope.IsSome && current.IsSome && currentMode = 0o600 then currentMode else transaction.BeforeMode
         if state <> transaction.Before || (current.IsSome && currentMode <> mode) then
             writeState transaction.Scope state transaction.Before mode
-        let startupLoadsDisk =
+        let rollbackStrategy =
             transaction.RollbackProof
-            |> Option.exists (fun proof ->
+            |> Option.bind (fun proof ->
                 match proof["strategy"] with
-                | null -> false
-                | strategy -> strategy.GetValue<string>() = "runtime-delta")
+                | null -> None
+                | strategy -> Some(strategy.GetValue<string>()))
+        let startupLoadsDisk = rollbackStrategy = Some "runtime-delta"
+        let legacyNativeRepair =
+            startupLoadsDisk || (rollbackStrategy = Some "object-delta" && transaction.ActivationStarted)
         let needsBootInverse = transaction.ActivationStarted || startupLoadsDisk || transaction.AwaitingPostBoot
         if transaction.ActivationStarted || transaction.AwaitingPostBoot || (phase <> ActiveDaemon && needsBootInverse) then
             match phase with
@@ -446,7 +449,7 @@ module FirewalldLifecycle =
                 // inverse. Upgrade a v3 repair only at a verified stopped
                 // daemon boundary, where the next daemon will load the disk.
                 let version =
-                    if transaction.SchemaVersion = 3 && startupLoadsDisk && transaction.NativeProgress.IsSome then
+                    if transaction.SchemaVersion = 3 && legacyNativeRepair && transaction.NativeProgress.IsSome then
                         match environment.Run "/usr/bin/systemctl" [ "show"; "--property=ActiveState"; "--value"; "firewalld.service" ] None with
                         | { ExitCode = 0; Stdout = state } when state.Trim() = "inactive" -> 4
                         | _ -> fail "Legacy native repair needs a stopped firewalld before boot-phase migration."
@@ -478,7 +481,12 @@ module FirewalldLifecycle =
                         |> Option.exists (fun (generation, _) -> generation = bootId environment)
                     if not hasCurrentBootUndo then
                         fail "Ordered post-boot recovery must verify the native repair before active recovery can retire it."
-                restoreRuntime transaction phase
+                    // A same-boot receipt keeps ordered startup verification in force.
+                    let retryPhase =
+                        if transaction.Configuration.Kind = "settings" then phase else BootAfterFirewalld
+                    restoreRuntime transaction retryPhase
+                else
+                    restoreRuntime transaction phase
         if not (needsBootInverse && phase = BootBeforeFirewalld) then
             match journal with
             | Some value ->

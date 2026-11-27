@@ -750,26 +750,26 @@ module FirewalldRecoveryProof =
             |> Option.exists (fun projected ->
                 nonSelectorFingerprint projected = nonSelectorFingerprint expected)
 
-    let private objectRuntimeMatchesPreimage
-        (environment: HostEnvironment)
+    let private objectSelectorsMatch
         (expected: FirewalldRuntime.RuntimeSnapshot)
         (actual: FirewalldRuntime.RuntimeSnapshot)
         =
-        if not (objectRuntimeNonSelectorsMatch environment expected actual) then false
-        else
-            let expectedSelectors = objectSelectorValues expected
-            let actualSelectors = objectSelectorValues actual
-            let exactSelectors =
-                objectSelectorFields expected.Kind
-                |> List.filter ((<>) "rich rules")
-                |> List.forall (fun field ->
-                    Set.ofList (Map.find field expectedSelectors) = Set.ofList (Map.find field actualSelectors))
-            let expectedRules = Set.ofList (Map.find "rich rules" expectedSelectors)
-            let actualRules = Set.ofList (Map.find "rich rules" actualSelectors)
-            let extras = Set.difference actualRules expectedRules
-            exactSelectors
-            && Set.isSubset expectedRules actualRules
-            && (extras |> Set.forall FirewalldRuntime.isRestrictiveRichRule)
+        let expectedSelectors = objectSelectorValues expected
+        let actualSelectors = objectSelectorValues actual
+        let exactSelectors =
+            objectSelectorFields expected.Kind
+            |> List.filter ((<>) "rich rules")
+            |> List.forall (fun field ->
+                Set.ofList expectedSelectors[field] = Set.ofList actualSelectors[field])
+        let expectedRules = Set.ofList expectedSelectors["rich rules"]
+        let actualRules = Set.ofList actualSelectors["rich rules"]
+        exactSelectors
+        && Set.isSubset expectedRules actualRules
+        && (Set.difference actualRules expectedRules |> Set.forall FirewalldRuntime.isRestrictiveRichRule)
+
+    let private objectRuntimeMatchesPreimage environment expected actual =
+        objectRuntimeNonSelectorsMatch environment expected actual && objectSelectorsMatch expected actual
+
     let private objectRuntimeRollbackStructureMatches
         (environment: HostEnvironment)
         (expected: FirewalldRuntime.RuntimeSnapshot)
@@ -793,30 +793,6 @@ module FirewalldRecoveryProof =
                             NativeFields = Map.add "interfaces" nativeInterfaces actual.NativeFields }
                     nonSelectorFingerprint projected = nonSelectorFingerprint expected
             | _ -> false
-
-    let private objectRuntimeMatchesPreimageForRollback
-        (environment: HostEnvironment)
-        (repair: ObjectRepair)
-        (actual: FirewalldRuntime.RuntimeSnapshot)
-        =
-        let inverseOnlyNarrows =
-            repair.Deltas
-            |> List.forall (fun delta -> inverseEffect delta.Effect = Restricts)
-        if not (objectRuntimeRollbackStructureMatches environment repair.Before actual inverseOnlyNarrows) then false
-        else
-            let expectedSelectors = objectSelectorValues repair.Before
-            let actualSelectors = objectSelectorValues actual
-            let exactSelectors =
-                objectSelectorFields repair.Before.Kind
-                |> List.filter ((<>) "rich rules")
-                |> List.forall (fun field ->
-                    Set.ofList (Map.find field expectedSelectors) = Set.ofList (Map.find field actualSelectors))
-            let expectedRules = Set.ofList (Map.find "rich rules" expectedSelectors)
-            let actualRules = Set.ofList (Map.find "rich rules" actualSelectors)
-            let extras = Set.difference actualRules expectedRules
-            exactSelectors
-            && Set.isSubset expectedRules actualRules
-            && (extras |> Set.forall FirewalldRuntime.isRestrictiveRichRule)
 
 
     let private objectRuntimeMatchesCheckpointZero
@@ -2260,11 +2236,12 @@ module FirewalldRecoveryProof =
                 let currentIndex =
                     objectRepairStateIndex repair current
                     |> Option.defaultWith (fun () -> fail "Runtime selectors are outside the recorded scoped object checkpoints.")
-                let inverseOnlyNarrows =
-                    repair.Deltas
-                    |> List.forall (fun delta -> inverseEffect delta.Effect = Restricts)
+                // Verification must not depend on whether the current invocation
+                // ran the inverse or resumed after its durable final receipt.
+                let allowForeignInterfaces =
+                    phase = FirewalldLifecycle.ActiveDaemon && not repair.Deltas.IsEmpty
+                    && (repair.Deltas |> List.forall (fun delta -> inverseEffect delta.Effect = Restricts))
                 let inverseCount = remainingUndo origin tracking currentIndex repair.Deltas.Length 0
-                let allowForeignInterfaces = phase = FirewalldLifecycle.ActiveDaemon && inverseCount > 0 && inverseOnlyNarrows
                 if inverseCount > 0 then
                     for index in inverseCount - 1 .. -1 .. 0 do
                         if objectRepairStateIndex repair current <> Some(index + 1)
@@ -2280,8 +2257,8 @@ module FirewalldRecoveryProof =
                                || not (objectRuntimeRollbackStructureMatches environment repair.Before current allowForeignInterfaces) then
                                 fail "firewalld did not restore the recorded scoped object checkpoint.")
                 let returnedToPreimage =
-                    if allowForeignInterfaces then objectRuntimeMatchesPreimageForRollback environment repair current
-                    else objectRuntimeMatchesPreimage environment repair.Before current
+                    objectRuntimeRollbackStructureMatches environment repair.Before current allowForeignInterfaces
+                    && objectSelectorsMatch repair.Before current
                 if not returnedToPreimage || objectRepairStateIndex repair current <> Some 0 then
                     fail "The scoped firewalld object did not return to its recorded runtime preimage."
                 persistUndo tracking 0 None true

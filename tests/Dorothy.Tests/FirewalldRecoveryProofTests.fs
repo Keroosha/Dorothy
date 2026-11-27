@@ -1104,6 +1104,38 @@ type FirewalldRecoveryProofTests() =
                 calls |> Seq.exists (fun args -> args |> List.exists (fun value -> value.StartsWith("--remove-", StringComparison.Ordinal))),
                 Is.False))
 
+    [<TestCase(false); TestCase(true)>]
+    member _.``Same midpoint does not distinguish an undispatched second step from an unacknowledged one``(dispatched: bool) =
+        let before = FirewalldModel.empty "zone" "quiet"
+        let after = { before with Ports = [ "8443/tcp"; "9443/tcp" ] }
+        let xml = Some(FieldRuntime.render before)
+        withSelectorRuntimeProgress before (selectorValues before) (fun env calls current _ report progress ->
+            let proof = FirewalldRecoveryProof.objectDeltaProof env after xml (Some(FieldRuntime.render after)) |> Option.get
+            let run exe args input =
+                if exe = "firewall-cmd" && args = [ "--zone=quiet"; "--add-port=9443/tcp" ] then
+                    calls.Add(exe :: args)
+                    { ExitCode = 1; Stdout = ""; Stderr = "No reply from the service" }
+                else env.Run exe args input
+            let observed = { env with Run = run }
+            let checkpoint p =
+                report p
+                if not dispatched && p.CompletedSteps = 1 && p.InFlightStep.IsNone then
+                    invalidOp "Interrupted before the second command was dispatched."
+            Assert.Throws<InvalidOperationException>(fun () ->
+                FirewalldRecoveryProof.activateObjectDeltaWithProgress observed after xml proof checkpoint) |> ignore
+            Assert.That((current ())["ports"], Is.EquivalentTo [ "8443/tcp" ])
+            Assert.That((progress ()).Value.CompletedSteps, Is.EqualTo 1)
+            Assert.That((progress ()).Value.InFlightStep, Is.EqualTo(if dispatched then Some 1 else None))
+            let recover () = restoreWithoutReload observed after xml (Some proof) FirewalldLifecycle.ActiveDaemon (progress ())
+            if dispatched then
+                Assert.Throws<InvalidOperationException>(TestDelegate recover) |> ignore
+                Assert.That((current ())["ports"], Is.EquivalentTo [ "8443/tcp" ])
+            else
+                recover ()
+                Assert.That((current ())["ports"], Is.Empty)
+            Assert.That(calls |> Seq.filter ((=) [ "firewall-cmd"; "--zone=quiet"; "--remove-port=8443/tcp" ]) |> Seq.length,
+                        Is.EqualTo(if dispatched then 0 else 1)))
+
     [<TestCase(false, false); TestCase(false, true); TestCase(true, false); TestCase(true, true)>]
     member _.``An interrupted inverse never consumes a later owner's identical restriction``(runtimeOnly: bool, completionStored: bool) =
         let before = FirewalldModel.empty "zone" "quiet"
@@ -1193,12 +1225,12 @@ type FirewalldRecoveryProofTests() =
             restoreWithoutReload env after xml (Some plan) FirewalldLifecycle.ActiveDaemon (getProgress ())
             Assert.That((current ())["rich rules"], Is.EquivalentTo((selectorValues before)["rich rules"])))
 
-    [<Test>]
-    member _.``A foreign zone interface does not block an attributable restrictive inverse``() =
-        let before = FirewalldModel.empty "zone" "quiet"
-        let after = { before with Ports = [ "8443/tcp" ] }
+    [<TestCase(false, false); TestCase(true, false); TestCase(true, true)>]
+    member _.``Narrowing inverse verifies the same owned preimage across retirement``(interrupt: bool, missingGrant: bool) =
+        let before = { FirewalldModel.empty "zone" "quiet" with Ports = [ "443/tcp" ] }
+        let after = { before with Ports = [ "443/tcp"; "8443/tcp" ] }
         let beforeXml = Some(FieldRuntime.render before)
-        withSelectorRuntimeProgress before (selectorValues before) (fun environment calls current _ report getProgress ->
+        withSelectorRuntimeProgress before (selectorValues before) (fun environment calls current setCurrent report getProgress ->
             let mutable foreignInterface = false
             let originalRun = environment.Run
             let run executable arguments input =
@@ -1211,10 +1243,31 @@ type FirewalldRecoveryProofTests() =
                 |> Option.get
             FirewalldRecoveryProof.activateObjectDeltaWithProgress environment after beforeXml proof report
             foreignInterface <- true
-            restoreWithoutReload environment after beforeXml (Some proof) FirewalldLifecycle.ActiveDaemon (getProgress ())
-            Assert.That((current ())["ports"], Is.Empty)
-            Assert.That(calls |> Seq.exists (fun args -> args |> List.exists (fun value -> value.StartsWith("--remove-interface=", StringComparison.Ordinal))), Is.False)
-            Assert.That(calls, Does.Contain [ "firewall-cmd"; "--zone=quiet"; "--remove-port=8443/tcp" ]))
+            let mutable durable = None
+            let recover persist =
+                FirewalldRecoveryProof.restoreRuntimeWithProgress environment after beforeXml (Some proof)
+                    FirewalldLifecycle.ActiveDaemon (fun () -> Assert.Fail "Unexpected reload") (getProgress ())
+                    (Some { Previous = durable; Persist = persist })
+            let save r = durable <- Some r
+            if interrupt then
+                Assert.Throws<IOException>(fun () ->
+                    recover (fun r ->
+                        save r
+                        if r.RemainingSteps = 0 && r.InFlightStep.IsNone && not r.PreimageVerified then
+                            raise (IOException "Interrupted after terminal acknowledgement"))) |> ignore
+                Assert.That(durable.Value.PreimageVerified, Is.False)
+                Assert.That((current ())["ports"], Is.EquivalentTo before.Ports)
+                if missingGrant then
+                    setCurrent (Map.add "ports" [] (current ()))
+                    Assert.Throws<InvalidOperationException>(fun () -> recover save) |> ignore
+                    Assert.That(durable.Value.PreimageVerified, Is.False)
+                    Assert.That((current ())["ports"], Is.Empty)
+                    setCurrent (selectorValues before)
+            recover save
+            Assert.That(durable.Value.PreimageVerified, Is.True)
+            Assert.That((current ())["ports"], Is.EquivalentTo before.Ports)
+            Assert.That(calls |> Seq.filter ((=) [ "firewall-cmd"; "--zone=quiet"; "--remove-port=8443/tcp" ]) |> Seq.length, Is.EqualTo 1)
+            Assert.That(calls |> Seq.exists (fun args -> args |> List.exists (fun value -> value.StartsWith("--remove-interface=", StringComparison.Ordinal))), Is.False))
 
 
 

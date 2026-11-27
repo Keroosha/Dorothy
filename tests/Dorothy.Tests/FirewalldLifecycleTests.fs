@@ -33,7 +33,7 @@ type FirewalldLifecycleTests() =
         value["managedMode"] <- JsonValue.Create 0o644
         value
 
-    let withHost (action: HostEnvironment -> string -> unit) =
+    let withHostForSystemctlState (systemctlState: CommandResult option) (action: HostEnvironment -> string -> unit) =
         let root = Path.Combine(Path.GetTempPath(), "dorothy-firewalld-lifecycle-" + Guid.NewGuid().ToString("N"))
         for directory in [ "etc/firewalld/zones"; "etc/systemd/system"; "run/lock"; "var/lib" ] do
             Directory.CreateDirectory(Path.Combine(root, directory)) |> ignore
@@ -46,12 +46,15 @@ type FirewalldLifecycleTests() =
                     let mode = File.GetUnixFileMode target |> int |> fun value -> Convert.ToString(value, 8)
                     { ExitCode = 0; Stdout = "0:" + mode; Stderr = "" }
             elif executable = "/usr/bin/systemctl" then
+                let mutable response: CommandResult = { ExitCode = 0; Stdout = "success"; Stderr = "" }
                 let createLink directory name target =
                     Directory.CreateDirectory(directory) |> ignore
                     let link = Path.Combine(directory, name)
                     if isNull (FileInfo(link).LinkTarget) && not (File.Exists link || Directory.Exists link) then
                         File.CreateSymbolicLink(link, target) |> ignore
                 match arguments with
+                | [ "show"; "--property=ActiveState"; "--value"; "firewalld.service" ] ->
+                    response <- systemctlState |> Option.defaultValue response
                 | [ "enable"; "keroosha-iac-firewalld-boot-recovery.service" ] ->
                     createLink (Path.Combine(root, "etc/systemd/system/multi-user.target.wants")) "keroosha-iac-firewalld-boot-recovery.service" "../keroosha-iac-firewalld-boot-recovery.service"
                     createLink (Path.Combine(root, "etc/systemd/system/firewalld.service.wants")) "keroosha-iac-firewalld-boot-recovery.service" "../keroosha-iac-firewalld-boot-recovery.service"
@@ -63,7 +66,7 @@ type FirewalldLifecycleTests() =
                 | [ "restart"; "keroosha-iac-firewalld-rollback.timer" ]
                 | [ "stop"; "keroosha-iac-firewalld-rollback.timer" ] -> ()
                 | _ -> ()
-                { ExitCode = 0; Stdout = "success"; Stderr = "" }
+                response
             else
                 invalidOp ("Unexpected lifecycle command: " + executable + " " + String.concat " " arguments)
         let environment: HostEnvironment =
@@ -73,6 +76,8 @@ type FirewalldLifecycleTests() =
         try action environment root
         finally
             if Directory.Exists root then Directory.Delete(root, true)
+    let withHost (action: HostEnvironment -> string -> unit) =
+        withHostForSystemctlState None action
 
     let configuration = FirewalldModel.empty "zone" "lifecycle"
     let logicalPath = "/etc/firewalld/zones/lifecycle.xml"
@@ -160,6 +165,13 @@ type FirewalldLifecycleTests() =
         value["releaseOnRollback"] <- JsonValue.Create false
         value["deleteOnConfirm"] <- JsonValue.Create false
         value["status"] <- JsonValue.Create "pending"
+        value
+    let nativeProgressRecord (strategy: string) (completedSteps: int) (awaitingPostBoot: bool) =
+        let value = pendingRecord 2 true awaitingPostBoot
+        value["version"] <- JsonValue.Create 3
+        value["rollbackProof"].AsObject()["strategy"] <- JsonValue.Create strategy
+        value["nativeProgress"] <-
+            JsonNode.Parse(sprintf """{"completedSteps":%d,"inFlightStep":null}""" completedSteps)
         value
 
     let savePendingRecord (root: string) (record: JsonObject) =
@@ -468,6 +480,112 @@ type FirewalldLifecycleTests() =
             use finished = JsonDocument.Parse(File.ReadAllText(physical root journalPath))
             Assert.That(finished.RootElement.GetProperty("pending").ValueKind, Is.EqualTo JsonValueKind.Null))
 
+    [<TestCase("inactive", 0, true)>]
+    [<TestCase("active", 0, false)>]
+    [<TestCase("activating", 0, false)>]
+    [<TestCase("inactive", 1, false)>]
+    member _.``Legacy object repair upgrades only after an inactive daemon observation``(state: string, exitCode: int, shouldMigrate: bool) =
+        let observation = { ExitCode = exitCode; Stdout = state; Stderr = "" }
+        withHostForSystemctlState (Some observation) (fun environment root ->
+            let generation = Guid.NewGuid()
+            writeFile root "/proc/sys/kernel/random/boot_id" (string generation) 0o644
+            let record = nativeProgressRecord "object-delta" 3 false
+            let markerText = record.ToJsonString()
+            let value = journal owner (Some before) (Some after)
+            value["pending"] <- record.DeepClone()
+            let ownerPath = "/var/lib/keroosha-iac/firewalld/zone-lifecycle.json"
+            let ownerText = value.ToJsonString()
+            writeFile root ownerPath ownerText 0o600
+            writeFile root logicalPath before 0o644
+            savePendingRecord root record
+            let recover phase (transaction: FirewalldLifecycle.PendingTransaction) storedJournal =
+                let stored = storedJournal |> Option.defaultWith (fun () -> failwith "Expected owner journal")
+                FirewalldLifecycle.recoverPendingTransaction environment transaction.Configuration stored transaction.Path phase
+                    readState (writeState root transaction.Path) (fun _ _ -> invalidOp "Boot-before recovery must not invoke native repair.")
+            if shouldMigrate then
+                FirewalldLifecycle.recoverPendingBoot environment (recover FirewalldLifecycle.BootBeforeFirewalld)
+                let migrated = FirewalldLifecycle.pending environment |> Option.defaultWith (fun () -> failwith "Expected post-boot continuation")
+                Assert.That(migrated.SchemaVersion, Is.EqualTo 4)
+                Assert.That(migrated.OwnerId, Is.EqualTo owner)
+                Assert.That(migrated.ActivationStarted, Is.True)
+                Assert.That(migrated.AwaitingPostBoot, Is.True)
+                Assert.That(migrated.NativeProgress.Value.CompletedSteps, Is.EqualTo 3)
+                Assert.That(migrated.NativeUndo.IsNone, Is.True)
+                Assert.That(File.ReadAllText(physical root logicalPath), Is.EqualTo before)
+                use storedOwner = JsonDocument.Parse(File.ReadAllText(physical root ownerPath))
+                let ownerPending = storedOwner.RootElement.GetProperty("pending")
+                Assert.That(ownerPending.GetProperty("version").GetInt32(), Is.EqualTo 4)
+                Assert.That(ownerPending.GetProperty("ownerId").GetString(), Is.EqualTo owner)
+                Assert.That(ownerPending.GetProperty("activationStarted").GetBoolean(), Is.True)
+                Assert.That(ownerPending.GetProperty("awaitingPostBoot").GetBoolean(), Is.True)
+                Assert.That(ownerPending.GetProperty("nativeProgress").GetProperty("completedSteps").GetInt32(), Is.EqualTo 3)
+                Assert.That(ownerPending.GetProperty("nativeUndo").ValueKind, Is.EqualTo JsonValueKind.Null)
+                let inverse = FirewalldLifecycle.undoJournal environment migrated |> Option.get
+                Assert.That(inverse.Previous.IsNone, Is.True)
+
+                let mutable activeCallback = false
+                let blocked =
+                    Assert.Throws<InvalidOperationException>(fun () ->
+                        FirewalldLifecycle.recoverPending environment (fun transaction storedJournal ->
+                            let stored = storedJournal |> Option.defaultWith (fun () -> failwith "Expected owner journal")
+                            FirewalldLifecycle.recoverPendingTransaction environment transaction.Configuration stored transaction.Path
+                                FirewalldLifecycle.ActiveDaemon readState (writeState root transaction.Path)
+                                (fun _ _ -> activeCallback <- true)))
+                Assert.That(blocked.Message, Does.Contain "Ordered post-boot recovery")
+                Assert.That(activeCallback, Is.False)
+                Assert.That((FirewalldLifecycle.pending environment).Value.AwaitingPostBoot, Is.True)
+                Assert.That((FirewalldLifecycle.pending environment).Value.NativeUndo.IsNone, Is.True)
+            else
+                let blocked =
+                    Assert.Throws<InvalidOperationException>(fun () ->
+                        FirewalldLifecycle.recoverPendingBoot environment (recover FirewalldLifecycle.BootBeforeFirewalld))
+                Assert.That(blocked.Message, Does.Contain "stopped firewalld")
+                Assert.That(File.ReadAllText(physical root logicalPath), Is.EqualTo before)
+                Assert.That(File.ReadAllText(physical root ownerPath), Is.EqualTo ownerText)
+                Assert.That(File.ReadAllText(physical root "/var/lib/keroosha-iac/firewalld/pending-transaction.json"), Is.EqualTo markerText)
+                let unchanged = FirewalldLifecycle.pending environment |> Option.defaultWith (fun () -> failwith "Expected unchanged intent")
+                Assert.That(unchanged.SchemaVersion, Is.EqualTo 3)
+                Assert.That(unchanged.OwnerId, Is.EqualTo owner)
+                Assert.That(unchanged.NativeProgress.Value.CompletedSteps, Is.EqualTo 3)
+                Assert.That(unchanged.AwaitingPostBoot, Is.False))
+
+    [<Test>]
+    member _.``Same-boot active retry delegates an awaiting object receipt as postboot recovery``() =
+        withHost (fun environment root ->
+            let generation = Guid.NewGuid()
+            writeFile root "/proc/sys/kernel/random/boot_id" (string generation) 0o644
+            let record = nativeProgressRecord "object-delta" 3 true
+            record["version"] <- JsonValue.Create 4
+            record["nativeUndo"] <- null
+            let value = journal owner (Some before) (Some after)
+            value["pending"] <- record.DeepClone()
+            let ownerPath = physical root "/var/lib/keroosha-iac/firewalld/zone-lifecycle.json"
+            let ownerText = value.ToJsonString()
+            writeFile root "/var/lib/keroosha-iac/firewalld/zone-lifecycle.json" ownerText 0o600
+            writeFile root logicalPath before 0o644
+            savePendingRecord root record
+            let waiting = FirewalldLifecycle.pending environment |> Option.get
+            (FirewalldLifecycle.undoJournal environment waiting |> Option.get).Persist
+                { RemainingSteps = 0; InFlightStep = None; PreimageVerified = false }
+            let mutable observedPhase = None
+            let failure =
+                Assert.Throws<InvalidOperationException>(fun () ->
+                    FirewalldLifecycle.recoverPending environment (fun transaction storedJournal ->
+                        let stored = storedJournal |> Option.defaultWith (fun () -> failwith "Expected owner journal")
+                        FirewalldLifecycle.recoverPendingTransaction environment transaction.Configuration stored transaction.Path
+                            FirewalldLifecycle.ActiveDaemon readState (writeState root transaction.Path)
+                            (fun _ phase ->
+                                observedPhase <- Some phase
+                                invalidOp "ordered postboot verifier remains pending")))
+            Assert.That(failure.Message, Does.Contain "ordered postboot verifier remains pending")
+            Assert.That(observedPhase, Is.EqualTo(Some FirewalldLifecycle.BootAfterFirewalld))
+            Assert.That(File.ReadAllText ownerPath, Is.EqualTo ownerText)
+            let retained = FirewalldLifecycle.pending environment |> Option.get
+            Assert.That(retained.AwaitingPostBoot, Is.True)
+            let receipt = (FirewalldLifecycle.undoJournal environment retained |> Option.get).Previous.Value
+            Assert.That(receipt.RemainingSteps, Is.Zero)
+            Assert.That(receipt.PreimageVerified, Is.False))
+
     [<TestCase(false, 0); TestCase(false, 2); TestCase(false, 4096); TestCase(true, 0)>]
     member _.``Active recovery requires a same-boot postboot receipt at every forward count``(hasRetryReceipt: bool, completedSteps: int) =
         withHost (fun environment root ->
@@ -505,7 +623,7 @@ type FirewalldLifecycleTests() =
                         invalidOp "postboot native repair remains pending")
             Assert.Throws<InvalidOperationException>(fun () -> FirewalldLifecycle.recoverPending environment recover) |> ignore
             if hasRetryReceipt then
-                Assert.That(observedPhase, Is.EqualTo(Some FirewalldLifecycle.ActiveDaemon))
+                Assert.That(observedPhase, Is.EqualTo(Some FirewalldLifecycle.BootAfterFirewalld))
                 Assert.That(observedRemaining, Is.EqualTo(Some 1))
                 Assert.That(observedVerified, Is.EqualTo(Some false))
             else
