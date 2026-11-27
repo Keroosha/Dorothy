@@ -748,6 +748,10 @@ module FirewalldLifecycle =
             staged <- activating
             writeJournalPending journal activating
             saveJournal environment c journal
+            let actual, actualMode = readPath environment path
+            verifyMetadata environment activating actual actualMode afterMode
+            if readState scope actual <> after then
+                fail "Firewalld target changed after staging and before native activation."
             activate ()
         with originalError ->
             try
