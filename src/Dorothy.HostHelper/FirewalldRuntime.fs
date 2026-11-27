@@ -503,6 +503,13 @@ module FirewalldRuntime =
     let normalizeFieldValues (kind: string) (fieldName: string) (values: string list) : string list =
         if fieldName = "sources" then
             words values |> List.map (fun value -> if isMacAddress value then value.ToUpperInvariant() else value) |> List.distinct |> List.sort
+        elif fieldName = "forward-ports" then
+            // list-all may render an absent destination as either "" or "None".
+            // Both the typed projection and its complete native-field fingerprint
+            // must agree; retain malformed observations rather than dropping them.
+            words values
+            |> List.map (fun raw -> forwardPortElement raw |> Option.bind canonicalForwardPortValue |> Option.defaultValue raw)
+            |> List.distinct |> List.sort
         elif fieldName = "ports" || fieldName = "source-ports" then
             normalizePortValues (words values)
         elif kind = "service" && fieldName = "modules" then
@@ -576,7 +583,8 @@ module FirewalldRuntime =
             if key = "target" then values |> List.map (fun value -> if value = "%%REJECT%%" then "REJECT" else value)
             elif key = "sources" then words values |> List.map normalizeSource |> List.distinct |> List.sort
             elif key = "interfaces" then normalizeFieldValues kind key values
-            elif key = "forward-ports" || key = "rich rules" then
+            elif key = "forward-ports" then normalizeFieldValues kind key values
+            elif key = "rich rules" then
                 values |> List.filter (String.IsNullOrWhiteSpace >> not) |> List.distinct |> List.sort
             elif Set.contains key listFields then normalizeFieldValues kind key values
             else values)

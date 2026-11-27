@@ -254,8 +254,8 @@ type FirewalldRecoveryProofTests() =
                             let value =
                                 if field <> "forward-ports" then argument
                                 elif argument.Contains(":toaddr=None") || argument.Contains(":toport=None") then failwith "Invalid forward-port operand"
-                                elif not (argument.Contains(":toaddr=")) then argument + ":toaddr=None"
-                                elif not (argument.Contains(":toport=")) then argument.Replace(":toaddr=", ":toport=None:toaddr=")
+                                elif not (argument.Contains(":toaddr=")) then argument + ":toaddr="
+                                elif not (argument.Contains(":toport=")) then argument.Replace(":toaddr=", ":toport=:toaddr=")
                                 else argument
                             let current = Map.find field runtime
                             let updated = if add then value :: current |> List.distinct else current |> List.filter ((<>) value)
@@ -533,7 +533,11 @@ type FirewalldRecoveryProofTests() =
             Assert.That((plan { pair with Elements = [ redirect "8181" "8080"; redirect "8182" "8181" ] }).IsNone, Is.True)
             let proof = plan pair |> Option.get
             FirewalldRecoveryProof.activateObjectDeltaWithProgress env pair beforeXml proof report
-            Assert.That((current ())["forward-ports"], Is.EquivalentTo((selectorValues pair)["forward-ports"]))
+            let observed = FirewalldRuntime.inspectRuntime env "zone" "quiet" |> Option.get
+            let disk = FirewalldRuntime.snapshotFromXml "zone" "quiet" (Some(FieldRuntime.render pair)) |> Result.defaultWith failwith |> Option.get
+            Assert.That(FirewalldRecoveryProof.matchesLoadedProjection env disk observed, Is.True)
+            let listed = (current ())["forward-ports"]
+            Assert.That(FirewalldRuntime.normalizeFieldValues "zone" "forward-ports" listed, Is.EquivalentTo((selectorValues pair)["forward-ports"]))
             restoreWithoutReload env pair beforeXml (Some proof) FirewalldLifecycle.ActiveDaemon (progress ())
             Assert.That((current ())["forward-ports"], Is.Empty)
             Assert.That(calls, Does.Contain [ "firewall-cmd"; "--zone=quiet"; "--remove-forward-port=port=8181:proto=tcp:toport=8080" ]))
