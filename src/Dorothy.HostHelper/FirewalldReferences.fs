@@ -53,6 +53,18 @@ module internal FirewalldReferences =
                     if sources other |> Seq.exists ownedSources.Contains then
                         invalidOp ("A source is already bound to zone " + otherName + "; remove that binding first.")
 
+    let usedByPacketFilter parse kind name (objects: Map<string, Map<string,string>>) =
+        let seen = HashSet<string>(StringComparer.Ordinal)
+        let rec depends (k, n) =
+            if (k, n) = (kind, name) then true
+            elif k = "service" && seen.Add n then
+                match Map.tryFind n objects["service"] with
+                | Some xml -> references (parse "service" xml) |> Seq.exists depends
+                | None -> true // an uninspectable dependency is not evidence of disuse
+            else false
+        [ "zone"; "policy" ] |> List.exists (fun k ->
+            objects[k] |> Map.exists (fun _ xml -> references (parse k xml) |> Seq.exists depends))
+
     let validate (parse: string -> string -> XElement) kind name defaultZone (objects: Map<string, Map<string,string>>) =
         let zones = objects["zone"]
         if not (Map.containsKey defaultZone zones) then invalidOp ("DefaultZone references a missing permanent zone: " + defaultZone)

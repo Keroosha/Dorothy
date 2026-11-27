@@ -264,6 +264,8 @@ type FirewalldRuntimeTests() =
             | "firewall-cmd", [ "--permanent"; "--get-zones" ] -> commandResult "public"
             | "firewall-cmd", [ "--get-policies" ]
             | "firewall-cmd", [ "--permanent"; "--get-policies" ] -> commandResult "edge"
+            | "firewall-cmd", [ "--get-services" ]
+            | "firewall-cmd", [ "--permanent"; "--get-services" ] -> commandResult "ssh ssh-aux"
             | "firewall-cmd", [ "--get-ipsets" ]
             | "firewall-cmd", [ "--permanent"; "--get-ipsets" ] -> commandResult "blocked"
             | "firewall-cmd", [ "--zone=public"; "--list-all" ] ->
@@ -295,6 +297,8 @@ type FirewalldRuntimeTests() =
         try
             Directory.CreateDirectory root |> ignore
             Assert.That(FirewalldRuntime.validateReload environment, Is.EqualTo(Ok () : Result<unit, string>))
+            let newTarget () = FirewalldRuntime.validateReloadExcludingTargetObject environment "service" "not-yet-loaded"
+            Assert.That(newTarget (), Is.EqualTo(Ok () : Result<unit, string>))
             timeout <- " timeout=60"
             expectRefusal ()
             timedMember <- false
@@ -302,6 +306,7 @@ type FirewalldRuntimeTests() =
             timeout <- ""
             foreignDirect <- "ipv4 filter INPUT 0 independently-owned-rule"
             expectRefusal ()
+            Assert.That(Result.isError (newTarget ()), Is.True)
             foreignDirect <- ""
             zoneServices <- ""
             zonePorts <- ""

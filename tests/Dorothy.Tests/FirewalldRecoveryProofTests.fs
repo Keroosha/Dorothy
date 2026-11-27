@@ -474,6 +474,18 @@ type FirewalldRecoveryProofTests() =
             Assert.That(calls, Does.Contain [ "firewall-cmd"; "--zone=quiet"; "--remove-port=8443/tcp" ]))
 
     [<Test>]
+    member _.``Scoped release records the restored baseline rather than departing inputs``() =
+        let departing = { FirewalldModel.empty "zone" "quiet" with Services = [ "ssh" ]; Ports = [ "8443/tcp" ] }
+        let baseline = { departing with Ports = [] }
+        let beforeXml = Some(FieldRuntime.render departing)
+        withSelectorRuntime departing (selectorValues departing) (fun environment _ current _ ->
+            let proof = FirewalldRecoveryProof.objectDeltaProof environment departing beforeXml (Some(FieldRuntime.render baseline)) |> Option.get
+            FirewalldRecoveryProof.activateObjectDelta environment departing beforeXml proof
+            Assert.That((current ())["ports"], Is.Empty)
+            restoreWithoutReload environment departing beforeXml (Some proof) FirewalldLifecycle.ActiveDaemon
+            Assert.That((current ())["ports"], Is.EquivalentTo [ "8443/tcp" ]))
+
+    [<Test>]
     member _.``Scoped object inverse declines structural projection changes``() =
         let before = { FirewalldModel.empty "zone" "quiet" with Services = [ "ssh" ] }
         let after = { before with Target = "ACCEPT" }

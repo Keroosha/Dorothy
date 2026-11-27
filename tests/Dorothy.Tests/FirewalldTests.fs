@@ -499,7 +499,7 @@ type FirewalldTests() =
             Assert.Throws<NativeFirewalld.BackendError>(fun () -> this.Invoke failing "apply" strictConfiguration |> ignore) |> ignore
             Assert.That(File.ReadAllText configPath, Is.EqualTo baseline)
             Assert.That(File.Exists(Path.Combine(root, "var/lib/keroosha-iac/firewalld/settings-strict-forward-ports.json")), Is.False)
-            Assert.That(calls |> Seq.filter (fun args -> args = [ "firewall-cmd"; "--reload" ]) |> Seq.length, Is.EqualTo 2))
+            Assert.That(NativeFirewalld.strictForwardPortsLoaded env, Is.True))
 
     [<Test>]
     member this.``Custom zone delete removes created XML and WireGuard binding is permanent only``() =

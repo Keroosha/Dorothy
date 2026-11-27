@@ -1322,8 +1322,10 @@ module Firewalld =
         let assigned =
             zoneSnapshots |> Map.toList |> List.collect (fun (zone, snapshot) -> snapshot.Interfaces |> List.map (fun iface -> iface, zone))
         let retainedViews candidates =
+            let parsed = candidates |> Map.map (fun _ xml -> parseXml "zone" xml)
             assigned |> List.choose (fun (iface, zone) ->
-                if not (Map.containsKey zone candidates) then None
+                let declared = zonesBoundToInterface iface parsed
+                if not (Map.containsKey zone candidates) || declared = [ zone ] || (declared.IsEmpty && zone = finalDefaultZone) then None
                 else
                     let candidatesForLink = candidates |> Map.map (fun name xml ->
                         let root = parseXml "zone" xml
@@ -1947,6 +1949,16 @@ module Firewalld =
                         firewall environment [ "--check-config" ] |> ignore
                         FirewalldRecoveryProof.activateObjectDelta environment c effectiveBefore proof)
                 | None ->
+                    // A shared definition can affect peers other than the SSH connection
+                    // running this request. Without an owned native selector inverse a
+                    // late third-party ban can make a global rollback impossible.
+                    if effectiveBefore.IsSome && (List.contains c.Kind [ "service"; "icmptype"; "helper"; "ipset" ]) then
+                        let definitions =
+                            [ "zone"; "policy"; "service" ]
+                            |> List.map (fun kind -> kind, definitionInventory environment kind)
+                            |> Map.ofList
+                        if FirewalldReferences.usedByPacketFilter parseXml c.Kind c.Name definitions then
+                            refuseManagementNarrowing ()
                     if FirewalldRecoveryProof.objectTransitionMayNarrowManagement environment c effectiveBefore effectiveAfter then
                         refuseManagementNarrowing ()
                     let proof =
@@ -2925,8 +2937,13 @@ module Firewalld =
                                 jsonProperty "flags" f |> Option.bind (fun v ->
                                     if v.ValueKind <> JsonValueKind.Array then None
                                     else Some(v.EnumerateArray() |> Seq.map _.GetString() |> Set.ofSeq))
+                            let exactBody =
+                                (exprs |> List.tryLast |> Option.exists (fun e -> (jsonProperty "drop" e).IsSome))
+                                && (exprs |> List.forall (fun e ->
+                                    e.ValueKind = JsonValueKind.Object && (e.EnumerateObject() |> Seq.length) = 1
+                                    && (["match"; "counter"; "log"; "drop"] |> List.exists (fun k -> (jsonProperty k e).IsSome))))
                             let core =
-                                if family && missing && predicates.Length = 2 && jsonString "op" m = Some "==" && jsonString "result" f = Some "oif" then
+                                if exactBody && family && missing && predicates.Length = 2 && jsonString "op" m = Some "==" && jsonString "result" f = Some "oif" then
                                     match flags with
                                     | Some names when names = set [ "saddr"; "mark" ] -> Some "loose"
                                     | Some names when names = set [ "saddr"; "mark"; "iif" ] -> Some "strict"
@@ -3214,8 +3231,12 @@ module Firewalld =
                 fail ("Cannot restore loaded " + key + " without replacing its proven permanent preimage.")
             match phase with
             | FirewalldLifecycle.ActiveDaemon ->
-                requireReloadProof environment
-                activateSettings environment key
+                let alreadyRestored =
+                    settingRuntimeObservable key
+                    && (runtimeSettingValue environment key |> Option.exists (fun actual -> settingValuesEqual key (Some actual) (Some loadedValue)))
+                if not alreadyRestored then
+                    requireReloadProof environment
+                    activateSettings environment key
             | FirewalldLifecycle.BootAfterFirewalld ->
                 if not (daemonActive environment) then fail "firewalld is not active at post-boot settings recovery."
                 let loaded =

@@ -281,6 +281,7 @@ module FirewalldRecoveryProof =
               "protocols", normalize "protocols" snapshot.Protocols
               "icmp-blocks", normalize "icmp-blocks" snapshot.IcmpBlocks
               "rich rules", snapshot.RichRules |> List.distinct |> sorted
+              "entries", normalize "entries" snapshot.IpSetEntries
               "forward-ports", forwardPorts |> List.distinct |> sorted ]
 
     let private expectedForwardPortElement (configuration: FirewalldModel.Configuration) value =
@@ -444,7 +445,7 @@ module FirewalldRecoveryProof =
     let private fieldOrder =
         Map.ofList
             [ "services", 0; "ports", 1; "source-ports", 2; "protocols", 3
-              "forward-ports", 4; "icmp-blocks", 5; "rich rules", 6 ]
+              "forward-ports", 4; "icmp-blocks", 5; "rich rules", 6; "entries", 7 ]
 
     let private sortDeltas (deltas: RuntimeDelta list) =
         deltas
@@ -628,12 +629,13 @@ module FirewalldRecoveryProof =
         proofBase configuration "unchanged"
 
     let private effectName = function Grants -> "grant" | Restricts -> "restrict" | Steers -> "steer"
-    let private objectSelectorFields =
-        [ "services"; "ports"; "source-ports"; "protocols"; "icmp-blocks"; "rich rules"; "forward-ports" ]
+    let private objectSelectorFields kind =
+        if kind = "ipset" then [ "entries" ]
+        else [ "services"; "ports"; "source-ports"; "protocols"; "icmp-blocks"; "rich rules"; "forward-ports" ]
 
     let private withoutObjectSelectors (snapshot: FirewalldRuntime.RuntimeSnapshot) =
         let nativeFields =
-            objectSelectorFields
+            objectSelectorFields snapshot.Kind
             |> List.fold (fun fields field -> Map.add field [] fields) snapshot.NativeFields
         { snapshot with
             Services = []
@@ -643,6 +645,7 @@ module FirewalldRecoveryProof =
             ForwardPorts = []
             IcmpBlocks = []
             RichRules = []
+            IpSetEntries = []
             NativeFields = nativeFields }
 
     let private nonSelectorFingerprint snapshot = fingerprint (withoutObjectSelectors snapshot)
@@ -657,7 +660,8 @@ module FirewalldRecoveryProof =
         | Steers -> Steers
 
     let private objectDeltaEffect (beforeConfiguration: FirewalldModel.Configuration) (afterConfiguration: FirewalldModel.Configuration) field value add =
-        if add then deltaEffect afterConfiguration field value
+        if field = "entries" then Steers // source membership can choose either a grant or a denial
+        elif add then deltaEffect afterConfiguration field value
         else deltaEffect beforeConfiguration field value |> inverseEffect
 
     let private sortObjectDeltas deltas =
@@ -669,7 +673,7 @@ module FirewalldRecoveryProof =
     let private deriveObjectDeltas before after beforeConfiguration afterConfiguration =
         let beforeSelectors = actualSelectorValues before
         let afterSelectors = actualSelectorValues after
-        objectSelectorFields
+        objectSelectorFields before.Kind
         |> List.collect (fun field ->
             let oldValues = Set.ofList (Map.find field beforeSelectors)
             let newValues = Set.ofList (Map.find field afterSelectors)
@@ -730,7 +734,7 @@ module FirewalldRecoveryProof =
             let expectedSelectors = actualSelectorValues expected
             let actualSelectors = actualSelectorValues actual
             let exactSelectors =
-                objectSelectorFields
+                objectSelectorFields expected.Kind
                 |> List.filter ((<>) "rich rules")
                 |> List.forall (fun field ->
                     Set.ofList (Map.find field expectedSelectors) = Set.ofList (Map.find field actualSelectors))
@@ -746,7 +750,8 @@ module FirewalldRecoveryProof =
         (expected: FirewalldRuntime.RuntimeSnapshot)
         (actual: FirewalldRuntime.RuntimeSnapshot)
         =
-        objectRuntimeMatchesPreimage environment expected actual
+        if expected.Kind = "zone" || expected.Kind = "policy" then objectRuntimeMatchesPreimage environment expected actual
+        else matchesLoadedProjection environment expected actual
 
     let objectDeltaProof
         (environment: HostEnvironment)
@@ -754,14 +759,16 @@ module FirewalldRecoveryProof =
         (effectiveBefore: string option)
         (effectiveAfter: string option)
         =
-        if not (List.contains configuration.Kind [ "zone"; "policy" ]) then None
+        if not (List.contains configuration.Kind [ "zone"; "policy"; "ipset" ]) then None
         else
             match FirewalldRuntime.snapshotFromXml configuration.Kind configuration.Name effectiveBefore,
                   FirewalldRuntime.snapshotFromXml configuration.Kind configuration.Name effectiveAfter with
             | Error reason, _ -> fail ("Cannot project the effective firewalld preimage: " + reason)
             | _, Error reason -> fail ("Cannot project the candidate firewalld object: " + reason)
             | Ok(Some before), Ok(Some after) when snapshotComplete before && snapshotComplete after ->
-                if nonSelectorFingerprint before <> nonSelectorFingerprint after then None
+                let expiring (s: FirewalldRuntime.RuntimeSnapshot) =
+                    match Map.tryFind "timeout" s.IpSetOptions with None | Some(Some "0") -> false | _ -> true
+                if expiring before || expiring after || nonSelectorFingerprint before <> nonSelectorFingerprint after then None
                 else
                     let beforeConfiguration =
                         effectiveBefore
@@ -783,7 +790,10 @@ module FirewalldRecoveryProof =
                             when matchesLoadedProjection environment before permanent
                                  && objectRuntimeMatchesPreimage environment before live ->
                             let node = proofBase configuration "object-delta"
-                            node["version"] <- JsonValue.Create 3
+                            node["version"] <- JsonValue.Create 4
+                            // On Delete the effective postimage can be an adopted or
+                            // vendor definition, not the departing provider inputs.
+                            node["afterConfiguration"] <- JsonValue.Create(FirewalldModel.toJson afterConfiguration)
                             node["beforePresent"] <- JsonValue.Create true
                             node["beforeFingerprint"] <- JsonValue.Create(fingerprint before)
                             node["afterPresent"] <- JsonValue.Create true
@@ -1091,7 +1101,7 @@ module FirewalldRecoveryProof =
             | value -> value.GetValue<string>()
         if isNull node["version"] then fail "Missing firewalld rollback proof version."
         let version = node["version"].GetValue<int>()
-        if not (List.contains version [ 1; 2; 3 ])
+        if not (List.contains version [ 1; 2; 3; 4 ])
            || getString "scope" <> "object"
            || getString "kind" <> configuration.Kind
            || getString "name" <> configuration.Name then
@@ -1108,9 +1118,10 @@ module FirewalldRecoveryProof =
             elif strategy = "reload-before" && version = 2 then
                 set [ "version"; "scope"; "kind"; "name"; "strategy"; "beforePresent"; "beforeFingerprint"; "afterPresent"; "afterFingerprint"
                       "beforeInterfaces"; "beforeNativeInterfaces"; "afterInterfaces"; "afterNativeInterfaces" ]
-            elif strategy = "object-delta" && version = 3 then
-                set [ "version"; "scope"; "kind"; "name"; "strategy"; "beforePresent"; "beforeFingerprint"; "afterPresent"; "afterFingerprint"
-                      "beforeInterfaces"; "beforeNativeInterfaces"; "afterInterfaces"; "afterNativeInterfaces"; "deltas"; "stateFingerprints" ]
+            elif strategy = "object-delta" && (version = 3 || version = 4) then
+                let fields = set [ "version"; "scope"; "kind"; "name"; "strategy"; "beforePresent"; "beforeFingerprint"; "afterPresent"; "afterFingerprint"
+                                   "beforeInterfaces"; "beforeNativeInterfaces"; "afterInterfaces"; "afterNativeInterfaces"; "deltas"; "stateFingerprints" ]
+                if version = 4 then Set.add "afterConfiguration" fields else fields
             elif strategy = "unchanged" && version = 1 then
                 set [ "version"; "scope"; "kind"; "name"; "strategy" ]
             else Set.empty
@@ -1143,8 +1154,8 @@ module FirewalldRecoveryProof =
                 validateInterfaceProjection "before" (node["beforePresent"].GetValue<bool>())
                 validateInterfaceProjection "after" (node["afterPresent"].GetValue<bool>())
         if strategy = "object-delta" then
-            if configuration.Kind <> "zone" && configuration.Kind <> "policy" then
-                fail "Scoped object rollback supports only firewalld zones and policies."
+            if configuration.Kind <> "zone" && configuration.Kind <> "policy" && not (version = 4 && configuration.Kind = "ipset") then
+                fail "Scoped object rollback is not supported for this object kind."
             if not (node["beforePresent"].GetValue<bool>() && node["afterPresent"].GetValue<bool>()) then
                 fail "Scoped object rollback requires an existing before and after object."
             let deltas =
@@ -1247,7 +1258,12 @@ module FirewalldRecoveryProof =
             | Error reason -> fail ("Cannot project the recorded firewalld object preimage: " + reason)
             | Ok(Some snapshot) when snapshotComplete snapshot -> snapshot
             | _ -> fail "The recorded firewalld object preimage is absent or incomplete."
-        let afterXml = Some(FieldRuntime.render configuration)
+        let afterConfiguration =
+            if node["version"].GetValue<int>() = 4 then FirewalldModel.parse (node["afterConfiguration"].GetValue<string>())
+            else configuration
+        if afterConfiguration.Kind <> configuration.Kind || afterConfiguration.Name <> configuration.Name then
+            fail "Scoped object postimage identity differs from its journal."
+        let afterXml = Some(FieldRuntime.render afterConfiguration)
         let after =
             match FirewalldRuntime.snapshotFromXml configuration.Kind configuration.Name afterXml with
             | Error reason -> fail ("Cannot project the recorded firewalld object candidate: " + reason)
@@ -1261,7 +1277,6 @@ module FirewalldRecoveryProof =
             effectiveBefore
             |> Option.defaultWith (fun () -> fail "A scoped object inverse requires an existing before object.")
             |> parseObjectConfiguration configuration.Kind configuration.Name
-        let afterConfiguration = parseObjectConfiguration configuration.Kind configuration.Name (FieldRuntime.render configuration)
         let deltas =
             node["deltas"].AsArray()
             |> Seq.map (fun item ->
@@ -1269,7 +1284,7 @@ module FirewalldRecoveryProof =
                 let field = value["field"].GetValue<string>()
                 let selectorValue = value["value"].GetValue<string>()
                 let add = value["add"].GetValue<bool>()
-                if not (List.contains field objectSelectorFields)
+                if not (List.contains field (objectSelectorFields configuration.Kind))
                    || String.IsNullOrWhiteSpace selectorValue then
                     fail "Unsupported selector in firewalld object delta proof."
                 let effect = objectDeltaEffect beforeConfiguration afterConfiguration field selectorValue add
@@ -1358,7 +1373,12 @@ module FirewalldRecoveryProof =
             fail ("Loaded firewalld target differs from the recorded " + label + " projection.")
 
     let private selectorArguments (configuration: FirewalldModel.Configuration) (delta: RuntimeDelta) action =
-        let selector = if configuration.Kind = "zone" then "--zone=" + configuration.Name else "--policy=" + configuration.Name
+        let selector =
+            match configuration.Kind with
+            | "zone" -> "--zone=" + configuration.Name
+            | "policy" -> "--policy=" + configuration.Name
+            | "ipset" when delta.Field = "entries" -> "--ipset=" + configuration.Name
+            | _ -> fail "No native selector inverse exists for this object kind."
         let optionName =
             match delta.Field with
             | "services" ->
@@ -1378,6 +1398,7 @@ module FirewalldRecoveryProof =
                 "icmp-block"
             | "rich rules" -> "rich-rule"
             | "forward-ports" -> "forward-port"
+            | "entries" when configuration.Kind = "ipset" -> "entry"
             | _ -> fail "Unsupported selector in firewalld rollback proof."
         [ selector; "--" + action + "-" + optionName + "=" + delta.Value ]
     let activateReload (environment: HostEnvironment) (configuration: FirewalldModel.Configuration) (proof: JsonObject) =

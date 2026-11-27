@@ -1361,7 +1361,6 @@ module FirewalldRuntime =
             let refuse reason =
                 if failure.IsNone then failure <- Some reason
             let mutable allowanceObserved = allowance.IsNone
-            let mutable excludedTargetObserved = excludedTarget.IsNone
             let names kind permanent =
                 match listObjectNames environment permanent kind with
                 | Some values -> values
@@ -1398,11 +1397,6 @@ module FirewalldRuntime =
             if not (namesMatch "zone" runtimeZones permanentZones) then refuse "Runtime and permanent firewalld zone inventories differ."
             if not (namesMatch "policy" runtimePolicies permanentPolicies) then refuse "Runtime and permanent firewalld policy inventories differ."
             if not (namesMatch "ipset" runtimeIpSets permanentIpSets) then refuse "Runtime and permanent firewalld ipset inventories differ."
-            match excludedTarget with
-            | Some(_, name) ->
-                excludedTargetObserved <- List.contains name excludedRuntimeNames || List.contains name excludedPermanentNames
-            | None -> ()
-
             let mutable services = Set.empty<string>
             let mutable icmpTypes = Set.empty<string>
             let mutable activeIpSets = Set.empty<string>
@@ -1604,8 +1598,6 @@ module FirewalldRuntime =
                 when Set.contains name activeIpSets && not (List.contains name permanentIpSets) ->
                 refuse "Reload would leave an active firewalld ipset selector unresolved."
             | _ -> ()
-            if not excludedTargetObserved then
-                refuse "The excluded target was not present in either firewalld inventory."
 
             if not allowanceObserved then
                 refuse "The requested missing selector was not the only proven live decrease."
@@ -1651,8 +1643,9 @@ module FirewalldRuntime =
         : Result<unit, string> =
         validateReloadAllowingMissingSelectors environment kind name [ field, value ]
 
-    /// Proves host-wide reload safety while excluding only the exact target object;
-    /// callers must separately verify its runtime state with observeExactly.
+    /// Compare all other objects. A new unreferenced object can be absent from
+    /// both daemon inventories until reload; callers verify its actual loaded
+    /// preimage and its staged/restored disk projection separately.
     let validateReloadExcludingTargetObject
         (environment: HostEnvironment)
         (kind: string)
