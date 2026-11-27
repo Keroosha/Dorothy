@@ -75,10 +75,62 @@ type FirewalldDockerGateTests() =
         transaction["status"] <- JsonValue.Create "pending"
         transaction.ToJsonString()
 
-
     let setPrivateDirectory path =
         Directory.CreateDirectory path |> ignore
         File.SetUnixFileMode(path, enum<UnixFileMode> 0o700)
+
+    let generatorDirectories =
+        [ "/etc/systemd/system-generators"
+          "/run/systemd/system-generators"
+          "/usr/local/lib/systemd/system-generators"
+          "/usr/lib/systemd/system-generators"
+          "/etc/systemd/system-environment-generators"
+          "/run/systemd/system-environment-generators"
+          "/usr/local/lib/systemd/system-environment-generators"
+          "/usr/lib/systemd/system-environment-generators" ]
+
+    let withGeneratorHost (action: HostEnvironment -> (string -> byte[] -> string) -> (CommandResult -> unit) -> unit) =
+        let root = Directory.CreateTempSubdirectory("dorothy-generator-profile-")
+        let mutable managerEnvironment =
+            { ExitCode = 0
+              Stdout = "PATH=/usr/sbin:/usr/bin:/sbin:/bin\n"
+              Stderr = "" }
+        let procExePath = Path.Combine(root.FullName, "proc", "1", "exe")
+        let run executable arguments _ =
+            match executable, arguments with
+            | "/usr/bin/systemctl", [ "show-environment" ] -> managerEnvironment
+            | "/usr/bin/sha256sum", [ "--"; path ] when path = procExePath ->
+                { ExitCode = 0
+                  Stdout = "799fd89964a716fb5f26c4506047190b6e842ac2745b473bd45351c4d8cbd929  " + path + "\n"
+                  Stderr = "" }
+            | "/usr/bin/apt-cache", [ "policy"; "docker.io" ] ->
+                { ExitCode = 0
+                  Stdout = "docker.io:\n  Installed: (none)\n  Candidate: 26.1.5+dfsg1-9+deb13u1+b1\n"
+                  Stderr = "" }
+            | "/usr/bin/stat", [ "-L"; "-c"; "%f"; "--"; path ] when File.Exists path ->
+                { ExitCode = 0; Stdout = "81ed\n"; Stderr = "" }
+            | "/usr/bin/stat", [ "-L"; "-c"; "%f"; "--"; _ ] ->
+                { ExitCode = 1; Stdout = ""; Stderr = "cannot stat file" }
+            | _ -> invalidOp ("Unexpected generator-profile command: " + executable + " " + String.concat " " arguments)
+        let environment: HostEnvironment = { HostEnvironment.system with Root = root.FullName; Run = run }
+        let writeHostFile (logicalPath: string) (body: byte[]) =
+            let path = HostEnvironment.path environment logicalPath
+            Directory.CreateDirectory(Path.GetDirectoryName path) |> ignore
+            File.WriteAllBytes(path, body)
+            path
+        let encode (value: string) = System.Text.Encoding.UTF8.GetBytes value
+        try
+            writeHostFile "/etc/debian_version" (encode "13.8\n") |> ignore
+            writeHostFile "/proc/1/environ" (encode "HOME=/\000PATH=/usr/sbin:/usr/bin:/sbin:/bin\000") |> ignore
+            writeHostFile "/proc/1/exe" (encode "mock systemd executable") |> ignore
+            action environment writeHostFile (fun result -> managerEnvironment <- result)
+        finally
+            if Directory.Exists root.FullName then root.Delete(true)
+
+    let assertRejectedFromEmptyInventory (environment: HostEnvironment) (addUnsafeItem: unit -> unit) =
+        Assert.That(Services.coldGeneratorProfile environment, Is.True, "The empty generator inventory must be a passing baseline.")
+        addUnsafeItem ()
+        Assert.That(Services.coldGeneratorProfile environment, Is.False)
 
     // A policy can be quiet until Docker binds its bridge. Query named loaded policies,
     // not just the active list. Input shape is firewall-cmd 2.3.1 --policy=NAME --list-all.
@@ -211,3 +263,88 @@ type FirewalldDockerGateTests() =
             Assert.That(File.Exists hook, Is.False)
         finally
             root.Delete(true)
+    [<Test>]
+    member _.``Cold generator profile permits missing and empty generator directories``() =
+        withGeneratorHost (fun environment _ _ ->
+            Assert.That(Services.coldGeneratorProfile environment, Is.True)
+            for directory in generatorDirectories do
+                Directory.CreateDirectory(HostEnvironment.path environment directory) |> ignore
+            Assert.That(Services.coldGeneratorProfile environment, Is.True))
+
+    [<TestCase("/etc/systemd/system-generators/untrusted")>]
+    [<TestCase("/run/systemd/system-generators/untrusted")>]
+    [<TestCase("/usr/local/lib/systemd/system-generators/untrusted")>]
+    [<TestCase("/etc/systemd/system-environment-generators/untrusted")>]
+    [<TestCase("/run/systemd/system-environment-generators/untrusted")>]
+    [<TestCase("/usr/local/lib/systemd/system-environment-generators/untrusted")>]
+    member _.``Cold generator profile rejects site executables``(logicalPath: string) =
+        withGeneratorHost (fun environment writeHostFile _ ->
+            assertRejectedFromEmptyInventory environment (fun () ->
+                let path = writeHostFile logicalPath (System.Text.Encoding.UTF8.GetBytes "#!/bin/sh\n")
+                File.SetUnixFileMode(path, enum<UnixFileMode> 0o755)))
+
+    [<TestCase("/etc/systemd/system-generators")>]
+    [<TestCase("/run/systemd/system-generators")>]
+    [<TestCase("/usr/local/lib/systemd/system-generators")>]
+    [<TestCase("/etc/systemd/system-environment-generators")>]
+    [<TestCase("/run/systemd/system-environment-generators")>]
+    [<TestCase("/usr/local/lib/systemd/system-environment-generators")>]
+    member _.``Cold generator profile rejects unknown site symlinks``(logicalDirectory: string) =
+        withGeneratorHost (fun environment _ _ ->
+            assertRejectedFromEmptyInventory environment (fun () ->
+                let path = HostEnvironment.path environment (logicalDirectory + "/unknown-generator")
+                Directory.CreateDirectory(Path.GetDirectoryName path) |> ignore
+                File.CreateSymbolicLink(path, Path.Combine(environment.Root, "unknown-generator-target")) |> ignore))
+
+    [<Test>]
+    member _.``Cold generator profile rejects a vendor executable masquerading as a stock generator``() =
+        withGeneratorHost (fun environment writeHostFile _ ->
+            assertRejectedFromEmptyInventory environment (fun () ->
+                let path =
+                    writeHostFile
+                        "/usr/lib/systemd/system-generators/systemd-fstab-generator"
+                        (System.Text.Encoding.UTF8.GetBytes "not the Debian stock generator")
+                File.SetUnixFileMode(path, enum<UnixFileMode> 0o755)))
+
+    [<Test>]
+    member _.``Cold generator profile rejects vendor environment generators``() =
+        withGeneratorHost (fun environment writeHostFile _ ->
+            assertRejectedFromEmptyInventory environment (fun () ->
+                let path =
+                    writeHostFile
+                        "/usr/lib/systemd/system-environment-generators/vendor-generator"
+                        (System.Text.Encoding.UTF8.GetBytes "#!/bin/sh\n")
+                File.SetUnixFileMode(path, enum<UnixFileMode> 0o755)))
+
+    [<TestCase("SYSTEMD_GENERATOR_PATH")>]
+    [<TestCase("SYSTEMD_ENVIRONMENT_GENERATOR_PATH")>]
+    member _.``Cold generator profile rejects PID1 generator path overrides``(variable: string) =
+        withGeneratorHost (fun environment writeHostFile _ ->
+            assertRejectedFromEmptyInventory environment (fun () ->
+                let pid1Environment =
+                    "HOME=/\000PATH=/usr/sbin:/usr/bin:/sbin:/bin\000"
+                    + variable + "=/opt/unapproved\000"
+                writeHostFile "/proc/1/environ" (System.Text.Encoding.UTF8.GetBytes pid1Environment) |> ignore))
+
+    [<TestCase("SYSTEMD_GENERATOR_PATH")>]
+    [<TestCase("SYSTEMD_ENVIRONMENT_GENERATOR_PATH")>]
+    member _.``Cold generator profile rejects manager generator path overrides``(variable: string) =
+        withGeneratorHost (fun environment _ setManagerEnvironment ->
+            assertRejectedFromEmptyInventory environment (fun () ->
+                setManagerEnvironment
+                    { ExitCode = 0
+                      Stdout = "PATH=/usr/sbin:/usr/bin:/sbin:/bin\n" + variable + "=/opt/unapproved\n"
+                      Stderr = "" }))
+
+    [<Test>]
+    member _.``Cold generator profile requires explicit PID1 and manager environment data``() =
+        withGeneratorHost (fun environment writeHostFile setManagerEnvironment ->
+            assertRejectedFromEmptyInventory environment (fun () ->
+                File.Delete(HostEnvironment.path environment "/proc/1/environ"))
+            // Restore PID1's environment before checking systemctl's independent evidence.
+            writeHostFile
+                "/proc/1/environ"
+                (System.Text.Encoding.UTF8.GetBytes "HOME=/\000PATH=/usr/sbin:/usr/bin:/sbin:/bin\000")
+            |> ignore
+            assertRejectedFromEmptyInventory environment (fun () ->
+                setManagerEnvironment { ExitCode = 1; Stdout = ""; Stderr = "systemctl failed" }))

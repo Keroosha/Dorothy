@@ -19,6 +19,74 @@ module Services =
             fail "Invalid systemd unit name."
         if name.EndsWith(".service", StringComparison.Ordinal) then name else name + ".service"
 
+    // Debian 13 amd64 cold-install profile. These generators come from the
+    // measured Debian packages; an installed name alone does not authenticate
+    // its implementation. Refresh deliberately when qualifying another image.
+    let private stockGenerators =
+        Map.ofList [
+            "netplan", "177488cdedb8637758cc2ec6521d1076609095f199499911b0a34a1f9b3f3c51"
+            "systemd-debug-generator", "0ed5110c491db1663a505b27658464d18516be2436310ab3e7074872a6b78d57"
+            "systemd-fstab-generator", "48b1e471ae09e84b1077275bf3e3620c28b7aa915837bf333cef20147ef370ea"
+            "systemd-getty-generator", "03b892ea431712300685687841c23ed8927317e7f52a2dcaa5d59a92a3b024c6"
+            "systemd-gpt-auto-generator", "5cab1473324acfe319121786aa49cb3a34e73ad715c673c34068799827abf2ff"
+            "systemd-hibernate-resume-generator", "2230099ee3150e2b5568d0a8a602d2f64a43346a1fd64f61acd9975230a625cf"
+            "systemd-rc-local-generator", "4924e494016eb3fac64c7d224d570d8d6b63dfdda44e2e5f50096c47ed21b966"
+            "systemd-run-generator", "ef797a9f83c1052c10f60194dd25f0cd051418b76ef89d598feeb3a25f0ffba5"
+            "systemd-ssh-generator", "7dcfab738a560149936db7b11ebfa5ca9317b50902cabbd48739ba77b001c649"
+            "systemd-system-update-generator", "a4530d6dc256d902786acb32372b678f196a4a760db135a0bbd68e35c4ce9824"
+            "systemd-sysv-generator", "662f91830e6f76e08a47be605ba2480ae87add1eac44aa095629bc0a4484cb11"
+            "systemd-tpm2-generator", "07dd5f254baa1f830c1ce97d9155b79fdde4e61a6ff84b0161439f63fc250f77" ]
+
+    let internal coldGeneratorProfile (environment: HostEnvironment) =
+        let path = HostEnvironment.path environment
+        let known vendor (file: string) =
+            match Map.tryFind (Path.GetFileName file) stockGenerators with
+            | Some hash when vendor ->
+                // Do not open a FIFO/device even if given a stock filename.
+                let info = environment.Run "/usr/bin/stat" [ "-L"; "-c"; "%f"; "--"; file ] None
+                info.ExitCode = 0 && info.Stderr = ""
+                && (Convert.ToInt32(info.Stdout.Trim(), 16) &&& 0xf000) = 0x8000
+                && (use stream = File.OpenRead file
+                    Convert.ToHexStringLower(Security.Cryptography.SHA256.HashData stream) = hash)
+            | _ -> false
+        let directory prefix kind =
+            let dir = path (prefix + "/systemd/" + kind)
+            let attributes =
+                try Some(File.GetAttributes dir)
+                with :? DirectoryNotFoundException | :? FileNotFoundException -> None
+            match attributes with
+            | None -> true
+            | Some attrs ->
+                attrs.HasFlag FileAttributes.Directory && not (attrs.HasFlag FileAttributes.ReparsePoint)
+                && (Directory.EnumerateFileSystemEntries dir
+                    |> Seq.forall (known (prefix = "/usr/lib" && kind = "system-generators")))
+        let ordinaryEnvironment (separator: char) (text: string) =
+            let entries = text.Split(separator, StringSplitOptions.RemoveEmptyEntries)
+            entries.Length > 0 && entries |> Array.forall (fun entry ->
+                let i = entry.IndexOf '='
+                i > 0 &&
+                match entry.Substring(0, i) with
+                | "PATH" ->
+                    entry.Substring(i + 1).Split(':')
+                    |> Array.forall (function "/usr/local/sbin" | "/usr/local/bin" | "/usr/sbin" | "/usr/bin" | "/sbin" | "/bin" -> true | _ -> false)
+                | "LANG" | "HOME" | "PWD" | "TERM" | "SHLVL" | "init" | "rootmnt" | "drop_caps" -> true
+                | _ -> false)
+        try
+            let manager = environment.Run "/usr/bin/systemctl" [ "show-environment" ] None
+            let exe = path "/proc/1/exe"
+            let pid1 = environment.Run "/usr/bin/sha256sum" [ "--"; exe ] None
+            let apt = environment.Run "/usr/bin/apt-cache" [ "policy"; "docker.io" ] None
+            let candidate = apt.Stdout.Split('\n') |> Array.filter (fun s -> s.TrimStart().StartsWith("Candidate:", StringComparison.Ordinal))
+            File.ReadAllText(path "/etc/debian_version").Trim() = "13.8"
+            && pid1.ExitCode = 0 && pid1.Stderr = ""
+            && pid1.Stdout.TrimEnd('\n') = "799fd89964a716fb5f26c4506047190b6e842ac2745b473bd45351c4d8cbd929  " + exe
+            && apt.ExitCode = 0 && apt.Stderr = "" && candidate = [| "  Candidate: 26.1.5+dfsg1-9+deb13u1+b1" |]
+            && ordinaryEnvironment '\000' (File.ReadAllText(path "/proc/1/environ"))
+            && manager.ExitCode = 0 && manager.Stderr = "" && ordinaryEnvironment '\n' manager.Stdout
+            && [ "/etc"; "/run"; "/usr/local/lib"; "/usr/lib" ]
+               |> List.forall (fun p -> directory p "system-generators" && directory p "system-environment-generators")
+        with _ -> false
+
     // A missing unit has no merged ExecStartPre in PID 1. Ask systemd's own
     // offline loader whether this exact drop-in slot would contribute a
     // mandatory command once a service fragment exists. Never load or start
@@ -121,7 +189,10 @@ module Services =
                 let absent = Array.contains "LoadState=not-found" lines
                 if absent then
                     coldBootstrap <- true
-                    fences = Some [] && (r.ExitCode = 0 || r.ExitCode = 4) && r.Stderr = ""
+                    let supported = fences = Some [] && coldGeneratorProfile environment
+                    if operation = "apply" && fences = Some [] && not supported then
+                        fail "Cannot establish the supported Debian cold-install generator profile; refusing before Docker package installation."
+                    supported && (r.ExitCode = 0 || r.ExitCode = 4) && r.Stderr = ""
                     && Array.contains "NeedDaemonReload=no" lines && coldHookEffective environment p body
                 else
                     r.ExitCode = 0 && String.IsNullOrWhiteSpace r.Stderr
