@@ -427,7 +427,7 @@ module FirewalldRecoveryProof =
         match verdicts with
         | [ verdict ] when verdict.Name = "drop" || verdict.Name = "reject" -> Restricts
         | [ verdict ] when verdict.Name = "accept" -> Grants
-        | [ verdict ] when verdict.Name = "forward-port" || verdict.Name = "masquerade" -> Steers
+        | [ verdict ] when verdict.Name = "forward-port" || verdict.Name = "masquerade" || verdict.Name = "mark" -> Steers
         | _ -> fail "A rich rule has no single reversible monotone verdict; refusing runtime-only repair."
 
     let private deltaEffect (configuration: FirewalldModel.Configuration) field value =

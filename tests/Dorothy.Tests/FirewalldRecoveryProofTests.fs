@@ -474,6 +474,25 @@ type FirewalldRecoveryProofTests() =
             Assert.That(calls, Does.Contain [ "firewall-cmd"; "--zone=quiet"; "--remove-port=8443/tcp" ]))
 
     [<Test>]
+    member _.``A single routing mark has a scoped inverse but cannot be batched with a grant``() =
+        let before = { FirewalldModel.empty "zone" "quiet" with Services = [ "ssh" ] }
+        let mark =
+            element "rule" [ "family", "ipv4" ]
+                [ element "port" [ "port", "8443"; "protocol", "tcp" ] []
+                  element "mark" [ "set", "0x2" ] [] ]
+        let after = { before with Elements = [ mark ] }
+        let beforeXml = Some(FieldRuntime.render before)
+        withSelectorRuntime before (selectorValues before) (fun environment _ current _ ->
+            let prove candidate =
+                FirewalldRecoveryProof.objectDeltaProof environment candidate beforeXml (Some(FieldRuntime.render candidate))
+            Assert.That((prove { after with Ports = [ "8444/tcp" ] }).IsNone, Is.True)
+            let proof = prove after |> Option.get
+            FirewalldRecoveryProof.activateObjectDelta environment after beforeXml proof
+            Assert.That((current ())["rich rules"], Is.EquivalentTo((selectorValues after)["rich rules"]))
+            restoreWithoutReload environment after beforeXml (Some proof) FirewalldLifecycle.ActiveDaemon
+            Assert.That((current ())["rich rules"], Is.Empty))
+
+    [<Test>]
     member _.``Scoped release records the restored baseline rather than departing inputs``() =
         let departing = { FirewalldModel.empty "zone" "quiet" with Services = [ "ssh" ]; Ports = [ "8443/tcp" ] }
         let baseline = { departing with Ports = [] }
