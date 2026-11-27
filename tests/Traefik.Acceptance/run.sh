@@ -1365,9 +1365,27 @@ grep -Fq 'prior configuration could not be verified' "$state_dir/logs/unverified
 }
 remote "bash '$GUEST_ROOT/review-transactions.sh' unverified-rollback-assert '$GUEST_ROOT'" \
     > "$state_dir/logs/unverified-rollback-assert.log" 2>&1
+for binding in static credentials unit binary; do
+    remote "bash '$GUEST_ROOT/review-transactions.sh' recovery-tamper '$GUEST_ROOT' '$binding'"
+    expect_pulumi_failure rotate "unverified-$binding-refusal.log" up --stack acceptance --yes --skip-preview --non-interactive --parallel 1
+    grep -Fq 'dynamic recovery refused:' "$state_dir/logs/unverified-$binding-refusal.log"
+    remote "bash '$GUEST_ROOT/review-transactions.sh' recovery-restore '$GUEST_ROOT' '$binding'"
+done
+expect_pulumi_failure rollback unverified-static-request.log up --stack acceptance --yes --skip-preview --non-interactive --parallel 1
+grep -Fq 'requires more than a dynamic file update' "$state_dir/logs/unverified-static-request.log"
+for point in bound written; do
+    remote "bash '$GUEST_ROOT/review-transactions.sh' recovery-interrupt '$GUEST_ROOT' '$point'"
+    expect_pulumi_failure rotate "repair-interrupted-$point.log" up --stack acceptance --yes --skip-preview --non-interactive --parallel 1
+    tx_control restart-interrupt-remove
+    tx_control recovery-assert-bound
+    expect_pulumi_failure rollback-udp "unrelated-target-$point.log" up --stack acceptance --yes --skip-preview --non-interactive --parallel 1
+    grep -Fq 'already bound to another target' "$state_dir/logs/unrelated-target-$point.log"
+done
 run_pulumi rotate unverified-repair-up.log up --stack acceptance --yes --non-interactive --parallel 1
 remote "bash '$GUEST_ROOT/review-transactions.sh' unverified-repair-assert '$GUEST_ROOT'" \
     > "$state_dir/logs/unverified-repair-assert.log" 2>&1
+tx_control verify-receipt
+copy_from_guest "$GUEST_ROOT/logs/healthy-recovery-after.json" "$state_dir/healthy-recovery-after.json" "$state_dir/logs/healthy-recovery-after-copy.log"
 remote "bash '$GUEST_ROOT/review-transactions.sh' disabled-inject '$GUEST_ROOT'"
 expect_pulumi_failure rollback-udp disabled-rollback.log up --stack acceptance --yes --non-interactive --skip-preview --parallel 1
 grep -Fq 'prior configuration could not be verified' "$state_dir/logs/disabled-rollback.log"
@@ -1506,6 +1524,21 @@ jq -n \
         systemctlExit: $systemctlExit
     }' > "$state_dir/foreign-owner-delete-metrics.json"
 chmod 600 "$state_dir/foreign-owner-delete-metrics.json"
+# A real second rollback, not a transplanted witness. No positive repair or
+# claim of health follows either of these final rejection controls.
+run_pulumi withdraw-udp before-stale-recovery.log up --stack acceptance --yes --non-interactive --parallel 1
+tx_control recovery-negative-inject
+expect_pulumi_failure rollback-udp before-stale-recovery-rollback.log up --stack acceptance --yes --skip-preview --non-interactive --parallel 1
+grep -Fq 'prior configuration could not be verified' "$state_dir/logs/before-stale-recovery-rollback.log"
+remote 'j=/etc/keroosha-iac/traefik/.keroosha-rollback.json; test "$(jq -er .recovery.invocation "$j")" = "$(systemctl show keroosha-traefik.service -p InvocationID --value)" && systemctl restart keroosha-traefik.service'
+expect_pulumi_failure rotate stale-recovery-invocation.log up --stack acceptance --yes --skip-preview --non-interactive --parallel 1
+grep -Fq 'rollback start is no longer the running invocation' "$state_dir/logs/stale-recovery-invocation.log"
+tx_control recovery-stale-assert
+tx_control recovery-historical
+historical_before=$(remote 'sha256sum /etc/keroosha-iac/traefik/.keroosha-rollback.json')
+expect_pulumi_failure rotate historical-recovery-refusal.log up --stack acceptance --yes --skip-preview --non-interactive --parallel 1
+grep -Fq 'restart requires a confirmed static file' "$state_dir/logs/historical-recovery-refusal.log"
+[[ $(remote 'sha256sum /etc/keroosha-iac/traefik/.keroosha-rollback.json') == "$historical_before" ]]
 remote 'find /var/lib/keroosha-traefik -maxdepth 1 -type f -name "acme-*.json" -size +0c -print | sort' \
     > "$state_dir/acme-stores-before-delete.txt"
 while read -r name port; do

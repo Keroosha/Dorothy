@@ -1568,3 +1568,13 @@ type TraefikBackendTests() =
                 observability["traceVerbosity"] <- JsonValue.Create("minimal")
                 child["observability"] <- observability)
         Assert.That(childWithObservability, Is.False, "Child routers do not inherit root defaults.")
+
+    [<Test>]
+    member _.``Only the identical bound dynamic step can resume across rename``() =
+        let accepts bound before after = Traefik.recoveryDiskAccepted bound "candidate" before after
+        Assert.That(accepts None true false, Is.True)
+        Assert.That(accepts None false true, Is.False, "An unbound journal cannot adopt an already installed candidate.")
+        Assert.That(accepts (Some "different") true false, Is.False, "The preimage must not reopen target selection.")
+        Assert.That(accepts (Some "candidate") true false, Is.True, "Interrupted before rename.")
+        Assert.That(accepts (Some "candidate") false true, Is.True, "Interrupted after rename.")
+        Assert.That(accepts (Some "candidate") false false, Is.False, "Foreign bytes after binding.")

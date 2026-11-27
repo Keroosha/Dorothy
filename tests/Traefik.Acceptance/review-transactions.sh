@@ -12,6 +12,9 @@ mode=$1
 guest_root=$2
 shift 2
 case "$mode" in
+    recovery-tamper|recovery-restore) [[ $# == 1 && $1 =~ ^(static|credentials|unit|binary)$ ]] || usage ;;
+    recovery-interrupt) [[ $# == 1 && $1 =~ ^(bound|written)$ ]] || usage ;;
+    recovery-assert-bound|recovery-negative-inject|recovery-stale-assert|recovery-historical) [[ $# == 0 ]] || usage ;;
     legacy-static-inject|legacy-static-reconcile|legacy-witness|maintenance-stop|verify-receipt|stale-receipt|opaque-tls-inject|opaque-transport-inject|opaque-witness|opaque-reconcile|disabled-rollback) [[ $# == 0 ]] || usage ;;
     disabled-inject|disabled-repaired) [[ $# == 0 ]] || usage ;;
     healthy-disk-inject|healthy-disk-refused|healthy-disk-reconcile) [[ $# == 0 ]] || usage ;;
@@ -422,14 +425,17 @@ unverified_rollback_assert() {
     [[ -f "$journal_file" && ! -L "$journal_file" ]] || fail 'unverifiable rollback cleared its owner journal'
     journal_mode=$(stat -c '%a %u' "$journal_file")
     [[ "$journal_mode" == '600 0' ]] || fail 'unverifiable rollback journal is not private root-owned mode 0600'
-    jq -e --arg owner "$owner" '.version == 3 and .owner == $owner and .restartRequired == false' "$journal_file" >/dev/null \
+    jq -e --arg owner "$owner" --arg invocation "$(systemctl show keroosha-traefik.service -p InvocationID --value)" '.version == 4 and .owner == $owner and .restartRequired == false and .recovery.invocation == $invocation and .recovery.target == null' "$journal_file" >/dev/null \
         || fail 'unverifiable rollback journal lost its owner or restart intent'
+    [[ $(sed -n 2p "$config_dir/.keroosha-static-receipt") != "$(jq -r .recovery.invocation "$journal_file")" ]] || fail 'unhealthy rollback was promoted to a confirmed receipt'
+    probe_udp recovery-withdrawn 19000 127.0.0.5 false false
+    probe_udp recovery-survivor 19003 127.0.0.6 true true
     cmp "$static_file" <(jq -er .static "$journal_file" | base64 -d) || fail 'journal static preimage differs'
     cmp "$dynamic_file" <(jq -er .dynamic "$journal_file" | base64 -d) || fail 'journal dynamic preimage differs'
     catalog_observation 503 "$root/logs/unhealthy-disk-after.json"
     jq -n --arg case "unverifiable-rollback-retained" --arg mainPid "$pid" \
         --arg dynamicSha256 "$(<"$root/logs/unverified-dynamic-drift.sha256")" \
-        --argjson journalVersion 3 --argjson rollbackVerified false --argjson journalPresent true \
+        --argjson journalVersion 4 --argjson rollbackVerified false --argjson journalPresent true \
         --arg journalMode "0600" --argjson ownerDigestMatched true --argjson httpControlStatus 503 \
         '{case:$case,mainPid:$mainPid,dynamicSha256:$dynamicSha256,journalVersion:$journalVersion,rollbackVerified:$rollbackVerified,journalPresent:$journalPresent,journalMode:$journalMode,ownerDigestMatched:$ownerDigestMatched,httpControlStatus:$httpControlStatus}' \
         > "$root/logs/review-transactions-unverified-rollback.json"
@@ -446,6 +452,7 @@ unverified_repair_assert() {
     [[ "$(digest_file "$dynamic_file")" != "$(<"$root/logs/unverified-dynamic-drift.sha256")" ]] \
         || fail 'corrective Apply left the invalid dynamic drift in place'
     assert_http_control
+    catalog_observation 200 "$root/logs/healthy-recovery-after.json"
     jq -n --arg case "unverifiable-baseline-repaired" --arg mainPid "$pid" \
         --arg dynamicSha256 "$(digest_file "$dynamic_file")" --argjson journalPresent false \
         --argjson graphRestored true --argjson ownerDigestMatched true --argjson httpControlStatus 200 \
@@ -513,6 +520,17 @@ restart_interrupt_install() {
 #!/usr/bin/env bash
 set -euo pipefail
 root='$root'
+if [[ -f "\$root/.recovery-interrupt" && "\${1:-}" == show ]]; then
+    j=/etc/keroosha-iac/traefik/.keroosha-rollback.json
+    target=\$(jq -er '.recovery.target // empty' "\$j" 2>/dev/null || :)
+    phase=\$(cat "\$root/.recovery-interrupt")
+    if [[ \$target =~ ^[a-f0-9]{64}$ && ( "\$phase" == bound || "\$(sha256sum /etc/keroosha-iac/traefik/dynamic/current.yml | cut -d' ' -f1)" == "\$target" ) ]]; then
+        rm -- "\$root/.recovery-interrupt"
+        printf '%s\\n' "\$phase" > "\$root/logs/recovery-interrupted"
+        kill -KILL "\$PPID"
+        exit 137
+    fi
+fi
 if [[ "\${1:-}" == restart && "\${2:-}" == keroosha-traefik.service && -e "\$root/.restart-interrupt-pending" ]]; then
     rm -f -- "\$root/.restart-interrupt-pending"
     printf '%s\\n' "\$PPID" > "\$root/logs/restart-interrupted-helper.pid"
@@ -702,6 +720,52 @@ restart_interrupt_assert_static_restarted() {
 
 
 case "$mode" in
+    recovery-tamper|recovery-restore)
+        kind=$1
+        case $kind in
+            static) path=$static_file ;; credentials) path=$credentials_file ;; unit) path=$unit_file ;; binary) path=$binary_file ;;
+        esac
+        backup="$root/recovery-$kind.original"
+        if [[ $mode == recovery-tamper ]]; then
+            [[ ! -e "$backup" && -f "$path" && ! -L "$path" ]]
+            cp -p -- "$path" "$backup"
+            tmp=$(mktemp "$(dirname "$path")/.alter.XXXXXXXX"); cp -p "$path" "$tmp"
+            printf '\n' >> "$tmp"; mv -T "$tmp" "$path"
+            digest_file "$path" > "$root/recovery-$kind.changed"
+            digest_file "$journal_file" > "$root/recovery-$kind.journal"
+        else
+            [[ $(digest_file "$path") == "$(<"$root/recovery-$kind.changed")" && $(digest_file "$journal_file") == "$(<"$root/recovery-$kind.journal")" ]]
+            tmp=$(mktemp "$(dirname "$path")/.restore.XXXXXXXX"); cp -p "$backup" "$tmp"; mv -T "$tmp" "$path"
+        fi ;;
+    recovery-interrupt)
+        restart_interrupt_install
+        printf '%s\n' "$1" > "$root/.recovery-interrupt" ;;
+    recovery-assert-bound)
+        [[ ! -e "$root/.recovery-interrupt" && -s "$root/logs/recovery-interrupted" ]]
+        jq -e '.version == 4 and (.recovery.target | test("^[a-f0-9]{64}$"))' "$journal_file" >/dev/null
+        if [[ $(<"$root/logs/recovery-interrupted") == bound ]]; then
+            cmp "$dynamic_file" <(jq -er .dynamic "$journal_file" | base64 -d)
+        else
+            [[ $(digest_file "$dynamic_file") == "$(jq -r .recovery.target "$journal_file")" ]]
+        fi ;;
+    recovery-negative-inject)
+        verify_owned_service >/dev/null
+        [[ ! -e "$journal_file" ]]
+        tmp=$(mktemp "${dynamic_file}.fixture.XXXXXXXX")
+        jq 'del(.http.services.catalog.loadBalancer.servers)' "$dynamic_file" > "$tmp"
+        chown --reference="$dynamic_file" "$tmp"; chmod --reference="$dynamic_file" "$tmp"; mv -T "$tmp" "$dynamic_file"
+        catalog_observation 503 "$root/logs/stale-recovery-baseline.json" ;;
+    recovery-stale-assert)
+        jq -e --arg id "$(systemctl show keroosha-traefik.service -p InvocationID --value)" '.version==4 and .recovery.invocation != $id and .recovery.target==null' "$journal_file" >/dev/null
+        catalog_observation 503 "$root/logs/stale-recovery-refused.json" ;;
+    recovery-historical)
+        # Negative control only, after all positive repair checks. Keep the real
+        # v4 journal privately; no bootstrap or positive Apply follows this.
+        [[ ! -e "$root/pre-historical.journal" ]]
+        cp -p "$journal_file" "$root/pre-historical.journal"
+        tmp=$(mktemp "$config_dir/.historical.XXXXXXXX")
+        jq 'select(.version==4) | del(.recovery) | .version=3' "$journal_file" > "$tmp"
+        [[ -s "$tmp" ]]; chmod 600 "$tmp"; mv -T "$tmp" "$journal_file" ;;
     maintenance-stop)
         verify_owned_service >/dev/null
         [[ ! -e "$journal_file" ]] || fail 'maintenance transition refuses a pending transaction'

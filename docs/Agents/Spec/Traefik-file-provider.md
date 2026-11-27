@@ -55,6 +55,12 @@ The private API cannot identify every static field (for example `log.level`). Be
 
 Upgrading the provider, preview, refresh, and an unchanged deployment do not stop the service or adopt a historical configuration. The **first restart-requiring change** without a valid receipt needs a maintenance window: back up the owned files (including credentials, privately), preserve unrelated edits and pending journals, reconcile the desired configuration with its authoritative source, and explicitly stop the owned service. Run a normal Apply with refresh, then verify backend-specific responses and the expected TLS leaf. Normal verified helper starts refresh the receipt; do not fabricate one, delete a pending journal, or use an external restart as a substitute. A restorable but already broken dynamic graph does not promise healthy traffic: inspect the activation and rollback diagnoses separately.
 
+### Repairing a restored but unhealthy dynamic graph
+
+A pending rollback journal is not a positive Read or a health receipt. If the helper itself started the previously confirmed static bytes, an unhealthy rollback may retain that start as evidence in the private journal. The helper correlates its systemd `StartUnit` job with the manager's completion record and the live invocation. It does not infer a start from a matching PID, leaf certificate or file on disk.
+
+With this evidence, an Apply that changes only the dynamic file can bind one target digest to that transaction. If interrupted, retry the same declaration. The helper accepts only the saved preimage or that bound target; it does not reselect a target or restart the service. It checks the prior receipt, service identity, binary, unit, credential and certificate material before writing. A new health receipt requires full readiness. An external restart, foreign bytes, a different target, or a pre-existing journal with no start evidence does not qualify. Preserve the journal and external changes for operator reconciliation rather than deleting or editing the journal to force an Apply.
+
 ### Reviewed baseline at `2da8bc4`
 
 The isolated producer run completed on one commit/helper. It distinguished a healthy backend-specific 200 across a pre-stage refusal from an already-loaded empty backend returning 503 before and after a failed candidate. The latter was repaired by a subsequent Apply, not by rollback. Delete preserved six nonempty stores by name and SHA-256. This run did **not** exercise a disabled router repair or establish attribution for rejected changes confined to opaque fields.
