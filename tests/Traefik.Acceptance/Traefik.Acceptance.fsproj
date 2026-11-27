@@ -4,6 +4,7 @@
     <TargetFramework>net10.0</TargetFramework>
     <AssemblyName>Traefik.Acceptance</AssemblyName>
     <RootNamespace>Dorothy.Traefik.Acceptance</RootNamespace>
+    <WarningsAsErrors>$(WarningsAsErrors);FS0020;FS3221</WarningsAsErrors>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="../../src/Dorothy.DSL/Dorothy.DSL.fsproj" />

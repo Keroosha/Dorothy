@@ -22,6 +22,7 @@ esac
     printf 'Private acceptance ownership marker is missing.\n' >&2
     exit 2
 }
+bash "$script_dir/../guest-barrier-check.sh" acceptance "$state_dir"
 [[ "$phase" =~ ^[A-Za-z0-9][A-Za-z0-9_-]*$ ]] || { printf 'Invalid review phase name.\n' >&2; exit 2; }
 case "$pulumi_command" in
     up|preview|refresh|destroy) ;;
@@ -169,18 +170,12 @@ if ! pulumi login "$PULUMI_BACKEND_URL" --non-interactive \
     exit 1
 fi
 
-pulumi_project="$state_dir/pulumi-project"
+# The engine keys this resource by project/stack/backend, not the directory containing
+# Pulumi.yaml. Keep the original consumer's manifest untouched, even across SIGKILL.
+pulumi_project="$state_dir/review-pulumi-project"
+mkdir -m 700 -p "$pulumi_project"
+cp -p "$state_dir/pulumi-project/Pulumi.acceptance.yaml" "$pulumi_project/"
 manifest="$pulumi_project/Pulumi.yaml"
-manifest_backup="$state_dir/review-Pulumi.yaml.backup"
-[[ ! -e "$manifest_backup" && ! -L "$manifest_backup" ]] || { printf 'A review manifest backup already exists.\n' >&2; exit 2; }
-cp -p "$manifest" "$manifest_backup"
-restore_manifest() {
-    if [[ -f "$manifest_backup" && -f "$manifest" ]]; then
-        cp -p "$manifest_backup" "$manifest"
-        rm -f -- "$manifest_backup"
-    fi
-}
-trap restore_manifest EXIT
 cat > "$manifest" <<EOF
 name: traefik-acceptance
 runtime:

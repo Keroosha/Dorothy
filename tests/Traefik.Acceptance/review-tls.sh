@@ -70,6 +70,30 @@ active_storage_path() {
     printf '%s' "$path"
 }
 
+# Exercise the otherwise unprobed client-auth-only route with a dedicated, verified client.
+# Return only the public leaf digest. The disposable CA, client key and account stay in guest.
+wire_leaf() {
+    local ca_port=$1 ca="$FIXTURE/issuer-$1.pem" body="$FIXTURE/wire.body"
+    curl --fail --silent --show-error --noproxy '*' --max-time 6 --cacert "$root/certs/pebble.minica.pem" \
+        "https://localhost:$ca_port/roots/0" -o "$ca" || return 1
+    curl --fail --silent --show-error --noproxy '*' --max-time 6 --resolve "$HOST:18444:127.0.0.1" \
+        --cert "$root/certs/client.pem" --key "$root/certs/client.key" --cacert "$ca" \
+        "https://$HOST:18444/review-store" -o "$body" || return 1
+    grep -Fq 'http-backend:/review-store;forwarded:' "$body" || return 1
+    timeout 6 openssl s_client -servername "$HOST" -connect 127.0.0.1:18444 -showcerts \
+        -cert "$root/certs/client.pem" -key "$root/certs/client.key" -CAfile "$ca" \
+        -verify_hostname "$HOST" -verify_return_error </dev/null 2>/dev/null \
+        | awk '/BEGIN CERTIFICATE/{n++} n==1{print} /END CERTIFICATE/ && n==1{n++}' \
+        | openssl x509 -outform DER | sha256sum | awk '{print $1}'
+}
+
+assert_cached_leaf() {
+    [[ $(systemctl show --property=MainPID --value keroosha-traefik.service) == "$(<"$FIXTURE/original.pid")" ]] \
+        || fail 'the server restarted during the store-only mutation'
+    [[ $(wire_leaf 15000) == "$(<"$FIXTURE/original-leaf.sha256")" ]] \
+        || fail 'store-only mutation did not leave the same authenticated leaf serving on the wire'
+}
+
 load_snapshot() {
     fail_if_unsafe_file "$SNAPSHOT"
     local path hash saved_metadata
@@ -121,6 +145,9 @@ case "$mode" in
         fail_if_unsafe_file "$store"
         [[ "$(metadata "$store")" == "$EXPECTED_METADATA" ]] || fail 'ACME store permissions or ownership are unsafe'
         store_hash=$(digest "$store")
+        wire_leaf 15000 > "$FIXTURE/original-leaf.sha256" || fail 'baseline authenticated TLS route failed'
+        grep -Eq '^[0-9a-f]{64}$' "$FIXTURE/original-leaf.sha256" || fail 'baseline public leaf digest is invalid'
+        systemctl show --property=MainPID --value keroosha-traefik.service > "$FIXTURE/original.pid"
         store_metadata=$(metadata "$store")
         cp --preserve=mode,ownership,timestamps -- "$store" "$SAVED_STORE" || fail 'cannot preserve original ACME store'
         chmod 600 "$SAVED_STORE"
@@ -138,6 +165,7 @@ case "$mode" in
         [[ "$(active_storage_path)" == "$store" ]] || fail 'active ACME resolver storage changed before removal'
         check_saved_store "$store" "$store_hash" "$store_metadata"
         rm -- "$store" || fail 'cannot remove ACME store'
+        assert_cached_leaf
         printf 'review-tls missing-store:injected\n'
         ;;
     incomplete)
@@ -162,6 +190,7 @@ case "$mode" in
         chmod "$mode" "$stage" || fail 'cannot preserve incomplete ACME store permissions'
         mv -fT -- "$stage" "$store" || fail 'cannot install incomplete ACME store'
         [[ "$(metadata "$store")" == "$store_metadata" ]] || fail 'incomplete ACME store metadata changed'
+        assert_cached_leaf
         printf 'review-tls incomplete-store:injected\n'
         ;;
     restore)
@@ -179,6 +208,9 @@ case "$mode" in
         check_saved_store "$old_store" "$store_hash" "$store_metadata"
         fail_if_unsafe_file "$new_store"
         [[ "$(metadata "$new_store")" == "$EXPECTED_METADATA" ]] || fail 'new issuer store permissions or ownership are unsafe'
+        switched_leaf=$(wire_leaf 15001) || fail 'switched same-name resolver did not serve a leaf verified by the second issuer'
+        [[ "$switched_leaf" =~ ^[a-f0-9]{64}$ && "$switched_leaf" != "$(<"$FIXTURE/original-leaf.sha256")" ]] \
+            || fail 'same-name issuer switch did not change the authenticated on-wire leaf'
         printf 'review-tls issuer-switch:isolated\n'
         ;;
 esac

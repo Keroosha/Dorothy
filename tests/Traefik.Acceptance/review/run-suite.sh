@@ -18,6 +18,7 @@ esac
     printf 'Private acceptance ownership marker is missing.\n' >&2
     exit 2
 }
+bash "$script_dir/../guest-barrier-check.sh" acceptance "$state_dir"
 source "$state_dir/handle.env"
 for command in pulumi scp ssh realpath sha256sum grep jq; do
     command -v "$command" >/dev/null || { printf 'Missing required command: %s\n' "$command" >&2; exit 2; }
@@ -234,6 +235,11 @@ printf '\n' >> "$state_dir/logs/review-client-checks.log"
 run_listener_stage prepare
 export_checkpoint "$state_dir/review-trust-baseline-checkpoint.json"
 assert_read_checkpoint "$state_dir/review-trust-baseline-checkpoint.json" true "Trust-drift baseline"
+# Both modeled root routers inherit TLS only on review-secure and share one SNI/socket.
+# The cleartext review-front bind must not count as a handshake.
+jq -e --arg u "$legacy_urn" '.deployment.resources[] | select(.urn==$u) | .outputs.tlsProbeSummary |
+    .legacyProbesAttempted==1 and .nativeProbesAttempted==1 and .unprobedCount==0 and .truncated==0' \
+    "$state_dir/review-trust-baseline-checkpoint.json" >/dev/null
 structured_inputs_hash=$(checkpoint_input_hash)
 structured_config_hash=$(config_hash)
 

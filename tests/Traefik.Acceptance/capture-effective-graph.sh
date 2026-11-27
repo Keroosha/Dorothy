@@ -3,9 +3,12 @@
 # otherwise-identical daemon with different live policy. No production host paths or credentials.
 set -euo pipefail
 umask 077
+curl() { command curl --disable --noproxy '*' "$@"; }
 fixture=$(realpath -e -- "${1:?guest fixture directory required}")
 [[ "$fixture" =~ ^/var/tmp/dorothy-traefik-acceptance\.[[:alnum:]]+$ && -f "$fixture/.owner" && $(<"$fixture/.owner") == dorothy-traefik-acceptance-guest-v1 ]]
-exe="$fixture/bin/traefik"; "$exe" version | grep -Eq '^Version:[[:space:]]+3\.7\.16$'
+exe="$fixture/bin/traefik"
+[[ $(sha256sum "$exe" | awk '{ print $1 }') == 86ee2b427888d24475051fc5f5bcca94cf4fa033b6fa54205b7eb0de6914f31e ]] \
+    || { printf 'Pinned Traefik executable digest mismatch.\n' >&2; exit 1; }
 out=$(mktemp -d "$fixture/effective-graph.XXXXXXXX"); pid=
 stop(){ if [[ -n "$pid" ]]; then kill "$pid" 2>/dev/null || :; wait "$pid" || :; pid=; fi; }
 trap stop EXIT
@@ -34,7 +37,8 @@ JSON
         jq 'del(.http.middlewares,.http.routers.app.middlewares)|.http.routers.app.entryPoints=["a"]
             | .tcp={routers:{echo:{entryPoints:["t"],rule:"HostSNI(`*`)",middlewares:["allow"],service:"echo"}},middlewares:{allow:{ipAllowList:{sourceRange:["127.0.0.1/32"]}}},services:{echo:{loadBalancer:{servers:[{address:"127.0.0.1:19001"}]}}}}' "$dir/dynamic.yml" > "$dir/x"; mv "$dir/x" "$dir/dynamic.yml"
     fi
-    "$exe" --configFile="$dir/static.yml" > "$dir/daemon.log" 2>&1 & pid=$!
+    "$fixture/guest-local-issuers.sh" check "$dir/static.yml" > "$dir/local-issuer-check.log"
+    env -i PATH=/usr/bin:/bin LANG=C "$exe" --configFile="$dir/static.yml" > "$dir/daemon.log" 2>&1 & pid=$!
     for _ in $(seq 1 60); do
         if curl -fsS --max-time 1 http://127.0.0.1:38307/api/rawdata > "$dir/rawdata.json" 2>/dev/null && jq -e '.services["app@file"].status=="enabled"' "$dir/rawdata.json" >/dev/null; then break; fi
         sleep 0.1

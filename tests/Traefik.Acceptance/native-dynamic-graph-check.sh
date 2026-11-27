@@ -9,7 +9,7 @@ native_dynamic_graph_check() {
         /var/tmp/dorothy-traefik-acceptance.*) ;;
         *) printf 'Refusing to write outside the private guest fixture.\n' >&2; return 2 ;;
     esac
-    [[ -d "$root/logs" && -w "$root/logs" ]] || {
+    [[ -f "$root/.owner" && "$(<"$root/.owner")" == dorothy-traefik-acceptance-guest-v1 && -d "$root/logs" && -w "$root/logs" ]] || {
         printf 'Private guest fixture logs directory is unavailable.\n' >&2
         return 2
     }
@@ -25,12 +25,12 @@ native_dynamic_graph_check() {
 
     headers="$root/logs/native-dynamic-graph.headers"
     body="$root/logs/native-dynamic-graph.body"
-    curl --fail --silent --show-error --max-time 10 \
+    curl --noproxy '*' --fail --silent --show-error --max-time 10 \
         --header 'Host: multi.example.test' \
         --dump-header "$headers" \
         --output "$body" \
         "http://127.0.0.1:${port_number}/multilayer/admin"
-    [[ "$(<"$body")" == other ]] || {
+    [[ "$(<"$body")" == 'other-backend:/multilayer/admin' ]] || {
         printf 'The parentRefs route selected the wrong backend.\n' >&2
         return 1
     }

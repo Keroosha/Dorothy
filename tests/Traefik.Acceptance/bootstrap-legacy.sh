@@ -16,6 +16,12 @@ esac
     printf 'Private acceptance ownership marker is missing.\n' >&2
     exit 2
 }
+barrier_checker="$script_dir/guest-barrier-check.sh"
+if ! bash "$barrier_checker" acceptance "$state_dir"; then
+    printf 'Guest barrier acceptance failed; refusing legacy bootstrap.\n' >&2
+    exit 1
+fi
+
 source "$state_dir/handle.env"
 for command in git tar dotnet pulumi openssl jq base64; do
     command -v "$command" >/dev/null || { printf 'Missing required command: %s\n' "$command" >&2; exit 2; }
@@ -29,6 +35,12 @@ base_sha=2d486e33fc8cdae60c6a7571f8ba6f07b5b5ebf3
 legacy_source="$state_dir/legacy-source"
 mkdir -m 700 -p "$state_dir/logs" "$state_dir/home" "$state_dir/dotnet-home" "$state_dir/nuget-packages" "$state_dir/legacy-program" "$state_dir/pulumi-project"
 chmod 700 "$state_dir/logs" "$state_dir/home" "$state_dir/dotnet-home" "$state_dir/nuget-packages" "$state_dir/legacy-program" "$state_dir/pulumi-project"
+# Reached only after authorization of this VM's exact isolation receipt.
+[[ "$GUEST_ROOT" =~ ^/var/tmp/dorothy-traefik-acceptance\.[[:alnum:]]+$ ]]
+/usr/bin/ssh -F "$SSH_CONFIG" -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" \
+    "bash '$GUEST_ROOT/guest-activate-fixtures.sh' '$GUEST_ROOT'" \
+    > "$state_dir/logs/approved-fixture-activation.log" 2>&1
+scp -F "$SSH_CONFIG" -P "$SSH_PORT" "$SSH_USER@$SSH_HOST:$GUEST_ROOT/logs/baseline-observations.log" "$state_dir/baseline-runtime.log"
 
 if [[ -e "$legacy_source" ]]; then
     [[ -d "$legacy_source" && -f "$legacy_source/.legacy-base-sha" && "$(<"$legacy_source/.legacy-base-sha")" == "$base_sha" ]] || {
@@ -92,6 +104,7 @@ cat > "$legacy_project/LegacyProgram.fsproj" <<EOF
     <TargetFramework>net10.0</TargetFramework>
     <AssemblyName>Traefik.Acceptance</AssemblyName>
     <RootNamespace>Dorothy.Traefik.Acceptance</RootNamespace>
+    <WarningsAsErrors>FS0020;FS3221</WarningsAsErrors>
   </PropertyGroup>
   <ItemGroup>
     <ProjectReference Include="$legacy_source/src/Dorothy.DSL/Dorothy.DSL.fsproj" />

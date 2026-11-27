@@ -2,7 +2,7 @@
 set -euo pipefail
 umask 077
 
-if [[ $# < 2 || $# > 3 ]]; then
+if (( $# < 2 || $# > 3 )); then
     printf 'Usage: %s /tmp/dorothy-traefik-acceptance.XXXXXXXX <candidate-provider-directory> [full|sni-proof-only|resume-after-sni]\nSet TRAEFIK_ACCEPTANCE_EXPECTED_HELPER_SHA256 to pin the optional helper digest; TRAEFIK_ACCEPTANCE_RESOLVER_EPOCH defaults to v2.\n' "$0" >&2
     exit 2
 fi
@@ -26,6 +26,21 @@ esac
     printf 'Candidate provider directory is missing its provider or linux-x64 native helper.\n' >&2
     exit 2
 }
+mkdir -m 700 -p "$state_dir/logs"
+if ! bash "$script_dir/guest-barrier-check.sh" acceptance "$state_dir" \
+    > "$state_dir/logs/guest-barrier-acceptance.log" 2>&1; then
+    printf 'Guest isolation barrier acceptance failed; see %s/logs/guest-barrier-acceptance.log\n' "$state_dir" >&2
+    exit 1
+fi
+barrier_receipt="$state_dir/barrier-receipt.json"
+barrier_authorization="$state_dir/barrier-authorization.json"
+for barrier_marker in "$barrier_receipt" "$barrier_authorization"; do
+    [[ -f "$barrier_marker" && ! -L "$barrier_marker" && -s "$barrier_marker" \
+        && "$(stat -c %a "$barrier_marker")" == 600 && "$(stat -c %u "$barrier_marker")" == "$(id -u)" ]] || {
+        printf 'The fresh guest barrier receipt or separate authorization marker is missing or unsafe.\n' >&2
+        exit 1
+    }
+done
 source "$state_dir/handle.env"
 [[ "$GUEST_ROOT" =~ ^/var/tmp/dorothy-traefik-acceptance\.[[:alnum:]]+$ ]] || {
     printf 'Guest fixture path is not the private acceptance root.\n' >&2
@@ -55,7 +70,7 @@ if [[ -n "$expected_helper_sha" ]]; then
         exit 2
     }
 fi
-for command in dotnet pulumi jq sha256sum scp ssh openssl mktemp ln git tr; do
+for command in dotnet pulumi jq sha256sum scp ssh openssl mktemp ln git tr install awk find realpath stat id; do
     command -v "$command" >/dev/null || { printf 'Missing required command: %s\n' "$command" >&2; exit 2; }
 done
 git -C "$repo_root" rev-parse HEAD > "$state_dir/git-head-before.txt"
@@ -86,6 +101,16 @@ openssl x509 -in "$state_dir/sni-proof.pem" -noout -checkhost sni-proof.acceptan
 
 mkdir -m 700 -p "$state_dir/logs" "$state_dir/home" "$state_dir/dotnet-home" "$state_dir/nuget-packages" "$state_dir/candidate-program"
 chmod 700 "$state_dir/logs" "$state_dir/home" "$state_dir/dotnet-home" "$state_dir/nuget-packages" "$state_dir/candidate-program"
+guest_process_snapshot_file="$state_dir/logs/guest-traefik-process-snapshot-$run_mode.log"
+[[ ! -e "$guest_process_snapshot_file" && ! -L "$guest_process_snapshot_file" ]] || {
+    printf 'Refusing to overwrite the private Traefik process snapshot.\n' >&2
+    exit 2
+}
+: > "$guest_process_snapshot_file"
+chmod 600 "$guest_process_snapshot_file"
+guest_process_snapshot_count=0
+guest_mainpid_cmdline_snapshot_count=0
+traefik_pid_before_delete=
 helper_evidence="$state_dir/candidate-helper-$run_mode.sha256"
 if [[ -e "$helper_evidence" || -L "$helper_evidence" ]]; then
     [[ "$(<"$helper_evidence")" == "$actual_helper_sha" ]] || {
@@ -126,6 +151,26 @@ export TRAEFIK_ACCEPTANCE_SNI_KEY_FILE="$state_dir/sni-proof.key"
 export UPSTREAM_CA_FILE="$UPSTREAM_CA_FILE"
 export CLIENT_CA_FILE="$CLIENT_CA_FILE"
 export DNS_TSIG_SECRET_FILE="$DNS_TSIG_SECRET_FILE"
+[[ -d "$state_dir/bin" && ! -L "$state_dir/bin" ]] || {
+    printf 'Private SSH wrapper directory is missing or unsafe.\n' >&2
+    exit 2
+}
+if [[ -e "$state_dir/bin/ssh" || -L "$state_dir/bin/ssh" ]]; then
+    [[ -f "$state_dir/bin/ssh" && ! -L "$state_dir/bin/ssh" ]] || {
+        printf 'Private SSH wrapper path is not a regular file.\n' >&2
+        exit 2
+    }
+fi
+install -m 700 "$script_dir/ssh-wrapper.sh" "$state_dir/bin/ssh"
+ssh_argv_audit_file="$state_dir/ssh-argv-audit-$run_mode.counts"
+[[ ! -e "$ssh_argv_audit_file" && ! -L "$ssh_argv_audit_file" ]] || {
+    printf 'Refusing to overwrite private SSH argv audit counts.\n' >&2
+    exit 2
+}
+: > "$ssh_argv_audit_file"
+chmod 600 "$ssh_argv_audit_file"
+export DOROTHY_ACCEPTANCE_DNS_TOKEN_FILES="$DNS_TSIG_SECRET_FILE:$state_dir/dns-tsig-secret-rotated"
+export DOROTHY_ACCEPTANCE_SSH_AUDIT_FILE="$ssh_argv_audit_file"
 export PATH="$state_dir/bin:$PATH"
 mkdir -m 700 -p "$candidate_source"
 git -C "$repo_root" archive "$(<"$state_dir/git-head-before.txt")" -- src/Dorothy.DSL tests/Traefik.Acceptance \
@@ -145,52 +190,163 @@ remote() {
 }
 assert_guest_secret_isolation() {
     local credential_state=$1
-    local credential_check
+    local snapshot_sequence
+    guest_process_snapshot_count=$((guest_process_snapshot_count + 1))
+    snapshot_sequence=$guest_process_snapshot_count
+
     case "$credential_state" in
-        present) credential_check='grep -aFq -f "$secret_file" "$credentials_file"' ;;
-        absent) credential_check='[ ! -e "$credentials_file" ]' ;;
-        *) printf 'Invalid internal credential-state expectation.\n' >&2; return 2 ;;
-    esac
-    if ! remote "secret_file='$GUEST_ROOT/dns/tsig-secret'; credentials_file='/etc/keroosha-iac/traefik/dns-credentials.env'; \
-        [ -f \"\$secret_file\" ] || exit 20; \
-        if grep -aFq -f \"\$secret_file\" /proc/[0-9]*/cmdline; then exit 21; else code=\$?; [ \$code -eq 1 ] || exit 22; fi; \
-        for path in /etc/keroosha-iac/traefik/static.yml /etc/keroosha-iac/traefik/dynamic/current.yml /etc/systemd/system/keroosha-traefik.service /etc/keroosha-iac/traefik/.keroosha-rollback.json; do \
-            [ -f \"\$path\" ] || continue; \
-            if grep -aFq -f \"\$secret_file\" \"\$path\"; then exit 23; else code=\$?; [ \$code -eq 1 ] || exit 24; fi; \
-        done; \
-        $credential_check || exit 25; \
-        journal=\$(journalctl --no-pager -u keroosha-traefik.service --output=cat 2>/dev/null) || exit 26; \
-        if printf '%s\\n' \"\$journal\" | grep -aFq -f \"\$secret_file\"; then exit 27; else code=\$?; [ \$code -eq 1 ] || exit 28; fi" ; then
-        printf 'Guest secret hygiene check failed without exposing secret contents.\n' >&2
-        return 1
-    fi
+        present)
+            guest_mainpid_cmdline_snapshot_count=$((guest_mainpid_cmdline_snapshot_count + 1))
+            if ! remote "set -eu
+secret_file='$GUEST_ROOT/dns/tsig-secret'
+credentials_file='/etc/keroosha-iac/traefik/dns-credentials.env'
+[ -f \"\$secret_file\" ] || exit 20
+pid=\$(systemctl show --property=MainPID --value keroosha-traefik.service)
+[ \"\$pid\" -gt 0 ] 2>/dev/null || exit 29
+cmdline_file=/proc/\$pid/cmdline
+[ -r \"\$cmdline_file\" ] || exit 30
+if grep -aFq -f \"\$secret_file\" \"\$cmdline_file\"; then exit 21; else code=\$?; [ \$code -eq 1 ] || exit 22; fi
+for path in /etc/keroosha-iac/traefik/static.yml /etc/keroosha-iac/traefik/dynamic/current.yml /etc/systemd/system/keroosha-traefik.service; do
+    [ -f \"\$path\" ] || exit 31
+    if grep -aFq -f \"\$secret_file\" \"\$path\"; then exit 23; else code=\$?; [ \$code -eq 1 ] || exit 24; fi
+done
+grep -aFq -f \"\$secret_file\" \"\$credentials_file\" || exit 25
+started=\$(systemctl show --property=ActiveEnterTimestamp --value keroosha-traefik.service)
+[ -n \"\$started\" ] || exit 32
+ended=\$(date --iso-8601=seconds)
+journal=\$(journalctl --no-pager --unit=keroosha-traefik.service --since \"\$started\" --until \"\$ended\" --output=cat --lines=1000 2>/dev/null) || exit 26
+if printf '%s\\n' \"\$journal\" | grep -aFq -f \"\$secret_file\"; then exit 27; else code=\$?; [ \$code -eq 1 ] || exit 28; fi
+cmdline=\$(tr '\\000' ' ' < \"\$cmdline_file\")
+journal_lines=\$(printf '%s' \"\$journal\" | awk 'END { print NR }')
+journal_sha=\$(printf '%s' \"\$journal\" | sha256sum | awk '{print \$1}')
+printf 'snapshot=%s\\ncredentialState=present\\nMainPID=%s\\ncmdline=%s\\njournalUnit=keroosha-traefik.service\\njournalSince=%s\\njournalUntil=%s\\njournalLines=%s\\njournalSha256=%s\\n' '$snapshot_sequence' \"\$pid\" \"\$cmdline\" \"\$started\" \"\$ended\" \"\$journal_lines\" \"\$journal_sha\"
+for path in /etc/keroosha-iac/traefik/static.yml /etc/keroosha-iac/traefik/dynamic/current.yml /etc/systemd/system/keroosha-traefik.service; do
+    printf 'file=%s ' \"\$path\"
+    stat -c 'mode=%a uid=%u gid=%g size=%s mtime=%y' \"\$path\"
+    sha256sum \"\$path\"
+done
+stat -c 'credentialEnvFile=present mode=%a uid=%u gid=%g size=%s mtime=%y' \"\$credentials_file\""
+            then
+                printf 'Guest secret hygiene check failed without exposing secret contents.\n' >&2
+                return 1
+            fi
+            ;;
+        absent)
+            if ! remote "set -eu
+credentials_file='/etc/keroosha-iac/traefik/dns-credentials.env'
+pid=\$(systemctl show --property=MainPID --value keroosha-traefik.service)
+[ "\$pid" = 0 ] || [ -z "\$pid" ] || exit 33
+[ ! -e '/proc/$traefik_pid_before_delete' ] || exit 34
+[ ! -e \"\$credentials_file\" ] || exit 35
+printf 'snapshot=%s\\ncredentialState=absent\\nMainPID=%s\\npriorMainPIDAbsent=true\\ncredentialEnvFileAbsent=true\\n' '$snapshot_sequence' \"\$pid\""
+            then
+                printf 'Post-delete Traefik process or credential environment remained present.\n' >&2
+                return 1
+            fi
+            ;;
+        *)
+            printf 'Invalid internal credential-state expectation.\n' >&2
+            return 2
+            ;;
+    esac >> "$guest_process_snapshot_file"
 }
 assert_local_secret_absent() {
-    local secret_path file grep_status
-    secret_path=$(realpath -e -- "$DNS_TSIG_SECRET_FILE") || return 1
-    if grep -aFq -f "$secret_path" /proc/[0-9]*/cmdline; then
-        printf 'Host process argv contains the DNS TSIG plaintext.\n' >&2
-        return 1
-    else
-        grep_status=$?
-        [[ "$grep_status" == 1 ]] || {
-            printf 'Could not inspect host process argv for secret disclosure.\n' >&2
+    local candidate secret_path file target duplicate grep_status audit_summary
+    local -a secret_files=() scan_files=() checkpoint_files=()
+    for candidate in "$DNS_TSIG_SECRET_FILE" "$state_dir"/dns-tsig-secret-*; do
+        if [[ ! -e "$candidate" && ! -L "$candidate" ]]; then
+            continue
+        fi
+        [[ -f "$candidate" && ! -L "$candidate" ]] || {
+            printf 'A DNS credential fixture is not a regular private file.\n' >&2
             return 1
         }
-    fi
-    while IFS= read -r -d '' file; do
-        [[ "$file" == "$secret_path" ]] && continue
-        if grep -aFq -f "$secret_path" "$file"; then
-            printf 'Private acceptance state contains the DNS TSIG plaintext in %s.\n' "${file##*/}" >&2
+        secret_path=$(realpath -e -- "$candidate") || return 1
+        [[ "$secret_path" == "$state_dir"/* ]] || {
+            printf 'DNS credential fixtures are outside the owned acceptance state.\n' >&2
             return 1
-        else
-            grep_status=$?
-            [[ "$grep_status" == 1 ]] || {
-                printf 'Could not inspect private acceptance state for secret disclosure.\n' >&2
+        }
+        duplicate=false
+        for file in "${secret_files[@]}"; do
+            [[ "$file" == "$secret_path" ]] && duplicate=true
+        done
+        [[ "$duplicate" == true ]] || secret_files+=("$secret_path")
+    done
+    ((${#secret_files[@]} > 0)) || {
+        printf 'No owned DNS credential fixture was available for secret checks.\n' >&2
+        return 1
+    }
+
+    for target in "$state_dir/backend" "$state_dir/pulumi-project" "$state_dir/logs"; do
+        [[ -d "$target" && ! -L "$target" ]] || {
+            printf 'An exposed Pulumi or harness artifact directory is missing or unsafe.\n' >&2
+            return 1
+        }
+        while IFS= read -r -d '' file; do
+            scan_files+=("$file")
+        done < <(find "$target" -type f -print0)
+    done
+    shopt -s nullglob
+    checkpoint_files=("$state_dir"/*checkpoint*.json)
+    shopt -u nullglob
+    for file in "${checkpoint_files[@]}"; do
+        [[ -f "$file" && ! -L "$file" ]] || {
+            printf 'A Pulumi checkpoint path is not a regular file.\n' >&2
+            return 1
+        }
+        scan_files+=("$file")
+    done
+    for file in "$state_dir/barrier-receipt.json" "$state_dir/barrier-authorization.json" "$state_dir/post-reboot-journal-window.json"; do
+        [[ -f "$file" && ! -L "$file" ]] || {
+            printf 'An exposed guest-barrier or journal-window artifact is missing or unsafe.\n' >&2
+            return 1
+        }
+        scan_files+=("$file")
+    done
+    [[ -f "$ssh_argv_audit_file" && ! -L "$ssh_argv_audit_file" ]] || {
+        printf 'The private SSH argv audit counts are missing or unsafe.\n' >&2
+        return 1
+    }
+    scan_files+=("$ssh_argv_audit_file")
+    for file in "${scan_files[@]}"; do
+        for secret_path in "${secret_files[@]}"; do
+            if grep -aFq -f "$secret_path" "$file"; then
+                printf 'DNS TSIG plaintext was found in an exposed Pulumi/project/log artifact: %s\n' "${file##*/}" >&2
                 return 1
+            else
+                grep_status=$?
+                [[ "$grep_status" == 1 ]] || {
+                    printf 'Could not inspect an exposed Pulumi/project/log artifact.\n' >&2
+                    return 1
+                }
+            fi
+        done
+    done
+
+    audit_summary=$(awk '
+        {
+            if (NF != 3 || split($1, a, "=") != 2 || split($2, t, "=") != 2 || split($3, c, "=") != 2
+                || a[1] != "argv" || t[1] != "tokens" || c[1] != "comparisons"
+                || a[2] !~ /^[0-9]+$/ || t[2] !~ /^[0-9]+$/ || c[2] !~ /^[0-9]+$/
+                || a[2] < 1 || t[2] < 1 || c[2] != a[2] * t[2]) {
+                invalid = 1
+                next
             }
-        fi
-    done < <(find "$state_dir" -type f -print0)
+            invocations++
+            argv += a[2]
+            tokens += t[2]
+            comparisons += c[2]
+        }
+        END {
+            if (NR == 0 || invalid || invocations == 0) exit 1
+            printf "%d %d %d %d\n", invocations, argv, tokens, comparisons
+        }
+    ' "$ssh_argv_audit_file") || {
+        printf 'SSH argv audit counts are malformed or incomplete.\n' >&2
+        return 1
+    }
+    read -r ssh_argv_audit_invocations ssh_argv_audit_entries ssh_argv_audit_tokens ssh_argv_audit_comparisons \
+        <<< "$audit_summary"
 }
 copy_to_guest() {
     local source_path=$1 remote_path=$2 log_path=$3
@@ -345,10 +501,12 @@ export_checkpoint() {
 }
 assert_secret_checkpoint() {
     local checkpoint=$1 secret_file=${2:-$DNS_TSIG_SECRET_FILE}
+    local candidate secret_path existing duplicate=false grep_status
+    local -a secret_files=()
     jq -e --arg expectedUrn "$legacy_urn" '
         def pulumiSecretEnvelope:
             type == "object"
-            and .["4dabf18193072939515e22adb298388d"] == "1b47061264138c4ac30d75fd1e6238c2"
+            and .["4dabf18193072939515e22adb298388d"] == "1b47061264138c4ac30d75fd1eb44270"
             and (.ciphertext | type == "string" and length > 0);
         [
             .deployment.resources[]
@@ -357,21 +515,46 @@ assert_secret_checkpoint() {
         ] as $matches
         | ($matches | length) == 1
           and ($matches[0].input | pulumiSecretEnvelope)
-          and ($matches[0].output == null or ($matches[0].output | pulumiSecretEnvelope))
+          and ($matches[0].output | pulumiSecretEnvelope)
     ' "$checkpoint" >/dev/null || {
-        printf 'Traefik configuration secret envelope is not stored as Pulumi ciphertext.\n' >&2
+        printf 'Traefik configuration input/output are not stored as Pulumi ciphertext envelopes.\n' >&2
         return 1
     }
-    if grep -aFq -f "$secret_file" "$checkpoint"; then
-        printf 'Pulumi checkpoint contains the DNS TSIG plaintext secret.\n' >&2
-        return 1
-    else
-        local grep_status=$?
-        [[ "$grep_status" == 1 ]] || {
-            printf 'Could not inspect Pulumi checkpoint secret storage.\n' >&2
+    for candidate in "$DNS_TSIG_SECRET_FILE" "$state_dir"/dns-tsig-secret-* "$secret_file"; do
+        if [[ ! -e "$candidate" && ! -L "$candidate" ]]; then
+            continue
+        fi
+        [[ -n "$candidate" && -f "$candidate" && ! -L "$candidate" ]] || {
+            printf 'A DNS credential fixture is not a regular private file.\n' >&2
             return 1
         }
-    fi
+        candidate=$(realpath -e -- "$candidate") || return 1
+        [[ "$candidate" == "$state_dir"/* ]] || {
+            printf 'DNS credential fixture is outside the owned acceptance state.\n' >&2
+            return 1
+        }
+        duplicate=false
+        for existing in "${secret_files[@]}"; do
+            [[ "$existing" == "$candidate" ]] && duplicate=true
+        done
+        [[ "$duplicate" == true ]] || secret_files+=("$candidate")
+    done
+    ((${#secret_files[@]} > 0)) || {
+        printf 'No owned DNS credential fixture was available for checkpoint checks.\n' >&2
+        return 1
+    }
+    for secret_path in "${secret_files[@]}"; do
+        if grep -aFq -f "$secret_path" "$checkpoint"; then
+            printf 'Pulumi checkpoint contains DNS TSIG plaintext.\n' >&2
+            return 1
+        else
+            grep_status=$?
+            [[ "$grep_status" == 1 ]] || {
+                printf 'Could not inspect Pulumi checkpoint secret storage.\n' >&2
+                return 1
+            }
+        fi
+    done
 }
 secret_value_sha() {
     tr -d '\r\n' < "$1" | sha256sum | awk '{print $1}'
@@ -639,12 +822,12 @@ run_transaction_review() {
         printf 'Restoring the original static log level did not restart Traefik.\n' >&2
         return 1
     }
-    remote "grep -Eq '^[[:space:]]*level:[[:space:]]*DEBUG$' /etc/keroosha-iac/traefik/static.yml"
+    remote "jq -e '.log.level == \"DEBUG\"' /etc/keroosha-iac/traefik/static.yml >/dev/null"
     export_checkpoint "$state_dir/after-static-log-info-restore-checkpoint.json"
     assert_checkpoint "$state_dir/after-static-log-info-restore-checkpoint.json" "Static log-level fixture restoration" true
     assert_secret_checkpoint "$state_dir/after-static-log-info-restore-checkpoint.json" "$DNS_TSIG_SECRET_FILE"
     assert_guest_secret_isolation present
-    rm -f -- "$new_secret_file"
+    assert_local_secret_absent
     jq -n \
         --arg oldSecretSha256 "$old_secret_sha" \
         --arg newSecretSha256 "$new_secret_sha" \
@@ -690,6 +873,7 @@ reboot_guest() {
     done
     chmod 600 "$after_file" 2>/dev/null || true
     [[ -n "$after" && "$after" != "$before" ]] || { printf 'The guest boot ID did not change after reboot.\n' >&2; return 1; }
+    bash "$script_dir/guest-barrier-check.sh" acceptance "$state_dir" > "$state_dir/logs/post-guest-reboot-barrier.log" || return 1
     remote 'systemctl is-active ssh dorothy-traefik-acceptance-dns.service dorothy-traefik-acceptance-pebble.service dorothy-traefik-acceptance-pebble-rotated.service dorothy-traefik-acceptance-otelcol.service dorothy-traefik-acceptance-backends.service dorothy-traefik-acceptance-tcp.service dorothy-traefik-acceptance-udp.service keroosha-traefik.service' \
         > "$state_dir/logs/rebooted-services.log"
     printf '%s\n' "$after"
@@ -960,12 +1144,35 @@ run_guest_client after-reboot > "$state_dir/logs/post-reboot-clients.log" 2>&1 |
     printf 'Post-reboot real client check failed; see %s/logs/post-reboot-clients.log\n' "$state_dir" >&2
     exit 1
 }
-remote 'journalctl --boot -u keroosha-traefik.service --no-pager --output=short-iso' \
-    > "$state_dir/logs/post-reboot-traefik-journal.log"
-[[ -s "$state_dir/logs/post-reboot-traefik-journal.log" ]] || {
-    printf 'Current-boot Traefik journal evidence is empty.\n' >&2
+post_reboot_journal_since=$(remote 'systemctl show --property=ActiveEnterTimestamp --value keroosha-traefik.service')
+post_reboot_journal_until=$(remote 'date --iso-8601=seconds')
+[[ -n "$post_reboot_journal_since" && -n "$post_reboot_journal_until" ]] || {
+    printf 'Could not capture the active Traefik unit journal time bounds.\n' >&2
     exit 1
 }
+remote "journalctl --boot --unit=keroosha-traefik.service --since '$post_reboot_journal_since' --until '$post_reboot_journal_until' --no-pager --output=short-iso --lines=1000" \
+    > "$state_dir/logs/post-reboot-traefik-journal.log"
+[[ -s "$state_dir/logs/post-reboot-traefik-journal.log" ]] || {
+    printf 'Active-instance Traefik journal evidence is empty.\n' >&2
+    exit 1
+}
+post_reboot_journal_lines=$(wc -l < "$state_dir/logs/post-reboot-traefik-journal.log" | tr -d '[:space:]')
+[[ "$post_reboot_journal_lines" =~ ^[0-9]+$ ]] && ((post_reboot_journal_lines <= 1000)) || {
+    printf 'Active-instance Traefik journal evidence exceeded its line bound.\n' >&2
+    exit 1
+}
+jq -n \
+    --arg since "$post_reboot_journal_since" \
+    --arg until "$post_reboot_journal_until" \
+    --argjson lineCount "$post_reboot_journal_lines" \
+    '{
+        unit: "keroosha-traefik.service",
+        since: $since,
+        until: $until,
+        maxLines: 1000,
+        lineCount: $lineCount
+    }' > "$state_dir/post-reboot-journal-window.json"
+chmod 600 "$state_dir/post-reboot-journal-window.json"
 assert_guest_secret_isolation present
 
 copy_to_guest "$script_dir/drift.sh" "$GUEST_ROOT/drift.sh" "$state_dir/logs/drift-script-copy.log"
@@ -1249,6 +1456,7 @@ remote 'find /var/lib/keroosha-traefik -maxdepth 1 -type f -name "acme-*.json" -
 [[ -s "$state_dir/acme-store-hashes-before-delete.txt" ]] || { printf 'ACME storage hash manifest is empty before Delete.\\n' >&2; exit 1; }
 acme_store_before_delete=$(sha256sum "$state_dir/acme-store-hashes-before-delete.txt" | awk '{ print $1 }')
 run_pulumi delete delete-preview.log preview --stack acceptance --diff --non-interactive --color=never
+traefik_pid_before_delete=$(remote_service_pid)
 run_pulumi delete delete-up.log up --stack acceptance --yes --non-interactive --parallel 1
 export_checkpoint "$state_dir/deleted-checkpoint.json"
 deleted_count=$(jq "$traefik_query | length" "$state_dir/deleted-checkpoint.json")
@@ -1281,22 +1489,56 @@ cmp -s "$state_dir/acme-stores-before-delete.txt" "$state_dir/acme-stores-after-
 }
 # Do not uninstall the guest's bootstrap packages: they are shared with the test CA and
 # SSH. The acceptance boundary is the Traefik resource; cleanup.sh discards this VM/backend.
-remote 'test ! -e /etc/systemd/system/keroosha-traefik.service && test ! -e /etc/keroosha-iac/traefik/dns-credentials.env' || {
-    printf 'Delete left the owned service unit or credential file behind.\n' >&2
+remote "test ! -e '/proc/$traefik_pid_before_delete' && test ! -e /etc/systemd/system/keroosha-traefik.service && test ! -e /etc/keroosha-iac/traefik/dns-credentials.env" || {
+    printf 'Delete left the Traefik process, service unit, or credential file behind.\n' >&2
     exit 1
 }
 assert_guest_secret_isolation absent
 assert_local_secret_absent
-jq -n '{
-    pulumiSecretCiphertextAsserted: true,
-    plaintextAbsentFromPulumiCheckpoints: true,
-    plaintextAbsentFromHostStateArtifactsExceptInputSecretFile: true,
-    plaintextAbsentFromGuestArgv: true,
-    plaintextAbsentFromHostArgv: true,
-    plaintextAbsentFromTraefikConfigurationsUnitJournalAndRollbackState: true,
-    expectedCredentialEnvironmentContainsSecretBeforeDelete: true,
-    credentialEnvironmentRemovedByDelete: true
-}' > "$state_dir/secret-hygiene-metrics.json"
+jq -n \
+    --arg mainPidBeforeDelete "$traefik_pid_before_delete" \
+    --arg journalSince "$post_reboot_journal_since" \
+    --arg journalUntil "$post_reboot_journal_until" \
+    --argjson journalLines "$post_reboot_journal_lines" \
+    --argjson guestMainPidCmdlineSnapshots "$guest_mainpid_cmdline_snapshot_count" \
+    --argjson sshArgvAuditInvocations "$ssh_argv_audit_invocations" \
+    --argjson sshArgvAuditEntries "$ssh_argv_audit_entries" \
+    --argjson sshArgvAuditTokenChecks "$ssh_argv_audit_tokens" \
+    --argjson sshArgvAuditComparisons "$ssh_argv_audit_comparisons" \
+    '{
+        pulumiConfigurationInputOutputCiphertextAsserted: true,
+        literalTsigValuesAbsentFromPulumiCheckpoints: true,
+        literalTsigValuesAbsentFromExposedHostArtifacts: true,
+        guestBarrierReceiptValidated: true,
+        guestBarrierAuthorizationValidated: true,
+        exposedHostScanScope: ["Pulumi file backend", "exported checkpoint JSON", "Pulumi project files", "harness logs"],
+        providerSshArgvComparedToEveryDnsFixtureToken: true,
+        providerSshArgvContainsNoDnsFixtureTokens: true,
+        sshArgvAudit: {
+            invocations: $sshArgvAuditInvocations,
+            outgoingArgvEntriesChecked: $sshArgvAuditEntries,
+            fixtureTokenChecks: $sshArgvAuditTokenChecks,
+            comparisons: $sshArgvAuditComparisons
+        },
+        guestTraefikMainPidCmdlineSnapshots: $guestMainPidCmdlineSnapshots,
+        literalTsigValuesAbsentFromTraefikMainPidCmdline: true,
+        literalTsigValuesAbsentFromTraefikConfigFilesUnitAndBoundedJournal: true,
+        postRebootJournalWindow: {
+            unit: "keroosha-traefik.service",
+            since: $journalSince,
+            until: $journalUntil,
+            maxLines: 1000,
+            lines: $journalLines
+        },
+        postDelete: {
+            mainPidBeforeDelete: $mainPidBeforeDelete,
+            priorMainPidAbsent: true,
+            serviceUnitRemoved: true,
+            credentialEnvironmentRemoved: true
+        },
+        rootOnlyRollbackSnapshotsMayContainReversibleCredentials: true,
+        rootOnlyRollbackSnapshotsArePrivateAndNotShared: true
+    }' > "$state_dir/secret-hygiene-metrics.json"
 chmod 600 "$state_dir/secret-hygiene-metrics.json"
 if [[ "$run_mode" == full ]]; then
     evidence_file=${TRAEFIK_ACCEPTANCE_EVIDENCE_FILE:-"$state_dir.evidence.json"}

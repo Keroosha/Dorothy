@@ -40,7 +40,7 @@ esac
     exit 2
 }
 
-for command in git jq sha256sum sort find mktemp ln grep realpath; do
+for command in git jq sha256sum sort find mktemp ln grep realpath stat; do
     command -v "$command" >/dev/null || { printf 'Missing required evidence command: %s\n' "$command" >&2; exit 2; }
 done
 
@@ -104,7 +104,12 @@ for required in \
     "$state_dir/transaction-review-metrics.json" \
     "$state_dir/review-suite-metrics.json" \
     "$state_dir/review-tls-metrics.json" \
+    "$state_dir/barrier-receipt.json" \
+    "$state_dir/barrier-authorization.json" \
     "$state_dir/secret-hygiene-metrics.json" \
+    "$state_dir/post-reboot-journal-window.json" \
+    "$state_dir/logs/guest-traefik-process-snapshot-full.log" \
+    "$state_dir/ssh-argv-audit-full.counts" \
     "$state_dir/logs/review-client-checks.log" \
     "$state_dir/logs/review-client-identity-absent.log" \
     "$state_dir/logs/review-client-identity-wrong.log" \
@@ -115,6 +120,48 @@ for required in \
         exit 1
     }
 done
+for barrier_marker in "$state_dir/barrier-receipt.json" "$state_dir/barrier-authorization.json"; do
+    [[ "$(stat -c %a "$barrier_marker")" == 600 ]] || {
+        printf 'Guest barrier receipt/authorization marker permissions are not private.\n' >&2
+        exit 1
+    }
+done
+
+jq -e --slurpfile journalWindow "$state_dir/post-reboot-journal-window.json" '
+    .pulumiConfigurationInputOutputCiphertextAsserted == true
+    and .literalTsigValuesAbsentFromPulumiCheckpoints == true
+    and .literalTsigValuesAbsentFromExposedHostArtifacts == true
+    and .guestBarrierReceiptValidated == true
+    and .guestBarrierAuthorizationValidated == true
+    and .providerSshArgvComparedToEveryDnsFixtureToken == true
+    and .providerSshArgvContainsNoDnsFixtureTokens == true
+    and (.sshArgvAudit.invocations | type == "number" and . > 0 and floor == .)
+    and (.sshArgvAudit.outgoingArgvEntriesChecked | type == "number" and . > 0 and floor == .)
+    and (.sshArgvAudit.fixtureTokenChecks | type == "number" and . > 0 and floor == .)
+    and (.sshArgvAudit.comparisons | type == "number" and . > 0 and floor == .)
+    and (.guestTraefikMainPidCmdlineSnapshots | type == "number" and . > 0 and floor == .)
+    and .literalTsigValuesAbsentFromTraefikMainPidCmdline == true
+    and .literalTsigValuesAbsentFromTraefikConfigFilesUnitAndBoundedJournal == true
+    and .postDelete.priorMainPidAbsent == true
+    and .postDelete.serviceUnitRemoved == true
+    and .postDelete.credentialEnvironmentRemoved == true
+    and .rootOnlyRollbackSnapshotsMayContainReversibleCredentials == true
+    and .postRebootJournalWindow.unit == $journalWindow[0].unit
+    and .postRebootJournalWindow.since == $journalWindow[0].since
+    and .postRebootJournalWindow.until == $journalWindow[0].until
+    and .postRebootJournalWindow.maxLines == $journalWindow[0].maxLines
+    and .postRebootJournalWindow.lines == $journalWindow[0].lineCount
+    and (.postRebootJournalWindow.lines | type == "number" and . >= 0 and . <= 1000 and floor == .)
+    and .rootOnlyRollbackSnapshotsArePrivateAndNotShared == true
+' "$state_dir/secret-hygiene-metrics.json" >/dev/null || {
+    printf 'Sanitized secret-hygiene metadata is incomplete or overclaims its scan scope.\n' >&2
+    exit 1
+}
+jq -e '.unit == "keroosha-traefik.service" and (.since | type == "string" and length > 0) and (.until | type == "string" and length > 0) and .maxLines == 1000 and (.lineCount | type == "number" and . >= 0 and . <= 1000 and floor == .)' \
+    "$state_dir/post-reboot-journal-window.json" >/dev/null || {
+    printf 'Post-reboot journal window metadata is invalid or unbounded.\n' >&2
+    exit 1
+}
 
 jq -e '.status == "unchanged" and .targetResourceCount == 1 and .sshInvocations == 0 and .refresh == false' \
     "$state_dir/offline-preview.json" >/dev/null || {
@@ -261,7 +308,12 @@ jq -e '.missingStoreReadInSync == false and .missingStoreUnprobedCount > 0 and .
 }
 
 journal_sha=$(file_sha256 "$state_dir/logs/post-reboot-traefik-journal.log")
-journal_lines=$(wc -l < "$state_dir/logs/post-reboot-traefik-journal.log" | tr -d '[:space:]')
+journal_window=$(jq -c . "$state_dir/post-reboot-journal-window.json")
+journal_lines=$(jq -er '.lineCount' "$state_dir/post-reboot-journal-window.json")
+[[ "$journal_lines" == "$(wc -l < "$state_dir/logs/post-reboot-traefik-journal.log" | tr -d '[:space:]')" ]] || {
+    printf 'Journal line count does not match the bounded window metadata.\n' >&2
+    exit 1
+}
 trace_file=$(printf '%s\n' "$state_dir"/otel-after-reboot-evidence-*.txt | head -n 1)
 [[ -s "$trace_file" ]] || { printf 'Post-reboot filtered trace evidence is missing.\n' >&2; exit 1; }
 trace_sha=$(file_sha256 "$trace_file")
@@ -272,6 +324,10 @@ review_identity_absent_sha=$(file_sha256 "$state_dir/logs/review-client-identity
 review_identity_wrong_sha=$(file_sha256 "$state_dir/logs/review-client-identity-wrong.log")
 review_identity_accepted_sha=$(file_sha256 "$state_dir/logs/review-client-identity-accepted.log")
 review_tls_sha=$(file_sha256 "$state_dir/review-tls-metrics.json")
+process_snapshot_sha=$(file_sha256 "$state_dir/logs/guest-traefik-process-snapshot-full.log")
+ssh_argv_audit_sha=$(file_sha256 "$state_dir/ssh-argv-audit-full.counts")
+barrier_receipt_sha=$(file_sha256 "$state_dir/barrier-receipt.json")
+barrier_authorization_sha=$(file_sha256 "$state_dir/barrier-authorization.json")
 artifact_digests=$(jq -n \
     --arg candidateSourceSha256 "$source_sha" \
     --arg candidateProgramTreeSha256 "$program_sha" \
@@ -279,7 +335,11 @@ artifact_digests=$(jq -n \
     --arg candidateHelperSha256 "$helper_sha" \
     --arg guestTraefikSha256 "$traefik_sha" \
     --arg postRebootJournalSha256 "$journal_sha" \
+    --arg guestProcessSnapshotSha256 "$process_snapshot_sha" \
+    --arg sshArgvAuditCountsSha256 "$ssh_argv_audit_sha" \
     --arg postRebootTraceEvidenceSha256 "$trace_sha" \
+    --arg guestBarrierReceiptSha256 "$barrier_receipt_sha" \
+    --arg guestBarrierAuthorizationSha256 "$barrier_authorization_sha" \
     --arg paginationEvidenceSha256 "$(file_sha256 "$state_dir/pagination-evidence.json")" \
     --arg legacyTlsSeventeenSha256 "$(file_sha256 "$state_dir/sni-seventeen.json")" \
     --arg reviewSuiteLogSha256 "$review_suite_sha" \
@@ -295,6 +355,10 @@ artifact_digests=$(jq -n \
       candidateHelperSha256:$candidateHelperSha256,
       pinnedTraefikBinarySha256:(if $guestTraefikSha256 == "" then null else $guestTraefikSha256 end),
       postRebootJournalSha256:$postRebootJournalSha256,
+      guestTraefikProcessSnapshotSha256:$guestProcessSnapshotSha256,
+      providerSshArgvAuditCountsSha256:$sshArgvAuditCountsSha256,
+      guestBarrierReceiptSha256:$guestBarrierReceiptSha256,
+      guestBarrierAuthorizationSha256:$guestBarrierAuthorizationSha256,
       postRebootTraceEvidenceSha256:$postRebootTraceEvidenceSha256,
       paginationEvidenceSha256:$paginationEvidenceSha256,
       legacyTlsSeventeenEvidenceSha256:$legacyTlsSeventeenSha256,
@@ -331,6 +395,7 @@ if ! jq -n \
     --slurpfile transactionSummary "$state_dir/transaction-review-metrics.json" \
     --slurpfile secretHygiene "$state_dir/secret-hygiene-metrics.json" \
     --argjson journalLines "$journal_lines" \
+    --argjson journalWindow "$journal_window" \
     --argjson digests "$artifact_digests" \
     '{
         schema: 1,
@@ -362,7 +427,8 @@ if ! jq -n \
                 passed:true,
                 protocols:$postReboot.protocols,
                 telemetry:$postReboot.telemetry,
-                currentBootJournalLines:$journalLines
+                activeInstanceJournalLines:$journalLines,
+                journalWindow:$journalWindow
             },
             secretHygiene: $secretHygiene[0]
         }
@@ -372,14 +438,33 @@ if ! jq -n \
     exit 1
 fi
 chmod 600 "$temporary"
-if grep -aFq -f "$state_dir/dns-tsig-secret" "$temporary"; then
+secret_files=()
+for secret_fixture in "$state_dir/dns-tsig-secret" "$state_dir"/dns-tsig-secret-*; do
+    if [[ ! -e "$secret_fixture" && ! -L "$secret_fixture" ]]; then
+        continue
+    fi
+    [[ -f "$secret_fixture" && ! -L "$secret_fixture" ]] || {
+        rm -f -- "$temporary"
+        printf 'A DNS credential fixture is not a regular private file.\n' >&2
+        exit 1
+    }
+    secret_files+=("$(realpath -e -- "$secret_fixture")")
+done
+((${#secret_files[@]} > 0)) || {
     rm -f -- "$temporary"
-    printf 'Sanitized acceptance evidence unexpectedly contains the plaintext DNS secret.\n' >&2
+    printf 'No owned DNS credential fixture was available for sanitized evidence checks.\n' >&2
     exit 1
-else
-    grep_status=$?
-    [[ "$grep_status" == 1 ]] || { rm -f -- "$temporary"; exit 1; }
-fi
+}
+for secret_fixture in "${secret_files[@]}"; do
+    if grep -aFq -f "$secret_fixture" "$temporary"; then
+        rm -f -- "$temporary"
+        printf 'Sanitized acceptance evidence unexpectedly contains DNS TSIG plaintext.\n' >&2
+        exit 1
+    else
+        grep_status=$?
+        [[ "$grep_status" == 1 ]] || { rm -f -- "$temporary"; exit 1; }
+    fi
+done
 if ! ln -- "$temporary" "$destination"; then
     rm -f -- "$temporary"
     printf 'Could not preserve sanitized acceptance evidence at the requested destination.\n' >&2

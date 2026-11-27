@@ -194,6 +194,18 @@ new_token() {
     printf 'review-%s-%s-%s' "$$" "$RANDOM" "$RANDOM"
 }
 
+# The collector interleaves app logs, access logs and metrics under overlapping service names.
+# Require the service and request marker to belong to a LogRecord in the same ResourceLog.
+has_otlp_record() {
+    awk -v service="$2" -v token="${3:-}" '
+        /Resource(Log|Metrics|Spans) #[0-9]+/ { logs = /ResourceLog #/; named = 0; record = 0 }
+        logs && index($0, "service.name: Str(" service ")") { named = 1 }
+        /^LogRecord #[0-9]+/ { record = logs && named }
+        record && (token == "" || index($0, token)) { found = 1; exit }
+        END { exit !found }
+    ' "$1"
+}
+
 probe_forwarded() {
     local trust=$1 label=$2 token body status
     token=$(new_token)
@@ -239,6 +251,7 @@ my $socket = IO::Socket::INET->new(
     Proto => "tcp", Timeout => 3,
 ) or die "connect failed";
 binmode($socket);
+my $socket_port = $socket->sockport;
 my $client_header = "PROXY TCP4 203.0.113.55 127.0.0.1 32123 $port\r\n";
 my $payload = "review-proxy-$token\r\n";
 my $packet = $client_header . $payload;
@@ -259,11 +272,12 @@ while (1) {
 close($socket);
 my ($outgoing_header, $forwarded_payload) = split(/\r\n/, $response, 2);
 my $expected_source = $trust eq "trusted" ? "203.0.113.55" : "127.0.0.1";
-$outgoing_header =~ /^PROXY TCP4 \Q$expected_source\E 127\.0\.0\.1 \d+ \d+$/
-    or die "outgoing PROXY source did not match inbound trust policy";
-my $expected_payload = $trust eq "trusted" ? $payload : $client_header . $payload;
-$forwarded_payload eq $expected_payload
-    or die "backend payload did not distinguish trusted PROXY metadata from plain bytes";
+my $expected_port = $trust eq "trusted" ? 32123 : $socket_port;
+$outgoing_header eq "PROXY TCP4 $expected_source 127.0.0.1 $expected_port $port"
+    or die "outgoing PROXY tuple did not match inbound trust policy";
+# The native listener consumes a valid input preface in both cases; the trust policy
+# determines whether the backend sees its tuple or the real peer's tuple.
+$forwarded_payload eq $payload or die "unexpected bytes after the outgoing PROXY header";
 open(my $output, ">:raw", $path) or die "cannot write private response";
 print {$output} $response;
 close($output) or die "cannot close private response";
@@ -443,10 +457,10 @@ case "$mode" in
         app_evidence="$FIXTURE/otel-application-current.log"
         for _ in {1..60}; do
             tail -c "+$((baseline_offset + 1))" "$OTEL_LOG" > "$app_evidence"
-            if grep -Fq 'dorothy-review-acceptance' "$app_evidence"; then break; fi
+            if has_otlp_record "$app_evidence" dorothy-review-acceptance; then break; fi
             sleep 1
         done
-        grep -Fq 'dorothy-review-acceptance' "$app_evidence" \
+        has_otlp_record "$app_evidence" dorothy-review-acceptance \
             || fail 'current application OTLP log event was not observed after listener restarts'
         chmod 600 "$app_evidence"
 
@@ -472,19 +486,13 @@ case "$mode" in
             current_size=$(stat --format='%s' "$OTEL_LOG")
             (( current_size >= access_offset )) || fail 'OTLP collector log shrank during access-log observation'
             tail -c "+$((access_offset + 1))" "$OTEL_LOG" > "$current_access"
-            if grep -Fq "$event_token" "$current_access" \
-               && grep -Fq 'dorothy-review-access' "$current_access" \
-               && grep -Fq 'LogRecord #' "$current_access"; then
+            if has_otlp_record "$current_access" dorothy-review-access "$event_token"; then
                 break
             fi
             sleep 1
         done
-        grep -Fq "$event_token" "$current_access" \
-            || fail 'current unique access-log event was not observed in OTLP'
-        grep -Fq 'dorothy-review-access' "$current_access" \
-            || fail 'current OTLP access log did not identify the configured access-log exporter'
-        grep -Fq 'LogRecord #' "$current_access" \
-            || fail 'current unique access-log observation contains no OTLP LogRecord'
+        has_otlp_record "$current_access" dorothy-review-access "$event_token" \
+            || fail 'no current access LogRecord from the configured exporter contains the unique request'
         chmod 600 "$current_access"
         printf 'Current application and unique access OTLP log events were observed.\n'
         ;;

@@ -39,6 +39,8 @@ The authoritative dynamic inventory uses the [pinned Go types and file decoder](
 
 Out of scope: alternate discovery providers and API/dashboard publishing; third-party plugins and template execution; changing service identity, binary, unit, watched paths or ACME storage; arbitrary host file access. Native field exclusions must identify the reason. Use only isolated loopback endpoints and a disposable Debian guest for acceptance; no public CA or DNS credentials.
 
+**Runtime evidence requires outbound isolation.** Binding SSH or traffic listeners to loopback does not deny guest egress. The native product retains its documented default issuer when `caServer` is omitted; acceptance must instead require an explicit, allowlisted local issuer in the effective file before every start. Historical packet/issuer observations below do not attest outbound isolation. Compile-only CI is not clearance to run the guest.
+
 ## Verification ledger
 
 The field-level boundaries and reasons for rejection are in [static](Traefik-static.md), [HTTP/TCP/UDP](Traefik-dynamic.md), and [TLS/ACME](Traefik-tls.md). An accepted value is not evidence that the specific protocol, exporter or DNS provider has been exercised. `tests/Traefik.Acceptance/compare-provider.sh` validates the Traefik resource plus its referenced types with `pulumi schema check`; it does not claim whole-package compatibility. CI pins Pulumi 3.273.0. The separate full-package observation below used 3.276.0.

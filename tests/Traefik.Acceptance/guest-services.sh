@@ -11,14 +11,19 @@ case "$root" in
     /var/tmp/dorothy-traefik-acceptance.*) ;;
     *) printf 'Refusing to configure outside the private guest temp root.\n' >&2; exit 2 ;;
 esac
-[[ -d "$root" && -x "$root/bin/pebble" && -x "$root/bin/otelcol-contrib" && -x "$root/bin/traefik" ]] || {
-    printf 'Required pinned binaries are missing from the guest temp root.\n' >&2
+[[ -d "$root" && -x "$root/bin/pebble" && -x "$root/bin/otelcol-contrib" && -x "$root/bin/traefik" \
+    && -x "$root/guest-local-issuers.sh" ]] || {
+    printf 'Required pinned binaries or the local issuer guard are missing from the guest temp root.\n' >&2
     exit 2
 }
 [[ -f "$root/dns/tsig-secret" && -f "$root/certs/pebble.minica.pem" && -f "$root/certs/cert.pem" && -f "$root/certs/key.pem" ]] || {
     printf 'Required private fixture files are missing from the guest temp root.\n' >&2
     exit 2
 }
+if systemctl is-active --quiet keroosha-traefik.service; then
+    printf 'Refusing barrier preparation while the managed Traefik service is active.\n' >&2
+    exit 1
+fi
 
 install -d -m 755 "$root/certs" "$root/config" "$root/logs" "$root/units" "$root/dns"
 chmod 755 "$root"
@@ -243,8 +248,7 @@ EOF
 cat > "$root/units/dorothy-traefik-acceptance-pebble.service" <<EOF
 [Unit]
 Description=Dorothy Traefik acceptance Pebble ACME CA
-After=network.target dorothy-traefik-acceptance-dns.service
-Requires=dorothy-traefik-acceptance-dns.service
+After=network.target
 
 [Service]
 Type=simple
@@ -261,8 +265,7 @@ EOF
 cat > "$root/units/dorothy-traefik-acceptance-pebble-rotated.service" <<EOF
 [Unit]
 Description=Dorothy Traefik acceptance rotated Pebble ACME CA
-After=network.target dorothy-traefik-acceptance-dns.service
-Requires=dorothy-traefik-acceptance-dns.service
+After=network.target
 
 [Service]
 Type=simple
@@ -340,74 +343,253 @@ StandardError=append:$root/logs/udp-echo.log
 [Install]
 WantedBy=multi-user.target
 EOF
+cat > "$root/units/dorothy-traefik-acceptance-local-issuer-check.service" <<EOF
+[Unit]
+Description=Dorothy fixture guard for the managed Traefik ACME issuer
+Before=keroosha-traefik.service
+
+[Service]
+Type=oneshot
+RemainAfterExit=no
+TimeoutStartSec=20s
+ExecStart=/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C /bin/bash $root/guest-local-issuers.sh check /etc/keroosha-iac/traefik/static.yml keroosha-traefik.service
+EOF
+
 chmod 644 "$root/config/pebble.json" "$root/config/pebble-rotated.json" "$root/config/otelcol.yaml" "$root/config/nginx.conf" "$root/units/"*.service
 for unit in "$root/units/"*.service; do
     install -m 644 "$unit" "/etc/systemd/system/$(basename "$unit")"
 done
+
+# Add an ordered, required oneshot without changing the product-owned unit or using a drop-in.
+traefik_requires=/etc/systemd/system/keroosha-traefik.service.requires
+issuer_guard_unit=dorothy-traefik-acceptance-local-issuer-check.service
+[[ ! -L "$traefik_requires" ]] || {
+    printf 'Refusing to follow a symlink for the managed Traefik requirement directory.\n' >&2
+    exit 1
+}
+install -d -m 755 "$traefik_requires"
+issuer_link="$traefik_requires/$issuer_guard_unit"
+if [[ -e "$issuer_link" || -L "$issuer_link" ]]; then
+    [[ -L "$issuer_link" && $(readlink -- "$issuer_link") == "/etc/systemd/system/$issuer_guard_unit" ]] || {
+        printf 'Refusing to replace an unrelated Traefik unit requirement.\n' >&2
+        exit 1
+    }
+else
+    ln -s "/etc/systemd/system/$issuer_guard_unit" "$issuer_link"
+fi
+
+# Use an active-exited target: start/restart returns only after it writes its execution marker.
+# The required issuer oneshot exits inactive; every target restart must run it again.
+guard_valid="$root/config/issuer-guard-valid.json"
+guard_acme="$root/config/issuer-guard-acme.json"
+guard_systemd_static="$root/config/issuer-guard-systemd-static.json"
+guard_bad="$root/config/issuer-guard-bad.json"
+guard_missing="$root/config/issuer-guard-missing.json"
+guard_duplicate="$root/config/issuer-guard-duplicate.json"
+guard_case="$root/config/issuer-guard-case.json"
+guard_dns_fallback="$root/config/issuer-guard-dns-fallback.json"
+guard_dns_provider="$root/config/issuer-guard-dns-provider.json"
+guard_http="$root/config/issuer-guard-http-listener.json"
+guard_tls="$root/config/issuer-guard-tls-listener.json"
+guard_non_acme="$root/config/issuer-guard-non-acme.json"
+guard_alias="$root/config/issuer-guard-alias.yml"
+guard_dns_env="$root/config/issuer-guard-dns.env"
+guard_dns_public="$root/config/issuer-guard-dns-public.env"
+guard_dns_proxy="$root/config/issuer-guard-dns-proxy.env"
+printf '%s\n' '{"entryPoints":{},"providers":{}}' > "$guard_valid"
+cat > "$guard_acme" <<'JSON'
+{"entryPoints":{"http01":{"address":"127.0.0.1:5002"},"tlsalpn":{"address":"127.0.0.1:5001"}},"certificatesResolvers":{"dns":{"acme":{"caServer":"https://localhost:14000/dir","dnsChallenge":{"provider":"dnsupdate","resolvers":["127.0.0.1:1053"]}}},"http":{"acme":{"caServer":"https://localhost:14000/dir","httpChallenge":{"entryPoint":"http01"}}},"tls":{"acme":{"caServer":"https://localhost:14001/dir","tlsChallenge":{}}}}}
+JSON
+cp "$guard_acme" "$guard_systemd_static"
+"$root/guest-local-issuers.sh" check "$guard_valid" > "$root/logs/issuer-guard-static-valid.log"
+"$root/guest-local-issuers.sh" check "$guard_acme" > "$root/logs/issuer-guard-static-acme.log"
+jq '.certificatesResolvers.dns.acme.caServer="https://example.invalid/dir"' "$guard_acme" > "$guard_bad"
+jq 'del(.certificatesResolvers.dns.acme.caServer)' "$guard_acme" > "$guard_missing"
+jq '(.certificatesResolvers.dns.acme.caServer) as $server
+    | del(.certificatesResolvers.dns.acme.caServer)
+    | .certificatesResolvers.dns.acme.CaServer=$server' "$guard_acme" > "$guard_case"
+jq '.certificatesResolvers.dns.acme.dnsChallenge.resolvers += ["192.0.2.53:53"]' "$guard_acme" > "$guard_dns_fallback"
+jq '.certificatesResolvers.dns.acme.dnsChallenge.provider="cloudflare"' "$guard_acme" > "$guard_dns_provider"
+jq '.certificatesResolvers.http.acme.httpChallenge.entryPoint="web"' "$guard_acme" > "$guard_http"
+jq '.certificatesResolvers.tls.acme.tlsChallenge.entryPoint="web"' "$guard_acme" > "$guard_tls"
+printf '%s\n' '{"entryPoints":{"http01":{"address":"127.0.0.1:5002/tcp"},"tlsalpn":{"address":"127.0.0.1:5001/tcp"}},"certificatesResolvers":{"duplicate":{"acme":{"caServer":"https://localhost:14000/dir","caServer":"https://localhost:14001/dir","dnsChallenge":{"provider":"dnsupdate","resolvers":["127.0.0.1:1053"]}}}}}' > "$guard_duplicate"
+printf '%s\n' '{"certificatesResolvers":{"non-acme":{}}}' > "$guard_non_acme"
+printf '%s\n' 'certificatesResolvers: &issuers {}' > "$guard_alias"
+for rejected in "$guard_bad" "$guard_missing" "$guard_duplicate" "$guard_case" \
+    "$guard_dns_fallback" "$guard_dns_provider" "$guard_http" "$guard_tls" "$guard_non_acme" "$guard_alias"; do
+    if "$root/guest-local-issuers.sh" check "$rejected" >/dev/null 2>&1; then
+        printf 'Local issuer guard accepted an invalid resolver fixture: %s\n' "${rejected##*/}" >&2
+        exit 1
+    fi
+done
+cat > "$guard_dns_env" <<'ENV'
+DNSUPDATE_NAMESERVER="127.0.0.1:1053"
+DNSUPDATE_ZONES="acceptance.test"
+DNSUPDATE_TSIG_KEY="traefik-acceptance."
+DNSUPDATE_TSIG_SECRET="fixture-only"
+DNSUPDATE_TSIG_ALGORITHM="hmac-sha256."
+ENV
+printf '%s\n' 'DNSUPDATE_NAMESERVER="192.0.2.53:53"' 'DNSUPDATE_ZONES="acceptance.test"' > "$guard_dns_public"
+printf '%s\n' 'DNSUPDATE_NAMESERVER="127.0.0.1:1053"' 'DNSUPDATE_ZONES="acceptance.test"' \
+    'HTTPS_PROXY="http://proxy.invalid:8080"' > "$guard_dns_proxy"
+"$root/guest-local-issuers.sh" check-env-file "$guard_dns_env" > "$root/logs/issuer-guard-dns-env.log"
+for rejected in "$guard_dns_public" "$guard_dns_proxy"; do
+    if "$root/guest-local-issuers.sh" check-env-file "$rejected" >/dev/null 2>&1; then
+        printf 'Local issuer guard accepted an unsafe DNS environment fixture: %s\n' "${rejected##*/}" >&2
+        exit 1
+    fi
+done
+
+test_check_unit=dorothy-traefik-acceptance-issuer-guard-test-check.service
+test_target_unit=dorothy-traefik-acceptance-issuer-guard-test.service
+test_check_path="/run/systemd/system/$test_check_unit"
+test_target_path="/run/systemd/system/$test_target_unit"
+test_requires="$test_target_path.requires"
+test_check_log="$root/logs/issuer-guard-systemd-check.log"
+test_run_log="$root/logs/issuer-guard-systemd-target.log"
+test_attempt_log="$root/logs/issuer-guard-systemd-target-attempts.log"
+test_target_script="$root/units/issuer-guard-test-target.sh"
+cat > "$test_target_script" <<EOF
+#!/usr/bin/env bash
+set -euo pipefail
+printf '%s\n' attempted >> "$test_attempt_log"
+check_count=\$(grep -cFx 'static Traefik issuer configuration accepted' "$test_check_log" || true)
+run_count=\$(grep -cFx started "$test_run_log" || true)
+[[ "\$check_count" -eq \$((run_count + 1)) ]]
+printf '%s\n' started >> "$test_run_log"
+EOF
+cat > "$root/units/$test_check_unit" <<EOF
+[Unit]
+Description=Temporary fixture-only issuer guard ordering check
+Before=$test_target_unit
+
+[Service]
+Type=oneshot
+TimeoutStartSec=20s
+ExecStart=/usr/bin/env -i PATH=/usr/sbin:/usr/bin:/sbin:/bin LANG=C /bin/bash $root/guest-local-issuers.sh check $guard_systemd_static
+RemainAfterExit=no
+StandardOutput=append:$test_check_log
+StandardError=append:$test_check_log
+EOF
+cat > "$root/units/$test_target_unit" <<EOF
+[Unit]
+Description=Temporary target for verifying required issuer checks before execution
+
+[Service]
+Type=oneshot
+RemainAfterExit=yes
+ExecStart=/bin/bash $test_target_script
+EOF
+install -d -m 755 /run/systemd/system
+install -m 644 "$root/units/$test_check_unit" "$test_check_path"
+install -m 644 "$root/units/$test_target_unit" "$test_target_path"
+install -d -m 755 "$test_requires"
+ln -s "$test_check_path" "$test_requires/$test_check_unit"
+issuer_guard_test_cleanup() {
+    systemctl stop "$test_target_unit" >/dev/null 2>&1 || true
+    rm -f -- "$test_requires/$test_check_unit" "$test_check_path" "$test_target_path"
+    rm -f -- "$test_target_script"
+    rmdir -- "$test_requires" 2>/dev/null || true
+    systemctl daemon-reload >/dev/null 2>&1 || true
+}
+trap issuer_guard_test_cleanup EXIT
+systemctl daemon-reload
+: > "$test_check_log"
+: > "$test_run_log"
+: > "$test_attempt_log"
+systemctl start "$test_target_unit" > "$root/logs/issuer-guard-systemd-start.log" 2>&1
+[[ $(grep -cFx 'static Traefik issuer configuration accepted' "$test_check_log" || true) == 1 \
+    && $(grep -cFx started "$test_run_log" || true) == 1 \
+    && $(grep -cFx attempted "$test_attempt_log" || true) == 1 ]] || {
+    printf 'Required issuer check did not run before the fixture target start.\n' >&2
+    exit 1
+}
+systemctl restart "$test_target_unit" > "$root/logs/issuer-guard-systemd-restart.log" 2>&1
+[[ $(grep -cFx 'static Traefik issuer configuration accepted' "$test_check_log" || true) == 2 \
+    && $(grep -cFx started "$test_run_log" || true) == 2 \
+    && $(grep -cFx attempted "$test_attempt_log" || true) == 2 ]] || {
+    printf 'Required issuer check did not rerun before the fixture target restart.\n' >&2
+    exit 1
+}
+systemctl stop "$test_target_unit" > "$root/logs/issuer-guard-systemd-stop.log" 2>&1
+[[ $(grep -cFx 'static Traefik issuer configuration accepted' "$test_check_log" || true) == 2 \
+    && $(grep -cFx started "$test_run_log" || true) == 2 \
+    && $(grep -cFx attempted "$test_attempt_log" || true) == 2 ]] || {
+    printf 'Stopping the fixture target unexpectedly reran the issuer check.\n' >&2
+    exit 1
+}
+systemctl start "$test_target_unit" > "$root/logs/issuer-guard-systemd-start-again.log" 2>&1
+[[ $(grep -cFx 'static Traefik issuer configuration accepted' "$test_check_log" || true) == 3 \
+    && $(grep -cFx started "$test_run_log" || true) == 3 \
+    && $(grep -cFx attempted "$test_attempt_log" || true) == 3 ]] || {
+    printf 'Required issuer check did not rerun before the fixture target start.\n' >&2
+    exit 1
+}
+jq '.certificatesResolvers.dns.acme.caServer="https://localhost:14999/dir"' "$guard_acme" > "$guard_systemd_static"
+if systemctl restart "$test_target_unit" > "$root/logs/issuer-guard-systemd-reject.log" 2>&1; then
+    printf 'Fixture target restarted despite a rejected local ACME issuer.\n' >&2
+    exit 1
+fi
+if systemctl is-active --quiet "$test_target_unit" \
+    || [[ $(grep -cFx started "$test_run_log" || true) != 3 \
+        || $(grep -cFx attempted "$test_attempt_log" || true) != 3 ]]; then
+    printf 'Failed issuer check did not block fixture target execution.\n' >&2
+    exit 1
+fi
+cp "$guard_acme" "$guard_systemd_static"
+systemctl restart "$test_target_unit" > "$root/logs/issuer-guard-systemd-recover.log" 2>&1
+[[ $(grep -cFx 'static Traefik issuer configuration accepted' "$test_check_log" || true) == 4 \
+    && $(grep -cFx started "$test_run_log" || true) == 4 \
+    && $(grep -cFx attempted "$test_attempt_log" || true) == 4 ]] || {
+    printf 'Required issuer check did not recover on the next fixture target start.\n' >&2
+    exit 1
+}
+issuer_guard_test_cleanup
+trap - EXIT
+
 systemctl daemon-reload
 systemctl enable --now \
-    dorothy-traefik-acceptance-dns.service \
     dorothy-traefik-acceptance-pebble.service \
-    dorothy-traefik-acceptance-pebble-rotated.service \
-    dorothy-traefik-acceptance-otelcol.service \
-    dorothy-traefik-acceptance-backends.service \
-    dorothy-traefik-acceptance-tcp.service \
-    dorothy-traefik-acceptance-udp.service > "$root/logs/systemd-start.log" 2>&1
+    dorothy-traefik-acceptance-pebble-rotated.service > "$root/logs/barrier-pebble-start.log" 2>&1
 
+directory_ready=false
 for _ in $(seq 1 90); do
-    if dig +time=1 +tries=1 @127.0.0.1 -p 1053 acceptance.test SOA >/dev/null 2>&1 \
-       && curl --fail --silent --show-error --cacert "$root/certs/pebble.minica.pem" \
-            https://localhost:14000/dir -o "$root/logs/pebble-directory.json" 2>/dev/null \
-       && curl --fail --silent --show-error --cacert "$root/certs/pebble.minica.pem" \
-            https://localhost:14001/dir -o "$root/logs/pebble-rotated-directory.json" 2>/dev/null \
-       && nc -z -w 1 127.0.0.1 4318; then
+    if env -i PATH=/usr/bin:/bin curl --disable --noproxy '*' --connect-timeout 2 --max-time 4 \
+        --fail --silent --show-error --cacert "$root/certs/pebble.minica.pem" \
+        https://localhost:14000/dir -o "$root/logs/pebble-directory.json" 2>/dev/null \
+       && env -i PATH=/usr/bin:/bin curl --disable --noproxy '*' --connect-timeout 2 --max-time 4 \
+        --fail --silent --show-error --cacert "$root/certs/pebble.minica.pem" \
+        https://localhost:14001/dir -o "$root/logs/pebble-rotated-directory.json" 2>/dev/null; then
+        directory_ready=true
         break
     fi
     sleep 1
 done
-curl --fail --silent --show-error --cacert "$root/certs/pebble.minica.pem" \
-    https://localhost:15001/roots/0 -o "$root/certs/pebble-rotated-issued-root.pem"
-openssl x509 -in "$root/certs/pebble-rotated-issued-root.pem" -noout -subject > "$root/logs/pebble-rotated-root.subject"
-
-dns_probe=_preflight.acceptance.test.
-printf 'server 127.0.0.1 1053\nzone acceptance.test.\nupdate add %s 30 TXT "rfc2136-ready"\nsend\n' "$dns_probe" \
-    | nsupdate -k "$root/dns/tsig.key" > "$root/logs/dns-update.log" 2>&1
-dns_observation=$(dig +time=2 +tries=1 +short @127.0.0.1 -p 1053 TXT "$dns_probe")
-[[ "$dns_observation" == '"rfc2136-ready"' ]] || { printf 'RFC2136 TSIG update was not visible in the isolated DNS zone.\n' >&2; exit 1; }
-printf 'server 127.0.0.1 1053\nzone acceptance.test.\nupdate delete %s TXT\nsend\n' "$dns_probe" \
-    | nsupdate -k "$root/dns/tsig.key" >> "$root/logs/dns-update.log" 2>&1
-
-[[ "$(curl --fail --silent http://127.0.0.1:8080/health)" == http-backend-ready ]] || { printf 'HTTP fixture failed its health probe.\n' >&2; exit 1; }
-[[ "$(curl --fail --silent --resolve backend.acceptance.test:8081:127.0.0.1 \
-    --cacert "$root/certs/upstream-ca.pem" https://backend.acceptance.test:8081/health)" == tls-backend-ready ]] || {
-    printf 'TLS backend fixture failed certificate verification or its health probe.\n' >&2
+[[ $directory_ready == true ]] || {
+    printf 'Loopback Pebble directory endpoints did not become ready.\n' >&2
     exit 1
 }
-curl --fail --silent --show-error --cacert "$root/certs/pebble.minica.pem" \
+env -i PATH=/usr/bin:/bin curl --disable --noproxy '*' --connect-timeout 2 --max-time 4 \
+    --fail --silent --show-error --cacert "$root/certs/pebble.minica.pem" \
     https://localhost:15000/roots/0 -o "$root/certs/pebble-issued-root.pem"
-openssl x509 -in "$root/certs/pebble-issued-root.pem" -noout -subject > "$root/logs/pebble-issued-root.subject"
-
-listeners=$(ss -H -lntup)
-for port in 1053 14000 14001 15000 15001 4317 4318 8080 8081 8082 19001 19002; do
-    row=$(printf '%s\n' "$listeners" | awk -v suffix=":$port" '$5 ~ (suffix "$" ) || $5 ~ ("\\]:" port "$" )')
-    [[ -n "$row" ]] || { printf 'Fixture listener %s did not start.\n' "$port" >&2; exit 1; }
-    if printf '%s\n' "$row" | awk '$5 ~ /^(0\.0\.0\.0|\[::\]|:::|\*):/ { found = 1 } END { exit !found }'; then
-        printf 'Fixture listener %s is not loopback-bound.\n' "$port" >&2
-        exit 1
-    fi
-done
-printf '%s\n' "$listeners" | grep -E ':(1053|14000|14001|15000|15001|4317|4318|8080|8081|8082|19001|19002)([[:space:]]|$)' \
-    > "$root/logs/listeners.txt"
+env -i PATH=/usr/bin:/bin curl --disable --noproxy '*' --connect-timeout 2 --max-time 4 \
+    --fail --silent --show-error --cacert "$root/certs/pebble.minica.pem" \
+    https://localhost:15001/roots/0 -o "$root/certs/pebble-rotated-issued-root.pem"
+openssl x509 -in "$root/certs/pebble-issued-root.pem" -noout -subject > "$root/logs/pebble-root.subject"
+openssl x509 -in "$root/certs/pebble-rotated-issued-root.pem" -noout -subject > "$root/logs/pebble-rotated-root.subject"
 
 {
     printf 'Debian '; cat /etc/debian_version
-    "$root/bin/traefik" version
+    staged_traefik_sha=$(sha256sum "$root/bin/traefik" | awk '{ print $1 }')
+    [[ "$staged_traefik_sha" == 86ee2b427888d24475051fc5f5bcca94cf4fa033b6fa54205b7eb0de6914f31e ]] || {
+        printf 'Staged Traefik executable digest does not match the pinned fixture.\n' >&2
+        exit 1
+    }
+    printf 'Staged only: Traefik 3.7.16, verified SHA-256=%s; executable not run before clearance.\n' "$staged_traefik_sha"
     "$root/bin/pebble" -version
-    "$root/bin/otelcol-contrib" --version
-    named -V 2>&1 | head -n 1
-    nginx -v 2>&1
-    printf 'RFC2136 fixture: BIND authoritative acceptance.test, signed update and TXT readback succeeded.\n'
-    printf 'ACME fixtures: two independent loopback Pebble servers are active; both CA roots are captured.\n'
-    printf 'TLS fixture: local backend certificate verified against its generated CA.\n'
-} > "$root/logs/baseline-observations.log" 2>&1
-printf 'Guest protocol endpoints, RFC2136 DNS issuer, Pebble ACME CA and OTel collector are active on loopback.\n'
+    printf 'Both local Pebble ACME directory endpoints and root snapshots were read over loopback.\n'
+    printf 'The guest-only required issuer oneshot passed valid, invalid and restart-gating checks against a dummy unit.\n'
+    printf 'Traefik was not run; DNS, telemetry, HTTP/TLS backends, TCP and UDP services remain stopped.\n'
+    printf 'No DNS updates or data-plane or telemetry acceptance probes were performed during barrier preparation.\n'
+} > "$root/logs/barrier-fixtures.log" 2>&1
+printf 'Loopback Pebble CAs are ready; Traefik and all non-CA fixtures remain off pending approval.\n'

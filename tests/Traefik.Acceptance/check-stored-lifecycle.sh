@@ -7,6 +7,7 @@ umask 077
 state=$(realpath -e "$1"); current=$(realpath -e "$2"); old=$(realpath -e "$3")
 [[ "$state" == /tmp/dorothy-traefik-acceptance.* && $(<"$state/.owner") == dorothy-traefik-acceptance-owned-state-v1 ]]
 [[ "${PULUMI_HOME:-}" == "$state/pulumi-home" && "${PULUMI_BACKEND_URL:-}" == "file://$state/backend" ]]
+bash "$(dirname "$(realpath "$0")")/guest-barrier-check.sh" acceptance "$state"
 source "$state/handle.env"
 fixture=$(dirname "$(realpath "$0")"); log="$state/logs/review-stored.log"; : > "$log"
 urn=$(jq -er '.deployment.resources[]|select(.type=="keroosha:debian:Traefik")|.urn' "$state/legacy-checkpoint.json")

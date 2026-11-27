@@ -6,6 +6,7 @@ umask 077
 [[ $# == 3 ]] || { echo 'usage: helper-skew.sh STATE_DIR FROZEN_PROVIDER CURRENT_PROVIDER' >&2; exit 2; }
 state=$(realpath -e "$1"); old=$(realpath -e "$2"); current=$(realpath -e "$3")
 [[ "$state" == /tmp/dorothy-traefik-acceptance.* && $(<"$state/.owner") == dorothy-traefik-acceptance-owned-state-v1 ]]
+bash "$(dirname "$(realpath "$0")")/guest-barrier-check.sh" acceptance "$state"
 source "$state/handle.env"
 [[ "$SSH_USER" == root && "$GUEST_ROOT" =~ ^/var/tmp/dorothy-traefik-acceptance\.[[:alnum:]]+$ ]]
 for bundle in "$old" "$current"; do

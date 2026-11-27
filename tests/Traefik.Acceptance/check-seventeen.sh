@@ -6,6 +6,7 @@ umask 077
 state=$(realpath -e -- "$1"); candidate=$(realpath -e -- "$2"); frozen=${3:-}
 [[ "$state" == /tmp/dorothy-traefik-acceptance.* && $(<"$state/.owner") == dorothy-traefik-acceptance-owned-state-v1 ]]
 [[ "${PULUMI_HOME:-}" == "$state/pulumi-home" && "${PULUMI_BACKEND_URL:-}" == "file://$state/backend" ]]
+bash "$(dirname "$(realpath "$0")")/guest-barrier-check.sh" acceptance "$state"
 source "$state/handle.env"
 script_dir=$(dirname "$(realpath "$0")")
 project="$state/pulumi-project"; log="$state/logs/review-seventeen.log"; : > "$log"

@@ -1,12 +1,22 @@
 # Traefik acceptance runner
 
-Run from the repository root on a Linux x86-64 host with KVM access, QEMU, xorriso, .NET 10 with a Linux Native AOT toolchain, Pulumi, jq, OpenSSL and OpenSSH. The harness downloads pinned public fixtures. No cloud API token, external CA or DNS account is needed. Root commands run inside the owned guest, not on the workstation.
+The host prepares dependencies before starting a fresh Debian 13 guest. Guest acceptance requires an outbound deny boundary **above** the guest from first boot; a loopback SSH forward or loopback-only Traefik listener is not that boundary. Do not reuse a guest from earlier runs or open egress to make a missing package, release archive, DNS lookup or ACME challenge succeed.
+
+Use an unprivileged Linux x86-64 account with KVM, user/network namespaces, QEMU, xorriso, socat, dnsmasq, dig, iproute2, OpenSSH, OpenSSL and jq. Building the provider also requires .NET 10, a linux-x64 Native AOT toolchain and Pulumi. To replay without even host-side artifact downloads, set `DOROTHY_ACCEPTANCE_PUBLIC_ASSET_CACHE` to the four pinned public release/image files and `DOROTHY_ACCEPTANCE_DEB_CACHE` to the flat `.deb` directory matching [`offline-deps.manifest`](offline-deps.manifest). A missing or mismatched cached artifact fails staging; it does not fall back to the Internet.
 
 ```bash
 fixture=tests/Traefik.Acceptance
 bash "$fixture/prepare.sh"
 # Set STATE_DIR to the private directory printed by prepare.sh.
 bash "$fixture/prepare-services.sh" "$STATE_DIR"
+bash "$fixture/guest-barrier-check.sh" receipt "$STATE_DIR"
+```
+
+**Stop here.** Review the fresh `$STATE_DIR/barrier-receipt.json` with Traefik inactive, verified reachability of the local CA, and a controlled negative path that uses no public service. Continue only after independent approval of the barrier and the historical artifact acquisition method. The stock frozen helper's first install requires a GitHub release download; an offline variant must be labelled as such and must retain the original archive digest/installation checks. Never manufacture owner markers or enable a proxy.
+
+```bash
+# Set REVIEWED_RECEIPT_SHA256 only from the independent review decision for this guest.
+bash "$fixture/guest-barrier-check.sh" authorize "$STATE_DIR" "${REVIEWED_RECEIPT_SHA256:?approval required}"
 
 # Every publish and Pulumi command uses private per-run caches and state.
 mkdir -m 700 -p "$STATE_DIR/home" "$STATE_DIR/dotnet-home" "$STATE_DIR/nuget-packages"
@@ -44,7 +54,11 @@ bash "$fixture/helper-skew.sh" "$STATE_DIR" "$FROZEN_PROVIDER_DIR" "$STATE_DIR/c
 
 The check requires the legacy-only checkpoint, asserts the exact Traefik capability envelope, and records private evidence while verifying that failed operations leave the Pulumi checkpoint and Traefik service/configuration unchanged.
 
-The full run writes a redacted machine-readable closure record outside the disposable state directory: `"$STATE_DIR.evidence.json"` by default, or `TRAEFIK_ACCEPTANCE_EVIDENCE_FILE` when set. It contains tested Git HEADs, source/artifact digests, stage results and counts; it does not contain checkpoint payloads, secret ciphertext/plaintext, private keys or raw logs. Copy this sanitized JSON to durable review storage before cleanup.
+The full run writes a redacted machine-readable closure record outside the disposable state directory: `"$STATE_DIR.evidence.json"` by default, or `TRAEFIK_ACCEPTANCE_EVIDENCE_FILE` when set. It contains tested Git HEADs, source/artifact digests, stage results and counts; it does not contain checkpoint payloads, secret ciphertext/plaintext, private keys, raw process cmdlines or raw logs. Copy this sanitized JSON to durable review storage before cleanup.
+
+Secret checks are scoped to the Pulumi file backend, exported checkpoint JSON, Pulumi project files, harness logs, each provider SSH argv (compared against every original/rotated DNS fixture token), and the running guest Traefik MainPID cmdline plus its configuration files, unit and timestamp-bounded unit journal. They do not scan unrelated host processes or the guest disk image. Root-only Traefik rollback snapshots may contain reversible credentials; keep the entire detailed state directory private and do not share it. Only the sanitized closure record is intended for review sharing.
+
+Before any Traefik lifecycle start, `run.sh` calls `guest-barrier-check.sh acceptance` and refuses to proceed unless the live guest matches the fresh barrier receipt and its separate mode-0600 authorization marker. The runner never creates or authorizes the receipt; the sanitized closure record includes only their digests.
 
 `TRAEFIK_REVIEW_FROZEN_PROVIDER_DIR` optionally supplies the frozen cfd5b41 provider to the full-run pagination and 17-target legacy TLS comparisons. Without it, those checks use the candidate provider only. The full runner also performs a copied-checkpoint preview with refresh disabled and a deny-SSH sentinel before the first active-stack refresh.
 

@@ -148,62 +148,96 @@ type TraefikBackendTests() =
             "[]"
             """{"Version":"3.7.16"}"""
 
-    let sandboxConnection () =
-        let address = Environment.GetEnvironmentVariable("KEROOSHA_TRAEFIK_SANDBOX_ADDRESS")
-        if String.IsNullOrWhiteSpace(address) then
-            invalidOp "Set KEROOSHA_TRAEFIK_SANDBOX_ADDRESS to a dedicated disposable host before running the Sandbox integration test."
-        let identityFile =
-            match Environment.GetEnvironmentVariable("KEROOSHA_TRAEFIK_SANDBOX_IDENTITY") with
-            | null
-            | "" -> None
-            | value -> Some value
-        { Address = address
-          User = "root"
-          Port = 22
-          IdentityFile = identityFile }
+    let acceptanceFile path =
+        let file = FileInfo(path)
+        if not file.Exists || not (String.IsNullOrEmpty(file.LinkTarget)) then
+            invalidOp "The sealed acceptance state contains a missing or linked file."
+        path
 
-    let runSandboxSsh (connection: SshConnection) (remoteCommand: string) (input: string option) =
-        let startInfo = ProcessStartInfo("ssh")
+    let verifiedAcceptanceStateDirectory () =
+        let stateValue =
+            match Environment.GetEnvironmentVariable("DOROTHY_TRAEFIK_ACCEPTANCE_STATE_DIR") with
+            | null
+            | "" -> invalidOp "Set DOROTHY_TRAEFIK_ACCEPTANCE_STATE_DIR to a fresh prepare.sh state directory."
+            | value -> value
+        let stateDirectory = Path.GetFullPath(stateValue)
+        let tempRoot = Path.GetFullPath(Path.GetTempPath()).TrimEnd([| Path.DirectorySeparatorChar |])
+        let directoryName = Path.GetFileName(stateDirectory)
+        let prefix = "dorothy-traefik-acceptance."
+        let suffix = if directoryName.StartsWith(prefix, StringComparison.Ordinal) then directoryName.Substring(prefix.Length) else ""
+        let directory = DirectoryInfo(stateDirectory)
+        if Path.GetDirectoryName(stateDirectory) <> tempRoot
+           || suffix.Length = 0
+           || not (suffix |> Seq.forall (fun character -> Char.IsAsciiLetterOrDigit(character)))
+           || not directory.Exists
+           || not (String.IsNullOrEmpty(directory.LinkTarget)) then
+            invalidOp "Refusing to run outside the private sealed acceptance state root."
+        if (int (File.GetUnixFileMode(stateDirectory)) &&& 0o077) <> 0 then
+            invalidOp "The sealed acceptance state directory is not private."
+        let owner = acceptanceFile (Path.Combine(stateDirectory, ".owner"))
+        if (FileInfo(owner)).Length > 128L
+           || File.ReadAllText(owner).Trim() <> "dorothy-traefik-acceptance-owned-state-v1" then
+            invalidOp "The sealed acceptance ownership marker is invalid."
+        for filename in [ "handle.env"; "legacy-checkpoint.json"; "legacy-resource-id.txt" ] do
+            acceptanceFile (Path.Combine(stateDirectory, filename)) |> ignore
+        if Directory.EnumerateFiles(stateDirectory, "candidate-helper-*.sha256", SearchOption.TopDirectoryOnly) |> Seq.isEmpty |> not then
+            invalidOp "Refusing to repeat the sealed full acceptance run in a used per-run state directory."
+        stateDirectory
+
+    let verifiedCandidateProviderDirectory () =
+        let providerValue =
+            match Environment.GetEnvironmentVariable("DOROTHY_TRAEFIK_ACCEPTANCE_PROVIDER_DIR") with
+            | null
+            | "" -> invalidOp "Set DOROTHY_TRAEFIK_ACCEPTANCE_PROVIDER_DIR to the candidate provider directory."
+            | value -> value
+        let providerDirectory = Path.GetFullPath(providerValue)
+        let directory = DirectoryInfo(providerDirectory)
+        if not directory.Exists || not (String.IsNullOrEmpty(directory.LinkTarget)) then
+            invalidOp "The candidate provider directory is missing or linked."
+        for filename in [ "pulumi-resource-keroosha"; "helper/linux-x64/keroosha-iac-helper" ] do
+            acceptanceFile (Path.Combine(providerDirectory, filename)) |> ignore
+        providerDirectory
+
+    let publicAcceptanceRunner () =
+        let rec find (directory: DirectoryInfo) =
+            if isNull directory then invalidOp "The public sealed acceptance runner was not found in the source tree."
+            let candidate = Path.Combine(directory.FullName, "tests", "Traefik.Acceptance", "run.sh")
+            if File.Exists(candidate) then
+                acceptanceFile candidate
+            else
+                match directory.Parent with
+                | null -> invalidOp "The public sealed acceptance runner was not found in the source tree."
+                | parent -> find parent
+        find (DirectoryInfo(AppContext.BaseDirectory))
+
+    let runPublicAcceptance (stateDirectory: string) (providerDirectory: string) =
+        let runner = publicAcceptanceRunner ()
+        let startInfo = ProcessStartInfo("/usr/bin/bash")
         startInfo.UseShellExecute <- false
-        startInfo.RedirectStandardInput <- true
         startInfo.RedirectStandardOutput <- true
         startInfo.RedirectStandardError <- true
         startInfo.CreateNoWindow <- true
-        for argument in [ "-T"; "-o"; "BatchMode=yes"; "-o"; "StrictHostKeyChecking=yes"; "-o"; "ConnectTimeout=15"; "-p"; string connection.Port ] do
+        startInfo.WorkingDirectory <- Path.GetDirectoryName(runner)
+        for name in
+            [ "SSH_CONFIG"; "SSH_HOST"; "SSH_PORT"; "SSH_USER"; "GUEST_ROOT"
+              "DOROTHY_ACCEPTANCE_SSH_CONFIG"; "DOROTHY_ACCEPTANCE_SSH_PORT"
+              "UPSTREAM_CA_FILE"; "CLIENT_CA_FILE"; "DNS_TSIG_SECRET_FILE"; "PULUMI_PASSPHRASE_FILE"
+              "PULUMI_CONFIG_PASSPHRASE"; "PULUMI_ACCESS_TOKEN"; "BASH_ENV"; "ENV"
+              "HTTP_PROXY"; "HTTPS_PROXY"; "ALL_PROXY"; "http_proxy"; "https_proxy"; "all_proxy" ] do
+            startInfo.Environment.Remove(name) |> ignore
+        for argument in [ runner; stateDirectory; providerDirectory; "full" ] do
             startInfo.ArgumentList.Add(argument)
-        match connection.IdentityFile with
-        | Some path ->
-            startInfo.ArgumentList.Add("-i")
-            startInfo.ArgumentList.Add(path)
-        | None -> ()
-        startInfo.ArgumentList.Add(connection.User + "@" + connection.Address)
-        startInfo.ArgumentList.Add(remoteCommand)
-        use childProcess = new Process(StartInfo = startInfo)
-        if not (childProcess.Start()) then invalidOp "Unable to start the SSH client for the Sandbox Traefik test."
-        let stdout = childProcess.StandardOutput.ReadToEndAsync()
-        let stderr = childProcess.StandardError.ReadToEndAsync()
-        match input with
-        | Some value -> childProcess.StandardInput.Write(value); childProcess.StandardInput.Flush()
-        | None -> ()
-        childProcess.StandardInput.Close()
-        if not (childProcess.WaitForExit(60000)) then
-            childProcess.Kill(true)
-            childProcess.WaitForExit()
-            invalidOp "Sandbox SSH command timed out."
-        let output = stdout.GetAwaiter().GetResult()
-        let error = stderr.GetAwaiter().GetResult()
-        if childProcess.ExitCode <> 0 then
-            invalidOp ("Sandbox SSH command failed: " + error.Trim())
-        output
-
-    let sandboxHelper (connection: SshConnection) (request: JsonObject) =
-        SshTransport.runHelper
-            connection
-            "traefik"
-            "Sandbox Traefik lifecycle test"
-            (request.ToJsonString())
-            CancellationToken.None
-        |> fun operation -> operation.GetAwaiter().GetResult()
+        use child = new Process(StartInfo = startInfo)
+        if not (child.Start()) then invalidOp "Could not start the public sealed QEMU acceptance runner."
+        let standardOutput = child.StandardOutput.BaseStream.CopyToAsync(Stream.Null)
+        let standardError = child.StandardError.BaseStream.CopyToAsync(Stream.Null)
+        child.WaitForExit()
+        standardOutput.GetAwaiter().GetResult()
+        standardError.GetAwaiter().GetResult()
+        if child.ExitCode <> 0 then
+            invalidOp "The sealed Traefik acceptance runner failed; inspect its private per-run logs."
+        for filename in [ "candidate-helper-full.sha256"; "deleted-checkpoint.json"; "secret-hygiene-metrics.json" ] do
+            acceptanceFile (Path.Combine(stateDirectory, filename)) |> ignore
 
     [<Test>]
     member _.``Traefik archive extraction streams the exact binary and rejects unsafe or malformed members``() =
@@ -1301,235 +1335,13 @@ type TraefikBackendTests() =
         // Assert
         Assert.Throws<Traefik.BackendError>(failure) |> ignore
 
-    [<Test; Explicit("Runs a real Traefik lifecycle only on the dedicated Sandbox host."); Category("Sandbox")>]
-    member _.``Sandbox apply redirect-only transition rollback read and Delete retain ACME storage and prove SNI``() =
-        // Arrange
-        if Environment.GetEnvironmentVariable("KEROOSHA_RUN_SANDBOX_TRAEFIK_TESTS") <> "1" then
-            Assert.Ignore("Set KEROOSHA_RUN_SANDBOX_TRAEFIK_TESTS=1 to run the explicit Sandbox integration test.")
-        let connection = sandboxConnection ()
-        let ownerId = "keroosha-iac-nunit-traefik-" + Guid.NewGuid().ToString("N")
-        TestContext.Progress.WriteLine("Sandbox Traefik test ownerId: " + ownerId)
-        let adminPort = RandomNumberGenerator.GetInt32(45000, 50000)
-        let webPort = RandomNumberGenerator.GetInt32(30000, 38000)
-        let nextWebPort = RandomNumberGenerator.GetInt32(38001, 44000)
-        let securePort = RandomNumberGenerator.GetInt32(50001, 60000)
-        let certificate = TestSupport.createValidCertificateFixture "sandbox.example.test" [ "sandbox.example.test" ]
-        let makeRequest (operation: string) (httpPort: int) (tlsPort: int) (backend: string option) (redirectOrigin: string option) : JsonObject =
-            let entryPoints = JsonObject()
-            entryPoints["web"] <- JsonValue.Create(httpPort)
-            entryPoints["websecure"] <- JsonValue.Create(tlsPort)
-            let tls = JsonObject()
-            tls["kind"] <- JsonValue.Create("provided")
-            tls["name"] <- JsonValue.Create("sandbox-cert")
-            let router = JsonObject()
-            router["host"] <- JsonValue.Create("sandbox.example.test")
-            router["entryPoint"] <- JsonValue.Create("websecure")
-            match backend, redirectOrigin with
-            | Some value, None -> router["backend"] <- JsonValue.Create(value)
-            | None, Some origin ->
-                let redirect = JsonObject()
-                redirect["kind"] <- JsonValue.Create("permanentToOrigin")
-                redirect["origin"] <- JsonValue.Create(origin)
-                router["redirect"] <- redirect
-            | _ -> invalidOp "Sandbox Traefik route must have exactly one target."
-            router["tls"] <- tls
-            let routers = JsonObject()
-            routers["site"] <- router
-            let certificateValue = JsonObject()
-            certificateValue["certificatePem"] <- JsonValue.Create(certificate.LeafCertificatePem)
-            certificateValue["privateKeyPem"] <- JsonValue.Create(certificate.PrivateKeyPem)
-            certificateValue["fingerprint"] <- JsonValue.Create(certificate.Fingerprint)
-            let certificates = JsonObject()
-            certificates["sandbox-cert"] <- certificateValue
-            let request = JsonObject()
-            request["operation"] <- JsonValue.Create(operation)
-            request["ownerId"] <- JsonValue.Create(ownerId)
-            request["entryPoints"] <- entryPoints
-            request["resolvers"] <- JsonObject()
-            request["routers"] <- routers
-            request["certificates"] <- certificates
-            request["adminPort"] <- JsonValue.Create(adminPort)
-            request
-        let applyRequest = makeRequest "apply" webPort securePort (Some "http://127.0.0.1:1") None
-        let redirectRequest = makeRequest "apply" webPort securePort None (Some "https://destination.example.test")
-        let dynamicUpdate = makeRequest "apply" webPort securePort (Some "http://127.0.0.1:2") None
-        let startupUpdate = makeRequest "apply" nextWebPort securePort (Some "http://127.0.0.1:2") None
-        let readRequest = makeRequest "read" nextWebPort securePort (Some "http://127.0.0.1:2") None
-        let failedUpdate = makeRequest "apply" nextWebPort 22 (Some "http://127.0.0.1:2") None
-        let deleteRequest = JsonObject()
-        deleteRequest["operation"] <- JsonValue.Create("delete")
-        deleteRequest["ownerId"] <- JsonValue.Create(ownerId)
-        let resolverName = "sandbox-nunit-" + Guid.NewGuid().ToString("N")
-        let resolverHash = digest resolverName
-        let acmeName = "acme-" + resolverHash + ".json"
-        let acmePath = "/var/lib/keroosha-traefik/" + acmeName
-        let acmeResolver = JsonObject()
-        acmeResolver["Certificates"] <- JsonArray()
-        let acmeStorage = JsonObject()
-        acmeStorage[resolverName] <- acmeResolver
-        let acmeContents = acmeStorage.ToJsonString()
-        let ownerHash = digest ownerId
-        let ownershipGuard =
-            String.concat "\n" [
-                "set -eu"
-                "for path in /etc/keroosha-iac/traefik /var/lib/keroosha-traefik /usr/local/libexec/keroosha-iac/traefik /etc/systemd/system/keroosha-traefik.service; do"
-                "  if [ -e \"$path\" ] || [ -L \"$path\" ]; then exit 73; fi"
-                "done"
-                "if getent passwd keroosha-traefik >/dev/null 2>&1 || getent group keroosha-traefik >/dev/null 2>&1; then exit 73; fi"
-                "if systemctl is-active --quiet keroosha-traefik.service || systemctl is-enabled --quiet keroosha-traefik.service; then exit 73; fi"
-                "echo safe"
-            ]
-        let cleanupOwnedSandbox =
-            String.concat "\n" [
-                "set -eu"
-                "owner='" + ownerHash + "'"
-                "state=/var/lib/keroosha-traefik"
-                "acme='" + acmePath + "'"
-                "expected='" + acmeContents + "'"
-                "for path in /etc/keroosha-iac/traefik /usr/local/libexec/keroosha-iac/traefik /etc/systemd/system/keroosha-traefik.service; do"
-                "  if [ -e \"$path\" ] || [ -L \"$path\" ]; then exit 73; fi"
-                "done"
-                "if systemctl is-active --quiet keroosha-traefik.service || systemctl is-enabled --quiet keroosha-traefik.service; then exit 73; fi"
-                "if [ -e \"$state\" ] || [ -L \"$state\" ]; then"
-                "  [ -d \"$state\" ] && [ ! -L \"$state\" ] || exit 73"
-                "  marker=\"$state/.keroosha-owner\""
-                "  [ -f \"$marker\" ] && [ ! -L \"$marker\" ] && [ \"$(cat -- \"$marker\")\" = \"$owner\" ] || exit 73"
-                "  if [ -e \"$acme\" ] || [ -L \"$acme\" ]; then"
-                "    [ -f \"$acme\" ] && [ ! -L \"$acme\" ] && [ \"$(cat -- \"$acme\")\" = \"$expected\" ] || exit 73"
-                "    rm -- \"$acme\""
-                "  fi"
-                "  [ \"$(find \"$state\" -mindepth 1 -maxdepth 1 -printf '%f\\n')\" = .keroosha-owner ] || exit 73"
-                "  rm -- \"$marker\""
-                "  rmdir -- \"$state\""
-                "fi"
-                "account=$(getent passwd keroosha-traefik || true)"
-                "group=$(getent group keroosha-traefik || true)"
-                "if [ -n \"$account\" ]; then"
-                "  uid=$(printf '%s\\n' \"$account\" | cut -d: -f3)"
-                "  primary_gid=$(printf '%s\\n' \"$account\" | cut -d: -f4)"
-                "  home=$(printf '%s\\n' \"$account\" | cut -d: -f6)"
-                "  shell=$(printf '%s\\n' \"$account\" | cut -d: -f7)"
-                "  group_gid=$(printf '%s\\n' \"$group\" | cut -d: -f3)"
-                "  [ \"$uid\" -ne 0 ] && [ \"$primary_gid\" = \"$group_gid\" ] && [ \"$home\" = /var/lib/keroosha-traefik ] && [ \"$shell\" = /usr/sbin/nologin ] || exit 73"
-                "  userdel keroosha-traefik"
-                "  if getent group keroosha-traefik >/dev/null 2>&1; then groupdel keroosha-traefik; fi"
-                "elif [ -n \"$group\" ]; then"
-                "  [ -z \"$(printf '%s\\n' \"$group\" | cut -d: -f4)\" ] || exit 73"
-                "  groupdel keroosha-traefik"
-                "fi"
-                ":"
-            ]
-
-        let invoke request =
-            let response = sandboxHelper connection request
-            use document = JsonDocument.Parse(response)
-            document.RootElement.Clone()
-        let mainPid () =
-            runSandboxSsh connection "systemctl show keroosha-traefik.service --property=MainPID --value" None |> fun value -> value.Trim()
-
-        let guardStatus = runSandboxSsh connection ownershipGuard None
-        Assert.That(guardStatus.Trim(), Is.EqualTo("safe"))
-        // Act
-        let sshListeners = runSandboxSsh connection "ss -H -ltn 'sport = :22'" None
-        if String.IsNullOrWhiteSpace(sshListeners) then
-            Assert.Ignore("The rollback scenario requires the Sandbox SSH daemon to retain port 22.")
-        let mutable cleanupCompleted = false
-        try
-            let applied = invoke applyRequest
-            let initialPid = mainPid ()
-
-            // Assert
-            Assert.That(applied.GetProperty("inSync").GetBoolean(), Is.True)
-            Assert.That(applied.GetProperty("certificateFingerprints").GetProperty("sandbox-cert").GetString(), Is.EqualTo(certificate.Fingerprint))
-
-            let writeAcme =
-                "set -eu; umask 077; temporary=$(mktemp /var/lib/keroosha-traefik/.acme.XXXXXX); trap 'rm -f -- \"$temporary\"' EXIT; cat > \"$temporary\"; chown keroosha-traefik:keroosha-traefik -- \"$temporary\"; chmod 0600 -- \"$temporary\"; mv -f -- \"$temporary\" '" + acmePath + "'; trap - EXIT"
-            runSandboxSsh connection writeAcme (Some acmeContents) |> ignore
-            let redirectResult = invoke redirectRequest
-            Assert.That(redirectResult.GetProperty("inSync").GetBoolean(), Is.True)
-            Assert.That(redirectResult.GetProperty("actualConfigHash").GetString(), Is.Not.EqualTo(applied.GetProperty("actualConfigHash").GetString()))
-            Assert.That(mainPid (), Is.EqualTo(initialPid), "A redirect-only dynamic update must not restart Traefik.")
-
-
-            let dynamicResult = invoke dynamicUpdate
-            Assert.That(dynamicResult.GetProperty("inSync").GetBoolean(), Is.True)
-            Assert.That(dynamicResult.GetProperty("actualConfigHash").GetString(), Is.Not.EqualTo(applied.GetProperty("actualConfigHash").GetString()))
-            Assert.That(mainPid (), Is.EqualTo(initialPid), "A dynamic-only update must not restart Traefik.")
-
-            let startupResult = invoke startupUpdate
-            Assert.That(startupResult.GetProperty("inSync").GetBoolean(), Is.True)
-            Assert.That(startupResult.GetProperty("certificateFingerprints").GetProperty("sandbox-cert").GetString(), Is.EqualTo(certificate.Fingerprint))
-            Assert.That(mainPid (), Is.Not.EqualTo(initialPid), "An entry-point change must restart Traefik.")
-            let stablePid = mainPid ()
-            let staticDriftPort = RandomNumberGenerator.GetInt32(60001, 65000)
-            let driftStaticConfiguration =
-                String.concat "\n" [
-                    "set -eu"
-                    "static=/etc/keroosha-iac/traefik/static.yml"
-                    "backup=$(mktemp /tmp/keroosha-traefik-static.XXXXXX)"
-                    "cp -- \"$static\" \"$backup\""
-                    "restore() { install -o root -g keroosha-traefik -m 0640 -- \"$backup\" \"$static\"; rm -f -- \"$backup\"; systemctl restart keroosha-traefik.service || true; }"
-                    "trap restore EXIT"
-                    "temporary=$(mktemp /tmp/keroosha-traefik-static.XXXXXX)"
-                    "sed 's/:" + string nextWebPort + "/:" + string staticDriftPort + "/g' \"$backup\" > \"$temporary\""
-                    "chown root:keroosha-traefik -- \"$temporary\""
-                    "chmod 0640 -- \"$temporary\""
-                    "mv -f -- \"$temporary\" \"$static\""
-                    "grep -Fq ':" + string staticDriftPort + "' \"$static\""
-                    "systemctl restart keroosha-traefik.service"
-                    "install -o root -g keroosha-traefik -m 0640 -- \"$backup\" \"$static\""
-                    "rm -- \"$backup\""
-                    "trap - EXIT"
-                ]
-            runSandboxSsh connection driftStaticConfiguration None |> ignore
-            let driftedPid = mainPid ()
-            Assert.That(driftedPid, Is.Not.EqualTo(stablePid), "The external static drift restart should have changed the process.")
-            let repairedStatic = invoke startupUpdate
-            Assert.That(repairedStatic.GetProperty("inSync").GetBoolean(), Is.True)
-            Assert.That(mainPid (), Is.Not.EqualTo(driftedPid), "Apply must restart when live entrypoint binds drift despite matching static file bytes.")
-
-            // Act
-            let rollbackAction = TestDelegate(fun () -> sandboxHelper connection failedUpdate |> ignore)
-
-            // Assert
-            Assert.Throws<NativeHelperBackendException>(rollbackAction) |> ignore
-            let restored = invoke readRequest
-            Assert.That(restored.GetProperty("inSync").GetBoolean(), Is.True)
-            Assert.That(restored.GetProperty("certificateFingerprints").GetProperty("sandbox-cert").GetString(), Is.EqualTo(certificate.Fingerprint))
-
-            let deletion = invoke deleteRequest
-            Assert.That(deletion.ValueKind, Is.EqualTo(JsonValueKind.Object))
-            let retained =
-                runSandboxSsh
-                    connection
-                    ("test -f /var/lib/keroosha-traefik/.keroosha-owner && [ \"$(cat -- /var/lib/keroosha-traefik/.keroosha-owner)\" = '" + ownerHash + "' ] && cat -- '" + acmePath + "'")
-                    None
-
-            // Assert
-            Assert.That(retained, Is.EqualTo(acmeContents))
-            runSandboxSsh connection cleanupOwnedSandbox None |> ignore
-            let postCleanupGuard = runSandboxSsh connection ownershipGuard None
-            Assert.That(postCleanupGuard.Trim(), Is.EqualTo("safe"))
-            cleanupCompleted <- true
-        finally
-            if not cleanupCompleted then
-                try
-                    sandboxHelper connection deleteRequest |> ignore
-                    runSandboxSsh connection cleanupOwnedSandbox None |> ignore
-                    runSandboxSsh connection ownershipGuard None |> ignore
-                    cleanupCompleted <- true
-                with error ->
-                    let detail =
-                        match error with
-                        | :? NativeHelperBackendException -> error.Message
-                        | _ -> error.GetType().Name
-                    let diagnostic =
-                        "Sandbox Traefik cleanup failed for ownerId "
-                        + ownerId
-                        + " ("
-                        + detail
-                        + ")."
-                    TestContext.Progress.WriteLine(diagnostic)
+    [<Test; Explicit("Invokes only the public sealed QEMU acceptance harness."); Category("Sandbox")>]
+    member _.``Sandbox lifecycle delegates to the sealed full acceptance runner``() =
+        if Environment.GetEnvironmentVariable("DOROTHY_RUN_SEALED_TRAEFIK_ACCEPTANCE") <> "1" then
+            Assert.Ignore("Set DOROTHY_RUN_SEALED_TRAEFIK_ACCEPTANCE=1 to invoke the explicit sealed acceptance harness.")
+        let stateDirectory = verifiedAcceptanceStateDirectory ()
+        let providerDirectory = verifiedCandidateProviderDirectory ()
+        runPublicAcceptance stateDirectory providerDirectory
     [<Test>]
     member _.``API comparison projects effective entrypoint routes and native middleware references``() =
         let dynamic =
