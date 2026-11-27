@@ -53,7 +53,7 @@ module internal FirewalldReferences =
                     if sources other |> Seq.exists ownedSources.Contains then
                         invalidOp ("A source is already bound to zone " + otherName + "; remove that binding first.")
 
-    let usedByPacketFilter parse kind name (objects: Map<string, Map<string,string>>) =
+    let private usedFrom parse kind name (objects: Map<string, Map<string,string>>) roots =
         let seen = HashSet<string>(StringComparer.Ordinal)
         let rec depends (k, n) =
             if (k, n) = (kind, name) then true
@@ -62,8 +62,48 @@ module internal FirewalldReferences =
                 | Some xml -> references (parse "service" xml) |> Seq.exists depends
                 | None -> true // an uninspectable dependency is not evidence of disuse
             else false
-        [ "zone"; "policy" ] |> List.exists (fun k ->
-            objects[k] |> Map.exists (fun _ xml -> references (parse k xml) |> Seq.exists depends))
+        roots |> Seq.exists (fun (k, xml) -> references (parse k xml) |> Seq.exists depends)
+
+    let usedByPacketFilter parse kind name (objects: Map<string, Map<string,string>>) =
+        seq { for k in [ "zone"; "policy" ] do for KeyValue(_, xml) in objects[k] -> k, xml }
+        |> usedFrom parse kind name objects
+
+    /// Only discard selectors proved disjoint for every possible SSH peer,
+    /// not just the peer that happens to stage the request. An output policy
+    /// can see an arbitrary client port as its destination.
+    let preservesManagement (parse: string -> string -> XElement) kind name objects serverPort before after =
+        match before, after with
+        | Some original, Some candidate ->
+            let outputConsumer =
+                kind = "service" &&
+                (objects |> Map.find "policy" |> Map.toSeq |> Seq.choose (fun (_, xml) ->
+                    let policy = parse "policy" xml
+                    if policy.Elements(XName.Get "ingress-zone") |> Seq.exists (fun e -> attribute "name" e = Some "HOST") then Some("policy", xml)
+                    else None)
+                 |> usedFrom parse kind name objects)
+            let excludesServerPort value =
+                match serverPort, value with
+                | Some port, Some(range: string) ->
+                    let parts = range.Split('-')
+                    match Int32.TryParse parts[0], Int32.TryParse parts[parts.Length-1] with
+                    | (true, low), (true, high) when parts.Length <= 2 && low > 0 && high >= low && high <= 65535 -> port < low || port > high
+                    | _ -> false
+                | _ -> false
+            let project xml =
+                let root = parse kind xml
+                for child in root.Elements() |> Seq.toArray do
+                    let tag = child.Name.LocalName
+                    let disjoint =
+                        if kind <> "service" || (tag <> "port" && tag <> "source-port") then false
+                        else
+                            match attribute "protocol" child with
+                            | Some ("udp" | "sctp" | "dccp") -> true
+                            | Some "tcp" when tag = "port" && not outputConsumer -> excludesServerPort (attribute "port" child)
+                            | _ -> false
+                    if disjoint || tag = "short" || tag = "description" then child.Remove()
+                root
+            XNode.DeepEquals(project original, project candidate)
+        | _ -> false
 
     let validate (parse: string -> string -> XElement) kind name defaultZone (objects: Map<string, Map<string,string>>) =
         let zones = objects["zone"]

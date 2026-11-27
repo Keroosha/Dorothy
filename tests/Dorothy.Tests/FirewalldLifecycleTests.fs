@@ -116,7 +116,7 @@ type FirewalldLifecycleTests() =
         =
         FirewalldLifecycle.transact environment c journal releaseOnRollback deleteOnConfirm logical None
             before beforeMode after afterMode managedBefore managedAfter (Some(rollbackProof()))
-            readState (writeState environment.Root logical) (fun _ _ -> ()) (fun () -> ()) (fun _ _ -> ())
+            readState (writeState environment.Root logical) (fun _ _ -> ()) (fun _ -> ()) (fun _ _ -> ())
 
     let transact
         (environment: HostEnvironment)
@@ -379,6 +379,7 @@ type FirewalldLifecycleTests() =
             let foreignUnit = physical root "/etc/systemd/system/foreign.service"
             File.WriteAllText(foreignUnit, "[Unit]\nDescription=Unowned test unit\n")
             let requiresLink = physical root "/etc/systemd/system/firewalld.service.wants/keroosha-iac-firewalld-boot-recovery.service"
+            let original = FileInfo(requiresLink).LinkTarget
             File.Delete requiresLink
             File.CreateSymbolicLink(requiresLink, "../foreign.service") |> ignore
             let failure = Assert.Throws<InvalidOperationException>(fun () -> FirewalldLifecycle.confirm environment configuration value nonce readState)
@@ -389,6 +390,13 @@ type FirewalldLifecycleTests() =
             Assert.That(File.Exists(physical root "/etc/systemd/system/keroosha-iac-firewalld-postboot-recovery.service"), Is.True)
             Assert.That(FileInfo(physical root "/etc/systemd/system/multi-user.target.wants/keroosha-iac-firewalld-boot-recovery.service").LinkTarget, Is.Not.Null)
             Assert.That(FileInfo(physical root "/etc/systemd/system/timers.target.wants/keroosha-iac-firewalld-rollback.timer").LinkTarget, Is.Not.Null)
+            Assert.That((FirewalldLifecycle.pending environment).Value.Status, Is.EqualTo "confirmed")
+            let owned = physical root "/var/lib/keroosha-iac/firewalld/zone-lifecycle.json"
+            Assert.That(File.Exists owned, Is.True)
+            File.Delete requiresLink
+            File.CreateSymbolicLink(requiresLink, original) |> ignore
+            FirewalldLifecycle.confirm environment configuration value nonce readState
+            Assert.That(File.Exists owned, Is.False)
             Assert.That(FirewalldLifecycle.pending environment, Is.EqualTo None))
 
     [<Test>]

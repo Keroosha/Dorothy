@@ -367,6 +367,35 @@ type FirewalldRuntimeTests() =
         finally
             if Directory.Exists root then Directory.Delete(root, true)
     [<Test>]
+    member _.``Bridge identity alone cannot authenticate a Docker firewall reload producer``() =
+        let id = String.replicate 64 "a"
+        let mutable subscriber = 42
+        let run exe args _ =
+            match exe, args with
+            | "nmcli", _ -> commandResult ""
+            | "ip", _ -> commandResult """[{"ifname":"docker0","linkinfo":{"info_kind":"bridge"}}]"""
+            | "/usr/bin/systemctl", _ -> commandResult "42"
+            | "busctl", _ when List.last args = "list" ->
+                commandResult (sprintf """[{"name":":1.5","pid":%d,"unit":"docker.service","process":"dockerd","user":"root"}]""" subscriber)
+            | "busctl", _ -> commandResult """{"data":[{":1.5":["type='signal',path='/org/fedoraproject/FirewallD1',sender='org.fedoraproject.FirewallD1',member='Reloaded',interface='org.fedoraproject.FirewallD1'","type='signal',path='/org/freedesktop/DBus',interface='org.freedesktop.DBus',sender='org.freedesktop.DBus',member='NameOwnerChanged',arg0='org.fedoraproject.FirewallD1'"]}]}"""
+            | "docker", _ when List.contains "ls" args -> commandResult id
+            | "docker", _ -> commandResult (sprintf """{"Driver":"bridge","Scope":"local","Id":"%s","Options":{"com.docker.network.bridge.name":"docker0"},"IPAM":{"Config":[{"Subnet":"192.0.2.0/24"}]}}""" id)
+            | _ -> failwith "Unexpected producer query."
+        let env, root = makeEnvironment run
+        try
+            let proc = Directory.CreateDirectory(Path.Combine(root, "proc/42"))
+            let flags enabled = File.WriteAllText(Path.Combine(proc.FullName,"cmdline"), "dockerd\000--iptables=" + enabled + "\000")
+            let restored () = FirewalldRuntime.restoresRuntimeInterface env "docker0" "docker"
+            flags "true"
+            Assert.That(restored (), Is.True)
+            subscriber <- 17
+            Assert.That(restored (), Is.False)
+            subscriber <- 42
+            flags "false"
+            Assert.That(restored (), Is.False)
+        finally Directory.Delete(root, true)
+
+    [<Test>]
     member _.``Read observes quiet zone selectors and runtime drift without claiming other objects``() =
         let config =
             { FirewalldModel.empty "zone" "quiet" with Services = [ "ssh" ] }

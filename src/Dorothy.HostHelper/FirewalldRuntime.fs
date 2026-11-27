@@ -1114,6 +1114,60 @@ module FirewalldRuntime =
             | _ -> false
         with _ -> false
 
+    // A kernel bridge and `docker network inspect` identify the link, not the
+    // producer of a runtime zone assignment. Authenticate the running daemon's
+    // firewalld callback and its IPv4 bridge integration, not stale iptables rules.
+    let private dockerRestoresFirewall (environment: HostEnvironment) =
+        let command exe args =
+            let result = environment.Run exe args None
+            if result.ExitCode <> 0 then invalidOp "Docker firewalld integration cannot be verified."
+            result.Stdout.Trim()
+        let pid = command "/usr/bin/systemctl" [ "show"; "--property=MainPID"; "--value"; "docker.service" ] |> Int32.Parse
+        if pid <= 0 then false
+        else
+            let args = IO.File.ReadAllText(HostEnvironment.path environment ("/proc/" + string pid + "/cmdline")).Split('\000', StringSplitOptions.RemoveEmptyEntries)
+            let explicit = args |> Array.tryPick (fun a -> if a.StartsWith("--iptables=", StringComparison.Ordinal) then Some(a.Substring(11)) else None)
+            let config =
+                args |> Array.tryFindIndex (fun a -> a = "--config-file" || a.StartsWith("--config-file=", StringComparison.Ordinal))
+                |> Option.map (fun i -> if args[i] = "--config-file" then args[i+1] else args[i].Substring(14))
+                |> Option.defaultValue "/etc/docker/daemon.json"
+            if not (IO.Path.IsPathFullyQualified config) || (explicit.IsSome && explicit <> Some "true") then false
+            else
+                let file = HostEnvironment.path environment config
+                let enabled =
+                    if explicit = Some "true" then true
+                    else
+                        let start = command "/usr/bin/systemctl" [ "show"; "--timestamp=unix"; "--property=ExecMainStartTimestamp"; "--value"; "docker.service" ]
+                        let rec closest path =
+                            if IO.File.Exists path || IO.Directory.Exists path then path
+                            else closest (IO.Path.GetDirectoryName path)
+                        let stamp = command "stat" [ "-c"; "%u:%g:%Z"; "--"; closest file ]
+                        let fields = stamp.Split(':')
+                        fields.Length = 3 && fields[0] = "0" && fields[1] = "0" && start.StartsWith('@')
+                        && command "readlink" [ "-m"; "--"; file ] = file
+                        && Int64.Parse(fields[2]) < Int64.Parse(start.Substring(1))
+                        && (not (IO.File.Exists file) ||
+                            (use doc = JsonDocument.Parse(IO.File.ReadAllBytes file)
+                             match doc.RootElement.TryGetProperty "iptables" with
+                             | true, v -> v.ValueKind = JsonValueKind.True
+                             | false, _ -> true))
+                enabled &&
+                (use connections = JsonDocument.Parse(command "busctl" [ "--system"; "--json=short"; "--unique"; "list" ])
+                 use matches = JsonDocument.Parse(command "busctl" [ "--system"; "--json=short"; "call"; "org.freedesktop.DBus"; "/org/freedesktop/DBus"; "org.freedesktop.DBus.Debug.Stats"; "GetAllMatchRules" ])
+                 let rules = matches.RootElement.GetProperty("data")[0]
+                 let expected = set [ "type='signal'"; "path='/org/fedoraproject/FirewallD1'"; "interface='org.fedoraproject.FirewallD1'"; "sender='org.fedoraproject.FirewallD1'"; "member='Reloaded'" ]
+                 let restarted = set [ "type='signal'"; "path='/org/freedesktop/DBus'"; "interface='org.freedesktop.DBus'"; "sender='org.freedesktop.DBus'"; "member='NameOwnerChanged'"; "arg0='org.fedoraproject.FirewallD1'" ]
+                 connections.RootElement.EnumerateArray() |> Seq.exists (fun entry ->
+                     match entry.TryGetProperty "pid", entry.TryGetProperty "process", entry.TryGetProperty "unit", entry.TryGetProperty "user" with
+                     | (true, p), (true, exe), (true, unit), (true, user)
+                         when p.ValueKind = JsonValueKind.Number && p.GetInt32() = pid && exe.GetString() = "dockerd" && unit.GetString() = "docker.service" && user.GetString() = "root" ->
+                         match rules.TryGetProperty(entry.GetProperty("name").GetString()) with
+                         | true, values ->
+                             let subscriptions = values.EnumerateArray() |> Seq.map (fun v -> Set.ofArray (v.GetString().Split(','))) |> Set.ofSeq
+                             Set.contains expected subscriptions && Set.contains restarted subscriptions
+                         | _ -> false
+                     | _ -> false))
+
     let private dockerOwnsBridge (environment: HostEnvironment) (interfaceName: string) =
         try
             let query arguments = environment.Run "docker" ("--host=unix:///run/docker.sock" :: arguments) None
@@ -1126,7 +1180,7 @@ module FirewalldRuntime =
                     |> Seq.exists (fun entry ->
                         entry.GetProperty("ifname").GetString() = interfaceName
                         && entry.GetProperty("linkinfo").GetProperty("info_kind").GetString() = "bridge")
-                if not bridge then false
+                if not bridge || not (dockerRestoresFirewall environment) then false
                 else
                     let inventory = query [ "network"; "ls"; "--filter"; "driver=bridge"; "--quiet"; "--no-trunc" ]
                     let ids = words [ inventory.Stdout ]
@@ -1149,13 +1203,42 @@ module FirewalldRuntime =
                                         | _ -> "br-" + id.Substring(0, 12)
                                     | JsonValueKind.Null -> "br-" + id.Substring(0, 12)
                                     | _ -> ""
-                                List.contains id ids && n.GetProperty("Driver").GetString() = "bridge"
+                                let hasIPv4 = n.GetProperty("IPAM").GetProperty("Config").EnumerateArray() |> Seq.exists (fun config ->
+                                    match config.TryGetProperty "Subnet" with
+                                    | true, subnet -> match IPAddress.TryParse(subnet.GetString().Split('/')[0]) with true, addr -> addr.AddressFamily = Sockets.AddressFamily.InterNetwork | _ -> false
+                                    | _ -> false)
+                                hasIPv4 && List.contains id ids && n.GetProperty("Driver").GetString() = "bridge"
                                 && n.GetProperty("Scope").GetString() = "local" && bridgeName = interfaceName))
         with _ -> false
 
     let restoresRuntimeInterface environment interfaceName zone =
         networkManagerAssignsZone environment interfaceName zone
         || (zone = "docker" && dockerOwnsBridge environment interfaceName)
+
+    let withVerifiedDockerBindings (environment: HostEnvironment) activate =
+        let required =
+            match listRuntime environment "zone" with
+            | None -> invalidOp "Cannot enumerate runtime zones before activation."
+            | Some zones when List.contains "docker" zones ->
+                let interfaces permanent =
+                    let values = if permanent then listPermanentInterfaces environment "docker" else listRuntimeInterfaces environment "docker"
+                    values |> Option.defaultWith (fun () -> invalidOp "Cannot verify Docker zone interfaces.") |> Set.ofList
+                let extra = Set.difference (interfaces false) (interfaces true)
+                for iface in extra do
+                    if not (restoresRuntimeInterface environment iface "docker") then
+                        invalidOp "Cannot verify the producer that restores the runtime Docker zone binding."
+                extra
+            | _ -> Set.empty
+        activate ()
+        if not required.IsEmpty then
+            // dockerd handles the daemon's Reloaded/NameOwnerChanged asynchronously.
+            let timer = Diagnostics.Stopwatch.StartNew()
+            let rec check () =
+                match listRuntimeInterfaces environment "docker" with
+                | Some names when Set.isSubset required (Set.ofList names) -> ()
+                | _ when timer.Elapsed.TotalSeconds < 5.0 -> Threading.Thread.Sleep 100; check ()
+                | _ -> invalidOp "The prior runtime Docker zone membership was not restored after activation."
+            check ()
 
     let private observeZonePolicy (allowCoexistingAdditions: bool) (environment: HostEnvironment) (c: FirewalldModel.Configuration) =
         match inspectRuntime environment c.Kind c.Name with

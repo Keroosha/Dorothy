@@ -1370,6 +1370,14 @@ module Firewalld =
                 validateSshState network context runtimeDefaultZone view hybridPolicies (runtimeIpSetXml environment) (runtimeServiceXml environment) |> ignore
             check hybridZones
             for bound in retainedViews hybridZones do check bound
+        elif configuration.Kind = "ipset" then
+            // A scoped entry update does not reload consumers. A live-only
+            // rule can start matching the peer only after the new member lands.
+            let candidateMembership name =
+                if name = configuration.Name then Map.tryFind name ipsets
+                else runtimeIpSetXml environment name
+            validateSshState network context runtimeDefaultZone runtimeZones runtimePolicies candidateMembership (runtimeServiceXml environment)
+            |> ignore
         let runtimeIngressCandidates, runtimeEgressCandidates =
             validateSshState network context runtimeDefaultZone runtimeZones runtimePolicies (runtimeIpSetXml environment) (runtimeServiceXml environment)
         let runtimeParsedZones = runtimeZones |> Map.map (fun _ xml -> parseXml "zone" xml)
@@ -1898,7 +1906,7 @@ module Firewalld =
         (phase: FirewalldLifecycle.RecoveryPhase)
         =
         let effectiveCurrent = effective environment c.Kind c.Name
-        FirewalldRecoveryProof.restoreRuntimeWithPreReload environment c effectiveCurrent transaction.RollbackProof phase preReload
+        FirewalldRecoveryProof.restoreRuntimeWithProgress environment c effectiveCurrent transaction.RollbackProof phase preReload transaction.NativeProgress
 
     let private recover environment (c: FirewalldModel.Configuration) (journal: JsonObject) (preReload: unit -> unit) =
         let logical = objectPath "/etc/firewalld" c.Kind c.Name
@@ -1909,6 +1917,41 @@ module Firewalld =
             FirewalldLifecycle.recover environment c journal logical readState writeState (restoreObjectRuntime environment c preReload)
         with :? InvalidOperationException as error ->
             fail error.Message
+
+    /// A bulk set change is not an atomic native command. With all uses on
+    /// ONE side of a packet, its decision sees only the old or new boolean
+    /// membership for that address. Zone bindings also select return paths and
+    /// are deliberately not covered by this shortcut.
+    let private permitsSetBatch environment (c: FirewalldModel.Configuration) before after =
+        try
+            let view xml =
+                match FirewalldRuntime.snapshotFromXml c.Kind c.Name xml with Ok(Some s) -> s | _ -> invalidOp "Incomplete static set"
+            let a, b = view before, view after
+            let bounded (s: FirewalldRuntime.RuntimeSnapshot) =
+                List.contains s.IpSetType [ Some "hash:ip"; Some "hash:net" ]
+                && List.contains (Map.tryFind "family" s.IpSetOptions) [ None; Some(Some "inet") ]
+                && List.contains (Map.tryFind "timeout" s.IpSetOptions) [ None; Some(Some "0") ]
+            let oldEntries, newEntries = Set.ofList a.IpSetEntries, Set.ofList b.IpSetEntries
+            let added, removed = Set.difference newEntries oldEntries, Set.difference oldEntries newEntries
+            if not (bounded a && bounded b && (added.IsEmpty || removed.IsEmpty)) then false
+            else
+                let fields = (Environment.GetEnvironmentVariable "SSH_CONNECTION").Split([| ' '; '\t' |], StringSplitOptions.RemoveEmptyEntries)
+                let endpoints = [ IPAddress.Parse fields[0]; IPAddress.Parse fields[2] ]
+                let disjoint = Set.union added removed |> Set.forall (fun entry ->
+                    endpoints |> List.forall (fun ip -> cidrMatches entry ip = NoMatch))
+                disjoint &&
+                (let sides =
+                    seq { for kind in [ "zone"; "policy" ] do
+                              yield! definitionInventory environment kind |> Map.toSeq |> Seq.map (fun (_, xml) -> parseXml kind xml)
+                              yield! runtimeSnapshots environment kind |> Map.toSeq |> Seq.map (fun (_, snap) -> parseXml kind (runtimeSnapshotXml snap)) }
+                    |> Seq.collect (fun root ->
+                        root.Descendants() |> Seq.choose (fun node ->
+                            if attr "ipset" node <> Some c.Name then None
+                            elif node.Parent.Name.LocalName = "rule" then Some node.Name.LocalName
+                            else Some "zone-binding"))
+                    |> Set.ofSeq
+                 sides.IsEmpty || sides = set [ "source" ] || sides = set [ "destination" ])
+        with _ -> false
 
     let private transact environment (c: FirewalldModel.Configuration) (journal: JsonObject) releaseOnRollback deleteOnConfirm desired afterMode (preflightSettings: unit -> unit) =
         if releaseOnRollback then
@@ -1941,10 +1984,9 @@ module Firewalld =
             let observation = FirewalldRuntime.observe environment c
             observation.Observed && observation.InSync
         let preStageRefusal reason =
-            if (c.Kind = "zone" || c.Kind = "policy")
+            if not deleteOnConfirm && (c.Kind = "zone" || c.Kind = "policy")
                && FirewalldLifecycle.canClassifyPreStageRefusal environment then
-                let operation = if deleteOnConfirm then "delete" else "apply"
-                raise (PreStageRefusal(operation, getString journal "ownerId", reason))
+                raise (PreStageRefusal("apply", getString journal "ownerId", reason))
             else fail reason
         let refuseUnsafeReload (error: BackendError) =
             preStageRefusal (
@@ -1952,19 +1994,29 @@ module Firewalld =
                 + error.Message
             )
         let refuseManagementNarrowing () =
-            preStageRefusal "This firewalld transition can narrow SSH admission for rebound peers or packet paths without an independently verifiable scoped inverse; refusing before staging."
-        let rollbackProof, activate =
+            preStageRefusal "This structural change could narrow an alternate SSH path without a scoped inverse. Create a source zone unbound, confirm its rules, then bind the source separately; for a policy, confirm its neutral endpoints before adding steering; migrate consumers before changing a management-bearing shared definition."
+        let rollbackProof, checkCheckpoint, activate =
             if before <> desired then
                 let effectiveBefore = effective environment c.Kind c.Name
                 let effectiveAfter =
                     desired |> Option.orElseWith (fun () -> readFile environment (objectPath "/usr/lib/firewalld" c.Kind c.Name))
-                match prove (fun () -> FirewalldRecoveryProof.objectDeltaProof environment c effectiveBefore effectiveAfter) with
+                let authorizeSetBatch () = permitsSetBatch environment c effectiveBefore effectiveAfter
+                match prove (fun () -> FirewalldRecoveryProof.objectDeltaProofWithSetBatch environment c effectiveBefore effectiveAfter authorizeSetBatch) with
                 | Some proof ->
+                    let contraction = FirewalldRecoveryProof.objectDeltaContractionXml c effectiveBefore proof
+                    let validateIntermediate () =
+                        contraction |> Option.iter (Some >> validate None)
+                        if c.Kind = "ipset" && proof["deltas"].AsArray().Count > 1 && not (authorizeSetBatch ()) then
+                            fail "Cannot certify this set batch against the loaded consumers. Confirm one membership change at a time."
                     proof,
                     (fun () ->
+                        validateIntermediate ()
+                        FirewalldRecoveryProof.validateObjectDeltaCheckpoint environment c effectiveBefore proof),
+                    (fun report ->
                         validate None desired
+                        validateIntermediate ()
                         firewall environment [ "--check-config" ] |> ignore
-                        FirewalldRecoveryProof.activateObjectDelta environment c effectiveBefore proof)
+                        FirewalldRecoveryProof.activateObjectDeltaWithProgress environment c effectiveBefore proof report)
                 | None ->
                     // A shared definition can affect peers other than the SSH connection
                     // running this request. Without an owned native selector inverse a
@@ -1974,7 +2026,8 @@ module Firewalld =
                             [ "zone"; "policy"; "service" ]
                             |> List.map (fun kind -> kind, definitionInventory environment kind)
                             |> Map.ofList
-                        if FirewalldReferences.usedByPacketFilter parseXml c.Kind c.Name definitions then
+                        if FirewalldReferences.usedByPacketFilter parseXml c.Kind c.Name definitions &&
+                           not (FirewalldReferences.preservesManagement parseXml c.Kind c.Name definitions (FirewalldRecoveryProof.managementServerPort()) effectiveBefore effectiveAfter) then
                             refuseManagementNarrowing ()
                     if FirewalldRecoveryProof.objectTransitionMayNarrowManagement environment c effectiveBefore effectiveAfter then
                         refuseManagementNarrowing ()
@@ -1986,25 +2039,28 @@ module Firewalld =
                         with :? BackendError as error ->
                             refuseUnsafeReload error
                     proof,
-                    (fun () ->
+                    ignore,
+                    (fun _ ->
                         preflightSettings()
                         FirewalldRecoveryProof.activateReload environment c proof)
             elif runtimeMatches () then
                 FirewalldRecoveryProof.unchangedProof c,
-                (fun () -> firewall environment [ "--check-config" ] |> ignore)
+                ignore, (fun _ -> firewall environment [ "--check-config" ] |> ignore)
             else
                 let live =
                     FirewalldRuntime.inspectRuntime environment c.Kind c.Name
                     |> Option.defaultWith (fun () -> fail "Unable to observe the loaded firewalld object before proving a runtime repair.")
                 let proof = prove (fun () -> FirewalldRecoveryProof.runtimeRepairProof environment c live)
                 proof,
-                (fun () ->
+                (fun () -> FirewalldRecoveryProof.validateRuntimeRepairCheckpoint environment c proof),
+                (fun report ->
                     firewall environment [ "--check-config" ] |> ignore
-                    FirewalldRecoveryProof.activateRuntimeRepair environment c proof)
+                    FirewalldRecoveryProof.activateRuntimeRepairWithProgress environment c proof report)
         try
             FirewalldLifecycle.transact
                 environment c journal releaseOnRollback deleteOnConfirm logical None before beforeMode desired afterMode
-                managedBefore desired (Some rollbackProof) readState writeState validate activate (restoreObjectRuntime environment c preflightSettings)
+                managedBefore desired (Some rollbackProof) readState writeState
+                (fun scope proposed -> validate scope proposed; checkCheckpoint ()) activate (restoreObjectRuntime environment c preflightSettings)
         with :? InvalidOperationException as error ->
             fail error.Message
 
@@ -3056,30 +3112,51 @@ module Firewalld =
 
     let private validateSettingsCandidate (environment: HostEnvironment) (c: FirewalldModel.Configuration) key proposed =
         proposed |> Option.iter (fun contents -> settingValue contents key |> ignore)
-        if key = "IPv6_rpfilter" then
-            let ssh = Environment.GetEnvironmentVariable "SSH_CONNECTION"
-            let peer = if isNull ssh then "" else ssh.Split(' ', StringSplitOptions.RemoveEmptyEntries) |> Array.tryHead |> Option.defaultValue ""
-            let candidate = effectiveSettingValue key proposed
-            if asAddress peer |> Option.exists (fun ip -> ip.AddressFamily = System.Net.Sockets.AddressFamily.InterNetworkV6) then
-                match candidate with
-                | Some mode when List.contains (mode.ToLowerInvariant()) [ "strict"; "loose"; "yes"; "true" ]
-                                 && not (settingValuesEqual key candidate (runtimeSettingValue environment key)) ->
-                    fail "A new input reverse-path filter cannot be proved from the existing IPv6 SSH route. Use an independent IPv4 management connection."
-                | _ -> ()
+        guardMutation environment c proposed
+        if key = "DefaultZone" then
+            let before = runtimeSettingValue environment key
+            let after = effectiveSettingValue key proposed
+            match before, after with
+            | Some oldZone, Some newZone when FirewalldRecoveryProof.equivalentDefaultZones environment oldZone newZone -> ()
+            | _ -> fail "DefaultZone could reclassify an alternate management path without a non-flushing inverse. Align the two zones' SSH admission and zone-specific HOST/steering policies before switching the default."
+        elif key = "IPv6_rpfilter" then
+            let inputStrength = function
+                | Some ("strict" | "yes" | "true") -> Some 2
+                | Some "loose" -> Some 1
+                | Some ("strict-forward" | "loose-forward" | "no" | "false") -> Some 0
+                | _ -> None
+            match inputStrength (runtimeSettingValue environment key), inputStrength (effectiveSettingValue key proposed) with
+            | Some old, Some next when next <= old -> ()
+            | Some _, Some _ ->
+                // IPv4 rescue is not evidence about a second IPv6 management
+                // path. A newly restrictive global FIB hook has no scoped undo.
+                let noIPv6 =
+                    try
+                        use links = JsonDocument.Parse(command environment "ip" [ "-j"; "-6"; "address"; "show"; "up" ])
+                        links.RootElement.ValueKind = JsonValueKind.Array &&
+                        (links.RootElement.EnumerateArray() |> Seq.forall (fun link ->
+                            link.GetProperty("ifname").GetString() = "lo" ||
+                            link.GetProperty("addr_info").EnumerateArray() |> Seq.forall (fun address -> address.GetProperty("family").GetString() <> "inet6")))
+                    with _ -> false
+                if not noIPv6 then fail "IPv6_rpfilter tightening may strand another IPv6 SSH path and cannot be rolled back without flushing foreign runtime state; refusing before staging."
+            | _ -> fail "Cannot classify the previous and proposed IPv6_rpfilter before staging."
         if nftablesSettings.Contains key then
             match effectiveSettingValue "FirewallBackend" proposed with
             | Some backend when String.Equals(backend, "iptables", StringComparison.OrdinalIgnoreCase) ->
                 fail (key + " cannot be confirmed with FirewallBackend=iptables.")
             | _ -> ()
-        guardMutation environment c proposed
 
     let private activateSettings (environment: HostEnvironment) key =
         requireLoadedSecuritySettings environment (Some key)
         firewall environment [ "--check-config" ] |> ignore
-        if key = "FirewallBackend" then
-            command environment "/usr/bin/systemctl" [ "restart"; "firewalld" ] |> ignore
-        else
-            firewall environment [ "--reload" ] |> ignore
+        try
+            FirewalldRuntime.withVerifiedDockerBindings environment (fun () ->
+                // The pre-stage inventory cannot vouch for a timed ban that
+                // appeared since the check. Recheck immediately before flushing.
+                requireReloadProof environment
+                if key = "FirewallBackend" then command environment "/usr/bin/systemctl" [ "restart"; "firewalld" ] |> ignore
+                else firewall environment [ "--reload" ] |> ignore)
+        with :? InvalidOperationException as error -> fail error.Message
         firewall environment [ "--state" ] |> ignore
         if settingRuntimeObservable key then
             let etcContents = readSettingsFile environment strictConfigPath
@@ -3252,7 +3329,6 @@ module Firewalld =
                     settingRuntimeObservable key
                     && (runtimeSettingValue environment key |> Option.exists (fun actual -> settingValuesEqual key (Some actual) (Some loadedValue)))
                 if not alreadyRestored then
-                    requireReloadProof environment
                     activateSettings environment key
             | FirewalldLifecycle.BootAfterFirewalld ->
                 if not (daemonActive environment) then fail "firewalld is not active at post-boot settings recovery."
@@ -3452,7 +3528,6 @@ module Firewalld =
                     if existingJournal.IsSome then loadJournal environment c owner
                     else None
                 activeJournal <- recoveredJournal
-                if recoveredJournal.IsSome then FirewalldLifecycle.migrateBootLink environment
                 if operation = "delete" && recoveredJournal.IsNone then
                     let unchanged = JsonObject()
                     unchanged["unchanged"] <- JsonValue.Create true
@@ -3560,6 +3635,7 @@ module Firewalld =
                             || (settingRuntimeObservable key && not runtimeMatches)
                             || (not (settingRuntimeObservable key) && not receiptMatches)
                         if not needsTransaction then
+                            if recoveredJournal.IsSome then FirewalldLifecycle.migrateBootLink environment
                             let unchanged = JsonObject()
                             unchanged["unchanged"] <- JsonValue.Create true
                             unchanged :> JsonNode
@@ -3601,7 +3677,7 @@ module Firewalld =
                                     currentProjected currentMode candidateProjected afterMode
                                     managedContents (Some(encodeSettingsKeyState candidateState))
                                     (Some rollbackProof) readState writeState validateState
-                                    (fun () -> activateSettings environment key) restoreRuntime
+                                    (fun _ -> activateSettings environment key) restoreRuntime
                             let activatedValue =
                                 effectiveAfter
                                 |> Option.defaultWith (fun () -> fail ("Unable to establish activated " + key + " value."))
@@ -3655,7 +3731,7 @@ module Firewalld =
                                 beforeProjected currentMode afterProjected afterMode
                                 managedContents (Some(encodeSettingsKeyState restoredState))
                                 (Some rollbackProof) readState writeState validateState
-                                (fun () -> activateSettings environment key) restoreRuntime
+                                (fun _ -> activateSettings environment key) restoreRuntime
                         let activatedValue =
                             effectiveAfter
                             |> Option.defaultWith (fun () -> fail ("Unable to establish restored " + key + " value."))

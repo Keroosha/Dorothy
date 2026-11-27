@@ -22,6 +22,19 @@ type FirewalldGuardTests() =
         Assert.Throws<FirewalldGuardNative.BackendError>(TestDelegate action) |> ignore
 
     [<Test>]
+    member _.``A shared inbound service can change unrelated ports but an output consumer can see the client port``() =
+        let defs output =
+            let policy = if output then Map.ofList ["out", "<policy><ingress-zone name='HOST'/><egress-zone name='ANY'/><service name='parent'/></policy>"] else Map.empty
+            Map.ofList ["policy", policy; "zone", Map.ofList ["work", "<zone><service name='parent'/></zone>"]
+                        "service", Map.ofList ["parent", "<service><include service='app'/></service>"]]
+        let port n = Some(sprintf "<service><port protocol='tcp' port='%d'/></service>" n)
+        let safe consumers oldPort newPort =
+            FirewalldReferences.preservesManagement FirewalldGuardNative.parseXml "service" "app" (defs consumers) (Some 2222) (port oldPort) (port newPort)
+        Assert.That(safe false 8080 8081, Is.True)
+        Assert.That(safe false 2222 8081, Is.False)
+        Assert.That(safe true 8080 8081, Is.False)
+
+    [<Test>]
     member _.``Guard matches peer and local ports and proves disjoint family and source port``() =
         let drop sourcePort family address =
             sprintf "<rule family=\"%s\"><source address=\"%s\"/><source-port port=\"%s\" protocol=\"tcp\"/><port port=\"22\" protocol=\"tcp\"/><drop/></rule>" family address sourcePort

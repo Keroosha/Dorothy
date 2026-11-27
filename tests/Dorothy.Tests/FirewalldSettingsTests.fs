@@ -127,6 +127,37 @@ type FirewalldSettingsTests() =
     let success = FirewalldSettingsTestSupport.success
 
     [<Test>]
+    member _.``Changing default cannot rely only on the staging peer's SSH grant``() =
+        FirewalldSettingsTestSupport.withHost (fun _ _ -> None) (fun environment root calls ->
+            let path = FirewalldSettingsTestSupport.settingsPath root
+            File.WriteAllText(path, "DefaultZone=public\n")
+            let zone = Path.Combine(root, "etc/firewalld/zones/work.xml")
+            File.WriteAllText(zone, """<zone><service name="ssh"/><rule family="ipv4"><source address="198.51.100.9"/><port protocol="tcp" port="22"/><drop/></rule></zone>""")
+            let candidate = FirewalldSettingsTestSupport.configuration "DefaultZone" "work"
+            let error = Assert.Throws<NativeFirewalldSettings.BackendError>(fun () ->
+                FirewalldSettingsTestSupport.invoke environment "apply" "default-owner" candidate None |> ignore)
+            Assert.That(error.Message, Does.Contain "alternate management")
+            Assert.That(File.ReadAllText path, Is.EqualTo "DefaultZone=public\n")
+            Assert.That(calls |> Seq.exists (List.contains "--reload"), Is.False))
+
+    [<Test>]
+    member _.``A foreign direct rule appearing after settings staging is not flushed``() =
+        FirewalldSettingsTestSupport.withHost (fun _ _ -> None) (fun environment root calls ->
+            let path = FirewalldSettingsTestSupport.settingsPath root
+            File.WriteAllText(path, "LogDenied=off\n")
+            let changed =
+                { environment with
+                    Run = fun exe args input ->
+                        if exe = "firewall-cmd" && args = [ "--direct"; "--get-all-rules" ] && File.ReadAllText(path) = "LogDenied=unicast\n" then
+                            success "ipv4 filter INPUT 0 independently-owned-rule"
+                        else environment.Run exe args input }
+            let config = FirewalldSettingsTestSupport.configuration "LogDenied" "unicast"
+            Assert.Throws<NativeFirewalldSettings.BackendError>(fun () ->
+                FirewalldSettingsTestSupport.invoke changed "apply" "settings-owner" config None |> ignore) |> ignore
+            Assert.That(File.ReadAllText path, Is.EqualTo "LogDenied=off\n")
+            Assert.That(calls |> Seq.exists (List.contains "--reload"), Is.False))
+
+    [<Test>]
     member _.``Settings update and delete merge only the owned key and restore its original line``() =
         FirewalldSettingsTestSupport.withHost (fun _ _ -> None) (fun environment root _ ->
             let path = FirewalldSettingsTestSupport.settingsPath root
