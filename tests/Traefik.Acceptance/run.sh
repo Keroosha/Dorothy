@@ -296,7 +296,9 @@ assert_local_secret_absent() {
         }
         scan_files+=("$file")
     done
-    for file in "$state_dir/barrier-receipt.json" "$state_dir/barrier-authorization.json" "$state_dir/post-reboot-journal-window.json"; do
+    local -a audited_artifacts=("$state_dir/barrier-receipt.json" "$state_dir/barrier-authorization.json")
+    if [[ ${1:-final} == final ]]; then audited_artifacts+=("$state_dir/post-reboot-journal-window.json"); fi
+    for file in "${audited_artifacts[@]}"; do
         [[ -f "$file" && ! -L "$file" ]] || {
             printf 'An exposed guest-barrier or journal-window artifact is missing or unsafe.\n' >&2
             return 1
@@ -325,10 +327,10 @@ assert_local_secret_absent() {
 
     audit_summary=$(awk '
         {
-            if (NF != 3 || split($1, a, "=") != 2 || split($2, t, "=") != 2 || split($3, c, "=") != 2
-                || a[1] != "argv" || t[1] != "tokens" || c[1] != "comparisons"
-                || a[2] !~ /^[0-9]+$/ || t[2] !~ /^[0-9]+$/ || c[2] !~ /^[0-9]+$/
-                || a[2] < 1 || t[2] < 1 || c[2] != a[2] * t[2]) {
+            if (NF != 3 || split($1, a, "=") != 2 || split($2, t, "=") != 2 || split($3, c, "=") != 2 ||
+                a[1] != "argv" || t[1] != "tokens" || c[1] != "comparisons" ||
+                a[2] !~ /^[0-9]+$/ || t[2] !~ /^[0-9]+$/ || c[2] !~ /^[0-9]+$/ ||
+                a[2] < 1 || t[2] < 1 || c[2] != a[2] * t[2]) {
                 invalid = 1
                 next
             }
@@ -827,7 +829,7 @@ run_transaction_review() {
     assert_checkpoint "$state_dir/after-static-log-info-restore-checkpoint.json" "Static log-level fixture restoration" true
     assert_secret_checkpoint "$state_dir/after-static-log-info-restore-checkpoint.json" "$DNS_TSIG_SECRET_FILE"
     assert_guest_secret_isolation present
-    assert_local_secret_absent
+    assert_local_secret_absent before-reboot
     jq -n \
         --arg oldSecretSha256 "$old_secret_sha" \
         --arg newSecretSha256 "$new_secret_sha" \

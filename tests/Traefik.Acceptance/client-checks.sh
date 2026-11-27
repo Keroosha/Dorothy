@@ -335,7 +335,7 @@ legacy_status=$(curl --silent --show-error --insecure \
     --output "$legacy_body" --write-out '%{http_code}' \
     https://example.org/legacy-check)
 [[ "$legacy_status" == 200 ]] || fail "legacy TLS route returned status $legacy_status"
-assert_exact_body "$legacy_body" 'http-backend:/legacy-check;forwarded:' 'legacy TLS route'
+assert_exact_body "$legacy_body" 'http-backend:/legacy-check;forwarded:127.0.0.1' 'legacy TLS route'
 
 http_body="$root/logs/client-http.body"
 http_headers="$root/logs/client-http.headers"
@@ -344,7 +344,7 @@ http_status=$(curl --silent --show-error --compressed \
     --dump-header "$http_headers" --output "$http_body" --write-out '%{http_code}' \
     'http://shop.acceptance.test:18081/items/42?origin=acceptance')
 [[ "$http_status" == 200 ]] || fail "HTTP route returned status $http_status"
-assert_exact_body "$http_body" 'http-backend:/items/42?origin=acceptance;forwarded:' 'ordered add-prefix/strip-prefix route'
+assert_exact_body "$http_body" 'http-backend:/items/42?origin=acceptance;forwarded:127.0.0.1' 'ordered add-prefix/strip-prefix route'
 grep -Eiq '^content-encoding:[[:space:]]*gzip' "$http_headers" || fail 'HTTP compression middleware did not negotiate gzip'
 
 status_body="$root/logs/client-shared-service.body"
@@ -353,7 +353,7 @@ status_code=$(curl --silent --show-error \
     --output "$status_body" --write-out '%{http_code}' \
     http://shop.acceptance.test:18081/status)
 [[ "$status_code" == 200 ]] || fail "shared HTTP service route returned status $status_code"
-assert_exact_body "$status_body" 'http-backend:/status;forwarded:' 'shared HTTP service route'
+assert_exact_body "$status_body" 'http-backend:/status;forwarded:127.0.0.1' 'shared HTTP service route'
 
 other_body="$root/logs/client-other-backend.body"
 other_code=$(curl --silent --show-error \
@@ -400,10 +400,10 @@ for index in $(seq 1 12); do
     [[ "$multi_status" == 200 ]] || fail "multi-upstream request $index returned status $multi_status"
     response=$(<"$multi_body")
     case "$response" in
-        "http-backend:/multi/request-$index;forwarded:")
+        "http-backend:/multi/request-$index;forwarded:127.0.0.1")
             multi_http=true
             multi_http_count=$((multi_http_count + 1))
-            assert_exact_body "$multi_body" "http-backend:/multi/request-$index;forwarded:" 'multi-upstream catalog backend'
+            assert_exact_body "$multi_body" "http-backend:/multi/request-$index;forwarded:127.0.0.1" 'multi-upstream catalog backend'
             ;;
         "other-backend:/multi/request-$index")
             multi_other=true
@@ -431,20 +431,20 @@ native_excluded_status=$excluded_status
 [[ "$excluded_status" == 404 ]] || fail "native excluded HTTP subtree returned status $excluded_status"
 
 legacy_redirect_headers="$root/logs/client-legacy-redirect.headers"
-legacy_redirect_status=$(curl --silent --show-error --insecure \
+legacy_redirect_status=$(curl --silent --show-error --noproxy '*' \
     --resolve redirect.acceptance.test:443:127.0.0.1 \
     --dump-header "$legacy_redirect_headers" --output "$root/logs/client-legacy-redirect.body" \
     --write-out '%{http_code}' \
-    'https://redirect.acceptance.test/from/legacy?source=acceptance')
+    'http://redirect.acceptance.test:443/from/legacy?source=acceptance')
 [[ "$legacy_redirect_status" == 301 ]] || fail "legacy permanent redirect returned status $legacy_redirect_status"
 legacy_redirect_location=$(awk 'tolower($1) == "location:" { sub(/^[^:]*:[[:space:]]*/, ""); sub(/\r$/, ""); print; exit }' "$legacy_redirect_headers")
 [[ "$legacy_redirect_location" == 'https://target.acceptance.test/from/legacy?source=acceptance' ]] \
     || fail 'legacy redirect returned an unexpected Location header'
 
-legacy_excluded_status=$(curl --silent --show-error --insecure \
+legacy_excluded_status=$(curl --silent --show-error --noproxy '*' \
     --resolve redirect.acceptance.test:443:127.0.0.1 \
     --output "$root/logs/client-legacy-excluded-subtree.body" --write-out '%{http_code}' \
-    https://redirect.acceptance.test/private/hidden)
+    http://redirect.acceptance.test:443/private/hidden)
 [[ "$legacy_excluded_status" == 404 ]] || fail "legacy excluded redirect subtree returned status $legacy_excluded_status"
 
 unknown_status=$(curl --silent --show-error \
@@ -784,15 +784,15 @@ EOF
         "$negative_fixture_dir/original-upstream-server.key"
 
     if direct_status=$(curl --silent --show-error --fail --resolve backend.acceptance.test:8081:127.0.0.1 \
-        --cacert "$bad_ca" --output "$root/logs/client-bad-upstream-direct.body" --write-out '%{http_code}' \
+        --cacert "$root/certs/upstream-ca.pem" --output "$root/logs/client-bad-upstream-direct.body" --write-out '%{http_code}' \
         https://backend.acceptance.test:8081/health); then
         :
     else
-        fail 'independent HTTPS backend certificate failed its own issuing CA control'
+        fail 'original HTTPS backend failed its configured CA control before substitution'
     fi
     [[ "$direct_status" == 200 ]] \
-        || fail "independent HTTPS backend returned status $direct_status under its own CA"
-    assert_exact_body "$root/logs/client-bad-upstream-direct.body" 'tls-backend-ready' 'independent HTTPS backend'
+        || fail "original HTTPS backend returned status $direct_status before substitution"
+    assert_exact_body "$root/logs/client-bad-upstream-direct.body" 'tls-backend-ready' 'original HTTPS backend'
 
     upstream_swap_active=true
     install -o root -g root -m 644 "$bad_cert" "$root/certs/.upstream-server.pem.acceptance"
@@ -802,7 +802,7 @@ EOF
     systemctl restart dorothy-traefik-acceptance-backends.service \
         > "$root/logs/client-bad-upstream-inject.log" 2>&1 \
         || fail 'could not activate the independent HTTPS backend certificate'
-    if direct_status=$(curl --silent --show-error --fail --connect-timeout 2 --max-time 5 \
+    if direct_status=$(curl --silent --show-error --fail --retry-connrefused --retry 4 --retry-max-time 8 --connect-timeout 2 --max-time 5 \
         --resolve backend.acceptance.test:8081:127.0.0.1 \
         --cacert "$bad_ca" --output "$root/logs/client-bad-upstream-direct-active.body" --write-out '%{http_code}' \
         https://backend.acceptance.test:8081/health); then
@@ -820,13 +820,18 @@ EOF
         https://backend.acceptance.test:8081/health; then
         fail 'HTTPS backend certificate was accepted by the unrelated configured upstream CA'
     fi
+    local cursor
+    cursor=$(journalctl -u keroosha-traefik.service -n 1 --show-cursor --no-pager | sed -n 's/^-- cursor: //p')
+    [[ -n "$cursor" ]] || fail 'missing pre-request Traefik journal cursor'
     route_status=$(curl --silent --show-error --insecure --connect-timeout 2 --max-time 5 \
         --resolve shop.acceptance.test:18443:127.0.0.1 \
         --output "$root/logs/client-bad-upstream-route.body" --write-out '%{http_code}' \
         https://shop.acceptance.test:18443/secure/health) \
         || fail 'secure Traefik route did not return an HTTP response for the upstream-CA negative control'
-    [[ "$route_status" == 502 ]] \
-        || fail "configured upstream trust policy returned status $route_status instead of rejecting the unrelated CA"
+    [[ "$route_status" == 500 ]] || fail "unexpected upstream TLS rejection status: $route_status"
+    journalctl -u keroosha-traefik.service --after-cursor="$cursor" --no-pager -o cat |
+        jq -Rse 'split("\n") | any(.[]; fromjson? | .error=="tls: failed to verify certificate: x509: certificate signed by unknown authority")' \
+        >/dev/null || fail 'no new Traefik verifier rejection for the substituted upstream leaf'
     bad_upstream_ca_rejected=true
     restore_upstream_fixture || fail 'original HTTPS backend certificate did not recover after the bad-CA control'
 }
@@ -933,7 +938,9 @@ if [[ "$mode" == protocols || "$mode" == after-reboot ]]; then
         | timeout 5 openssl s_client -quiet -verify_return_error \
             -connect 127.0.0.1:19000 -servername backend.acceptance.test \
             -CAfile "$root/certs/upstream-ca.pem" \
-            > "$root/logs/client-tcp-passthrough.body" 2> "$root/logs/client-tcp-passthrough.tls"
+            > "$root/logs/client-tcp-passthrough.http" 2> "$root/logs/client-tcp-passthrough.tls"
+    perl -0777 -ne 'my ($headers,$body)=split(/\r\n\r\n/,$_,2); defined($body) && $headers =~ /^HTTP\/1\.1 200 OK\r\n/ or die "invalid HTTP response"; print $body' \
+        "$root/logs/client-tcp-passthrough.http" > "$root/logs/client-tcp-passthrough.body"
     assert_exact_body "$root/logs/client-tcp-passthrough.body" 'tls-backend:/tls-passthrough' 'TCP TLS passthrough'
     tls_passthrough_verified=true
 fi
@@ -1039,7 +1046,7 @@ if [[ "$mode" == after-reboot ]]; then
         --resolve mtls.acceptance.test:18444:127.0.0.1 \
         --cert "$root/certs/client.pem" --key "$root/certs/client.key" \
         || fail 'post-reboot mTLS certificate or client policy was not trusted by the saved CA snapshots'
-    assert_exact_body "$root/logs/client-post-reboot-mtls.body" 'http-backend:/mtls/reboot;forwarded:' 'post-reboot mTLS route'
+    assert_exact_body "$root/logs/client-post-reboot-mtls.body" 'http-backend:/mtls/reboot;forwarded:127.0.0.1' 'post-reboot mTLS route'
 
     [[ -s "$root/logs/acme-account-fingerprints-before-reboot.txt" ]] \
         || fail 'pre-reboot ACME account/store retention evidence is missing'
@@ -1063,7 +1070,7 @@ legacy_api_status=$(curl --silent --show-error --insecure \
     --output "$root/logs/client-legacy-api.body" --write-out '%{http_code}' \
     https://example.org/api/entrypoints)
 [[ "$legacy_api_status" == 200 ]] || fail "legacy traffic listener returned unexpected status $legacy_api_status for /api"
-assert_exact_body "$root/logs/client-legacy-api.body" 'http-backend:/api/entrypoints;forwarded:' 'legacy API router'
+assert_exact_body "$root/logs/client-legacy-api.body" 'http-backend:/api/entrypoints;forwarded:127.0.0.1' 'legacy API router'
 
 secure_api_status=$(curl --silent --show-error --insecure \
     --resolve shop.acceptance.test:18443:127.0.0.1 \

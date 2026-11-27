@@ -313,7 +313,7 @@ udp_withdrawn_witness() {
 unverified_drift_inject() {
     local owner metadata mode uid gid temporary pid
     owner=$(verify_owned_service)
-    jq -e '(.http.services.catalog.loadBalancer.servers | type == "array") and (.http.routers.catalog != null) and (.udp.routers.echo != null)' \
+    jq -e '(.http.services.catalog.loadBalancer.servers | type == "array") and (.http.routers.catalog != null) and (.udp.routers | (has("echo") | not) and has("echo-other"))' \
         "$dynamic_file" >/dev/null || fail 'valid baseline graph is unavailable for the drifted-baseline case'
     [[ ! -e "$root/unverified-dynamic-before.yml" && ! -L "$root/unverified-dynamic-before.yml" ]] \
         || fail 'unverified-baseline backup already exists'
