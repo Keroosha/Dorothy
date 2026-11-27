@@ -1589,3 +1589,22 @@ type TraefikBackendTests() =
         Assert.That(accepts (Some "candidate") true false, Is.True, "Interrupted before rename.")
         Assert.That(accepts (Some "candidate") false true, Is.True, "Interrupted after rename.")
         Assert.That(accepts (Some "candidate") false false, Is.False, "Foreign bytes after binding.")
+
+    [<Test>]
+    member _.``Pending start is not failed by an empty PID but a recorded exit belongs to its exact invocation``() =
+        let id = String('a',32)
+        let mutable completed = false
+        let mutable exited = false
+        let env = TestSupport.fakeHostEnvironment "/" (fun cmd args _ ->
+            let text =
+                if cmd = "systemctl" then "InvocationID=" + id + "\nMainPID=0"
+                elif List.contains "JOB_ID=123" args && completed then "{\"JOB_RESULT\":\"done\",\"JOB_TYPE\":\"start\",\"INVOCATION_ID\":\"" + id + "\"}"
+                elif List.contains ("INVOCATION_ID=" + id) args && exited then "{\"UNIT_RESULT\":\"exit-code\"}"
+                else ""
+            { ExitCode=0; Stdout=text; Stderr="" }) (fun () -> DateTimeOffset.UtcNow)
+        Assert.That(Traefik.checkActivationJob env "123" None, Is.EqualTo(None:string option))
+        completed <- true
+        Assert.That(Traefik.checkActivationJob env "123" None, Is.EqualTo(Some id))
+        exited <- true
+        let error = Assert.Throws<Traefik.BackendError>(fun () -> Traefik.checkActivationJob env "123" (Some id) |> ignore)
+        Assert.That(error.Message, Does.Contain(id + " failed: exit-code"))

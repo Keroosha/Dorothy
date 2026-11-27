@@ -4576,6 +4576,38 @@ module Traefik =
             true
             None
 
+    let private managerRecord environment filters =
+        let r = run environment "journalctl" ([ "--boot"; "--no-pager"; "--output=json"; "--lines=1"; "_PID=1"; "UNIT=" + ServiceName ] @ filters)
+        if r.ExitCode <> 0 then None
+        else
+            try
+                use doc = JsonDocument.Parse(r.Stdout)
+                Some(doc.RootElement.Clone())
+            with :? JsonException -> None
+
+    let internal checkActivationJob environment job knownInvocation =
+        let invocation =
+            match knownInvocation with
+            | Some _ -> knownInvocation
+            | None ->
+                managerRecord environment [ "JOB_ID=" + job ]
+                |> Option.bind (fun entry ->
+                    match tryString entry "JOB_RESULT", tryString entry "JOB_TYPE" with
+                    | "done", ("start" | "restart") ->
+                        let id = tryString entry "INVOCATION_ID"
+                        if id.Length = 32 && Seq.forall Uri.IsHexDigit id then Some id else None
+                    | ("dependency" | "failed" | "timeout" | "canceled" | "skipped" | "assert" | "unsupported" | "collected") as result, _ ->
+                        fail ("Traefik systemd activation job " + job + " failed: " + result)
+                    | _ -> None)
+        invocation |> Option.iter (fun id ->
+            match managerRecord environment [ "INVOCATION_ID=" + id; "MESSAGE_ID=d9b373ed55a64feb8242e02dbe79a49c" ] with
+            | Some record -> fail ("Traefik activation invocation " + id + " failed: " + tryString record "UNIT_RESULT")
+            | None ->
+                match showUnit environment [ "InvocationID" ] |> Option.bind (Map.tryFind "InvocationID") with
+                | Some current when current.Length = 32 && current <> String('0',32) && current <> id -> fail ("Traefik activation invocation " + id + " was replaced before readiness")
+                | _ -> ())
+        invocation
+
     let private waitForActivation (environment: HostEnvironment) (requestElement: JsonElement) (paths: RuntimePaths) (timeoutSeconds: float) job : JsonObject =
         let jobMatches () = job |> Option.forall (fun id -> (managedJobInvocation environment id).IsSome)
         let request = validateRequest requestElement
@@ -4596,7 +4628,9 @@ module Traefik =
         latest["certificateFingerprints"] <- JsonObject()
         latest["tlsObservations"] <- JsonObject()
         let mutable complete = false
+        let mutable started = None
         while not complete do
+            job |> Option.iter (fun j -> started <- checkActivationJob environment j started)
             let candidate =
                 observeRuntimePrepared
                     environment request certificateMaterialDigests paths expectedStaticData expectedDynamicData

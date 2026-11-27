@@ -1437,8 +1437,9 @@ done
 export_checkpoint "$state_dir/before-rollback-checkpoint.json"
 static_rollback_config_hash_before=$(remote 'sha256sum /etc/keroosha-iac/traefik/static.yml /etc/keroosha-iac/traefik/dynamic/current.yml' | sha256sum | awk '{print $1}')
 static_rollback_pid_before=$(remote_service_pid)
+rollback_started=$SECONDS
 expect_pulumi_failure rollback rollback-up.log up --stack acceptance --yes --non-interactive --skip-preview --parallel 1
-grep -Fq 'Traefik activation did not satisfy the bounded readiness checks' "$state_dir/logs/rollback-up.log" || {
+((SECONDS - rollback_started < 120)) && grep -Eq 'Traefik activation invocation [[:xdigit:]]{32} failed: exit-code' "$state_dir/logs/rollback-up.log" || {
     printf 'Static rollback failure did not report the bounded activation rollback diagnostic.\n' >&2
     exit 1
 }
@@ -1470,7 +1471,7 @@ jq -n \
     --arg pidAfter "$static_rollback_pid_after" \
     --arg hashBefore "$static_rollback_config_hash_before" \
     --arg hashAfter "$static_rollback_config_hash_after" \
-    --arg diagnostic 'Traefik activation did not satisfy the bounded readiness checks' \
+    --arg diagnostic "$(grep -Eo 'Traefik activation invocation [[:xdigit:]]{32} failed: exit-code' "$state_dir/logs/rollback-up.log" | sort -u)" \
     --arg serviceState "$REMOTE_SYSTEMCTL_STATE" \
     --argjson systemctlExit "$REMOTE_SYSTEMCTL_EXIT" \
     '{
