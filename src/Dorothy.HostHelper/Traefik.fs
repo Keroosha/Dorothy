@@ -221,6 +221,7 @@ module Traefik =
           RestartRequired: bool
           CertificateFiles: string list
           JournalSha256: string
+          StoppedIntent: (string * bool) option
           Recovery: RecoveryStart option }
 
     let pathsFor (environment: HostEnvironment) =
@@ -1844,26 +1845,25 @@ module Traefik =
         with _ -> false
 
 
-    let private installBinary (environment: HostEnvironment) (paths: RuntimePaths) (ownerId: string) (architecture: string) (prepared: FileStream) : bool =
-        use archive = if isNull prepared then (downloadArchive architecture CancellationToken.None).GetAwaiter().GetResult() else prepared
-        use temporaryBinary = createTemporaryFile ()
-        let _, binaryHash = extractBinary archive temporaryBinary
-        temporaryBinary.Flush(true)
-        temporaryBinary.Position <- 0L
+    let private releaseBytes ownerId architecture binaryHash =
+        let marker = JsonObject()
+        marker["owner"] <- JsonValue.Create(ownerDigest ownerId)
+        marker["version"] <- JsonValue.Create(Version)
+        marker["architecture"] <- JsonValue.Create(architecture:string)
+        marker["archiveSha256"] <- JsonValue.Create(archiveChecksums[architecture])
+        marker["binarySha256"] <- JsonValue.Create(binaryHash:string)
+        Encoding.UTF8.GetBytes(jsonText marker)
+
+    let private installBinary environment (paths: RuntimePaths) ownerId architecture (prepared: FileStream, binaryHash: string) =
+        if isNull prepared then fail "pinned installation changed since preparation"
+        prepared.Position <- 0L
         let _, rootGid = hostOwner environment
         createOwnedDirectory environment paths.InstallDir ownerId 0o755 (Some rootGid) |> ignore
         ensureDirectory environment (Path.GetDirectoryName(paths.BinaryPath)) 0o755 (Some rootGid)
         publishOrdinary environment paths.BinaryPath binaryHash 0o755 (Some rootGid) ignore
             (fun stage -> if not (binaryVersion environment stage) then fail "pinned binary version did not match")
-            (fun stream -> temporaryBinary.CopyTo(stream))
-
-        let marker = JsonObject()
-        marker["owner"] <- JsonValue.Create(ownerDigest ownerId)
-        marker["version"] <- JsonValue.Create(Version)
-        marker["architecture"] <- JsonValue.Create(architecture)
-        marker["archiveSha256"] <- JsonValue.Create(archiveChecksums[architecture])
-        marker["binarySha256"] <- JsonValue.Create(binaryHash)
-        writeAtomic environment (Path.Combine(paths.InstallDir, ".keroosha-release.json")) (Encoding.UTF8.GetBytes(jsonText marker)) 0o644 (Some rootGid)
+            (fun stream -> prepared.CopyTo(stream))
+        writeAtomic environment (Path.Combine(paths.InstallDir, ".keroosha-release.json")) (releaseBytes ownerId architecture binaryHash) 0o644 (Some rootGid)
         true
 
     let private pinnedReleaseMatches environment (paths: RuntimePaths) ownerId arch (hash: string option) =
@@ -4801,10 +4801,17 @@ module Traefik =
         (wasEnabled: bool)
         (restartRequired: bool)
         (certificateFiles: string list)
+        (intent: string option)
         confirmPreimage
         =
         let journal = JsonObject()
-        journal["version"] <- JsonValue.Create(3)
+        journal["version"] <- JsonValue.Create(if intent.IsSome then 5 else 3)
+        match intent with
+        | Some digest ->
+            journal["generation"] <- JsonValue.Create(Guid.NewGuid().ToString("N"))
+            journal["intent"] <- JsonValue.Create(digest)
+            journal["staged"] <- JsonValue.Create(false)
+        | None -> ()
         journal["owner"] <- JsonValue.Create(ownerDigest ownerId)
         journal["static"] <- encodeSnapshot staticData
         journal["dynamic"] <- encodeSnapshot dynamicData
@@ -4888,13 +4895,14 @@ module Traefik =
                     | Some 2 -> Set.add "credentials" baseFields
                     | Some 3 -> Set.add "restartRequired" (Set.add "credentials" baseFields)
                     | Some 4 -> Set.union baseFields (set [ "credentials"; "restartRequired"; "recovery" ])
+                    | Some 5 -> Set.union baseFields (set [ "credentials"; "restartRequired"; "generation"; "intent"; "staged" ])
                     | _ -> fail "Traefik rollback journal is invalid"
                 if objectNames journal <> expected then fail "Traefik rollback journal is invalid"
                 let owner = tryString journal "owner"
                 let binaryPresent = jsonBool (get "binaryPresent")
                 let wasActive = jsonBool (get "wasActive")
                 let wasEnabled = jsonBool (get "wasEnabled")
-                let restartRequired = if version = Some 3 || version = Some 4 then jsonBool (get "restartRequired") else Some true
+                let restartRequired = if version >= Some 3 then jsonBool (get "restartRequired") else Some true
                 let binarySha = if (get "binarySha256").ValueKind = JsonValueKind.Null then None else Some(stringValue "Traefik rollback journal is invalid" (get "binarySha256"))
                 let names = get "certificateFiles"
                 if owner <> ownerDigest ownerId || binaryPresent.IsNone || wasActive.IsNone || wasEnabled.IsNone || restartRequired.IsNone || names.ValueKind <> JsonValueKind.Array then
@@ -4911,6 +4919,12 @@ module Traefik =
                 if binaryPresent = Some true && binarySha.IsNone then fail "Traefik rollback journal is invalid"
                 Some {
                     JournalSha256 = sha256Bytes bytes
+                    StoppedIntent =
+                        if version <> Some 5 then None
+                        else
+                            let intent = tryString journal "intent"
+                            if wasActive <> Some false || not (fingerprintPattern.IsMatch(intent)) || not (Regex.IsMatch(tryString journal "generation","^[0-9a-f]{32}$")) then fail "invalid stopped intent"
+                            Some(intent, (get "staged").GetBoolean())
                     Recovery =
                         if version <> Some 4 then None
                         else
@@ -5031,9 +5045,63 @@ module Traefik =
                 && apiDynamicMatches Attribution observed None root true
             with :? JsonException | :? KeyNotFoundException | :? InvalidOperationException -> false
         | _ -> false
+    let private certificateDigests environment (paths: RuntimePaths) =
+        let uid,_ = hostOwner environment
+        let _,gid = serviceAccountOwner environment
+        let names = entries paths.CertificateDir |> Set.ofArray |> Set.remove ".keroosha-owner"
+        let mutable result = Map.empty
+        for name in names do
+            let path = Path.Combine(paths.CertificateDir,name)
+            if not (certificateFilenamePattern.IsMatch(name) && metadataMatches environment path "file" 0o640 uid gid) then fail "invalid certificate inventory"
+            if name.EndsWith(".crt", StringComparison.Ordinal) then
+                let stem = Path.GetFileNameWithoutExtension(name)
+                let keyName = stem + ".key"
+                if not (names.Contains keyName) then fail "incomplete certificate inventory"
+                if not (metadataMatches environment (Path.Combine(paths.CertificateDir,keyName)) "file" 0o640 uid gid) then fail "invalid protected key metadata"
+                let cert = readBytes environment path
+                let key = readBytes environment (Path.Combine(paths.CertificateDir,keyName))
+                use pair = IncrementalHash.CreateHash(HashAlgorithmName.SHA256)
+                pair.AppendData(cert); pair.AppendData([|0uy|]); pair.AppendData(key)
+                if Convert.ToHexStringLower(pair.GetHashAndReset()) <> stem then fail "certificate inventory content differs"
+                result <- result.Add(name,sha256Bytes cert).Add(keyName,sha256Bytes key)
+        if result.Count <> names.Count then fail "incomplete certificate inventory"
+        result
+
+    let private manifestDigest (serviceUid:int,serviceGid:int) staticHash dynamicHash credentialHash unitHash binaryHash releaseHash receiptHash (certs: Map<string,string>) =
+        let values = JsonArray()
+        values.Add(JsonValue.Create(serviceUid))
+        values.Add(JsonValue.Create(serviceGid))
+        for value: string option in [Some staticHash; Some dynamicHash; credentialHash; Some unitHash; Some binaryHash; Some releaseHash; receiptHash] do
+            values.Add(match value with None -> null | Some s -> JsonValue.Create(s) :> JsonNode)
+        let inventory = JsonObject()
+        for KeyValue(name,digest) in certs do inventory[name] <- JsonValue.Create(digest)
+        values.Add(inventory)
+        sha256Text (jsonText values)
+
+    let private verifyStoppedManifest environment (paths: RuntimePaths) owner intent =
+        let c,s,i,unit = validateActualOwner environment paths owner
+        let uid,gid = hostOwner environment
+        let serviceOwner =
+            match lookupUser environment, lookupGroup environment with
+            | Some user, Some group when user.Uid <> 0 && user.Gid = group && user.Home = paths.StateDir && user.Shell = "/usr/sbin/nologin" -> user.Uid,group
+            | _ -> fail "dedicated service identity changed"
+        if (c,s,i) <> ("owned","owned","owned") || not (isStopped environment && isEnabled environment && unitMatches environment paths && filesystemMetadataMatches environment paths) then fail "stopped staging ownership, metadata, enablement or unit mismatch"
+        let expectedMarker = Encoding.ASCII.GetBytes(ownerDigest owner + "\n")
+        for dir in [paths.ConfigDir;paths.DynamicDir;paths.CertificateDir;paths.InstallDir;paths.StateDir] do
+            let marker = Path.Combine(dir,".keroosha-owner")
+            if not (metadataMatches environment marker "file" 0o644 uid gid) || readBytes environment marker <> expectedMarker then fail "stopped staging marker mismatch"
+        let receipt = readOptional environment paths.StaticReceipt
+        if receipt.IsSome && not (metadataMatches environment paths.StaticReceipt "file" 0o600 uid gid) then fail "stopped staging receipt metadata mismatch"
+        let digest = manifestDigest serviceOwner (binarySha256 environment (Path.Combine(paths.ConfigDir,"static.yml"))) (binarySha256 environment (Path.Combine(paths.DynamicDir,"current.yml")))
+                         (readCredentialSnapshot environment paths |> Option.map sha256Bytes) (unit |> Option.map sha256Bytes |> Option.defaultWith (fun () -> fail "missing staged unit"))
+                         (binarySha256 environment paths.BinaryPath) (binarySha256 environment (Path.Combine(paths.InstallDir,".keroosha-release.json")))
+                         (receipt |> Option.map sha256Bytes) (certificateDigests environment paths)
+        if digest <> intent then fail "stopped staging manifest mismatch; preserving journal and files"
+
     let private recoverPendingTransaction (environment: HostEnvironment) (paths: RuntimePaths) (ownerId: string) (request: JsonElement) (activationTimeout: float) : PendingTransaction option =
         match loadPendingTransaction environment paths ownerId with
         | None -> None
+        | Some { StoppedIntent = Some(_,true) } -> fail "completed stopped staging requires local forward-stopped handoff"
         | Some journal when journal.Recovery.IsSome -> fail "pending recovery start requires scoped dynamic repair"
         | Some journal ->
             let currentUnit = safeUnitStatus environment paths.UnitPath ownerId
@@ -5157,9 +5225,19 @@ module Traefik =
         if initialUnit.IsNone && (initiallyActive || initiallyEnabled) then fail "Traefik service name collides with an unowned systemd unit"
         let existingOwned = configStatus = "owned" || stateStatus = "owned" || installStatus = "owned"
         // Reject an invalid acquisition before creating a service user, owner markers or journal.
+        let existingHash = if assertRegular environment paths.BinaryPath "Traefik binary" then Some(binarySha256 environment paths.BinaryPath) else None
+        let mutable intendedBinary = existingHash |> Option.defaultValue ""
         use prepared =
-            if not initiallyActive && not (assertRegular environment paths.BinaryPath "Traefik binary") then
-                (downloadArchive (architecture ()) CancellationToken.None).GetAwaiter().GetResult()
+            if not initiallyActive && existingHash.IsSome && not (pinnedReleaseMatches environment paths request.OwnerId (architecture ()) existingHash) then
+                fail "unconfirmed installed binary or release marker; reconcile before stopped staging"
+            if not initiallyActive && existingHash.IsNone then
+                use archive = (downloadArchive (architecture ()) CancellationToken.None).GetAwaiter().GetResult()
+                let binary = createTemporaryFile ()
+                try
+                    intendedBinary <- extractBinary archive binary |> snd
+                    binary.Flush(true)
+                    binary
+                with _ -> binary.Dispose(); reraise()
             else null
         let _, serviceGroup = ensureLayout environment paths request.OwnerId existingOwned
         let configStatus, stateStatus, installStatus, currentUnit = validateActualOwner environment paths request.OwnerId
@@ -5239,7 +5317,17 @@ module Traefik =
             if capture () <> initial then
                 fail "Apply refused: rollback files changed after inspection; preserve concurrent edits and retry with a reconciled configuration."
         confirmUnchanged ()
-        savePendingTransaction environment paths request.OwnerId oldStatic oldDynamic oldCredentials oldUnitBytes oldReleaseMarker oldBinaryExists oldBinaryHash wasActive wasEnabled restartRequired (Set.toList oldCertificateFiles) confirmUnchanged
+        let intent =
+            if wasActive then None
+            else
+                let mutable certs = certificateDigests environment paths
+                for KeyValue(_,cert) in request.Certificates do
+                    let stem = materialDigest cert
+                    certs <- certs.Add(stem+".crt",sha256Text cert.CertificatePem).Add(stem+".key",sha256Text cert.PrivateKeyPem)
+                let release = if isNull prepared then oldReleaseMarker |> Option.defaultWith (fun () -> fail "missing pinned release marker") else releaseBytes request.OwnerId (architecture ()) intendedBinary
+                Some(manifestDigest (serviceAccountOwner environment) (sha256Bytes staticData) (sha256Bytes dynamicData) (desiredCredentials |> Option.map sha256Bytes)
+                         (sha256Bytes currentUnitText) intendedBinary (sha256Bytes release) (readOptional environment paths.StaticReceipt |> Option.map sha256Bytes) certs)
+        savePendingTransaction environment paths request.OwnerId oldStatic oldDynamic oldCredentials oldUnitBytes oldReleaseMarker oldBinaryExists oldBinaryHash wasActive wasEnabled restartRequired (Set.toList oldCertificateFiles) intent confirmUnchanged
         let stagedJournal = readBytes environment paths.RollbackPath
         // A conflict here is not an activation failure: no candidate file was installed.
         // The generic rollback handler must not replace the newly observed external bytes.
@@ -5250,8 +5338,9 @@ module Traefik =
         let mutable binaryChanged = false
         let mutable restartAttempted = false
         let mutable candidateJob = None
+        let mutable fullyStaged = false
         try
-            binaryChanged <- ensureInstalledBinary environment paths request.OwnerId (not wasActive) prepared
+            binaryChanged <- ensureInstalledBinary environment paths request.OwnerId (not wasActive) (prepared,intendedBinary)
             writeCredentialFile environment paths request.Configuration
             writeCertificateFiles environment paths request serviceGroup
             confirmUnchanged ()
@@ -5267,6 +5356,14 @@ module Traefik =
                (capture () <> struct (Some staticData, Some dynamicData) || readCredentialSnapshot environment paths <> desiredCredentials ||
                 safeUnitStatus environment paths.UnitPath request.OwnerId <> Some currentUnitText) then fail "candidate changed before managed start"
             if needsStart then
+                let digest = intent.Value
+                let complete = JsonNode.Parse(stagedJournal).AsObject()
+                complete["staged"] <- JsonValue.Create(true)
+                writeRecoveryFile environment paths (sha256Bytes stagedJournal) paths.RollbackPath (Encoding.UTF8.GetBytes(jsonText complete)) 0o600 rootGid true (fun () ->
+                    verifyInvocation ()
+                    verifyStoppedManifest environment paths request.OwnerId digest
+                    if readOptional environment paths.RollbackPath <> Some stagedJournal then fail "stopped journal changed before completion")
+                fullyStaged <- true
                 verifyInvocation ()
                 candidateJob <- Some(enqueueServiceJob environment false)
             elif binaryChanged || restartRequired then
@@ -5291,7 +5388,9 @@ module Traefik =
                     try admissionInvocation environment |> Option.defaultValue "stopped"
                     with :? BackendError -> "unknown"
                 fail ("Traefik activation failed from stopped baseline: " + failureReason
-                      + "; rollback sample=" + sampled + "; no automatic stop, restore or journal retirement; use offline maintenance")
+                      + "; rollback sample=" + sampled + "; no automatic stop, restore or journal retirement; "
+                      + (if fullyStaged then "completed staging: use local forward-stopped after backup and operator stop"
+                         else "staging completion not recorded: forward-stopped unavailable; preserve the preimage for operator reconciliation"))
             let rollbackFailure =
                 try
                     if candidateJob.IsNone then verifyInvocation ()
@@ -5535,7 +5634,7 @@ module Traefik =
 #if TRAEFIK_MAINTENANCE
     /// Compiled only into the standalone administrator binary. Never dispatch
     /// through the deployment helper (which may itself have passwordless sudo).
-    let maintainStopped owner (expected: string) =
+    let maintainStopped forward owner (expected: string) =
         let environment = HostEnvironment.system
         let paths = pathsFor environment
         rootRequired environment
@@ -5549,7 +5648,7 @@ module Traefik =
             if not (isStopped environment) || not (unitMatches environment paths) then fail "operator must stop the owned unit and wait for all jobs"
         verifyStopped ()
         let archiveDir = Path.Combine(Path.GetDirectoryName(paths.ConfigDir), ".dorothy-traefik-recovery")
-        let archive = Path.Combine(archiveDir, ownerHash + "-" + expected + ".journal")
+        let archive = Path.Combine(archiveDir, ownerHash + "-" + expected + (if forward then ".forward.journal" else ".journal"))
         let verifiedArchive () =
             metadataMatches environment archiveDir "directory" 0o700 uid gid &&
             metadataMatches environment archive "file" 0o600 uid gid &&
@@ -5557,6 +5656,23 @@ module Traefik =
         match loadPendingTransaction environment paths owner with
         | None when verifiedArchive () -> fsyncDirectory paths.ConfigDir
         | None -> fail "no pending journal or matching completed archival handoff"
+        | Some journal when forward ->
+            match journal.StoppedIntent with
+            | Some(intent,true) when journal.JournalSha256 = expected ->
+                let bytes = readBytes environment paths.RollbackPath
+                let verify () =
+                    verifyStoppedManifest environment paths owner intent
+                    if not (metadataMatches environment paths.RollbackPath "file" 0o600 uid gid) || sha256Bytes bytes <> expected || readOptional environment paths.RollbackPath <> Some bytes then fail "forward handoff journal changed"
+                verify ()
+                writeRecoveryFile environment paths expected archive bytes 0o600 gid false verify
+                verify ()
+                if not (verifiedArchive ()) then fail "forward archive verification failed"
+                verifyStopped ()
+                if readOptional environment paths.RollbackPath <> Some bytes then fail "forward journal changed before retirement"
+                File.Delete(paths.RollbackPath)
+                fsyncDirectory paths.ConfigDir
+            | _ -> fail "forward handoff requires the exact completed stopped journal, not an incomplete or historical transaction"
+        | Some { StoppedIntent = Some(_,true) } -> fail "completed stopped staging requires forward-stopped, not recovery to an unconfirmed preimage"
         | Some journal ->
             if journal.JournalSha256 <> expected || not journal.CredentialsKnown || not journal.BinaryPresent then fail "journal hash mismatch or incomplete protected preimage"
             let dynamicPath = Path.Combine(paths.DynamicDir, "current.yml")

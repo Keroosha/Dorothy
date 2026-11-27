@@ -535,7 +535,7 @@ if [[ -f "\$root/.ordinary-interrupt" && "\${1:-}" == show && \$(readlink /proc/
           committed) [[ \$candidate == "\$j" ]] || continue ;;
         esac
         [[ -f "\$candidate" && \$(stat -Lc '%a:%u:%g' "\$candidate") == 600:0:0 ]] || continue
-        jq -e --arg owner "\$(</etc/keroosha-iac/traefik/.keroosha-owner)" '.version==3 and .owner==\$owner and (.credentials|type)=="string" and (.dynamic|type)=="string"' "\$candidate" >/dev/null 2>&1 || continue
+        jq -e --arg owner "\$(</etc/keroosha-iac/traefik/.keroosha-owner)" '(.version==3 or (.version==5 and .wasActive==false and .staged==false)) and .owner==\$owner and (.credentials|type)=="string" and (.dynamic|type)=="string"' "\$candidate" >/dev/null 2>&1 || continue
         sha=\$(sha256sum "\$candidate"|cut -d' ' -f1)
         if [[ \$point == linked ]]; then
             expected=\$(printf 'ordinary\\n%s\\n%s' "\$j" "\$sha"|sha256sum|cut -d' ' -f1)

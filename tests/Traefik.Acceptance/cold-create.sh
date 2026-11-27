@@ -34,12 +34,39 @@ remote "set -eu; cat > '$cache'; echo '$sha  $cache' |sha256sum -c -" < "$archiv
 stores(){ remote 'set -euo pipefail; files=(/var/lib/keroosha-traefik/acme-*.json); test ${#files[@]} -eq 3; for f in "${files[@]}"; do test -s "$f"; sha256sum "$f"; done'; }
 proof(){ remote "set -eu; exe=/usr/local/libexec/keroosha-iac/traefik/3.7.16/traefik; echo '86ee2b427888d24475051fc5f5bcca94cf4fa033b6fa54205b7eb0de6914f31e  '\"\$exe\" | sha256sum -c -; \"\$exe\" version |grep '3.7.16'; for path in /etc/keroosha-iac/traefik/{,dynamic/,dynamic/certificates/}.keroosha-owner /usr/local/libexec/keroosha-iac/traefik/.keroosha-owner; do cmp \"\$path\" /var/lib/keroosha-traefik/.keroosha-owner; done; curl -fsS --cacert '$GUEST_ROOT/certs/pebble.minica.pem' https://localhost:15001/roots/0 > '$GUEST_ROOT/cold-root.pem'; curl -fsS --noproxy '*' --resolve shop.acceptance.test:18443:127.0.0.1 --cacert '$GUEST_ROOT/cold-root.pem' https://shop.acceptance.test:18443/secure/health |grep -F tls-backend:/secure/health; echo '$sha  $cache' |sha256sum -c -"; }
 control(){ remote "bash -s -- '$GUEST_ROOT' '$1'" < "$f/cold-controls.sh"; }
+handoff(){ remote "bash -s -- 'forward-$1' '$GUEST_ROOT'" < "$f/offline-handoff.sh"; }
+# Derive owner from the expected engine URN and declared SSH address, never the guest journal.
+p preview --stack acceptance --json --non-interactive > "$s/cold-preview.json"
+urn=$(jq -er '[.steps[].urn|select(endswith("::keroosha:debian:Traefik::sandbox"))]|unique|select(length==1)|first' "$s/cold-preview.json")
+owner="$urn::192.0.2.1"
+operator=${TRAEFIK_ACCEPTANCE_MAINTENANCE_BIN:?standalone operator binary required}
+remote "umask 077; cat > '$GUEST_ROOT/maintenance-bin'" < "$operator"
+remote "printf '%s\\n' '$owner' > '$GUEST_ROOT/maintenance-owner'; printf '%s\\n' '$(sha256sum "$operator"|cut -d' ' -f1)' > '$GUEST_ROOT/maintenance-sha'; printf '%s\\n' '$(sha256sum "$provider/helper/linux-x64/keroosha-iac-helper"|cut -d' ' -f1)' > '$GUEST_ROOT/product-helper-sha'"
+if TRAEFIK_ACCEPTANCE_PHASE=rollback up > "$log/failed-cold-create.log" 2>&1; then exit 1; fi
+grep -Fq 'activation failed from stopped baseline' "$log/failed-cold-create.log"
+p stack export --stack acceptance | jq -e --arg u "$urn" 'all(.deployment.resources[]; .urn!=$u or (.id//"")=="")' > "$log/failed-create-no-id.log"
+remote 'set -eu; d=/etc/keroosha-iac/traefik; test ! -e "$d/.keroosha-static-receipt"; jq -e ".version==5 and .staged==true and .binaryPresent==false and .static==null and .dynamic==null" "$d/.keroosha-rollback.json"'
+handoff install; handoff stop; handoff negatives; handoff interrupt; handoff retire
+checkpoint_identity(){ p stack export --stack acceptance | jq -er --arg u "$urn" --arg id "$owner" '[.deployment.resources[]|select(.urn==$u and .id==$id)]|length==1'; }
 for pass in first recreated; do
     up > "$log/cold-$pass-up.log" 2>&1
     proof > "$log/cold-$pass-proof.log"
     p refresh --yes --non-interactive > "$log/cold-$pass-refresh.log"
     p preview --expect-no-changes --non-interactive > "$log/cold-$pass-preview.log"
     if [[ $pass == first ]]; then
+        checkpoint_identity
+        stores > "$s/pre-forward-update-stores"
+        remote "set -eu; b=\$(mktemp -d '$GUEST_ROOT/pre-update.XXXXXXXX'); cp -a /etc/keroosha-iac/traefik/. \"\$b/\"; systemctl stop keroosha-traefik.service"
+        openssl req -x509 -newkey ec -pkeyopt ec_paramgen_curve:P-256 -nodes -days 2 -subj '/CN=sni-proof.acceptance.test' -addext 'subjectAltName=DNS:sni-proof.acceptance.test' -addext 'basicConstraints=critical,CA:FALSE' -addext 'extendedKeyUsage=serverAuth' -keyout "$s/update.key" -out "$s/update.pem" 2> "$log/update-cert.log"
+        if TRAEFIK_ACCEPTANCE_SNI_CERT_FILE="$s/update.pem" TRAEFIK_ACCEPTANCE_SNI_KEY_FILE="$s/update.key" TRAEFIK_ACCEPTANCE_LOG_LEVEL=INFO TRAEFIK_ACCEPTANCE_PHASE=rollback-udp up > "$log/failed-static-update.log" 2>&1; then exit 1; fi
+        grep -Fq 'activation failed from stopped baseline' "$log/failed-static-update.log"
+        remote 'set -eu; d=/etc/keroosha-iac/traefik; test "$(find "$d/dynamic/certificates" -type f | wc -l)" -gt "$(jq ".certificateFiles|length" "$d/.keroosha-rollback.json")"'
+        remote 'set -eu; d=/etc/keroosha-iac/traefik; jq -e ".version==5 and .staged==true and .binaryPresent==true" "$d/.keroosha-rollback.json"; ! cmp -s "$d/static.yml" <(jq -er .static "$d/.keroosha-rollback.json"|base64 -d) || exit 1'
+        if handoff retire > "$log/active-forward-refusal.log" 2>&1; then exit 1; fi
+        checkpoint_identity
+        handoff stop; handoff negatives; handoff interrupt; handoff retire
+        p up --refresh --stack acceptance --yes --non-interactive --parallel 1 > "$log/after-forward-update-up.log" 2>&1; checkpoint_identity; proof > "$log/after-forward-update-proof.log"
+        stores > "$s/post-forward-update-stores"; cmp "$s/pre-forward-update-stores" "$s/post-forward-update-stores"
         control http-inject; control http-witness > "$log/http-before"
         if TRAEFIK_ACCEPTANCE_PHASE=withdraw-udp up > "$log/http-refusal" 2>&1; then exit 1; fi
         grep -Fq 'cannot establish that the dynamic rollback file represents the running graph' "$log/http-refusal"
@@ -53,6 +80,8 @@ for pass in first recreated; do
         if TRAEFIK_ACCEPTANCE_PHASE=withdraw-udp up > "$log/independent-refusal" 2>&1; then exit 1; fi
         grep -Fq 'service invocation changed since admission' "$log/independent-refusal"
         control race-assert
+        handoff stop; handoff incomplete > "$log/partial-forward-refusal.log" 2>&1
+        grep -Fq 'not an incomplete or historical transaction' "$log/partial-forward-refusal.log"
     fi
     stores > "$s/$pass-before-delete.txt"
     TRAEFIK_ACCEPTANCE_PHASE=delete up > "$log/cold-$pass-delete.log" 2>&1
