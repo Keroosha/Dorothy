@@ -41,6 +41,18 @@ Out of scope: alternate discovery providers and API/dashboard publishing; third-
 
 **Runtime evidence requires outbound isolation.** Binding SSH or traffic listeners to loopback does not deny guest egress. The native product retains its documented default issuer when `caServer` is omitted; acceptance must instead require an explicit, allowlisted local issuer in the effective file before every start. Historical packet/issuer observations below do not attest outbound isolation. Compile-only CI is not clearance to run the guest.
 
+## Before Apply: can the running configuration be restored?
+
+Read reports drift and does not reconcile it. Before starting a new transaction on a running owned service, Apply compares the captured listener and dynamic graph with the private runtime API. A loaded router with `disabled` or `warning` status is not a healthy router, but its configuration can still identify the rollback baseline. Successful activation and a positive Read still require enabled resources.
+
+If the private API cannot be reached, check the daemon and admin address. If a file is missing, unreadable, or does not represent the running configuration, preserve the external edits and reconcile the file and process before retrying ordinary Apply. Merely copying desired static bytes over a running process with a different trust policy is not reconciliation. A refusal before staging neither restarts the daemon nor creates a pending journal.
+
+The transaction uses the captured bytes, not a later reread as a replacement preimage. Byte comparisons detect intervening changes; they do not lock out an unrelated writer or provide filesystem-wide compare-and-swap. Coordinate external writers. Rawdata omits root TLS and named transport bodies: the current structured renderer commits those separately inside the loaded private generation rule. This is not independent proof that a remote TLS peer is healthy or that an external file reference still has the same contents.
+
+### Reviewed baseline at `2da8bc4`
+
+The isolated producer run completed on one commit/helper. It distinguished a healthy backend-specific 200 across a pre-stage refusal from an already-loaded empty backend returning 503 before and after a failed candidate. The latter was repaired by a subsequent Apply, not by rollback. Delete preserved six nonempty stores by name and SHA-256. This run did **not** exercise a disabled router repair or establish attribution for rejected changes confined to opaque fields.
+
 ## Verification ledger
 
 The field-level boundaries and reasons for rejection are in [static](Traefik-static.md), [HTTP/TCP/UDP](Traefik-dynamic.md), and [TLS/ACME](Traefik-tls.md). An accepted value is not evidence that the specific protocol, exporter or DNS provider has been exercised. `tests/Traefik.Acceptance/compare-provider.sh` validates the Traefik resource plus its referenced types with `pulumi schema check`; it does not claim whole-package compatibility. CI pins Pulumi 3.273.0. The separate full-package observation below used 3.276.0.

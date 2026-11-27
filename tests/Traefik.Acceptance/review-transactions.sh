@@ -12,6 +12,7 @@ mode=$1
 guest_root=$2
 shift 2
 case "$mode" in
+    disabled-inject|disabled-repaired) [[ $# == 0 ]] || usage ;;
     healthy-disk-inject|healthy-disk-refused|healthy-disk-reconcile) [[ $# == 0 ]] || usage ;;
     udp-drift-inject|udp-live-witness|udp-withdrawn-witness|binary-stage-inject|binary-stage-assert-clean|unverified-drift-inject|unverified-rollback-assert|unverified-repair-assert|restart-interrupt-install|restart-interrupt-remove|restart-interrupt-downgrade-v2) [[ $# == 0 ]] || usage ;;
     restart-interrupt-assert-staged) [[ $# == 3 ]] || usage ;;
@@ -698,6 +699,23 @@ restart_interrupt_assert_static_restarted() {
 
 
 case "$mode" in
+    disabled-inject|disabled-repaired)
+        verify_owned_service >/dev/null
+        if [[ $mode == disabled-inject ]]; then
+            tmp=$(mktemp "${dynamic_file}.fixture.XXXXXXXX")
+            jq '.http.routers.catalog.middlewares += ["missing-review-middleware"]' "$dynamic_file" > "$tmp"
+            chmod --reference="$dynamic_file" "$tmp"; chown --reference="$dynamic_file" "$tmp"; mv -T "$tmp" "$dynamic_file"
+            for _ in $(seq 1 60); do
+                curl -fsS http://127.0.0.1:19080/api/rawdata > "$root/logs/disabled-raw.json" &&
+                    jq -e '.routers["catalog@file"] | .status=="disabled" or .status=="warning"' "$root/logs/disabled-raw.json" >/dev/null && break
+                sleep .25
+            done
+            jq -e '.routers["catalog@file"] | select(.status=="disabled" or .status=="warning") | {status,errors:(.error|length)}' "$root/logs/disabled-raw.json" > "$root/logs/disabled-before.json"
+            status=$(curl --noproxy '*' -sS -o /dev/null -w '%{http_code}' -H 'Host: shop.acceptance.test' http://127.0.0.1:18081/items/transactions-control)
+            [[ "$status" == 404 ]] || fail "disabled router unexpectedly answered with $status"
+        else
+            catalog_observation 200 "$root/logs/disabled-repaired.json"
+        fi ;;
     healthy-disk-inject|healthy-disk-refused|healthy-disk-reconcile) healthy_disk_control ;;
     binary-stage-inject) binary_stage_inject ;;
     binary-stage-assert-clean) binary_stage_assert_clean ;;

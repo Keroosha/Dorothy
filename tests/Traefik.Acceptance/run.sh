@@ -963,9 +963,15 @@ jq -e '.status == "unchanged" and .targetResourceCount == 1 and .sshInvocations 
     printf 'Frozen copied-checkpoint preview did not report its no-SSH unchanged result.\n' >&2
     exit 1
 }
+legacy_baseline_witness() {
+    remote "set -eu; systemctl show keroosha-traefik.service -p MainPID -p InvocationID -p ActiveState; sudo test ! -e /etc/keroosha-iac/traefik/.keroosha-static-receipt; sudo sha256sum /etc/keroosha-iac/traefik/static.yml /etc/keroosha-iac/traefik/dynamic/current.yml"
+}
+legacy_baseline_witness > "$state_dir/legacy-pre-noop.txt"
 run_pulumi legacy candidate-legacy-refresh.log refresh --stack acceptance --yes --non-interactive
 run_pulumi legacy candidate-legacy-noop-preview.log preview --stack acceptance --expect-no-changes --non-interactive --color=never
 run_pulumi legacy candidate-legacy-noop-up.log up --stack acceptance --yes --non-interactive --skip-preview --expect-no-changes --parallel 1
+legacy_baseline_witness > "$state_dir/legacy-post-noop.txt"
+cmp "$state_dir/legacy-pre-noop.txt" "$state_dir/legacy-post-noop.txt"
 export_checkpoint "$state_dir/newer-legacy-checkpoint.json"
 [[ "$(resource_id "$state_dir/newer-legacy-checkpoint.json")" == "$legacy_id" ]] || {
     printf 'New provider changed the legacy Traefik resource ID.\n' >&2
@@ -1341,6 +1347,14 @@ remote "bash '$GUEST_ROOT/review-transactions.sh' unverified-rollback-assert '$G
 run_pulumi rotate unverified-repair-up.log up --stack acceptance --yes --non-interactive --parallel 1
 remote "bash '$GUEST_ROOT/review-transactions.sh' unverified-repair-assert '$GUEST_ROOT'" \
     > "$state_dir/logs/unverified-repair-assert.log" 2>&1
+remote "bash '$GUEST_ROOT/review-transactions.sh' disabled-inject '$GUEST_ROOT'"
+expect_pulumi_failure rollback-udp disabled-rollback.log up --stack acceptance --yes --non-interactive --skip-preview --parallel 1
+grep -Fq 'prior configuration could not be verified' "$state_dir/logs/disabled-rollback.log"
+run_pulumi rotate disabled-repair.log up --stack acceptance --refresh --yes --non-interactive --parallel 1
+remote "bash '$GUEST_ROOT/review-transactions.sh' disabled-repaired '$GUEST_ROOT'"
+for witness in disabled-before disabled-repaired; do
+    copy_from_guest "$GUEST_ROOT/logs/$witness.json" "$state_dir/$witness.json" "$state_dir/logs/$witness-copy.log"
+done
 for witness in healthy-disk-before healthy-disk-after unhealthy-disk-before unhealthy-disk-after; do
     copy_from_guest "$GUEST_ROOT/logs/$witness.json" "$state_dir/$witness.json" "$state_dir/logs/$witness-copy.log"
 done

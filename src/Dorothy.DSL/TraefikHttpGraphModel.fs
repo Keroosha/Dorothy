@@ -296,7 +296,7 @@ module TraefikHttpGraphModel =
         let isLowerHex character =
             (character >= '0' && character <= '9')
             || (character >= 'a' && character <= 'f')
-        if isNull generation || generation.Length <> 64 || (generation |> Seq.exists (fun character -> Microsoft.FSharp.Core.Operators.not (isLowerHex character))) then
+        if isNull generation || (generation.Length <> 64 && generation.Length <> 128) || (generation |> Seq.exists (fun character -> Microsoft.FSharp.Core.Operators.not (isLowerHex character))) then
             invalidArg "generation" "A generated Traefik configuration digest must be lowercase SHA-256 hex."
         generationPrefix + generation + generationSuffix
 
@@ -309,8 +309,8 @@ module TraefikHttpGraphModel =
             let prefix = generationPrefix
             let suffix = generationSuffix
             let prefixLength = prefix.Length
-            let generationLength = 64
-            if rule.Length = prefixLength + generationLength + suffix.Length
+            let generationLength = rule.Length - prefixLength - suffix.Length
+            if (generationLength = 64 || generationLength = 128)
                && rule.StartsWith(prefix, StringComparison.Ordinal)
                && rule.EndsWith(suffix, StringComparison.Ordinal) then
                 let mutable index = 0

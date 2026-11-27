@@ -984,6 +984,8 @@ type TraefikBackendTests() =
                 .Replace("VersionTLS13", "VersionTLS12", StringComparison.Ordinal)
                 |> Encoding.UTF8.GetBytes
         Assert.That(Traefik.apiMatchesDynamic (Some api) (Some changedBytes), Is.False)
+        Assert.That(Traefik.loadedRollbackGraph (Some api) (Some dynamicBytes), Is.True)
+        Assert.That(Traefik.loadedRollbackGraph (Some api) (Some changedBytes), Is.False, "Matching routers do not attest modified TLS options.")
 
     [<Test>]
     member _.``API comparison rejects a suffixed router service identifier``() =
@@ -1413,6 +1415,14 @@ type TraefikBackendTests() =
         Assert.That(recoverable dynamic, Is.True)
         Assert.That(recoverable "{\"http\":[", Is.False, "Serving a good graph cannot make malformed disk bytes recoverable.")
         Assert.That(recoverable (dynamic.Replace("127.0.0.1:19001", "127.0.0.1:19002")), Is.False, "A different live backend is not the disk preimage.")
+        for status in [ "warning"; "disabled" ] do
+            let live = JsonNode.Parse(rawData)
+            let route = live["routers"].["a-app@file"]
+            route["status"] <- JsonValue.Create(status)
+            route["error"] <- JsonNode.Parse("""["router configuration error"]""")
+            let raw = live.ToJsonString()
+            Assert.That(matches raw, Is.False, "Unhealthy is never successful activation.")
+            Assert.That(Traefik.loadedRollbackGraph (Some(apiFor raw)) (Some(Encoding.UTF8.GetBytes(dynamic))), Is.True)
 
         let priorityDrift = JsonNode.Parse(rawData) :?> JsonObject
         let routers = priorityDrift["routers"] :?> JsonObject

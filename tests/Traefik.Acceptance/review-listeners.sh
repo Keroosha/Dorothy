@@ -25,6 +25,7 @@ fail() {
 [[ $# == 2 ]] || usage
 mode=$1
 case "$mode" in
+    reconcile-forwarded|reconcile-proxy) ;;
     prepare|inject-forwarded|assert-forwarded-drift|restore-forwarded|assert-forwarded-restored|assert-forwarded-repaired|inject-proxy|assert-proxy-drift|restore-proxy|assert-proxy-restored|assert-proxy-repaired|assert-otlp-current|restore) ;;
     *) usage ;;
 esac
@@ -359,6 +360,14 @@ case "$mode" in
         restore_snapshot forwarded-before
         [[ "$(service_pid)" == "$(<"$FIXTURE/forwarded-injected.pid")" ]] \
             || fail 'restoring desired forwarded-header bytes unexpectedly restarted Traefik'
+        ;;
+    reconcile-forwarded|reconcile-proxy)
+        load_fixture
+        kind=${mode#reconcile-}
+        cmp -s "$STATIC_CONFIG" "$FIXTURE/$kind-before.static" || fail 'refusal changed desired static bytes'
+        [[ $(service_pid) == "$(<"$FIXTURE/$kind-injected.pid")" && ! -e /etc/keroosha-iac/traefik/.keroosha-rollback.json ]] || fail 'refusal changed PID or created journal'
+        if [[ $kind == forwarded ]]; then probe_forwarded untrusted forwarded-refused; else probe_proxy_v1 untrusted proxy-refused; fi
+        replace_static "$FIXTURE/$kind-mutated.json" "$FIXTURE/$kind-before.meta"
         ;;
     assert-forwarded-restored)
         load_fixture
