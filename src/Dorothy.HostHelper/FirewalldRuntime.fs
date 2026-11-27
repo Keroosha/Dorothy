@@ -1476,6 +1476,13 @@ module FirewalldRuntime =
                     else
                         match inspectRuntimeWith environment permanent kind name with
                         | Some snapshot when snapshot.UnknownFields.IsEmpty -> recordReferences snapshot
+                        // During a structural Delete the daemon's permanent file watcher
+                        // can remove exactly the target between enumeration and lookup.
+                        // Prove its absence with a fresh successful permanent inventory;
+                        // never treat a lookup error or an unreadable live target as absent.
+                        | None when permanent ->
+                            listObjectNames environment true kind
+                            |> Option.exists (List.contains name >> not)
                         | _ -> false
                 if not (collect (List.contains name runtimeNames) false
                         && collect (List.contains name permanentNames) true) then

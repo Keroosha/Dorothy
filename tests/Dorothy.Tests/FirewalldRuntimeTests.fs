@@ -299,6 +299,19 @@ type FirewalldRuntimeTests() =
             Assert.That(FirewalldRuntime.validateReload environment, Is.EqualTo(Ok () : Result<unit, string>))
             let newTarget () = FirewalldRuntime.validateReloadExcludingTargetObject environment "service" "not-yet-loaded"
             Assert.That(newTarget (), Is.EqualTo(Ok () : Result<unit, string>))
+            let releasedPolicy disappears =
+                let mutable inspected = false
+                let runChanging exe args input =
+                    match exe, args with
+                    | "firewall-cmd", [ "--permanent"; "--policy=edge"; "--list-all" ] ->
+                        inspected <- true
+                        { commandResult "" with ExitCode = 1 }
+                    | "firewall-cmd", [ "--permanent"; "--get-policies" ] when inspected && disappears -> commandResult ""
+                    | _ -> run exe args input
+                let changing = { environment with Run = runChanging }
+                FirewalldRuntime.validateReloadExcludingTargetObject changing "policy" "edge"
+            Assert.That(releasedPolicy true, Is.EqualTo(Ok () : Result<unit, string>))
+            Assert.That(Result.isError (releasedPolicy false), Is.True)
             timeout <- " timeout=60"
             expectRefusal ()
             timedMember <- false
