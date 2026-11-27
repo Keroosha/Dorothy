@@ -861,7 +861,8 @@ case "$mode" in
         if [[ $mode == opaque-tls-inject ]]; then
             jq '.tls.options["opaque-review"].notAValidOption = true' "$dynamic_file" > "$tmp"
         elif [[ $mode == opaque-false-inject || $mode == opaque-null-inject ]]; then
-            value=${mode#opaque-}; jq --argjson value "${value%-inject}" '.http.services.catalog.loadBalancer.notAField=$value' "$dynamic_file" > "$tmp"
+            value=${mode#opaque-}
+            jq --argjson value "${value%-inject}" '.http.services.catalog.loadBalancer.notAField=$value | if $value==null then .http.routers.catalog.priority=173173 else . end' "$dynamic_file" > "$tmp"
         else
             jq '.http.serversTransports["opaque-review"].notAValidTransportField = true' "$dynamic_file" > "$tmp"
         fi
@@ -869,11 +870,23 @@ case "$mode" in
         [[ -n $cursor ]]
         chown --reference="$dynamic_file" "$tmp"; chmod --reference="$dynamic_file" "$tmp"; mv -T "$tmp" "$dynamic_file"
         digest_file "$dynamic_file" > "$root/opaque-injected.sha256"
+        if [[ $mode == opaque-null-inject ]]; then
+            # Native decoding omits null without rejecting the whole file.
+            # The sibling priority proves this file was processed, while the
+            # missing key itself still cannot establish byte attribution.
+            observed=false
+            for _ in {1..40}; do
+                if curl -fsS --max-time 2 http://127.0.0.1:19080/api/rawdata | jq -e '.routers["catalog@file"].priority==173173 and (.services["catalog@file"].loadBalancer | has("notAField") | not)' >/dev/null; then observed=true; break; fi
+                sleep .25
+            done
+            [[ $observed == true ]] || fail 'null omission with loaded sibling priority not observed'
+        else
         for _ in $(seq 1 40); do
             journalctl -u keroosha-traefik.service --after-cursor="$cursor" -o cat --no-pager | grep -F 'collecting file configs' >/dev/null && break
             sleep .25
         done
-        journalctl -u keroosha-traefik.service --after-cursor="$cursor" -o cat --no-pager | grep -F 'collecting file configs' >/dev/null ;;
+        journalctl -u keroosha-traefik.service --after-cursor="$cursor" -o cat --no-pager | grep -F 'collecting file configs' >/dev/null
+        fi ;;
     opaque-witness)
         [[ ! -e "$journal_file" && $(digest_file "$dynamic_file") == "$(<"$root/opaque-injected.sha256")" ]]
         catalog_observation 200 "$root/logs/opaque-witness.json"; cat "$root/logs/opaque-witness.json" ;;
