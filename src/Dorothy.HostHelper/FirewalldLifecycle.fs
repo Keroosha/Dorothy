@@ -43,6 +43,8 @@ module FirewalldLifecycle =
     let private postBootServicePath = "/etc/systemd/system/keroosha-iac-firewalld-postboot-recovery.service"
     let private postBootServiceName = "keroosha-iac-firewalld-postboot-recovery.service"
     let private bootServiceName = "keroosha-iac-firewalld-boot-recovery.service"
+    let private containmentName = "keroosha-iac-firewalld-boot-containment.service"
+    let private containmentPath = "/etc/systemd/system/" + containmentName
     let private ownerMarker = "# Dorothy firewalld transaction recovery"
     let private timerText =
         String.concat "\n"
@@ -189,7 +191,7 @@ module FirewalldLifecycle =
         let awaitingPostBoot = if version = 1 then false else getBool node "awaitingPostBoot"
         if version = 2 && c.Kind = "settings" && scope.IsNone then fail "Invalid firewalld settings transaction scope."
         if activationStarted && rollbackProof.IsNone then fail "Firewalld transaction lacks required runtime rollback proof."
-        if awaitingPostBoot && not activationStarted then fail "Invalid firewalld post-boot recovery state."
+        if awaitingPostBoot && rollbackProof.IsNone then fail "Post-boot recovery lacks a durable inverse."
         { SchemaVersion = version
           Nonce = nonce
           OwnerId = owner
@@ -287,6 +289,19 @@ module FirewalldLifecycle =
         setOptionalString journal "managed" contents
         journal["managedMode"] <- JsonValue.Create mode
 
+    // A key owner may preserve a native 0600 tightening; it never widens a
+    // shared config file on rollback. XML owners require exact metadata.
+    let internal compatibleMode (scope: JsonObject option) expected actual =
+        actual = expected || (scope.IsSome && actual = 0o600 && (expected = 0o644 || expected = 0o640))
+
+    let private verifyMetadata environment transaction contents mode expected =
+        if Option.isSome contents then
+            let physical = regularPath environment transaction.Path
+            if run environment "stat" [ "-c"; "%u:%g"; "--"; physical ] <> "0:0" then
+                fail "Firewalld transaction file ownership changed; refusing to replace it."
+            if not (compatibleMode transaction.Scope expected mode) then
+                fail "Firewalld transaction file permissions changed; refusing to replace it."
+
 
     let private finishConfirmed
         (environment: HostEnvironment)
@@ -296,13 +311,14 @@ module FirewalldLifecycle =
         =
         let current, currentMode = readPath environment transaction.Path
         let state = if transaction.SchemaVersion = 1 then current else readState transaction.Scope current
-        if state <> transaction.After || (transaction.After.IsSome && currentMode <> transaction.AfterMode) then
+        verifyMetadata environment transaction current currentMode transaction.AfterMode
+        if state <> transaction.After then
             fail "Confirmed firewalld configuration changed before transaction finalization."
         match journal with
         | Some value ->
             if transaction.DeleteOnConfirm then removeJournal environment transaction.Configuration transaction.OwnerId
             else
-                updateManaged value transaction.ManagedAfter transaction.AfterMode
+                updateManaged value transaction.ManagedAfter (if current.IsSome then currentMode else transaction.AfterMode)
                 clearJournalPending value
                 if value.ContainsKey "deleteOnConfirm" then value.Remove "deleteOnConfirm" |> ignore
                 saveJournal environment transaction.Configuration value
@@ -323,14 +339,21 @@ module FirewalldLifecycle =
         let state = if transaction.SchemaVersion = 1 then current else readState transaction.Scope current
         if state <> transaction.Before && state <> transaction.After then
             fail "Firewalld configuration changed during an interrupted transaction; refusing recovery."
-        if transaction.Before.IsSome && state = transaction.Before && currentMode <> transaction.BeforeMode then
-            fail "Firewalld configuration mode changed during interrupted transaction; refusing recovery."
-        if transaction.After.IsSome && state = transaction.After && currentMode <> transaction.AfterMode then
-            fail "Firewalld configuration mode changed during interrupted transaction; refusing recovery."
+        if state = transaction.Before then verifyMetadata environment transaction current currentMode transaction.BeforeMode
+        if state = transaction.After then verifyMetadata environment transaction current currentMode transaction.AfterMode
         if transaction.SchemaVersion <> 2 && transaction.Status = "pending" then
             fail "Legacy firewalld transaction lacks a durable runtime rollback proof; refusing recovery."
-        writeState transaction.Scope state transaction.Before transaction.BeforeMode
-        if transaction.ActivationStarted then
+        let mode = if transaction.Scope.IsSome && current.IsSome && currentMode = 0o600 then currentMode else transaction.BeforeMode
+        if state <> transaction.Before || (current.IsSome && currentMode <> mode) then
+            writeState transaction.Scope state transaction.Before mode
+        let startupLoadsDisk =
+            transaction.RollbackProof
+            |> Option.exists (fun proof ->
+                match proof["strategy"] with
+                | null -> false
+                | strategy -> strategy.GetValue<string>() = "runtime-delta")
+        let needsBootInverse = transaction.ActivationStarted || startupLoadsDisk || transaction.AwaitingPostBoot
+        if transaction.ActivationStarted || transaction.AwaitingPostBoot || (phase <> ActiveDaemon && needsBootInverse) then
             match phase with
             | BootBeforeFirewalld ->
                 let waiting = { transaction with AwaitingPostBoot = true }
@@ -346,12 +369,12 @@ module FirewalldLifecycle =
                     fail "Firewalld permanent preimage changed before post-boot runtime recovery."
                 restoreRuntime transaction BootAfterFirewalld
             | _ -> restoreRuntime transaction phase
-        if not (transaction.ActivationStarted && phase = BootBeforeFirewalld) then
+        if not (needsBootInverse && phase = BootBeforeFirewalld) then
             match journal with
             | Some value ->
                 if transaction.ReleaseOnRollback then removeJournal environment transaction.Configuration transaction.OwnerId
                 else
-                    updateManaged value transaction.ManagedBefore transaction.BeforeMode
+                    updateManaged value transaction.ManagedBefore mode
                     clearJournalPending value
                     if value.ContainsKey "deleteOnConfirm" then value.Remove "deleteOnConfirm" |> ignore
                     saveJournal environment transaction.Configuration value
@@ -400,15 +423,33 @@ module FirewalldLifecycle =
         let helper = Environment.ProcessPath
         if String.IsNullOrWhiteSpace helper || not (Path.IsPathRooted helper) || helper |> Seq.exists (fun c -> Char.IsControl c || Char.IsWhiteSpace c) then
             fail "Cannot arm firewalld rollback without a canonical native helper executable path."
-        let serviceText =
+        let previousServiceText =
             String.concat "\n"
                 [ ownerMarker; "[Unit]"; "Description=Dorothy firewalld transaction rollback"; "DefaultDependencies=no"; "After=local-fs.target"; "StartLimitIntervalSec=0"; "[Service]"; "Type=oneshot"; "TimeoutStartSec=3min"; "Restart=on-failure"; "RestartSec=30s"; "ExecStart=" + helper + " firewalld-recover"; "" ]
-        let bootServiceText =
+        let previousBootServiceText =
             String.concat "\n"
                 [ ownerMarker; "[Unit]"; "Description=Dorothy firewalld boot recovery"; "DefaultDependencies=no"; "After=local-fs.target"; "Before=firewalld.service"; "[Service]"; "Type=oneshot"; "RemainAfterExit=yes"; "TimeoutStartSec=90s"; "ExecStart=" + helper + " firewalld-recover-boot"; "[Install]"; "WantedBy=multi-user.target"; "RequiredBy=firewalld.service"; "" ]
-        let postBootServiceText =
+        let previousPostBootServiceText =
             String.concat "\n"
                 [ ownerMarker; "[Unit]"; "Description=Dorothy firewalld post-boot recovery"; "DefaultDependencies=no"; "After=firewalld.service"; "Requires=firewalld.service"; "[Service]"; "Type=oneshot"; "TimeoutStartSec=90s"; "ExecStart=" + helper + " firewalld-recover-postboot"; "[Install]"; "WantedBy=multi-user.target"; "" ]
+        // Bound each external command, not the sum over a valid inventory.
+        let serviceText = previousServiceText.Replace("TimeoutStartSec=3min", "TimeoutStartSec=infinity")
+        let bootServiceText =
+            previousBootServiceText.Replace("TimeoutStartSec=90s", "TimeoutStartSec=infinity")
+                                   .Replace("WantedBy=multi-user.target\nRequiredBy=firewalld.service", "WantedBy=multi-user.target firewalld.service")
+        let postBootServiceText = previousPostBootServiceText.Replace("TimeoutStartSec=90s", "TimeoutStartSec=infinity")
+        // No reference to the helper or its cache. If boot recovery actually
+        // failed with a reserved transaction, quarantine under the *running*
+        // native daemon before the normal network-pre barrier is released.
+        let containmentText =
+            String.concat "\n"
+                [ ownerMarker; "[Unit]"; "Description=Quarantine an unverifiable firewalld boot transaction"
+                  "DefaultDependencies=no"; "Wants=firewalld.service " + bootServiceName + " " + postBootServiceName
+                  "After=firewalld.service " + bootServiceName + " " + postBootServiceName
+                  "Before=network-pre.target"; "ConditionPathExists=" + pendingPath
+                  "[Service]"; "Type=oneshot"
+                  "ExecCondition=/usr/bin/systemctl --quiet is-failed " + bootServiceName + " " + postBootServiceName
+                  "ExecStart=/usr/bin/firewall-cmd --panic-on"; "[Install]"; "WantedBy=multi-user.target"; "" ]
         let legacyServiceText =
             String.concat "\n"
                 [ ownerMarker; "[Unit]"; "Description=Dorothy firewalld transaction rollback"; "DefaultDependencies=no"; "After=local-fs.target"; "[Service]"; "Type=oneshot"; "ExecStart=" + helper + " firewalld-recover"; "" ]
@@ -472,19 +513,27 @@ module FirewalldLifecycle =
                     fail "A firewalld recovery systemd enable link points to an unowned unit."
         validateEnableLink ("/etc/systemd/system/multi-user.target.wants/" + bootServiceName) bootServicePath
         validateEnableLink ("/etc/systemd/system/firewalld.service.requires/" + bootServiceName) bootServicePath
+        validateEnableLink ("/etc/systemd/system/firewalld.service.wants/" + bootServiceName) bootServicePath
+        validateEnableLink ("/etc/systemd/system/multi-user.target.wants/" + containmentName) containmentPath
         validateEnableLink ("/etc/systemd/system/multi-user.target.wants/" + postBootServiceName) postBootServicePath
         validateEnableLink ("/etc/systemd/system/timers.target.wants/" + timerName) timerPath
         ensureDirectory environment "/etc/systemd/system" (int unitDirectoryMode) |> ignore
-        writeOwned servicePath serviceText [ legacyServiceText ]
-        writeOwned bootServicePath bootServiceText [ legacyBootServiceText ]
-        writeOwned postBootServicePath postBootServiceText []
+        writeOwned servicePath serviceText [ previousServiceText; legacyServiceText ]
+        writeOwned bootServicePath bootServiceText [ previousBootServiceText; legacyBootServiceText ]
+        writeOwned postBootServicePath postBootServiceText [ previousPostBootServiceText ]
+        writeOwned containmentPath containmentText []
         writeOwned timerPath timerText [ legacyTimerText ]
+        let oldLink = logicalPath environment ("/etc/systemd/system/firewalld.service.requires/" + bootServiceName)
+        if not (isNull (FileInfo(oldLink).LinkTarget)) then
+            File.Delete oldLink
+            HostFiles.syncDirectory (Path.GetDirectoryName oldLink)
         run environment "/usr/bin/systemctl" [ "daemon-reload" ] |> ignore
         run environment "/usr/bin/systemctl" [ "enable"; bootServiceName ] |> ignore
         // Latch this boot before timer activation or staging. With RemainAfterExit=yes,
         // a daemon restart cannot re-run the lock-taking preboot hook.
         run environment "/usr/bin/systemctl" [ "start"; bootServiceName ] |> ignore
         run environment "/usr/bin/systemctl" [ "enable"; postBootServiceName ] |> ignore
+        run environment "/usr/bin/systemctl" [ "enable"; containmentName ] |> ignore
         // This caller holds the mutation lock and verified there is no pending
         // intent. Cancel any previous generation's delayed callback before
         // arming a new full confirmation interval; retry only FAILED recoveries.
@@ -549,11 +598,13 @@ module FirewalldLifecycle =
         | None ->
             stopRetryTimer environment
             if not (hasOwnerJournalFiles environment) then
-                for logical in [ servicePath; bootServicePath; postBootServicePath; timerPath ] do
+                for logical in [ servicePath; bootServicePath; postBootServicePath; containmentPath; timerPath ] do
                     verifyOwnedUnitFile environment logical
                 let links =
                     [ "/etc/systemd/system/multi-user.target.wants/" + bootServiceName, bootServicePath
                       "/etc/systemd/system/firewalld.service.requires/" + bootServiceName, bootServicePath
+                      "/etc/systemd/system/firewalld.service.wants/" + bootServiceName, bootServicePath
+                      "/etc/systemd/system/multi-user.target.wants/" + containmentName, containmentPath
                       "/etc/systemd/system/multi-user.target.wants/" + postBootServiceName, postBootServicePath
                       "/etc/systemd/system/timers.target.wants/" + timerName, timerPath ]
                     |> List.choose (fun (logicalLink, logicalTarget) -> ownedEnableLink environment logicalLink logicalTarget)
@@ -562,6 +613,19 @@ module FirewalldLifecycle =
                     HostFiles.syncDirectory (Path.GetDirectoryName link)
                 if not links.IsEmpty then
                     run environment "/usr/bin/systemctl" [ "daemon-reload" ] |> ignore
+
+    let internal needsBootLinkMigration environment =
+        let link = logicalPath environment ("/etc/systemd/system/firewalld.service.requires/" + bootServiceName)
+        File.Exists link || not (isNull (FileInfo(link).LinkTarget))
+
+    /// Under the existing mutation lock only. Retire the legacy hard edge
+    /// without activating a daemon setting or restarting a dependent service.
+    let internal migrateBootLink environment =
+        if needsBootLinkMigration environment then
+            if (pending environment).IsSome then fail "Cannot migrate recovery units over a pending intent."
+            ensureNoOrphanedOwnerPending environment
+            createRecoveryUnits environment
+            stopRetryTimer environment
 
     let private makeTransaction
         (c: FirewalldModel.Configuration)
@@ -636,7 +700,7 @@ module FirewalldLifecycle =
         validate scope after
         let actual, actualMode = readPath environment path
         let actualState = readState scope actual
-        if actualState <> before || (before.IsSome && actualMode <> beforeMode) then
+        if actualState <> before || (actual.IsSome && actualMode <> beforeMode) then
             fail "Firewalld configuration changed before transaction staging."
         if managedBefore <> getOptionalString journal "managed" then
             fail "Firewalld managed configuration changed before transaction staging."
@@ -752,7 +816,8 @@ module FirewalldLifecycle =
             if transaction.Nonce <> nonce then fail "Firewalld transaction confirmation nonce does not match."
             let current, currentMode = readPath environment transaction.Path
             let currentState = if transaction.SchemaVersion = 1 then current else readState transaction.Scope current
-            if currentState <> transaction.After || (transaction.After.IsSome && currentMode <> transaction.AfterMode) then
+            verifyMetadata environment transaction current currentMode transaction.AfterMode
+            if currentState <> transaction.After then
                 fail "Firewalld configuration changed before fresh-connection confirmation."
             let committed =
                 if transaction.Status = "confirmed" then transaction

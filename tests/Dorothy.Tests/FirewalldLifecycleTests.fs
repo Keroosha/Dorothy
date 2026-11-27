@@ -54,7 +54,7 @@ type FirewalldLifecycleTests() =
                 match arguments with
                 | [ "enable"; "keroosha-iac-firewalld-boot-recovery.service" ] ->
                     createLink (Path.Combine(root, "etc/systemd/system/multi-user.target.wants")) "keroosha-iac-firewalld-boot-recovery.service" "../keroosha-iac-firewalld-boot-recovery.service"
-                    createLink (Path.Combine(root, "etc/systemd/system/firewalld.service.requires")) "keroosha-iac-firewalld-boot-recovery.service" "../keroosha-iac-firewalld-boot-recovery.service"
+                    createLink (Path.Combine(root, "etc/systemd/system/firewalld.service.wants")) "keroosha-iac-firewalld-boot-recovery.service" "../keroosha-iac-firewalld-boot-recovery.service"
                 | [ "start"; "keroosha-iac-firewalld-boot-recovery.service" ] -> ()
                 | [ "enable"; "keroosha-iac-firewalld-postboot-recovery.service" ] ->
                     createLink (Path.Combine(root, "etc/systemd/system/multi-user.target.wants")) "keroosha-iac-firewalld-postboot-recovery.service" "../keroosha-iac-firewalld-postboot-recovery.service"
@@ -285,15 +285,17 @@ type FirewalldLifecycleTests() =
             recovery.GetAwaiter().GetResult()
             Assert.That(finishedWhileLocked, Is.True))
 
-    [<Test>]
-    member _.``Boot rollback retains runtime proof until post-firewalld verification``() =
+    [<TestCase(true); TestCase(false)>]
+    member _.``Boot rollback retains preexisting runtime divergence from the first durable intent``(started: bool) =
         withHost (fun environment root ->
             let journalPath = "/var/lib/keroosha-iac/firewalld/zone-lifecycle.json"
-            let record = pendingRecord 2 true false
+            let record = pendingRecord 2 started false
+            record["rollbackProof"].AsObject().["strategy"] <- JsonValue.Create "runtime-delta"
+            if not started then record["after"] <- JsonValue.Create before
             let value = journal owner (Some before) (Some before)
             value["pending"] <- record.DeepClone()
             writeFile root journalPath (value.ToJsonString()) 0o600
-            writeFile root logicalPath after 0o644
+            writeFile root logicalPath (if started then after else before) 0o644
             savePendingRecord root record
             let restored = ResizeArray<FirewalldLifecycle.RecoveryPhase>()
             let recover phase (transaction: FirewalldLifecycle.PendingTransaction) storedJournal =
@@ -376,7 +378,7 @@ type FirewalldLifecycleTests() =
             let nonce = transact environment value (Some managed) (Some baseline) false true
             let foreignUnit = physical root "/etc/systemd/system/foreign.service"
             File.WriteAllText(foreignUnit, "[Unit]\nDescription=Unowned test unit\n")
-            let requiresLink = physical root "/etc/systemd/system/firewalld.service.requires/keroosha-iac-firewalld-boot-recovery.service"
+            let requiresLink = physical root "/etc/systemd/system/firewalld.service.wants/keroosha-iac-firewalld-boot-recovery.service"
             File.Delete requiresLink
             File.CreateSymbolicLink(requiresLink, "../foreign.service") |> ignore
             let failure = Assert.Throws<InvalidOperationException>(fun () -> FirewalldLifecycle.confirm environment configuration value nonce readState)

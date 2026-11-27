@@ -51,6 +51,27 @@ If the provider process died before printing the ticket, inspect the private `ke
 
 **Ambiguous legacy records.** A pre-proof pending transaction is not evidence of a working rollback policy. Likewise, the original mode of an adopted override is not derivable from an old journal lacking `baselineMode`. Do not invent a mode, delete the marker, or use `--runtime-to-permanent`. Preserve the checkpoint, journal, current disk and observed runtime; use an independent management path and the original backup to reconcile the native policy and metadata. Verify a fresh SSH connection and the original traffic controls before retiring the old ownership record. Without an independently established baseline, automatic release is refused.
 
+### Recovery invariants and acceptance gate
+
+1. The daemon must not depend on a successful Dorothy recovery executable to start filtering. An unsuccessful boot repair retains the reservation; its exit status is not a successful rollback. Verify a fresh boot, a live listener behind a denied path, the resulting loaded firewall, and the recovery diagnostic.
+2. From the first durable intent, a reboot must restore the recorded working runtime, even if the daemon had not begun activation. A scoped inverse must not reload away another owner's live ban, change its timeout, or persist it. A candidate that cannot be reversed without losing such state needs a pre-write refusal.
+3. Restored interfaces must be attributed to their actual producer and the effective zone. An interface name, a running process, or the reply route alone does not authenticate a binding. With the engine, container and NetworkManager already active, make an actual permanent change and prove allowed/denied traffic, not just a no-op refresh or a unit update.
+4. Validate both the candidate and its recovery under effective IPv6 filtering, neighbor discovery, loaded service definitions, and retained ingress bindings. A timeout-backed ipset's empty userspace entry list does not prove absence of live kernel members. Releasing an ipset member or interface must not silently expose a restrictive source to the fallback zone.
+5. Ownership is per logical object or key. Refuse foreign file ownership and unsafe permission changes; do not undo a native permission tightening or take ownership of another key. An authenticated committed owner of a default-valued setting exists even without an override file. Transitioning an old Docker fence must never delete the gate merely because Dorothy owns none of the running containers.
+
+For each invariant, record the final helper digest, the native state before and after, and a control that distinguishes success from an inactive daemon, missing listener, cached neighbor or unrelated deny. Older guest records are historical evidence, not a deployment of a later binary.
+
+### Operator recovery without adopting someone else's rules
+
+Use a console or independently routed rescue channel. Preserve the private checkpoint, owner journal, global reservation, file bytes/mode/owner and the live native policy before intervening. `firewall-cmd --state`, `--get-active-zones`, `--get-default-zone`, `--info-policy`, `--query-panic`, `journalctl -b` for the boot/postboot/rollback units, and `systemctl status firewalld.service` are observations, not repairs. Do not publish tokens or private management coordinates.
+
+* **Boot repair failed:** a weak, ordered preboot dependency allows the packaged firewall to start even when its recovery executable is missing. With a still-reserved transaction and a failed boot/postboot check, a separate unit uses the packaged `firewall-cmd --panic-on` before the normal network-pre barrier. This deliberately can deny remote SSH; console access is required when the working policy cannot be authenticated. It is not a replacement for a functional native firewall/kernel. Restore the exact trusted helper or the conflicting file/metadata from an independently verified backup; do not clear the evidence to get a green boot. Re-run recovery, verify the reservation is resolved and the configured zone/policy, then release panic mode from the console and check fresh SSH **and a denied listener**. A failure with no reserved transaction does not disable the native daemon or introduce a new permit.
+* **Pending conflict:** compare only the reserved target or key, owner and before/after projections. If a third-party edit is legitimate, have its owner and the firewall operator reconcile that exact conflict out of band. Restore a verifiable preimage, run `systemctl start keroosha-iac-firewalld-rollback.service`, and observe its exit status, fresh connections and journal transition. Never delete the global marker, overwrite another owner's journal, copy runtime-to-permanent, or turn an unknown mode into `0644`.
+* **Foreign live state:** runtime selector repair is not the same as a global reload. For a change which requires reload, wait for a timed ban to expire naturally, have the responsible controller persist a genuinely permanent policy, or schedule a coordinated maintenance window. Do not remove a ban or disable its controller merely to pass preflight. Runtime legacy direct rules are inspected only for comparison; Dorothy never applies or synthesizes those commands. Timeout-backed kernel sets cannot be certified empty by `--info-ipset` alone.
+* **Security-key mismatch:** compare the effective system file and loaded native default zone, backend, strict DNAT and IPv6 reverse-path rules. Resolve the independently staged key with its owner first. An SSH exception does not override IPv6 reverse-path filtering. If exact backend state cannot be distinguished, use an independent management path to restore a coherent, natively validated configuration before retrying; a preview or active process is not that proof.
+* **Lost local receipt / unknown legacy baseline:** restore the exact private receipt directory or an authenticated checkpoint backup. No unverified operator may manufacture a ticket from a resource name. If all such evidence or the original file mode is lost, automatic import/release is intentionally unavailable: independently reconcile host and stack ownership before using Pulumi's supported state-management tools. A policy name too long for this daemon may be renamed in offline Diff; Read/Delete do not pretend to find a valid 19-character native policy. Verify absence of the old native object **and** journal before retiring any stale checkpoint entry.
+* **Existing stock public zone / engine-only workloads:** first acquisition of an existing stock zone must include effective target and vendor features, including metadata, `dhcpv6-client` and forwarding where present. Strict Docker validation applies to the engine even with zero Dorothy-owned containers. A now-ineligible old fence must be corrected on its existing URN before migration, never silently deleted. If an immutable helper is evicted from cache, the Docker gate refuses start until the exact verified helper is restored; do not disable the gate.
+
 ## Implementation and acceptance matrix
 
 | Native capability | Public declaration / wire | Helper and Read contract | Required evidence |
@@ -93,7 +114,7 @@ On Debian's 2.3.1 native oracle, the compiled consumer produced all 202 supporte
 | `DefaultZone`, `LogDenied` | Their `firewall-cmd --get-*` answers come from the running daemon. |
 | `FirewallBackend`, `StrictForwardPorts` | Identify the loaded backend and its own rules. In strict nftables mode, input, forward and output DNAT each jump to a scoped chain ending in rejection; in non-strict mode the generic DNAT acceptance is present. A setting in the file alone is not evidence. |
 | `NftablesCounters`, `NftablesTableOwner`, `NftablesFlowtable` | Inspect counters on rules, flags on `inet firewalld` and flowtable interfaces. These checks concern the nftables backend, not iptables. |
-| `IPv6_rpfilter` | The public boolean cannot distinguish the native strict/loose and forwarding-only modes. |
+| `IPv6_rpfilter` | Match the daemon's enable bit to its actual IPv6 FIB-drop hook and flags (or IPv6 iptables mangle PREROUTING rule). Unrecognized or contradictory shapes cannot authorize reload. A new input reverse-path restriction cannot be justified by one existing IPv6 SSH route. |
 | `IndividualCalls`, `CleanupOnExit`, `CleanupModulesOnExit`, `FlushAllOnReload`, `ReloadPolicy`, `RFC3964_IPv4` | Key-specific ownership and successful activation can be recorded. There is no exact public live value to assert. |
 | Deprecated/ignored keys | A persisted spelling does not create a traffic or security guarantee. |
 
@@ -101,7 +122,9 @@ For a key without an exact getter, `runtimeObserved=false` and `runtimeInSync=fa
 
 The host lock coordinates Dorothy writers, not other administrators, NetworkManager, or the daemon's own runtime API. Native validation, selector observation and reload are separate operations. If attribution no longer holds, recovery retains its journal rather than erasing foreign state; no atomic transaction with arbitrary external writers is claimed.
 
-## Re-review acceptance: Debian 13, firewalld 2.3.1
+## Historical guest controls for reviewed revision `4cc02d5`
+
+These were collected on intermediate release candidates for that review. In particular the old mode-conflict refusal and old systemd dependency are not the current recovery contract.
 
 | Scenario | What the guest established |
 |---|---|

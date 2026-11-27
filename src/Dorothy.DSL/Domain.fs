@@ -437,14 +437,14 @@ type DebianBuilder() =
             firewalldObjects
             |> List.filter (fun item ->
                 FirewalldGraph.isEffectiveDockerGuard firewalldConfigurations item.Value)
+        if docker.IsSome && strictForwardPorts = Some true && dockerGuardPolicies.IsEmpty then
+            invalidArg "strictForwardPorts" "A strict Docker engine requires a negative-priority DROP policy whose egress includes docker, including when all containers are externally managed."
         for container in docker |> Option.map _.Containers |> Option.defaultValue [] do
             for policy in container.FirewalldPolicyDependencies do
                 let declared = firewalldObjects |> List.exists (fun item -> Object.ReferenceEquals(item, policy))
                 if not declared || policy.Kind <> "policy" then
                     invalidArg "dependsOnFirewalld" (sprintf "Container '%s' references a firewalld policy that is not declared in this Debian environment." container.Name)
             if strictForwardPorts = Some true then
-                if dockerGuardPolicies.IsEmpty then
-                    invalidArg "strictForwardPorts" "StrictForwardPorts requires a negative-priority DROP policy whose egress includes docker."
                 if not (container.FirewalldPolicyDependencies |> List.exists (fun item -> dockerGuardPolicies |> List.exists (fun guard -> Object.ReferenceEquals(guard, item)))) then
                     invalidArg "dependsOnFirewalld" (sprintf "Container '%s' must explicitly depend on a Docker DROP policy when StrictForwardPorts is enabled." container.Name)
             elif container.FirewalldPolicyDependencies |> List.exists (fun item -> item.Value.Egress |> List.contains "docker") then

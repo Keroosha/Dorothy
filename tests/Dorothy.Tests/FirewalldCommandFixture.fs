@@ -163,6 +163,9 @@ module internal FirewalldCommandFixture =
                     if fields.Length = 2 && fields[0] = key then Some fields[1] else None)
                 |> Option.defaultValue fallback
             match executable, arguments with
+            | "firewall-cmd", [ "--direct"; ("--get-all-rules" | "--get-all-chains" | "--get-all-passthroughs") ] -> Some ""
+            | "/usr/bin/busctl", args when List.tryLast args = Some "IPv6_rpfilter" ->
+                Some(if List.contains (setting "IPv6_rpfilter" "strict") [ "no"; "false" ] then "b false" else "b true")
             | "firewall-cmd", [ "--reload" ]
             | ("systemctl" | "/usr/bin/systemctl"), [ "restart"; ("firewalld" | "firewalld.service") ] ->
                 let snapshot = load ()
@@ -219,6 +222,11 @@ module internal FirewalldCommandFixture =
                 let matchDnat = """{"match":{"op":"in","left":{"ct":{"key":"status"}},"right":"dnat"}}"""
                 let records = [
                     yield table
+                    let rpf = setting "IPv6_rpfilter" "strict"
+                    if not (List.contains rpf [ "no"; "false" ]) then
+                        let hook = if rpf.EndsWith("-forward") then "filter_FORWARD" else "filter_PREROUTING"
+                        let flags = if rpf.StartsWith("loose") then "\"saddr\",\"mark\"" else "\"saddr\",\"mark\",\"iif\""
+                        yield rule hook ("""{"match":{"op":"==","left":{"meta":{"key":"nfproto"}},"right":"ipv6"}},{"match":{"op":"==","left":{"fib":{"result":"oif","flags":[""" + flags + """]}},"right":false}},{"drop":null}""")
                     for baseName in [ "filter_INPUT"; "filter_FORWARD"; "filter_OUTPUT" ] do
                         yield chain baseName
                         if strict then

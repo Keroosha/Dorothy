@@ -243,14 +243,23 @@ type FirewalldRuntimeTests() =
         let mutable serviceDestination = ""
         let mutable includedServicePorts = ""
         let mutable ipsetEntries = "192.0.2.7"
+        let mutable timeout = ""
+        let mutable foreignDirect = ""
+        let mutable timedMember = true
         let serviceOutput name ports destination includes =
             name + "\n  ports: " + ports + "\n  protocols:\n  source-ports:\n  modules:\n  destination: " + destination + "\n  includes: " + includes + "\n  helpers:\n"
         let zoneWithPorts services ports rules =
             (zoneOutput services "" [] rules).Replace("  ports: \n", "  ports: " + ports + "\n", StringComparison.Ordinal)
         let ipsetOutput entries =
-            "blocked\n  type: hash:net\n  options: family=inet hashsize=1024\n  entries: " + entries + "\n"
+            "blocked\n  type: hash:net\n  options: family=inet hashsize=1024" + timeout + "\n  entries: " + (if timeout = "" then entries else "") + "\n"
         let run executable arguments _ =
             match executable, arguments with
+            | "nft", [ "-j"; "list"; "table"; "inet"; "firewalld" ] ->
+                let entries = if timedMember then ",\"elem\":[{\"elem\":{\"val\":\"192.0.2.7\",\"expires\":15000}}]" else ""
+                commandResult ("{\"nftables\":[{\"set\":{\"family\":\"inet\",\"table\":\"firewalld\",\"name\":\"blocked\"" + entries + "}}]}")
+            | "firewall-cmd", [ "--direct"; "--get-all-rules" ] -> commandResult foreignDirect
+            | "firewall-cmd", [ "--direct"; _ ]
+            | "firewall-cmd", [ "--permanent"; "--direct"; _ ] -> commandResult ""
             | "firewall-cmd", [ "--get-zones" ]
             | "firewall-cmd", [ "--permanent"; "--get-zones" ] -> commandResult "public"
             | "firewall-cmd", [ "--get-policies" ]
@@ -286,6 +295,14 @@ type FirewalldRuntimeTests() =
         try
             Directory.CreateDirectory root |> ignore
             Assert.That(FirewalldRuntime.validateReload environment, Is.EqualTo(Ok () : Result<unit, string>))
+            timeout <- " timeout=60"
+            expectRefusal ()
+            timedMember <- false
+            Assert.That(FirewalldRuntime.validateReload environment, Is.EqualTo(Ok () : Result<unit, string>))
+            timeout <- ""
+            foreignDirect <- "ipv4 filter INPUT 0 independently-owned-rule"
+            expectRefusal ()
+            foreignDirect <- ""
             zoneServices <- ""
             zonePorts <- ""
             expectRefusal ()
@@ -396,7 +413,7 @@ type FirewalldRuntimeTests() =
             Directory.CreateDirectory root |> ignore
             let snapshot = FirewalldRuntime.inspectRuntime environment "zone" "quiet" |> Option.get
             Assert.That(snapshot.SourcesRaw, Is.EquivalentTo [ "192.0.2.0/24"; "02:00:00:00:00:01"; "ipset:trusted" ])
-            Assert.That(snapshot.Sources |> List.map (fun source -> source.Attributes), Is.EquivalentTo [ Map.ofList [ "address", "192.0.2.0/24" ]; Map.ofList [ "mac", "02:00:00:00:00:01" ]; Map.ofList [ "ipset", "trusted" ] ])
+            Assert.That(snapshot.Sources |> List.map (fun source -> source.Attributes), Is.EquivalentTo [ Map.ofList [ "address", "192.0.2.0/24" ]; Map.ofList [ "address", "02:00:00:00:00:01" ]; Map.ofList [ "ipset", "trusted" ] ])
             Assert.That(snapshot.ForwardPorts.Head.Attributes, Is.EqualTo<Map<string,string>>(Map.ofList [ "port", "443"; "protocol", "tcp"; "to-port", "8443"; "to-addr", "192.0.2.9" ]))
             Assert.That(
                 FirewalldRuntime.canonicalForwardPortValue snapshot.ForwardPorts.Head,
@@ -466,3 +483,17 @@ type FirewalldRuntimeTests() =
             Assert.That(snapshot.UnknownFields, Is.Empty)
         finally
             if Directory.Exists root then Directory.Delete(root, true)
+
+    [<Test>]
+    member _.``An empty active NM zone resolves to the running default only``() =
+        let uuid = "7bf884ec-3192-4527-acbb-f3b29477b7c6"
+        let run exe args _ =
+            match exe, args with
+            | "nmcli", [ "-g"; "GENERAL.CON-UUID"; "device"; "show"; "nm0" ] -> commandResult uuid
+            | "nmcli", [ "-g"; "connection.zone"; "connection"; "show"; "uuid"; id ] when id = uuid -> commandResult ""
+            | "firewall-cmd", [ "--get-default-zone" ] -> commandResult "public"
+            | _ -> commandResult ""
+        let env, _ = makeEnvironment run
+        Assert.That(FirewalldRuntime.restoresRuntimeInterface env "nm0" "public", Is.True)
+        Assert.That(FirewalldRuntime.restoresRuntimeInterface env "nm0" "trusted", Is.False)
+        Assert.That(FirewalldRuntime.restoresRuntimeInterface env "unowned" "public", Is.False)

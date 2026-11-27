@@ -283,6 +283,33 @@ type FirewalldGuardTests() =
         let anyToHostDnat =
             "<policy target=\"CONTINUE\" priority=\"10\"><ingress-zone name=\"ANY\"/><egress-zone name=\"HOST\"/><forward-port port=\"22\" protocol=\"tcp\" to-addr=\"198.51.100.8\"/></policy>"
         expectDenied (fun () -> validate zone (Map.ofList [ "any-host-nat", anyToHostDnat ]) Map.empty services)
+        let concreteHost = anyToHostDnat.Replace("ingress-zone name=\"ANY\"", "ingress-zone name=\"public\"")
+        expectDenied (fun () -> validate zone (Map.ofList [ "host-nat", concreteHost ]) Map.empty services)
+
+    [<Test>]
+    member _.``Zone prerouting marks precede grants and an earlier terminal HOST grant wins``() =
+        let withMark port =
+            Map.ofList [ "public", "<zone><service name=\"ssh\"/><rule family=\"ipv4\"><port port=\"" + port + "\" protocol=\"tcp\"/><mark set=\"0x2\"/></rule></zone>" ]
+        expectDenied (fun () -> validate (withMark "22") Map.empty Map.empty services)
+        validate (withMark "2222") Map.empty Map.empty services
+        let host target priority =
+            sprintf "<policy target=\"%s\" priority=\"%d\"><ingress-zone name=\"public\"/><egress-zone name=\"HOST\"/></policy>" target priority
+        validate (Map.ofList [ "public", "<zone target=\"DROP\"/>" ])
+            (Map.ofList [ "early", host "ACCEPT" -50; "late", host "DROP" -10 ]) Map.empty services
+
+    [<Test>]
+    member _.``Both NDP types must survive protocol-wide denies on next-hop zones``() =
+        let v6 = FirewalldGuardNative.parseSshContext "2001:db8:1::10 49200 2001:db8:2::20 22" "[{\"dev\":\"eth0\",\"gateway\":\"fe80::1\"}]"
+        let zones = Map.ofList [ "public", safeZone; "peer", "<zone><source address=\"2001:db8:1::/64\"/><service name=\"ssh\"/></zone>"
+                                 "next-hop", "<zone><source address=\"fe80::/10\"/></zone>" ]
+        let policy rules priority target =
+            sprintf "<policy priority=\"%d\" target=\"%s\"><ingress-zone name=\"next-hop\"/><egress-zone name=\"HOST\"/>%s</policy>" priority target rules
+        let ns = "<rule family=\"ipv6\"><icmp-type name=\"neighbour-solicitation\"/><accept/></rule>"
+        let na = "<rule family=\"ipv6\"><icmp-type name=\"neighbour-advertisement\"/><accept/></rule>"
+        let deny = "<rule family=\"ipv6\"><protocol value=\"ipv6-icmp\"/><drop/></rule>"
+        let check permits = validateContext v6 "public" zones (Map.ofList [ "early", policy permits -100 "CONTINUE"; "late", policy deny -50 "CONTINUE" ]) Map.empty services
+        expectDenied (fun () -> check ns)
+        check (ns + na)
 
 
     [<Test>]

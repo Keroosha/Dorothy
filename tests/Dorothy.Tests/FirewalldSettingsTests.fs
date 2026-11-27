@@ -255,6 +255,7 @@ type FirewalldSettingsTests() =
             let path = FirewalldSettingsTestSupport.settingsPath root
             Directory.CreateDirectory(Path.GetDirectoryName path) |> ignore
             File.WriteAllText(path, "ReloadPolicy=INPUT:REJECT,FORWARD:DROP,OUTPUT:DROP\n")
+            File.SetUnixFileMode(path, enum<UnixFileMode> 0o644)
             let configuration = FirewalldSettingsTestSupport.configuration "ReloadPolicy" "INPUT:REJECT,FORWARD:DROP,OUTPUT:DROP"
             FirewalldSettingsTestSupport.applyAndConfirm environment "mode-drift-owner" configuration |> ignore
             File.SetUnixFileMode(path, enum<UnixFileMode> 0o600)
@@ -263,8 +264,8 @@ type FirewalldSettingsTests() =
             Assert.That(snapshot["inSync"].GetValue<bool>(), Is.False))
 
 
-    [<Test>]
-    member _.``Legacy vendor-seeded override is removed only when its remaining text is pristine``() =
+    [<TestCase(false); TestCase(true)>]
+    member _.``Legacy vendor-seeded override is removed only when its remaining text is pristine``(compact: bool) =
         let runCase (addition: string) (expectedExists: bool) (expectedContents: string) =
             FirewalldSettingsTestSupport.withHost (fun _ _ -> None) (fun environment root _ ->
                 let vendor = "StrictForwardPorts=no\nLogDenied=all\n"
@@ -284,15 +285,18 @@ type FirewalldSettingsTests() =
                 let journalPath = Path.Combine(root, "var/lib/keroosha-iac/firewalld/settings-strict-forward-ports.json")
                 let journal = JsonNode.Parse(File.ReadAllText journalPath).AsObject()
                 let baseline = JsonObject()
-                baseline["version"] <- JsonValue.Create 3
-                baseline["key"] <- JsonValue.Create "StrictForwardPorts"
                 baseline["etcExists"] <- JsonValue.Create false
-                baseline["etcContents"] <- null
-                baseline["etcValue"] <- null
                 baseline["etcMode"] <- JsonValue.Create 0o600
-                baseline["originEtcExists"] <- JsonValue.Create false
-                baseline["originVendorContents"] <- JsonValue.Create vendor
-                baseline["originVendorMode"] <- JsonValue.Create 0o644
+                if compact then
+                    baseline["etcStrictValue"] <- null
+                else
+                    baseline["version"] <- JsonValue.Create 3
+                    baseline["key"] <- JsonValue.Create "StrictForwardPorts"
+                    baseline["etcContents"] <- null
+                    baseline["etcValue"] <- null
+                    baseline["originEtcExists"] <- JsonValue.Create false
+                    baseline["originVendorContents"] <- JsonValue.Create vendor
+                    baseline["originVendorMode"] <- JsonValue.Create 0o644
                 journal["baseline"] <- JsonValue.Create(baseline.ToJsonString())
                 journal["managed"] <- JsonValue.Create(current: string)
                 journal.Remove "settingsScopeVersion" |> ignore
@@ -334,6 +338,7 @@ type FirewalldSettingsTests() =
             let configuration = FirewalldSettingsTestSupport.configuration "LogDenied" "unicast"
             FirewalldSettingsTestSupport.applyAndConfirm environment owner configuration |> ignore
             File.WriteAllText(path, "DefaultZone=public\nLogDenied=all\n# foreign comment\n")
+            File.SetUnixFileMode(path, enum<UnixFileMode> 0o600)
             let reload = environment.Run "firewall-cmd" [ "--reload" ] None
             Assert.That(reload.ExitCode, Is.EqualTo 0)
             let drift = FirewalldSettingsTestSupport.invoke environment "read" owner configuration None
@@ -341,9 +346,31 @@ type FirewalldSettingsTests() =
             Assert.That(drift["runtimeActual"].GetValue<string>(), Is.EqualTo "all")
             let repaired = FirewalldSettingsTestSupport.applyAndConfirm environment owner configuration
             Assert.That(repaired["inSync"].GetValue<bool>(), Is.True)
+            Assert.That(int (File.GetUnixFileMode path), Is.EqualTo 0o600)
             Assert.That(File.ReadAllText path, Is.EqualTo "DefaultZone=public\nLogDenied=unicast\n# foreign comment\n")
             FirewalldSettingsTestSupport.invoke environment "delete" owner configuration None |> ignore
+            Assert.That(int (File.GetUnixFileMode path), Is.EqualTo 0o600)
             Assert.That(File.ReadAllText path, Is.EqualTo("DefaultZone=public\n" + originalLine + "\n# foreign comment\n")))
+
+    [<Test>]
+    member _.``An absent key can be released without adding a newline to a foreign file``() =
+        FirewalldSettingsTestSupport.withHost (fun _ _ -> None) (fun environment root _ ->
+            let path = FirewalldSettingsTestSupport.settingsPath root
+            File.WriteAllText(path, "# unterminated")
+            let c = FirewalldSettingsTestSupport.configuration "LogDenied" "all"
+            FirewalldSettingsTestSupport.applyAndConfirm environment "newline-owner" c |> ignore
+            FirewalldSettingsTestSupport.invoke environment "delete" "newline-owner" c None |> ignore
+            Assert.That(File.ReadAllText path, Is.EqualTo "# unterminated"))
+
+    [<Test>]
+    member _.``A default-valued setting has a logical owner despite an absent override``() =
+        FirewalldSettingsTestSupport.withHost (fun _ _ -> None) (fun environment root _ ->
+            let c = FirewalldSettingsTestSupport.configuration "LogDenied" "off"
+            let result = FirewalldSettingsTestSupport.applyAndConfirm environment "default-owner" c
+            Assert.That(result["exists"].GetValue<bool>(), Is.True)
+            Assert.That(File.Exists(FirewalldSettingsTestSupport.settingsPath root), Is.False)
+            let observed = FirewalldSettingsTestSupport.invoke environment "read" "default-owner" c None
+            Assert.That(observed["inSync"].GetValue<bool>(), Is.True))
 
     [<Test>]
     member _.``Loaded strict detection ignores DNAT comments but rejects an ACCEPT bypass``() =

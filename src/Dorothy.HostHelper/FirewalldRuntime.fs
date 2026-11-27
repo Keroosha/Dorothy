@@ -3,6 +3,7 @@ namespace Dorothy.HostHelper
 open System
 open System.Net
 open System.Collections.Generic
+open System.Text.Json
 
 module FirewalldRuntime =
     type RuntimeSnapshot =
@@ -168,7 +169,7 @@ module FirewalldRuntime =
         if source.StartsWith("ipset:", StringComparison.Ordinal) && source.Length > 6 then
             Some(element "source" [ "ipset", source.Substring(6) ])
         elif isMacAddress source then
-            Some(element "source" [ "mac", source ])
+            Some(element "source" [ "address", source.ToUpperInvariant() ])
         else
             let address = source.Split('/')[0]
             match IPAddress.TryParse address with
@@ -491,7 +492,9 @@ module FirewalldRuntime =
 
     /// Canonicalizes native list-valued fields for comparison and bounded repair proofs.
     let normalizeFieldValues (kind: string) (fieldName: string) (values: string list) : string list =
-        if fieldName = "ports" || fieldName = "source-ports" then
+        if fieldName = "sources" then
+            words values |> List.map (fun value -> if isMacAddress value then value.ToUpperInvariant() else value) |> List.distinct |> List.sort
+        elif fieldName = "ports" || fieldName = "source-ports" then
             normalizePortValues (words values)
         elif kind = "service" && fieldName = "modules" then
             words values
@@ -1051,7 +1054,8 @@ module FirewalldRuntime =
                                 Egress = values fields "egress-zones" |> words
                                 Interfaces = interfaces
                                 SourcesRaw = values fields "sources" |> words
-                                Sources = directElements c "source"
+                                Sources = values fields "sources" |> words |> List.map (fun source ->
+                                    sourceElement source |> Option.defaultWith (fun () -> invalidOp "Cannot project the declared zone source."))
                                 Services = values fields "services" |> words
                                 Ports = values fields "ports" |> words
                                 Protocols = values fields "protocols" |> words
@@ -1101,10 +1105,57 @@ module FirewalldRuntime =
             match environment.Run "nmcli" [ "-g"; "GENERAL.CON-UUID"; "device"; "show"; interfaceName ] None with
             | { ExitCode = 0; Stdout = connection } when fst (Guid.TryParseExact(connection.Trim(), "D")) ->
                 match environment.Run "nmcli" [ "-g"; "connection.zone"; "connection"; "show"; "uuid"; connection.Trim() ] None with
-                | { ExitCode = 0; Stdout = configuredZone } -> configuredZone.Trim() = zone
+                | { ExitCode = 0; Stdout = configuredZone } ->
+                    let explicitZone = configuredZone.Trim()
+                    if explicitZone = "" then
+                        run environment [ "--get-default-zone" ] |> Option.exists (fun activeDefault -> activeDefault.Trim() = zone)
+                    else explicitZone = zone
                 | _ -> false
             | _ -> false
         with _ -> false
+
+    let private dockerOwnsBridge (environment: HostEnvironment) (interfaceName: string) =
+        try
+            let query arguments = environment.Run "docker" ("--host=unix:///run/docker.sock" :: arguments) None
+            let link = environment.Run "ip" [ "-j"; "-d"; "link"; "show"; "dev"; interfaceName ] None
+            if link.ExitCode <> 0 then false
+            else
+                use links = JsonDocument.Parse(link.Stdout)
+                let bridge =
+                    links.RootElement.EnumerateArray()
+                    |> Seq.exists (fun entry ->
+                        entry.GetProperty("ifname").GetString() = interfaceName
+                        && entry.GetProperty("linkinfo").GetProperty("info_kind").GetString() = "bridge")
+                if not bridge then false
+                else
+                    let inventory = query [ "network"; "ls"; "--filter"; "driver=bridge"; "--quiet"; "--no-trunc" ]
+                    let ids = words [ inventory.Stdout ]
+                    if inventory.ExitCode <> 0 || ids.IsEmpty || ids.Length > 1024
+                       || not (ids |> List.forall (fun id -> id.Length = 64 && id |> Seq.forall Uri.IsHexDigit)) then false
+                    else
+                        let result = query ([ "network"; "inspect"; "--format"; "{{json .}}" ] @ ids)
+                        result.ExitCode = 0
+                        && (result.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries)
+                            |> Array.exists (fun line ->
+                                use net = JsonDocument.Parse(line)
+                                let n = net.RootElement
+                                let id = n.GetProperty("Id").GetString()
+                                let options = n.GetProperty("Options")
+                                let bridgeName =
+                                    match options.ValueKind with
+                                    | JsonValueKind.Object ->
+                                        match options.TryGetProperty "com.docker.network.bridge.name" with
+                                        | true, value -> value.GetString()
+                                        | _ -> "br-" + id.Substring(0, 12)
+                                    | JsonValueKind.Null -> "br-" + id.Substring(0, 12)
+                                    | _ -> ""
+                                List.contains id ids && n.GetProperty("Driver").GetString() = "bridge"
+                                && n.GetProperty("Scope").GetString() = "local" && bridgeName = interfaceName))
+        with _ -> false
+
+    let restoresRuntimeInterface environment interfaceName zone =
+        networkManagerAssignsZone environment interfaceName zone
+        || (zone = "docker" && dockerOwnsBridge environment interfaceName)
 
     let private observeZonePolicy (allowCoexistingAdditions: bool) (environment: HostEnvironment) (c: FirewalldModel.Configuration) =
         match inspectRuntime environment c.Kind c.Name with
@@ -1131,7 +1182,7 @@ module FirewalldRuntime =
                             if allowCoexistingAdditions then
                                 Set.isSubset expected actual
                                 && (Set.difference actual expected
-                                    |> Set.forall (fun interfaceName -> networkManagerAssignsZone environment interfaceName c.Name))
+                                    |> Set.forall (fun interfaceName -> restoresRuntimeInterface environment interfaceName c.Name))
                             else actual = expected
                     let sourcesMatch = Set.ofList (runtime.SourcesRaw |> List.map normalizeSource) = expectedSources
                     let forwardPortsMatch = Set.ofList runtime.ForwardPorts = expectedForwardPorts
@@ -1279,6 +1330,27 @@ module FirewalldRuntime =
     /// referenced definition matches permanent data, except active NetworkManager
     /// interface bindings which firewalld restores from NetworkManager on reload.
     /// This is a read-only preflight; it never copies runtime state into permanent data.
+    let private kernelSetIsEmpty (environment: HostEnvironment) name =
+        try
+            let table = environment.Run "nft" [ "-j"; "list"; "table"; "inet"; "firewalld" ] None
+            if table.ExitCode <> 0 then false
+            else
+                use document = JsonDocument.Parse(table.Stdout)
+                let mutable matched, empty = 0, true
+                for row in document.RootElement.GetProperty("nftables").EnumerateArray() do
+                    for kind in [ "set"; "element" ] do
+                        match row.TryGetProperty kind with
+                        | true, obj when obj.GetProperty("family").GetString() = "inet" &&
+                                         obj.GetProperty("table").GetString() = "firewalld" && obj.GetProperty("name").GetString() = name ->
+                            if kind = "set" then matched <- matched + 1
+                            match obj.TryGetProperty "elem" with
+                            | true, entries when entries.ValueKind = JsonValueKind.Array && entries.GetArrayLength() = 0 -> ()
+                            | false, _ when kind = "set" -> ()
+                            | _ -> empty <- false
+                        | _ -> ()
+                matched = 1 && empty
+        with _ -> false
+
     let private validateReloadCore
         (environment: HostEnvironment)
         (allowance: (string * string * (string * string) list) option)
@@ -1296,6 +1368,14 @@ module FirewalldRuntime =
                 | None ->
                     refuse ("Unable to enumerate " + (if permanent then "permanent " else "runtime ") + "firewalld " + kind + " objects.")
                     []
+            // These three legacy getters are read-only. Never import, execute
+            // or write direct/passthrough rules. A reload can discard them too.
+            let mutable hasDirect = false
+            for getter in [ "--get-all-rules"; "--get-all-chains"; "--get-all-passthroughs" ] do
+                match run environment [ "--direct"; getter ], run environment [ "--permanent"; "--direct"; getter ] with
+                | Some live, Some disk when live.TrimEnd() = disk.TrimEnd() ->
+                    if not (String.IsNullOrWhiteSpace live) then hasDirect <- true
+                | _ -> refuse "Unattributed direct runtime state prevents a daemon-wide firewalld activation."
             let runtimeZones = names "zone" false
             let permanentZones = names "zone" true
             let runtimePolicies = names "policy" false
@@ -1380,9 +1460,8 @@ module FirewalldRuntime =
                         else
                             let live = Set.ofList runtime.Interfaces
                             let disk = Set.ofList permanent.Interfaces
-                            let changed = Set.union (Set.difference disk live) (Set.difference live disk)
-                            changed
-                            |> Set.forall (fun interfaceName -> networkManagerAssignsZone environment interfaceName name)
+                            Set.isSubset disk live
+                            && (Set.difference live disk |> Set.forall (fun iface -> restoresRuntimeInterface environment iface name))
                     if not fieldsMatch || not interfacesMatch then
                         refuse ("Reload would change unpersisted live selectors in firewalld " + kind + " " + name + ".")
                     if not isExcluded && not (recordReferences runtime) then
@@ -1504,8 +1583,14 @@ module FirewalldRuntime =
             if not (Set.isSubset referencedIpSets knownIpSets) then
                 refuse "An active firewalld selector references an uninspectable ipset."
             for name in runtimeIpSets do
-                if failure.IsNone && excludedTarget <> Some("ipset", name) then
+                if failure.IsNone then
                     match inspectRuntimeWith environment false "ipset" name, inspectRuntimeWith environment true "ipset" name with
+                    | Some runtime, _ when
+                        (match Map.tryFind "timeout" runtime.IpSetOptions with
+                         | None | Some(Some "0") -> false
+                         | _ -> true) && (hasDirect || not (kernelSetIsEmpty environment name)) ->
+                        refuse ("The expiring kernel members of ipset " + name + " are not observable through firewalld; refusing a flushing activation.")
+                    | Some _, _ when excludedTarget = Some("ipset", name) -> ()
                     | Some runtime, Some permanent
                         when runtime.UnknownFields.IsEmpty
                              && permanent.UnknownFields.IsEmpty

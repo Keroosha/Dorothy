@@ -583,7 +583,7 @@ module internal FirewalldBindingTransfer =
             policyCanIngress fallbackZones policy
             && not (policy.Priority < 0 && (List.contains "ANY" policy.Ingress || List.contains sourceZone policy.Ingress))
         let egressPolicyCanStart policy =
-            let ingressCanApply = policyCanIngress fallbackZones policy
+            let ingressCanApply = policy.Ingress |> List.exists ((<>) "HOST")
             let specificFallbackEgress =
                 policy.Egress
                 |> List.exists (fun zone -> zone <> sourceZone && Set.contains zone fallbackZones)
@@ -642,7 +642,9 @@ module internal FirewalldBindingTransfer =
             && (target = "DROP" || target = "%%REJECT%%")
             && safeChild && not inversion
 
-    let private policyMayIngressFallback fallbackZones (policy: PolicyInfo) = policyCanIngress fallbackZones policy
+    let private policyMayIngressFallback fallbackZones (policy: PolicyInfo) =
+        policyCanIngress fallbackZones policy
+        || (not policy.Ingress.IsEmpty && policy.Egress |> List.exists (fun z -> z = "ANY" || Set.contains z fallbackZones))
 
     let private fallbackIsRestrictive fallbackZones (candidateZones: Map<string, string>) runtimeZones candidatePolicies runtimePolicies =
         let zonesAreDenied =
@@ -669,8 +671,8 @@ module internal FirewalldBindingTransfer =
     let private noPolicyFromZone zoneName (policies: (string * PolicyInfo) list) =
         policies
         |> List.forall (fun (_, policy) ->
-            policy.Egress.IsEmpty
-            || not (policy.Ingress |> List.exists (fun ingress -> ingress = "ANY" || ingress = zoneName)))
+            policy.Egress.IsEmpty || policy.Ingress.IsEmpty
+            || not (List.exists (fun z -> z = "ANY" || z = zoneName) (policy.Ingress @ policy.Egress)))
 
     let private hostOutputFenceRequired oldZone fallbackZones policies =
         let egressZones = Set.add oldZone fallbackZones
@@ -837,7 +839,103 @@ module internal FirewalldBindingTransfer =
                                         "Refusing to remove or weaken firewalld transfer fence " + configuration.Name + " for " + selectors
                                         + ": the selector is not bound in both permanent and runtime state, and its fallback is not proven restrictive. Keep the fence until the destination binding is active, or quarantine the selector in a confirmed restrictive fallback before releasing it.")
 
+    let private checkedRoot kind xml =
+        match parseRoot kind xml with Ok root -> root | Error reason -> invalidOp ("Cannot inspect " + kind + ": " + reason)
+
+    let private validateInterfaceRelease (kernelInterfaces: Set<string> option) name before afterZones candidatePolicies defaultZone runtimeDefault runtimeZones runtimePolicies =
+        let elements tag xml = (checkedRoot "zone" xml).Elements(xn tag)
+        let interfaces xml = elements "interface" xml |> Seq.choose (attribute "name") |> Set.ofSeq
+        let samePacketConfig (left: string) (right: string) =
+            let describe xml =
+                let z = checkedRoot "zone" xml
+                for child in z.Elements() |> Seq.toArray do
+                    if List.contains child.Name.LocalName [ "source"; "interface"; "short"; "description" ] then child.Remove()
+                let attrs =
+                    z.Attributes() |> Seq.filter (fun a ->
+                        a.Name.LocalName <> "version" && not (a.Name.LocalName = "target" && a.Value = "default")
+                        && not (List.contains a.Name.LocalName ["ingress-priority";"egress-priority"] && a.Value = "0"))
+                    |> Seq.map (fun a -> a.Name.ToString(), a.Value) |> Set.ofSeq
+                let children = z.Elements() |> Seq.toList
+                let grantsOnly = children |> List.forall (fun e -> List.contains e.Name.LocalName ["service";"port";"protocol";"source-port";"forward";"masquerade"])
+                attrs, (children |> Seq.map (fun e -> e.ToString(SaveOptions.DisableFormatting)) |> Set.ofSeq), grantsOnly
+            let a, x, gx = describe left
+            let b, y, gy = describe right
+            a = b && (x = y || (gx && gy && Set.isSubset y x))
+        match before with
+        | None -> Ok ()
+        | Some original ->
+            let next = Map.tryFind name afterZones |> Option.map interfaces |> Option.defaultValue Set.empty
+            let instantiated binding =
+                match kernelInterfaces with
+                | None -> true
+                | Some links when (binding: string).EndsWith('+') -> links |> Set.exists (fun link -> link.StartsWith(binding.TrimEnd('+'), StringComparison.Ordinal))
+                | Some links -> links.Contains binding
+            let released = Set.difference (interfaces original) next |> Set.filter instantiated
+            if released.IsEmpty then Ok ()
+            else
+                let overlaps (a: string) (b: string) =
+                    let prefix (s: string) = s.TrimEnd('+')
+                    a = b || (a.EndsWith('+') && (prefix b).StartsWith(prefix a, StringComparison.Ordinal))
+                    || (b.EndsWith('+') && (prefix a).StartsWith(prefix b, StringComparison.Ordinal))
+                let fallbacks =
+                    [ afterZones; runtimeZones ] |> List.fold (fun zones definitions ->
+                        definitions |> Map.fold (fun acc n xml ->
+                            if n <> name && (not (Seq.isEmpty (elements "source" xml))
+                                            || interfaces xml |> Set.exists (fun i -> released |> Set.exists (overlaps i))) then Set.add n acc else acc) zones)
+                        (set [ defaultZone; runtimeDefault ])
+                let relevant = Set.add name fallbacks
+                let policyCanDistinguish (xml: string) =
+                    let p = checkedRoot "policy" xml
+                    [ "ingress-zone"; "egress-zone" ] |> List.exists (fun tag ->
+                        p.Elements(xn tag) |> Seq.exists (fun e -> attribute "name" e |> Option.exists (fun z -> relevant.Contains z)))
+                let restrictedPolicies = [candidatePolicies; runtimePolicies] |> List.exists (Map.exists (fun _ p -> policyCanDistinguish p))
+                let safe n =
+                    n = name || ([afterZones; runtimeZones] |> List.forall (fun zones ->
+                        Map.tryFind n zones |> Option.exists (fun xml ->
+                            samePacketConfig original xml || zoneIsUnrestricted original || zoneIsBlanketDropXml xml)))
+                if not restrictedPolicies && fallbacks |> Set.forall safe then Ok ()
+                else Error("Refusing interface release from " + name + ": its permanent and live fallbacks are not proven at least as restrictive in both directions. Establish equivalent isolation or a restrictive fallback before moving the interface.")
+
+    /// Changing an ipset can remove an effective zone source without modifying
+    /// that zone's XML. Expand representable static memberships only for this
+    /// proof and apply the literal-source transfer check to every consumer.
+    let validateBoundSet name before after (live: string option) zones policies defaultZone runtimeDefault runtimeZones runtimePolicies =
+        let references (xml: string) =
+            (checkedRoot "zone" xml).Elements(xn "source") |> Seq.exists (fun s -> attribute "ipset" s = Some name)
+        let affected =
+            [ zones; runtimeZones ] |> Seq.collect Map.toSeq |> Seq.choose (fun (n, xml) -> if references xml then Some n else None) |> Set.ofSeq
+        if affected.IsEmpty then Ok ()
+        else
+            let missingLive = live.IsNone && (runtimeZones |> Map.exists (fun _ xml -> references xml))
+            let members (xml: string option) =
+                xml |> Option.map (fun text ->
+                    let root = checkedRoot "ipset" text
+                    let timeout = root.Elements(xn "option") |> Seq.exists (fun e -> attribute "name" e = Some "timeout" && attribute "value" e <> Some "0")
+                    if timeout || not (List.contains (attribute "type" root) [ Some "hash:ip"; Some "hash:net"; Some "hash:mac" ]) then
+                        invalidOp "Cannot prove a bound compound or expiring ipset transfer; detach its source with a verified fence first."
+                    root.Elements(xn "entry") |> Seq.map _.Value |> Set.ofSeq)
+                |> Option.defaultValue Set.empty
+            let expand entries (xml: string) =
+                let root = checkedRoot "zone" xml
+                for s in root.Elements(xn "source") |> Seq.toArray do
+                    if attribute "ipset" s = Some name then
+                        if s.Attributes() |> Seq.length <> 1 then invalidOp "Unrecognized zone ipset source attributes."
+                        s.Remove()
+                        for entry in entries do root.Add(XElement(xn "source", XAttribute(xn "address", (entry: string))))
+                root.ToString(SaveOptions.DisableFormatting)
+            try
+                if missingLive then invalidOp "Cannot release a bound ipset with unreadable runtime membership."
+                let oldEntries, newEntries, runtimeEntries = members before, members after, members live
+                let candidate = zones |> Map.map (fun _ -> expand newEntries)
+                let current = runtimeZones |> Map.map (fun _ -> expand runtimeEntries)
+                affected |> Set.fold (fun status zone ->
+                    status |> Result.bind (fun () ->
+                        validateZoneSourceBinding (FirewalldModel.empty "zone" zone) (Map.tryFind zone zones |> Option.map (expand oldEntries))
+                            candidate policies defaultZone runtimeDefault current runtimePolicies)) (Ok ())
+            with :? InvalidOperationException as error -> Error error.Message
+
     let validate
+        (kernelInterfaces: Set<string> option)
         (configuration: FirewalldModel.Configuration)
         (beforeObject: string option)
         (afterZones: Map<string, string>)
@@ -849,7 +947,9 @@ module internal FirewalldBindingTransfer =
         =
         match configuration.Kind with
         | "zone" ->
-            validateZoneSourceBinding configuration beforeObject afterZones candidatePolicyXml candidateDefaultZone runtimeDefaultZone runtimeZones runtimePolicyXml
+            validateInterfaceRelease kernelInterfaces configuration.Name beforeObject afterZones candidatePolicyXml candidateDefaultZone runtimeDefaultZone runtimeZones runtimePolicyXml
+            |> Result.bind (fun () ->
+                validateZoneSourceBinding configuration beforeObject afterZones candidatePolicyXml candidateDefaultZone runtimeDefaultZone runtimeZones runtimePolicyXml)
         | "policy" ->
             validateStagePolicyChange configuration beforeObject afterZones candidatePolicyXml candidateDefaultZone runtimeDefaultZone runtimeZones runtimePolicyXml
         | _ -> Ok ()

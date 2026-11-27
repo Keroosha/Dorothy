@@ -362,6 +362,14 @@ type FirewalldDeploymentTests() =
         Assert.DoesNotThrow(fun () -> compile [ continues ] anyGuard |> ignore)
         Assert.Throws<ArgumentException>(fun () -> compile [] safeRichGuard |> ignore) |> ignore
         Assert.DoesNotThrow(fun () -> compile [ hostRichService ] guard |> ignore)
+        let externalOnly (fence: FirewalldObjectSpec) =
+            let stackFirewall = firewalld { strictForwardPorts true; fence }
+            let engine = docker { yield! ([]: DockerContainerSpec list) }
+            debian { engine; stackFirewall }
+        Assert.Throws<ArgumentException>(fun () -> externalOnly perforatedGuard |> ignore) |> ignore
+        match externalOnly guard with
+        | Debian spec -> Assert.That(spec.Docker.Value.Containers, Is.Empty)
+        | _ -> Assert.Fail("Expected the validated Debian engine declaration.")
 
     [<Test>]
     member _.``Docker readiness unit depends only on effective docker guard and preserves old resource names``() =

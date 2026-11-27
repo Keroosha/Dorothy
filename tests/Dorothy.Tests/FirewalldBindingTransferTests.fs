@@ -276,3 +276,32 @@ type FirewalldBindingTransferTests() =
         withSsh (fun () ->
             Assert.DoesNotThrow(TestDelegate(fun () ->
                 BindingTransferNative.guardMutation environment zoneConfiguration None)))
+
+    [<Test>]
+    member _.``A permit to the fallback invalidates a blanket-DROP release proof``() =
+        use temporary = new TemporaryDirectory("dorothy-source-reverse-")
+        createRoot temporary.Path publicDrop
+        write temporary.Path "etc/firewalld/policies/reverse.xml"
+            "<policy priority=\"-5\" target=\"ACCEPT\"><ingress-zone name=\"destination-net\"/><egress-zone name=\"public\"/></policy>"
+        withSsh (fun () -> assertBlocked (environment temporary.Path) proposedSourceRemoval)
+
+    [<Test>]
+    member _.``Shrinking a bound hash net set uses the source transfer fences``() =
+        let zone = "<zone target=\"DROP\"><source ipset=\"clients\"/></zone>"
+        let zones = Map.ofList [ "source-net", zone; "public", publicOpen ]
+        let old = Some "<ipset type=\"hash:net\"><entry>192.0.2.0/24</entry></ipset>"
+        let empty = Some "<ipset type=\"hash:net\"/>"
+        let transition policies =
+            FirewalldBindingTransfer.validateBoundSet "clients" old empty old zones policies "public" "public" zones policies
+        Assert.That(Result.isError (transition Map.empty), Is.True)
+        let fences = Map.ofList [ "fence-h", stagePolicy "HOST"; "fence-t", stagePolicy "ANY" ]
+        Assert.That(transition fences, Is.EqualTo(Ok () : Result<unit, string>))
+
+    [<Test>]
+    member _.``An interface cannot be released through a more permissive default``() =
+        let before = "<zone target=\"DROP\"><interface name=\"app0\"/></zone>"
+        let run fallback =
+            let after = Map.ofList [ "source-net", unboundSourceZone; "public", fallback ]
+            FirewalldBindingTransfer.validate (Some(set ["app0"])) zoneConfiguration (Some before) after Map.empty "public" "public" (Map.add "source-net" before after) Map.empty
+        Assert.That(Result.isError (run publicOpen), Is.True)
+        Assert.That(run publicDrop, Is.EqualTo(Ok () : Result<unit, string>))

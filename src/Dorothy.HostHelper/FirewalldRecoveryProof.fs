@@ -17,12 +17,23 @@ module FirewalldRecoveryProof =
           Value: string
           Effect: RepairEffect }
 
+    type private ObjectDelta =
+        { Field: string
+          Value: string
+          Add: bool
+          Effect: RepairEffect }
+
     type private RuntimeRepair =
         { Deltas: RuntimeDelta list
           StateFingerprints: string list
           Version: int
           DeclaredInterfaces: string list
           DeclaredNativeInterfaces: string list }
+    type private ObjectRepair =
+        { Before: FirewalldRuntime.RuntimeSnapshot
+          After: FirewalldRuntime.RuntimeSnapshot
+          Deltas: ObjectDelta list
+          StateFingerprints: string list }
 
     let private fail message = raise (InvalidOperationException(message))
 
@@ -181,11 +192,11 @@ module FirewalldRecoveryProof =
             | Some(liveInterfaces, _) when Set.isSubset (Set.ofList declaredInterfaces) (Set.ofList liveInterfaces) ->
                 let declared = Set.ofList declaredInterfaces
                 let extra = Set.difference (Set.ofList liveInterfaces) declared
-                let networkManagerOwned =
+                let restoredByOwner =
                     extra
                     |> Set.forall (fun interfaceName ->
-                        FirewalldRuntime.networkManagerAssignsZone environment interfaceName actualLive.Name)
-                if not networkManagerOwned then None
+                        FirewalldRuntime.restoresRuntimeInterface environment interfaceName actualLive.Name)
+                if not restoredByOwner then None
                 else
                     let nativeValue =
                         if declaredInterfaces.IsEmpty then []
@@ -435,7 +446,7 @@ module FirewalldRecoveryProof =
             [ "services", 0; "ports", 1; "source-ports", 2; "protocols", 3
               "forward-ports", 4; "icmp-blocks", 5; "rich rules", 6 ]
 
-    let private sortDeltas deltas =
+    let private sortDeltas (deltas: RuntimeDelta list) =
         deltas
         |> List.sortWith (fun left right ->
             let fieldCompare = compare (Map.find left.Field fieldOrder) (Map.find right.Field fieldOrder)
@@ -617,6 +628,437 @@ module FirewalldRecoveryProof =
         proofBase configuration "unchanged"
 
     let private effectName = function Grants -> "grant" | Restricts -> "restrict" | Steers -> "steer"
+    let private objectSelectorFields =
+        [ "services"; "ports"; "source-ports"; "protocols"; "icmp-blocks"; "rich rules"; "forward-ports" ]
+
+    let private withoutObjectSelectors (snapshot: FirewalldRuntime.RuntimeSnapshot) =
+        let nativeFields =
+            objectSelectorFields
+            |> List.fold (fun fields field -> Map.add field [] fields) snapshot.NativeFields
+        { snapshot with
+            Services = []
+            Ports = []
+            SourcePorts = []
+            Protocols = []
+            ForwardPorts = []
+            IcmpBlocks = []
+            RichRules = []
+            NativeFields = nativeFields }
+
+    let private nonSelectorFingerprint snapshot = fingerprint (withoutObjectSelectors snapshot)
+
+    let private parseObjectConfiguration kind name xml =
+        FieldRuntime.parseConfiguration kind name xml
+        |> Result.defaultWith (fun reason -> fail ("Cannot parse the firewalld object projection: " + reason))
+
+    let private inverseEffect = function
+        | Grants -> Restricts
+        | Restricts -> Grants
+        | Steers -> Steers
+
+    let private objectDeltaEffect (beforeConfiguration: FirewalldModel.Configuration) (afterConfiguration: FirewalldModel.Configuration) field value add =
+        if add then deltaEffect afterConfiguration field value
+        else deltaEffect beforeConfiguration field value |> inverseEffect
+
+    let private sortObjectDeltas deltas =
+        deltas
+        |> List.sortWith (fun left right ->
+            let fieldCompare = compare (Map.find left.Field fieldOrder) (Map.find right.Field fieldOrder)
+            if fieldCompare <> 0 then fieldCompare
+            else StringComparer.Ordinal.Compare(left.Value, right.Value))
+    let private deriveObjectDeltas before after beforeConfiguration afterConfiguration =
+        let beforeSelectors = actualSelectorValues before
+        let afterSelectors = actualSelectorValues after
+        objectSelectorFields
+        |> List.collect (fun field ->
+            let oldValues = Set.ofList (Map.find field beforeSelectors)
+            let newValues = Set.ofList (Map.find field afterSelectors)
+            (Set.difference newValues oldValues
+             |> Set.toList
+             |> List.map (fun value ->
+                 { Field = field; Value = value; Add = true
+                   Effect = objectDeltaEffect beforeConfiguration afterConfiguration field value true }))
+            @ (Set.difference oldValues newValues
+               |> Set.toList
+               |> List.map (fun value ->
+                   { Field = field; Value = value; Add = false
+                     Effect = objectDeltaEffect beforeConfiguration afterConfiguration field value false })))
+        |> sortObjectDeltas
+
+
+    let private applyObjectDeltaSet (values: Map<string, Set<string>>) (delta: ObjectDelta) =
+        let current = Map.find delta.Field values
+        Map.add delta.Field (if delta.Add then Set.add delta.Value current else Set.remove delta.Value current) values
+
+    let private objectStateFingerprint (deltas: ObjectDelta list) (values: Map<string, Set<string>>) =
+        let state = JsonArray()
+        for delta in deltas do
+            let item = JsonObject()
+            item["field"] <- JsonValue.Create delta.Field
+            item["value"] <- JsonValue.Create delta.Value
+            item["present"] <- JsonValue.Create(Set.contains delta.Value (Map.find delta.Field values))
+            state.Add item
+        Convert.ToHexString(SHA256.HashData(Encoding.UTF8.GetBytes(state.ToJsonString()))).ToLowerInvariant()
+
+    let private objectStateFingerprints before deltas =
+        let mutable values = actualSelectorValues before |> Map.map (fun _ items -> Set.ofList items)
+        let states = ResizeArray<string>()
+        states.Add(objectStateFingerprint deltas values)
+        for delta in deltas do
+            values <- applyObjectDeltaSet values delta
+            states.Add(objectStateFingerprint deltas values)
+        List.ofSeq states
+
+    let private objectRuntimeNonSelectorsMatch
+        (environment: HostEnvironment)
+        (expected: FirewalldRuntime.RuntimeSnapshot)
+        (actual: FirewalldRuntime.RuntimeSnapshot)
+        =
+        if expected.Kind <> actual.Kind || expected.Name <> actual.Name || not (snapshotComplete expected && snapshotComplete actual) then false
+        else
+            projectLiveInterfaces environment expected.Interfaces actual
+            |> Option.exists (fun projected ->
+                nonSelectorFingerprint projected = nonSelectorFingerprint expected)
+
+    let private objectRuntimeMatchesPreimage
+        (environment: HostEnvironment)
+        (expected: FirewalldRuntime.RuntimeSnapshot)
+        (actual: FirewalldRuntime.RuntimeSnapshot)
+        =
+        if not (objectRuntimeNonSelectorsMatch environment expected actual) then false
+        else
+            let expectedSelectors = actualSelectorValues expected
+            let actualSelectors = actualSelectorValues actual
+            let exactSelectors =
+                objectSelectorFields
+                |> List.filter ((<>) "rich rules")
+                |> List.forall (fun field ->
+                    Set.ofList (Map.find field expectedSelectors) = Set.ofList (Map.find field actualSelectors))
+            let expectedRules = Set.ofList (Map.find "rich rules" expectedSelectors)
+            let actualRules = Set.ofList (Map.find "rich rules" actualSelectors)
+            let extras = Set.difference actualRules expectedRules
+            exactSelectors
+            && Set.isSubset expectedRules actualRules
+            && (extras |> Set.forall FirewalldRuntime.isRestrictiveRichRule)
+
+    let matchesLoadedProjectionPreservingRestrictions
+        (environment: HostEnvironment)
+        (expected: FirewalldRuntime.RuntimeSnapshot)
+        (actual: FirewalldRuntime.RuntimeSnapshot)
+        =
+        objectRuntimeMatchesPreimage environment expected actual
+
+    let objectDeltaProof
+        (environment: HostEnvironment)
+        (configuration: FirewalldModel.Configuration)
+        (effectiveBefore: string option)
+        (effectiveAfter: string option)
+        =
+        if not (List.contains configuration.Kind [ "zone"; "policy" ]) then None
+        else
+            match FirewalldRuntime.snapshotFromXml configuration.Kind configuration.Name effectiveBefore,
+                  FirewalldRuntime.snapshotFromXml configuration.Kind configuration.Name effectiveAfter with
+            | Error reason, _ -> fail ("Cannot project the effective firewalld preimage: " + reason)
+            | _, Error reason -> fail ("Cannot project the candidate firewalld object: " + reason)
+            | Ok(Some before), Ok(Some after) when snapshotComplete before && snapshotComplete after ->
+                if nonSelectorFingerprint before <> nonSelectorFingerprint after then None
+                else
+                    let beforeConfiguration =
+                        effectiveBefore
+                        |> Option.defaultWith (fun () -> fail "A scoped object inverse requires an existing before object.")
+                        |> parseObjectConfiguration configuration.Kind configuration.Name
+                    let afterConfiguration =
+                        effectiveAfter
+                        |> Option.defaultWith (fun () -> fail "A scoped object inverse requires an existing after object.")
+                        |> parseObjectConfiguration configuration.Kind configuration.Name
+                    let deltas = deriveObjectDeltas before after beforeConfiguration afterConfiguration
+                    let effects = deltas |> List.map (fun delta -> delta.Effect) |> Set.ofList
+                    if effects.Count > 1
+                       || (effects = set [ Steers ] && deltas.Length > 1)
+                       || deltas.Length > 4096 then None
+                    else
+                        match FirewalldRuntime.queryPermanent environment configuration.Kind configuration.Name,
+                              FirewalldRuntime.inspectRuntime environment configuration.Kind configuration.Name with
+                        | Ok(Some permanent), Some live
+                            when matchesLoadedProjection environment before permanent
+                                 && objectRuntimeMatchesPreimage environment before live ->
+                            let node = proofBase configuration "object-delta"
+                            node["version"] <- JsonValue.Create 3
+                            node["beforePresent"] <- JsonValue.Create true
+                            node["beforeFingerprint"] <- JsonValue.Create(fingerprint before)
+                            node["afterPresent"] <- JsonValue.Create true
+                            node["afterFingerprint"] <- JsonValue.Create(fingerprint after)
+                            writeInterfaceEvidence node "before" (Some before)
+                            writeInterfaceEvidence node "after" (Some after)
+                            let deltaNodes = JsonArray()
+                            for delta in deltas do
+                                let item = JsonObject()
+                                item["field"] <- JsonValue.Create delta.Field
+                                item["value"] <- JsonValue.Create delta.Value
+                                item["add"] <- JsonValue.Create delta.Add
+                                item["effect"] <- JsonValue.Create(effectName delta.Effect)
+                                deltaNodes.Add item
+                            let states = JsonArray()
+                            for state in objectStateFingerprints before deltas do states.Add(JsonValue.Create state)
+                            node["deltas"] <- deltaNodes
+                            node["stateFingerprints"] <- states
+                            Some node
+                        | _ ->
+                            fail "Cannot prove the live firewalld target is the recorded preimage; a scoped object transaction would overwrite independent runtime state."
+            | Ok _, Ok _ -> None
+    // Releasing an interface is not an SSH tightening if every zone it can
+    // reach has identical host admission and no policy dispatch distinguishes
+    // those zones. Forward/masquerade are transit settings; binding-transfer
+    // validation independently checks whether a workload becomes exposed.
+    let private equivalentZoneAdmission environment name (before: FirewalldRuntime.RuntimeSnapshot option) (after: FirewalldRuntime.RuntimeSnapshot option) =
+        let managementPort =
+            match Environment.GetEnvironmentVariable "SSH_CONNECTION" with
+            | null -> None
+            | text ->
+                match text.Split(' ', StringSplitOptions.RemoveEmptyEntries) with
+                | [| _; _; _; p |] -> match Int32.TryParse p with true, n when n > 0 && n <= 65535 -> Some n | _ -> None
+                | _ -> None
+        let relevantPorts ports =
+            match managementPort with
+            | None -> Set.ofList ports
+            | Some port ->
+                ports |> List.filter (fun (value: string) ->
+                    match value.Split('/') with
+                    | [| range; "tcp" |] ->
+                        let ends = range.Split('-')
+                        Int32.Parse(ends[0]) <= port && Int32.Parse(ends[ends.Length - 1]) >= port
+                    | _ -> false) |> Set.ofList
+        let signature (s: FirewalldRuntime.RuntimeSnapshot) =
+            s.Target, Set.ofList s.Services, relevantPorts s.Ports, Set.ofList s.Protocols,
+            Set.ofList s.SourcePorts, Set.ofList s.ForwardPorts, Set.ofList s.RichRules,
+            Set.ofList s.IcmpBlocks, s.IcmpBlockInversion
+        let candidates = [before; after] |> List.choose id
+        let sameShape first snapshots = snapshots |> List.forall (fun x -> signature x = signature first)
+        match candidates with
+        | [] -> true
+        | first :: _ when not (sameShape first candidates) -> false
+        | first :: _ ->
+            let selection (s: FirewalldRuntime.RuntimeSnapshot) = Set.ofList s.Interfaces, Set.ofList s.SourcesRaw, s.IngressPriority, s.EgressPriority
+            if Option.map selection before = Option.map selection after then true
+            else
+                let zones = FirewalldRuntime.listRuntime environment "zone" |> Option.get
+                let policies = FirewalldRuntime.listRuntime environment "policy" |> Option.get
+                let dz = environment.Run "firewall-cmd" ["--get-default-zone"] None
+                if dz.ExitCode <> 0 || not (List.contains (dz.Stdout.Trim()) zones) then false
+                else
+                    let changed = candidates |> List.collect _.Interfaces
+                    let overlaps (a: string) (b: string) =
+                        a = b || (a.EndsWith('+') && b.StartsWith(a.TrimEnd('+'), StringComparison.Ordinal))
+                        || (b.EndsWith('+') && a.StartsWith(b.TrimEnd('+'), StringComparison.Ordinal))
+                    let mutable affected = Set.singleton name
+                    let zonesAgree =
+                        zones |> List.forall (fun z ->
+                            if z = name then true
+                            else
+                                let views = [ FirewalldRuntime.inspectRuntime environment "zone" z |> Option.get
+                                              FirewalldRuntime.inspectPermanent environment "zone" z |> Option.get ]
+                                if views |> List.exists (fun view ->
+                                    z = dz.Stdout.Trim() || not view.SourcesRaw.IsEmpty
+                                    || view.Interfaces |> List.exists (fun iface -> changed |> List.exists (overlaps iface))) then
+                                    affected <- Set.add z affected
+                                    views |> List.forall snapshotComplete && sameShape first views
+                                else true)
+                    zonesAgree && (policies |> List.forall (fun p ->
+                        [ FirewalldRuntime.inspectRuntime environment "policy" p |> Option.get
+                          FirewalldRuntime.inspectPermanent environment "policy" p |> Option.get ]
+                        |> List.forall (fun policy ->
+                            snapshotComplete policy && not (List.exists affected.Contains (policy.Ingress @ policy.Egress)))))
+
+    let objectTransitionMayNarrowManagement
+        (environment: HostEnvironment)
+        (configuration: FirewalldModel.Configuration)
+        (effectiveBefore: string option)
+        (effectiveAfter: string option)
+        =
+        if configuration.Kind <> "zone" && configuration.Kind <> "policy" then false
+        else
+            try
+                let project xml =
+                    match FirewalldRuntime.snapshotFromXml configuration.Kind configuration.Name xml with
+                    | Ok(Some snapshot) when snapshotComplete snapshot -> Some snapshot
+                    | Ok None -> None
+                    | _ -> fail "The native object projection is incomplete."
+                let before = project effectiveBefore
+                let after = project effectiveAfter
+                let empty =
+                    let configuration = FirewalldModel.empty configuration.Kind configuration.Name
+                    match FirewalldRuntime.snapshotFromXml configuration.Kind configuration.Name (Some(FieldRuntime.render configuration)) with
+                    | Ok(Some snapshot) when snapshotComplete snapshot -> snapshot
+                    | _ -> fail "Cannot construct an empty firewalld object projection."
+                let beforeSnapshot = Option.defaultValue empty before
+                let afterSnapshot = Option.defaultValue empty after
+                let beforeConfiguration =
+                    effectiveBefore
+                    |> Option.map (parseObjectConfiguration configuration.Kind configuration.Name)
+                    |> Option.defaultValue (FirewalldModel.empty configuration.Kind configuration.Name)
+                let afterConfiguration =
+                    effectiveAfter
+                    |> Option.map (parseObjectConfiguration configuration.Kind configuration.Name)
+                    |> Option.defaultValue (FirewalldModel.empty configuration.Kind configuration.Name)
+                let managementZone =
+                    if configuration.Kind <> "zone" then false
+                    else
+                        let defaultZone =
+                            match environment.Run "firewall-cmd" [ "--get-default-zone" ] None with
+                            | { ExitCode = 0; Stdout = value } when not (String.IsNullOrWhiteSpace value) -> Some(value.Trim())
+                            | _ -> None
+                        let declaredInterfaces = beforeSnapshot.Interfaces @ afterSnapshot.Interfaces
+                        let runtimeInterfaces =
+                            match FirewalldRuntime.listRuntime environment "zone" with
+                            | Some names when List.contains configuration.Name names ->
+                                FirewalldRuntime.listRuntimeInterfaces environment configuration.Name
+                                |> Option.defaultValue declaredInterfaces
+                            | Some _ -> []
+                            | None -> declaredInterfaces
+                        let activeInterfaces =
+                            try
+                                match environment.Run "ip" [ "-j"; "link"; "show" ] None with
+                                | { ExitCode = 0; Stdout = output } ->
+                                    use document = System.Text.Json.JsonDocument.Parse output
+                                    if document.RootElement.ValueKind <> System.Text.Json.JsonValueKind.Array then None
+                                    else
+                                        document.RootElement.EnumerateArray()
+                                        |> Seq.choose (fun link ->
+                                            let mutable name = Unchecked.defaultof<System.Text.Json.JsonElement>
+                                            if link.TryGetProperty("ifname", &name)
+                                               && name.ValueKind = System.Text.Json.JsonValueKind.String then
+                                                Some(name.GetString())
+                                            else None)
+                                        |> Set.ofSeq
+                                        |> Some
+                                | _ -> None
+                            with _ -> None
+                        let boundToActiveInterface =
+                            let bindings = declaredInterfaces @ runtimeInterfaces
+                            match activeInterfaces with
+                            | Some names -> bindings |> List.exists (fun name -> Set.contains name names)
+                            | None -> not bindings.IsEmpty
+                        defaultZone.IsNone
+                        || defaultZone = Some configuration.Name
+                        || boundToActiveInterface
+                        || not beforeSnapshot.SourcesRaw.IsEmpty
+                        || not afterSnapshot.SourcesRaw.IsEmpty
+                let managementPolicy =
+                    if configuration.Kind <> "policy" then false
+                    else
+                        [ beforeSnapshot; afterSnapshot ]
+                        |> List.exists (fun snapshot ->
+                            List.contains "HOST" snapshot.Ingress
+                            || List.contains "HOST" snapshot.Egress)
+                if not (managementZone || managementPolicy) then false
+                else
+                    let targetRank (target: string) =
+                        match target.ToUpperInvariant() with
+                        | "ACCEPT" -> 2
+                        | "DROP" | "REJECT" | "%%REJECT%%" -> 0
+                        | "DEFAULT" | "CONTINUE" -> 1
+                        | _ -> -1
+                    let beforeTarget, afterTarget = targetRank beforeSnapshot.Target, targetRank afterSnapshot.Target
+                    let targetNarrowed =
+                        afterTarget < beforeTarget
+                        || (beforeSnapshot.Target <> afterSnapshot.Target && (beforeTarget < 0 || afterTarget < 0))
+                    let beforeRules = Set.ofList beforeSnapshot.RichRules
+                    let afterRules = Set.ofList afterSnapshot.RichRules
+                    let addedRules = Set.difference afterRules beforeRules
+                    let removedRules = Set.difference beforeRules afterRules
+                    let ruleNarrowed =
+                        (addedRules |> Set.exists FirewalldRuntime.isRestrictiveRichRule)
+                        || (removedRules |> Set.exists (FirewalldRuntime.isRestrictiveRichRule >> not))
+                    let selectorDeltas =
+                        deriveObjectDeltas beforeSnapshot afterSnapshot beforeConfiguration afterConfiguration
+                    let selectorNarrowed =
+                        selectorDeltas |> List.exists (fun delta -> delta.Effect = Restricts || delta.Effect = Steers)
+                    let managementPort =
+                        let connection = Environment.GetEnvironmentVariable "SSH_CONNECTION"
+                        let fields =
+                            if isNull connection then [||]
+                            else connection.Split([| ' '; '\t' |], StringSplitOptions.RemoveEmptyEntries)
+                        if fields.Length = 4 then
+                            match Int32.TryParse fields[3] with
+                            | true, port when port >= 1 && port <= 65535 -> Some port
+                            | _ -> None
+                        else None
+                    let hasManagementGrant (snapshot: FirewalldRuntime.RuntimeSnapshot) =
+                        let ports =
+                            match managementPort with
+                            | None -> false
+                            | Some port ->
+                                snapshot.Ports
+                                |> List.exists (fun value ->
+                                    match value.Split('/') with
+                                    | [| range; "tcp" |] ->
+                                        let bounds = range.Split('-')
+                                        match bounds with
+                                        | [| one |] ->
+                                            match Int32.TryParse one with
+                                            | true, candidate -> candidate = port
+                                            | _ -> false
+                                        | [| first; last |] ->
+                                            match Int32.TryParse first, Int32.TryParse last with
+                                            | (true, low), (true, high) -> low <= port && port <= high
+                                            | _ -> false
+                                        | _ -> false
+                                    | _ -> false)
+                        targetRank snapshot.Target = 2
+                        || List.contains "ssh" snapshot.Services
+                        || ports
+                    let hasBlockingSemantics (snapshot: FirewalldRuntime.RuntimeSnapshot) =
+                        targetRank snapshot.Target = 0
+                        || (snapshot.RichRules |> List.exists FirewalldRuntime.isRestrictiveRichRule)
+                        || (not snapshot.IcmpBlockInversion && not snapshot.IcmpBlocks.IsEmpty)
+                    let bindingsRemoved oldValues newValues =
+                        not (Set.difference (Set.ofList oldValues) (Set.ofList newValues)).IsEmpty
+                    let structuralNarrowed =
+                        if configuration.Kind = "zone" then
+                            let oldInterfaces, newInterfaces = beforeSnapshot.Interfaces, afterSnapshot.Interfaces
+                            let oldSources, newSources = beforeSnapshot.SourcesRaw, afterSnapshot.SourcesRaw
+                            let bindingChanged =
+                                Set.ofList oldInterfaces <> Set.ofList newInterfaces
+                                || Set.ofList oldSources <> Set.ofList newSources
+                            let bindingRemoved =
+                                bindingsRemoved oldInterfaces newInterfaces
+                                || bindingsRemoved oldSources newSources
+                            let priorityChanged =
+                                beforeSnapshot.IngressPriority <> afterSnapshot.IngressPriority
+                                || beforeSnapshot.EgressPriority <> afterSnapshot.EgressPriority
+                            let forwardingChanged =
+                                beforeSnapshot.Forward <> afterSnapshot.Forward
+                                || beforeSnapshot.Masquerade <> afterSnapshot.Masquerade
+                            let inversionChanged =
+                                beforeSnapshot.IcmpBlockInversion <> afterSnapshot.IcmpBlockInversion
+                                && (not beforeSnapshot.IcmpBlocks.IsEmpty || not afterSnapshot.IcmpBlocks.IsEmpty)
+                            (bindingRemoved && hasManagementGrant beforeSnapshot)
+                            || (bindingChanged
+                                && (hasBlockingSemantics afterSnapshot || not (hasManagementGrant afterSnapshot)))
+                            || (priorityChanged && (hasManagementGrant beforeSnapshot || hasManagementGrant afterSnapshot
+                                                    || hasBlockingSemantics beforeSnapshot || hasBlockingSemantics afterSnapshot))
+                            || forwardingChanged
+                            || inversionChanged
+                        else
+                            let endpointsRemoved =
+                                bindingsRemoved beforeSnapshot.Ingress afterSnapshot.Ingress
+                                || bindingsRemoved beforeSnapshot.Egress afterSnapshot.Egress
+                            let endpointsChanged =
+                                Set.ofList beforeSnapshot.Ingress <> Set.ofList afterSnapshot.Ingress
+                                || Set.ofList beforeSnapshot.Egress <> Set.ofList afterSnapshot.Egress
+                            let priorityChanged = beforeSnapshot.Priority <> afterSnapshot.Priority
+                            let endpointRisk =
+                                endpointsChanged
+                                && (hasBlockingSemantics afterSnapshot
+                                    || (endpointsRemoved && hasManagementGrant beforeSnapshot))
+                            let priorityRisk =
+                                priorityChanged
+                                && (hasBlockingSemantics beforeSnapshot || hasBlockingSemantics afterSnapshot
+                                    || hasManagementGrant beforeSnapshot || hasManagementGrant afterSnapshot)
+                            endpointRisk || priorityRisk || beforeSnapshot.Masquerade <> afterSnapshot.Masquerade
+                    let risk = targetNarrowed || ruleNarrowed || selectorNarrowed || structuralNarrowed
+                    risk && not (configuration.Kind = "zone" && equivalentZoneAdmission environment configuration.Name before after)
+            with _ -> true
 
     let runtimeRepairProof
         (environment: HostEnvironment)
@@ -649,7 +1091,7 @@ module FirewalldRecoveryProof =
             | value -> value.GetValue<string>()
         if isNull node["version"] then fail "Missing firewalld rollback proof version."
         let version = node["version"].GetValue<int>()
-        if not (List.contains version [ 1; 2 ])
+        if not (List.contains version [ 1; 2; 3 ])
            || getString "scope" <> "object"
            || getString "kind" <> configuration.Kind
            || getString "name" <> configuration.Name then
@@ -666,6 +1108,9 @@ module FirewalldRecoveryProof =
             elif strategy = "reload-before" && version = 2 then
                 set [ "version"; "scope"; "kind"; "name"; "strategy"; "beforePresent"; "beforeFingerprint"; "afterPresent"; "afterFingerprint"
                       "beforeInterfaces"; "beforeNativeInterfaces"; "afterInterfaces"; "afterNativeInterfaces" ]
+            elif strategy = "object-delta" && version = 3 then
+                set [ "version"; "scope"; "kind"; "name"; "strategy"; "beforePresent"; "beforeFingerprint"; "afterPresent"; "afterFingerprint"
+                      "beforeInterfaces"; "beforeNativeInterfaces"; "afterInterfaces"; "afterNativeInterfaces"; "deltas"; "stateFingerprints" ]
             elif strategy = "unchanged" && version = 1 then
                 set [ "version"; "scope"; "kind"; "name"; "strategy" ]
             else Set.empty
@@ -691,12 +1136,39 @@ module FirewalldRecoveryProof =
                || (configuration.Kind <> "zone" && not typed.IsEmpty)
                || (not present && not typed.IsEmpty) then
                 fail ("Invalid declared interface evidence for " + label + ".")
-        if strategy = "reload-before" then
+        if strategy = "reload-before" || strategy = "object-delta" then
             validateProjection "before"
             validateProjection "after"
-            if version = 2 then
+            if version >= 2 then
                 validateInterfaceProjection "before" (node["beforePresent"].GetValue<bool>())
                 validateInterfaceProjection "after" (node["afterPresent"].GetValue<bool>())
+        if strategy = "object-delta" then
+            if configuration.Kind <> "zone" && configuration.Kind <> "policy" then
+                fail "Scoped object rollback supports only firewalld zones and policies."
+            if not (node["beforePresent"].GetValue<bool>() && node["afterPresent"].GetValue<bool>()) then
+                fail "Scoped object rollback requires an existing before and after object."
+            let deltas =
+                match node["deltas"] with
+                | :? JsonArray as values -> values
+                | _ -> fail "Missing firewalld object selector delta list."
+            let states =
+                match node["stateFingerprints"] with
+                | :? JsonArray as values -> values
+                | _ -> fail "Missing firewalld object selector checkpoints."
+            if deltas.Count > 4096 || states.Count <> deltas.Count + 1 then
+                fail "Invalid number of firewalld object selector checkpoints."
+            for item in deltas do
+                match item with
+                | :? JsonObject as value ->
+                    let keys = value |> Seq.map (fun pair -> pair.Key) |> Set.ofSeq
+                    if keys <> set [ "field"; "value"; "add"; "effect" ] then
+                        fail "Invalid firewalld object selector delta fields."
+                | _ -> fail "Invalid firewalld object selector delta record."
+            for item in states do
+                if isNull item then fail "Missing firewalld object selector checkpoint."
+                let value = item.GetValue<string>()
+                if not (Regex.IsMatch(value, "^[0-9a-f]{64}$", RegexOptions.CultureInvariant)) then
+                    fail "Invalid firewalld object selector checkpoint fingerprint."
         if strategy = "runtime-delta" && version = 2 then
             let typed, native = readInterfaceEvidence node "declared"
             let expectedTyped, expectedNative = declaredInterfaceEvidence configuration
@@ -765,6 +1237,61 @@ module FirewalldRecoveryProof =
           Version = version
           DeclaredInterfaces = declaredInterfaces
           DeclaredNativeInterfaces = declaredNativeInterfaces }
+    let private decodeObjectRepair
+        (configuration: FirewalldModel.Configuration)
+        (effectiveBefore: string option)
+        (node: JsonObject)
+        =
+        let before =
+            match FirewalldRuntime.snapshotFromXml configuration.Kind configuration.Name effectiveBefore with
+            | Error reason -> fail ("Cannot project the recorded firewalld object preimage: " + reason)
+            | Ok(Some snapshot) when snapshotComplete snapshot -> snapshot
+            | _ -> fail "The recorded firewalld object preimage is absent or incomplete."
+        let afterXml = Some(FieldRuntime.render configuration)
+        let after =
+            match FirewalldRuntime.snapshotFromXml configuration.Kind configuration.Name afterXml with
+            | Error reason -> fail ("Cannot project the recorded firewalld object candidate: " + reason)
+            | Ok(Some snapshot) when snapshotComplete snapshot -> snapshot
+            | _ -> fail "The recorded firewalld object candidate is absent or incomplete."
+        if fingerprint before <> node["beforeFingerprint"].GetValue<string>()
+           || fingerprint after <> node["afterFingerprint"].GetValue<string>()
+           || nonSelectorFingerprint before <> nonSelectorFingerprint after then
+            fail "The scoped firewalld object projection differs from its durable before/after proof."
+        let beforeConfiguration =
+            effectiveBefore
+            |> Option.defaultWith (fun () -> fail "A scoped object inverse requires an existing before object.")
+            |> parseObjectConfiguration configuration.Kind configuration.Name
+        let afterConfiguration = parseObjectConfiguration configuration.Kind configuration.Name (FieldRuntime.render configuration)
+        let deltas =
+            node["deltas"].AsArray()
+            |> Seq.map (fun item ->
+                let value = item.AsObject()
+                let field = value["field"].GetValue<string>()
+                let selectorValue = value["value"].GetValue<string>()
+                let add = value["add"].GetValue<bool>()
+                if not (List.contains field objectSelectorFields)
+                   || String.IsNullOrWhiteSpace selectorValue then
+                    fail "Unsupported selector in firewalld object delta proof."
+                let effect = objectDeltaEffect beforeConfiguration afterConfiguration field selectorValue add
+                if value["effect"].GetValue<string>() <> effectName effect then
+                    fail "Firewalld object delta effect differs from its native selector."
+                { Field = field; Value = selectorValue; Add = add; Effect = effect })
+            |> List.ofSeq
+        let expectedDeltas = deriveObjectDeltas before after beforeConfiguration afterConfiguration
+        let effects = deltas |> List.map (fun delta -> delta.Effect) |> Set.ofList
+        if deltas <> expectedDeltas
+           || sortObjectDeltas deltas <> deltas
+           || effects.Count > 1
+           || (effects = set [ Steers ] && deltas.Length > 1) then
+            fail "Firewalld object delta list is incomplete, duplicated, unordered, or non-monotone."
+        let states = node["stateFingerprints"].AsArray() |> Seq.map (fun item -> item.GetValue<string>()) |> List.ofSeq
+        if states <> objectStateFingerprints before deltas then
+            fail "Firewalld object selector checkpoints do not match their recorded inverse."
+        { Before = before
+          After = after
+          Deltas = deltas
+          StateFingerprints = states }
+
 
     let private checkedCommand (environment: HostEnvironment) arguments =
         let result = environment.Run "firewall-cmd" arguments None
@@ -810,7 +1337,7 @@ module FirewalldRecoveryProof =
         let verifySnapshot (snapshot: FirewalldRuntime.RuntimeSnapshot) =
             if not (snapshotComplete snapshot) then
                 fail ("Effective on-disk firewalld " + label + " target has incomplete selectors.")
-            if version = 2 then
+            if version >= 2 then
                 let expectedTyped, expectedNative = readInterfaceEvidence proof label
                 match interfaceEvidence snapshot with
                 | Some(typed, native) when typed = expectedTyped && native = expectedNative -> ()
@@ -820,7 +1347,7 @@ module FirewalldRecoveryProof =
         match FirewalldRuntime.snapshotFromXml configuration.Kind configuration.Name effectiveXml with
         | Error reason -> fail ("Cannot project the effective on-disk firewalld " + label + " target: " + reason)
         | Ok None when not expectedPresent ->
-            if version = 2 then
+            if version >= 2 then
                 let typed, native = readInterfaceEvidence proof label
                 if not typed.IsEmpty || not native.IsEmpty then
                     fail ("Absent firewalld " + label + " target has interface evidence.")
@@ -853,6 +1380,59 @@ module FirewalldRecoveryProof =
             | "forward-ports" -> "forward-port"
             | _ -> fail "Unsupported selector in firewalld rollback proof."
         [ selector; "--" + action + "-" + optionName + "=" + delta.Value ]
+    let activateReload (environment: HostEnvironment) (configuration: FirewalldModel.Configuration) (proof: JsonObject) =
+        let strategy, node = readProof configuration (Some proof)
+        if strategy <> "reload-before" then fail "Expected a validated daemon reload proof."
+        if not (targetProjectionMatches environment configuration node "before") then
+            fail "Loaded firewalld target changed after staging; refusing a daemon-wide reload that would erase foreign runtime state."
+        match FirewalldRuntime.validateReloadExcludingTargetObject environment configuration.Kind configuration.Name with
+        | Ok () -> ()
+        | Error reason -> fail ("Refusing daemon-wide firewalld activation because non-target runtime state changed after staging: " + reason)
+        checkedCommand environment [ "--check-config" ]
+        checkedCommand environment [ "--reload" ]
+        verifyTargetProjection environment configuration node "after"
+        match FirewalldRuntime.validateReload environment with
+        | Ok () -> ()
+        | Error reason -> fail ("The activated firewalld runtime differs from its staged native projection: " + reason)
+
+    let private objectRepairStateIndex (repair: ObjectRepair) (snapshot: FirewalldRuntime.RuntimeSnapshot) =
+        let values = actualSelectorValues snapshot |> Map.map (fun _ items -> Set.ofList items)
+        let fingerprint = objectStateFingerprint repair.Deltas values
+        repair.StateFingerprints |> List.tryFindIndex ((=) fingerprint)
+
+    let activateObjectDelta
+        (environment: HostEnvironment)
+        (configuration: FirewalldModel.Configuration)
+        (effectiveBefore: string option)
+        (proof: JsonObject)
+        =
+        let strategy, node = readProof configuration (Some proof)
+        if strategy <> "object-delta" then fail "Expected a scoped firewalld object proof."
+        verifyEffectiveProjection configuration effectiveBefore node "before"
+        let repair = decodeObjectRepair configuration effectiveBefore node
+        let mutable current = inspect environment configuration
+        ensureCompleteSnapshot configuration current
+        if not (objectRuntimeNonSelectorsMatch environment repair.Before current) then
+            fail "The firewalld object's structural runtime state changed after staging."
+        let currentIndex =
+            objectRepairStateIndex repair current
+            |> Option.defaultWith (fun () -> fail "Runtime selectors are outside every scoped object checkpoint.")
+        if currentIndex < repair.Deltas.Length then
+            for index in currentIndex .. repair.Deltas.Length - 1 do
+                if objectRepairStateIndex repair current <> Some index
+                   || not (objectRuntimeNonSelectorsMatch environment repair.Before current) then
+                    fail "Runtime selectors or structure changed before the next scoped object step."
+                let delta = repair.Deltas[index]
+                let runtimeDelta = { Field = delta.Field; Value = delta.Value; Effect = delta.Effect }
+                checkedCommand environment (selectorArguments configuration runtimeDelta (if delta.Add then "add" else "remove"))
+                current <- inspect environment configuration
+                ensureCompleteSnapshot configuration current
+                if objectRepairStateIndex repair current <> Some(index + 1)
+                   || not (objectRuntimeNonSelectorsMatch environment repair.Before current) then
+                    fail "firewalld did not apply the recorded scoped object selector step."
+        if not (objectRuntimeMatchesPreimage environment repair.After current) then
+            fail "The activated firewalld object differs from its after projection outside preserved restrictive rich rules."
+
 
     let activateRuntimeRepair (environment: HostEnvironment) (configuration: FirewalldModel.Configuration) (proof: JsonObject) =
         let strategy, node = readProof configuration (Some proof)
@@ -891,7 +1471,24 @@ module FirewalldRecoveryProof =
         (preReload: unit -> unit)
         =
         let strategy, node = readProof configuration proof
-        if strategy = "reload-before" then verifyEffectiveProjection configuration effectiveCurrent node "before"
+        if strategy = "reload-before" || strategy = "object-delta" then
+            verifyEffectiveProjection configuration effectiveCurrent node "before"
+        let loadedBeforeMatches =
+            if phase = FirewalldLifecycle.BootBeforeFirewalld || strategy <> "reload-before" then false
+            else
+                match FirewalldRuntime.snapshotFromXml configuration.Kind configuration.Name effectiveCurrent with
+                | Error reason -> fail ("Cannot project the restored firewalld preimage: " + reason)
+                | Ok None ->
+                    match FirewalldRuntime.queryRuntime environment configuration.Kind configuration.Name with
+                    | Ok None -> true
+                    | Error reason -> fail ("Unable to observe the restored firewalld target: " + reason)
+                    | Ok(Some _) -> false
+                | Ok(Some expected) ->
+                    match FirewalldRuntime.queryRuntime environment configuration.Kind configuration.Name with
+                    | Ok(Some live) ->
+                        matchesLoadedProjectionPreservingRestrictions environment expected live
+                    | Error reason -> fail ("Unable to observe the restored firewalld target: " + reason)
+                    | Ok None -> false
         match phase with
         | FirewalldLifecycle.BootBeforeFirewalld -> ()
         | FirewalldLifecycle.ActiveDaemon | FirewalldLifecycle.BootAfterFirewalld ->
@@ -899,7 +1496,7 @@ module FirewalldRecoveryProof =
             | "unchanged" -> ()
             | "reload-before" ->
                 if phase = FirewalldLifecycle.ActiveDaemon then
-                    if targetProjectionMatches environment configuration node "before" then ()
+                    if loadedBeforeMatches then ()
                     elif targetProjectionMatches environment configuration node "after" then
                         preReload ()
                         match FirewalldRuntime.validateReloadExcludingTargetObject environment configuration.Kind configuration.Name with
@@ -915,11 +1512,36 @@ module FirewalldRecoveryProof =
                         | Error reason -> fail ("The restored firewalld runtime did not match its known-working preimage: " + reason)
                     else
                         fail "Loaded target is neither the saved preimage nor the staged post-state; refusing rollback reload."
-                else
-                    verifyTargetProjection environment configuration node "before"
-                    match FirewalldRuntime.validateReload environment with
-                    | Ok () -> ()
-                    | Error reason -> fail ("Post-boot runtime did not match the restored firewalld preimage: " + reason)
+                elif not loadedBeforeMatches then
+                    fail "Post-boot firewalld did not load the restored target preimage."
+            | "object-delta" ->
+                let repair = decodeObjectRepair configuration effectiveCurrent node
+                let mutable current = inspect environment configuration
+                ensureCompleteSnapshot configuration current
+                if not (objectRuntimeNonSelectorsMatch environment repair.Before current) then
+                    fail "The live firewalld object structure differs from its recorded preimage; refusing a scoped inverse."
+                let currentIndex =
+                    objectRepairStateIndex repair current
+                    |> Option.defaultWith (fun () -> fail "Runtime selectors are outside the recorded scoped object checkpoints.")
+                if phase = FirewalldLifecycle.BootAfterFirewalld && currentIndex <> 0 then
+                    fail "Post-boot firewalld did not load the restored scoped object preimage."
+                if phase = FirewalldLifecycle.ActiveDaemon && currentIndex > 0 then
+                    for index in currentIndex - 1 .. -1 .. 0 do
+                        if objectRepairStateIndex repair current <> Some(index + 1)
+                           || not (objectRuntimeNonSelectorsMatch environment repair.Before current) then
+                            fail "Runtime selectors changed before their recorded scoped inverse."
+                        let delta = repair.Deltas[index]
+                        let runtimeDelta = { Field = delta.Field; Value = delta.Value; Effect = delta.Effect }
+                        checkedCommand environment
+                            (selectorArguments configuration runtimeDelta (if delta.Add then "remove" else "add"))
+                        current <- inspect environment configuration
+                        ensureCompleteSnapshot configuration current
+                        if objectRepairStateIndex repair current <> Some index
+                           || not (objectRuntimeNonSelectorsMatch environment repair.Before current) then
+                            fail "firewalld did not restore the recorded scoped object checkpoint."
+                if not (objectRuntimeNonSelectorsMatch environment repair.Before current)
+                   || objectRepairStateIndex repair current <> Some 0 then
+                    fail "The scoped firewalld object did not return to its recorded runtime preimage."
             | "runtime-delta" ->
                 let repair = decodeRuntimeRepair configuration node
                 let states = repair.StateFingerprints

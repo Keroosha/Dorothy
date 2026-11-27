@@ -450,6 +450,68 @@ type FirewalldRecoveryProofTests() =
             Assert.That(restored["icmp-blocks"], Is.Empty))
 
     [<Test>]
+    member _.``Scoped object inverse preserves a post-stage foreign timed restriction``() =
+        let before =
+            { FirewalldModel.empty "zone" "quiet" with
+                Services = [ "ssh" ] }
+        let after = { before with Ports = [ "8443/tcp" ] }
+        let beforeXml = Some(FieldRuntime.render before)
+        let afterXml = Some(FieldRuntime.render after)
+        let expectedBefore = selectorValues before
+        withSelectorRuntime before expectedBefore (fun environment calls current setCurrent ->
+            let proof = FirewalldRecoveryProof.objectDeltaProof environment after beforeXml afterXml |> Option.get
+            Assert.That(proof["strategy"].GetValue<string>(), Is.EqualTo "object-delta")
+            FirewalldRecoveryProof.activateObjectDelta environment after beforeXml proof
+            let foreignBan = "rule family=\"ipv4\" source address=\"198.51.100.99\" drop"
+            setCurrent (Map.add "rich rules" [ foreignBan ] (current ()))
+            restoreWithoutReload environment after beforeXml (Some proof) FirewalldLifecycle.ActiveDaemon
+            let restored = current ()
+            Assert.That(restored["ports"], Is.Empty)
+            Assert.That(restored["services"], Is.EquivalentTo [ "ssh" ])
+            Assert.That(restored["rich rules"], Is.EquivalentTo [ foreignBan ])
+            Assert.That(calls |> Seq.exists (fun args -> List.contains "--reload" args), Is.False)
+            Assert.That(calls, Does.Contain [ "firewall-cmd"; "--zone=quiet"; "--add-port=8443/tcp" ])
+            Assert.That(calls, Does.Contain [ "firewall-cmd"; "--zone=quiet"; "--remove-port=8443/tcp" ]))
+
+    [<Test>]
+    member _.``Scoped object inverse declines structural projection changes``() =
+        let before = { FirewalldModel.empty "zone" "quiet" with Services = [ "ssh" ] }
+        let after = { before with Target = "ACCEPT" }
+        withSelectorRuntime before (selectorValues before) (fun environment _ _ _ ->
+            let proof =
+                FirewalldRecoveryProof.objectDeltaProof environment after
+                    (Some(FieldRuntime.render before)) (Some(FieldRuntime.render after))
+            Assert.That(proof.IsNone, Is.True))
+
+    [<Test>]
+    member _.``Structural management narrowing is refused while quiet policies and expansions remain usable``() =
+        let environment =
+            { Root = Path.Combine(Path.GetTempPath(), "dorothy-firewalld-structural-gate")
+              Run = fun _ _ _ -> failwith "Policy structural classification must not query the host."
+              UtcNow = fun () -> DateTimeOffset.UnixEpoch }
+        let hostPolicy =
+            { FirewalldModel.empty "policy" "host-policy" with
+                Ingress = [ "ANY" ]
+                Egress = [ "HOST" ] }
+        let blocked = { hostPolicy with Target = "DROP" }
+        let expanded = { hostPolicy with Target = "ACCEPT" }
+        let xml value = Some(FieldRuntime.render value)
+        Assert.That(
+            FirewalldRecoveryProof.objectTransitionMayNarrowManagement environment blocked (xml hostPolicy) (xml blocked),
+            Is.True)
+        Assert.That(
+            FirewalldRecoveryProof.objectTransitionMayNarrowManagement environment expanded (xml hostPolicy) (xml expanded),
+            Is.False)
+        let quiet =
+            { FirewalldModel.empty "policy" "quiet-policy" with
+                Ingress = [ "public" ]
+                Egress = [ "docker" ] }
+        let quietDrop = { quiet with Target = "DROP" }
+        Assert.That(
+            FirewalldRecoveryProof.objectTransitionMayNarrowManagement environment quietDrop (xml quiet) (xml quietDrop),
+            Is.False)
+
+    [<Test>]
     member _.``Native reject zone spelling survives disk and loaded rollback comparison``() =
         // 2.3.1 reports %%REJECT%% in both the vendor zone XML and --list-all.
         let blocked = { configuration with Target = "%%REJECT%%" }
