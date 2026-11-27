@@ -18,7 +18,8 @@ module FirewalldLifecycle =
 
     type NativeUndoProgress =
         { RemainingSteps: int
-          InFlightStep: int option }
+          InFlightStep: int option
+          PreimageVerified: bool }
 
     type UndoJournal =
         { Previous: NativeUndoProgress option
@@ -171,6 +172,8 @@ module FirewalldLifecycle =
                 value["bootId"] <- JsonValue.Create(boot.ToString("D"))
                 value["remainingSteps"] <- JsonValue.Create p.RemainingSteps
                 value["inFlightStep"] <- (match p.InFlightStep with Some i -> JsonValue.Create i :> JsonNode | None -> null)
+                if pending.SchemaVersion >= 5 then
+                    value["preimageVerified"] <- JsonValue.Create p.PreimageVerified
                 value)
             setOptionalObject node "nativeUndo" undo
         node["nonce"] <- JsonValue.Create pending.Nonce
@@ -200,11 +203,13 @@ module FirewalldLifecycle =
         let actual = node |> Seq.map (fun pair -> pair.Key) |> Set.ofSeq
         let version = getInt node "version"
         let fieldsV3 = Set.add "nativeProgress" fieldsV2
-        if (version < 1 || version > 4)
+        let fieldsV4 = Set.add "nativeUndo" fieldsV3
+        if (version < 1 || version > 5)
            || (version = 1 && actual <> fieldsV1)
            || (version = 2 && actual <> fieldsV2)
            || (version = 3 && actual <> fieldsV3)
-           || (version = 4 && actual <> Set.add "nativeUndo" fieldsV3) then
+           || (version = 4 && actual <> fieldsV4)
+           || (version = 5 && actual <> fieldsV4) then
             fail "Invalid firewalld transaction record."
         let nonce = getString node "nonce"
         if not (Regex.IsMatch(nonce, "^[0-9a-f]{32}$", RegexOptions.CultureInvariant)) then fail "Invalid firewalld transaction nonce."
@@ -232,14 +237,21 @@ module FirewalldLifecycle =
         let nativeUndo =
             if version < 4 then None
             else getOptionalObject node "nativeUndo" |> Option.map (fun value ->
-                if (value |> Seq.map _.Key |> Set.ofSeq) <> set [ "bootId"; "remainingSteps"; "inFlightStep" ] || nativeProgress.IsNone || status <> "pending" then
+                let undoFields = set [ "bootId"; "remainingSteps"; "inFlightStep" ]
+                let undoFields = if version >= 5 then Set.add "preimageVerified" undoFields else undoFields
+                if (value |> Seq.map _.Key |> Set.ofSeq) <> undoFields || nativeProgress.IsNone || status <> "pending" then
                     fail "Invalid firewalld native inverse receipt."
                 let remaining = getInt value "remainingSteps"
                 let inFlight = match value["inFlightStep"] with null -> None | step -> Some(step.GetValue<int>())
+                let preimageVerified = if version >= 5 then getBool value "preimageVerified" else false
                 if remaining < 0 || remaining > 4096 || (not awaitingPostBoot && remaining > nativeProgress.Value.CompletedSteps) ||
-                   (inFlight |> Option.exists (fun i -> i < 0 || i <> remaining - 1)) then
+                   (inFlight |> Option.exists (fun i -> i < 0 || i <> remaining - 1)) ||
+                   (preimageVerified && (remaining <> 0 || inFlight.IsSome)) then
                     fail "Invalid firewalld native inverse checkpoint."
-                Guid.ParseExact(getString value "bootId", "D"), { RemainingSteps = remaining; InFlightStep = inFlight })
+                Guid.ParseExact(getString value "bootId", "D"),
+                { RemainingSteps = remaining
+                  InFlightStep = inFlight
+                  PreimageVerified = preimageVerified })
         if version >= 2 && c.Kind = "settings" && scope.IsNone then fail "Invalid firewalld settings transaction scope."
         if activationStarted && rollbackProof.IsNone then fail "Firewalld transaction lacks required runtime rollback proof."
         if awaitingPostBoot && rollbackProof.IsNone then fail "Post-boot recovery lacks a durable inverse."
@@ -324,19 +336,29 @@ module FirewalldLifecycle =
                 receipt)
             let mutable last = previous
             let interrupted = previous |> Option.exists (fun p -> p.InFlightStep.IsSome)
+            let completedForward =
+                transaction.NativeProgress |> Option.exists (fun progress -> progress.CompletedSteps > 0)
+            let freshAuthorityAllowed = transaction.AwaitingPostBoot || completedForward
             let persist (next: NativeUndoProgress) =
                 if interrupted then fail "A new recovery attempt cannot attest an interrupted inverse command."
                 let valid =
-                    match last, next.InFlightStep with
-                    | None, None ->
-                        next.RemainingSteps = 0
-                        && (transaction.NativeProgress |> Option.exists (fun progress -> progress.CompletedSteps > 0))
-                    | None, Some i -> i >= 0 && i < 4096 && next.RemainingSteps = i + 1
-                    | Some prior, Some i -> prior.InFlightStep.IsNone && prior.RemainingSteps = next.RemainingSteps && i >= 0 && i = next.RemainingSteps - 1
-                    | Some prior, None -> prior.InFlightStep = Some next.RemainingSteps && prior.RemainingSteps = next.RemainingSteps + 1
+                    match last, next.InFlightStep, next.PreimageVerified with
+                    | None, None, false ->
+                        freshAuthorityAllowed && next.RemainingSteps = 0
+                    | None, Some i, false ->
+                        freshAuthorityAllowed && i >= 0 && i < 4096 && next.RemainingSteps = i + 1
+                    | Some prior, Some i, false ->
+                        not prior.PreimageVerified && prior.InFlightStep.IsNone && prior.RemainingSteps = next.RemainingSteps
+                        && i >= 0 && i = next.RemainingSteps - 1
+                    | Some prior, None, false ->
+                        not prior.PreimageVerified && prior.InFlightStep = Some next.RemainingSteps
+                        && prior.RemainingSteps = next.RemainingSteps + 1
+                    | Some prior, None, true ->
+                        not prior.PreimageVerified && prior.InFlightStep.IsNone && prior.RemainingSteps = 0
+                        && next.RemainingSteps = 0
                     | _ -> false
                 if not valid then fail "Invalid transition of durable native inverse authority."
-                savePending environment { transaction with NativeUndo = Some(boot.Value, next) }
+                savePending environment { transaction with SchemaVersion = 5; NativeUndo = Some(boot.Value, next) }
                 last <- Some next
             Some { Previous = previous; Persist = persist }
 
@@ -443,11 +465,19 @@ module FirewalldLifecycle =
                 restoreRuntime transaction BootAfterFirewalld
             | BootAfterFirewalld -> fail "Post-boot recovery lacks the ordered preboot reservation."
             | _ ->
-                let unstartedNativeRepair =
-                    transaction.NativeProgress
-                    |> Option.exists (fun progress -> progress.CompletedSteps = 0)
-                if phase = ActiveDaemon && transaction.AwaitingPostBoot && transaction.NativeUndo.IsNone && unstartedNativeRepair then
-                    fail "Ordered post-boot recovery must verify the native repair before active recovery can retire it."
+                let hasNativeRepair =
+                    transaction.NativeProgress.IsSome
+                    || (transaction.RollbackProof
+                        |> Option.exists (fun proof ->
+                            match proof["strategy"] with
+                            | null -> false
+                            | strategy -> List.contains (strategy.GetValue<string>()) [ "object-delta"; "runtime-delta" ]))
+                if phase = ActiveDaemon && transaction.AwaitingPostBoot && hasNativeRepair then
+                    let hasCurrentBootUndo =
+                        transaction.NativeUndo
+                        |> Option.exists (fun (generation, _) -> generation = bootId environment)
+                    if not hasCurrentBootUndo then
+                        fail "Ordered post-boot recovery must verify the native repair before active recovery can retire it."
                 restoreRuntime transaction phase
         if not (needsBootInverse && phase = BootBeforeFirewalld) then
             match journal with
@@ -751,7 +781,7 @@ module FirewalldLifecycle =
         =
         if path <> expectedPath c then fail "Firewalld transaction path does not match its declared object."
         let owner = journalOwner journal
-        { SchemaVersion = 4
+        { SchemaVersion = 5
           Nonce = Guid.NewGuid().ToString("N")
           OwnerId = owner
           Configuration = c
@@ -882,7 +912,7 @@ module FirewalldLifecycle =
                 reconcileRecoveryUnits environment
             with cleanupError ->
                 fail ("Firewalld apply failed and was rolled back, but recovery-unit cleanup failed: " + diagnostic cleanupError.Message)
-            fail ("Firewalld apply failed; the permanent preimage and recorded working runtime were restored: " + diagnostic originalError.Message)
+            fail ("Firewalld apply failed; rollback completed for this transaction: " + diagnostic originalError.Message)
         transaction.Nonce
 
     let recover

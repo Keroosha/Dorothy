@@ -474,11 +474,12 @@ type FirewalldRecoveryProofTests() =
             let retired = receipt |> Option.defaultWith (fun () -> failwith "Expected durable preimage retirement")
             Assert.That(retired.RemainingSteps, Is.Zero)
             Assert.That(retired.InFlightStep, Is.EqualTo None)
-            Assert.That(persisted, Is.EqualTo 1)
+            Assert.That(retired.PreimageVerified, Is.True)
+            let writesAfterVerification = persisted
             Assert.That(removeCount (), Is.Zero)
             setCurrent afterValues
             restore (Some retired)
-            Assert.That(persisted, Is.EqualTo 1)
+            Assert.That(persisted, Is.EqualTo writesAfterVerification)
             Assert.That(removeCount (), Is.Zero)
             Assert.That(current (), Is.EqualTo(box afterValues)))
 
@@ -510,11 +511,12 @@ type FirewalldRecoveryProofTests() =
             let retired = receipt |> Option.defaultWith (fun () -> failwith "Expected durable preimage retirement")
             Assert.That(retired.RemainingSteps, Is.Zero)
             Assert.That(retired.InFlightStep, Is.EqualTo None)
-            Assert.That(persisted, Is.EqualTo 1)
+            Assert.That(retired.PreimageVerified, Is.True)
+            let writesAfterVerification = persisted
             Assert.That(removeCount (), Is.Zero)
             setCurrent afterValues
             restore (Some retired)
-            Assert.That(persisted, Is.EqualTo 1)
+            Assert.That(persisted, Is.EqualTo writesAfterVerification)
             Assert.That(removeCount (), Is.Zero)
             Assert.That(current (), Is.EqualTo(box afterValues)))
 
@@ -570,6 +572,98 @@ type FirewalldRecoveryProofTests() =
             Assert.That(
                 calls |> Seq.exists (fun args -> args |> List.exists (fun value -> value.StartsWith("--remove-", StringComparison.Ordinal))),
                 Is.True))
+
+    [<TestCase(false); TestCase(true)>]
+    member _.``Spent inverse cannot certify an unrelated missing grant, even on retry``(runtimeOnly: bool) =
+        let before = { FirewalldModel.empty "zone" "quiet" with Ports = ["443/tcp"] }
+        let after = { before with Ports = ["443/tcp"; "8443/tcp"] }
+        let disk = if runtimeOnly then after else before
+        let xml = Some(FieldRuntime.render disk)
+        let preimage = selectorValues before
+        withSelectorRuntimeProgress disk preimage (fun env calls current setCurrent report forward ->
+            let proof =
+                if runtimeOnly then
+                    FirewalldRecoveryProof.runtimeRepairProof env after (FirewalldRuntime.inspectRuntime env "zone" "quiet" |> Option.get)
+                else FirewalldRecoveryProof.objectDeltaProof env after xml (Some(FieldRuntime.render after)) |> Option.get
+            if runtimeOnly then FirewalldRecoveryProof.activateRuntimeRepairWithProgress env after proof report
+            else FirewalldRecoveryProof.activateObjectDeltaWithProgress env after xml proof report
+            let mutable saved = None
+            let restore () =
+                FirewalldRecoveryProof.restoreRuntimeWithProgress env after xml (Some proof) FirewalldLifecycle.ActiveDaemon
+                    (fun () -> Assert.Fail "No reload") (forward ()) (Some { Previous = saved; Persist = fun r -> saved <- Some r })
+            calls.Clear()
+            setCurrent (Map.add "ports" [] preimage)
+            for _ in 1..2 do
+                Assert.Throws<InvalidOperationException>(TestDelegate restore) |> ignore
+                Assert.That(saved.Value.RemainingSteps, Is.Zero)
+                Assert.That(saved.Value.PreimageVerified, Is.False)
+                Assert.That((current ())["ports"], Is.Empty)
+            // Resolving an unrelated mismatch is the independent owner's job.
+            setCurrent preimage
+            restore ()
+            Assert.That(saved.Value.PreimageVerified, Is.True)
+            Assert.That(calls |> Seq.exists (List.exists (fun a -> a.StartsWith("--add-") || a.StartsWith("--remove-"))), Is.False))
+
+    [<TestCase(false); TestCase(true)>]
+    member _.``A pristine active transaction preserves foreign membership while an ambiguous forward holds``(runtimeOnly: bool) =
+        let before = FirewalldModel.empty "zone" "quiet"
+        let after = { before with Ports = [ "8443/tcp" ] }
+        let disk = if runtimeOnly then after else before
+        let xml = Some(FieldRuntime.render disk)
+        withSelectorRuntimeProgress disk (selectorValues before) (fun env calls current setCurrent _ _ ->
+            let proof =
+                if runtimeOnly then
+                    FirewalldRecoveryProof.runtimeRepairProof env after (FirewalldRuntime.inspectRuntime env "zone" "quiet" |> Option.get)
+                else FirewalldRecoveryProof.objectDeltaProof env after xml (Some(FieldRuntime.render after)) |> Option.get
+            setCurrent (selectorValues after)
+            calls.Clear()
+            let recover flight =
+                FirewalldRecoveryProof.restoreRuntimeWithProgress env after xml (Some proof) FirewalldLifecycle.ActiveDaemon
+                    (fun () -> Assert.Fail "No reload") (Some { CompletedSteps = 0; InFlightStep = flight })
+                    (Some { Previous = None; Persist = fun _ -> Assert.Fail "No inverse authority" })
+            recover None
+            Assert.Throws<InvalidOperationException>(fun () -> recover (Some 0)) |> ignore
+            Assert.That((current ())["ports"], Is.EqualTo(box ["8443/tcp"]))
+            Assert.That(calls |> Seq.exists (List.exists (fun a -> a.StartsWith("--add-") || a.StartsWith("--remove-"))), Is.False))
+
+    [<Test>]
+    member _.``Ordered postboot first sees working runtime with pristine forward progress``() =
+        let before = selectorValues configuration |> Map.add "ports" []
+        withSelectorRuntimeProgress configuration before (fun env calls current setCurrent _ _ ->
+            let proof = FirewalldRecoveryProof.runtimeRepairProof env configuration (FirewalldRuntime.inspectRuntime env "zone" "quiet" |> Option.get)
+            let mutable saved = None
+            let recover () =
+                FirewalldRecoveryProof.restoreRuntimeWithProgress env configuration None (Some proof) FirewalldLifecycle.BootAfterFirewalld
+                    (fun () -> Assert.Fail "No reload") (Some { CompletedSteps = 0; InFlightStep = None })
+                    (Some { Previous = saved; Persist = fun r -> saved <- Some r })
+            recover ()
+            Assert.That(saved.Value.RemainingSteps, Is.Zero)
+            Assert.That(saved.Value.PreimageVerified, Is.True)
+            setCurrent (selectorValues configuration)
+            recover ()
+            Assert.That(current (), Is.EqualTo(box (selectorValues configuration)))
+            Assert.That(calls |> Seq.exists (List.exists (fun a -> a.StartsWith("--remove-"))), Is.False))
+
+    [<TestCase(false); TestCase(true)>]
+    member _.``An intermediate native checkpoint is not ordered startup evidence``(runtimeOnly: bool) =
+        let before = { FirewalldModel.empty "zone" "quiet" with Ports = ["443/tcp"] }
+        let after = { before with Ports = ["443/tcp"; "8443/tcp"; "9443/tcp"] }
+        let disk = if runtimeOnly then after else before
+        let xml = Some(FieldRuntime.render disk)
+        withSelectorRuntimeProgress disk (selectorValues before) (fun env calls current setCurrent _ _ ->
+            let proof =
+                if runtimeOnly then
+                    FirewalldRecoveryProof.runtimeRepairProof env after (FirewalldRuntime.inspectRuntime env "zone" "quiet" |> Option.get)
+                else FirewalldRecoveryProof.objectDeltaProof env after xml (Some(FieldRuntime.render after)) |> Option.get
+            let midpoint = selectorValues { before with Ports = ["443/tcp"; "8443/tcp"] }
+            setCurrent midpoint
+            calls.Clear()
+            Assert.Throws<InvalidOperationException>(fun () ->
+                FirewalldRecoveryProof.restoreRuntimeWithProgress env after xml (Some proof) FirewalldLifecycle.BootAfterFirewalld
+                    (fun () -> Assert.Fail "No reload") (Some { CompletedSteps = 0; InFlightStep = None })
+                    (Some { Previous = None; Persist = fun _ -> Assert.Fail "No startup checkpoint" })) |> ignore
+            Assert.That(current (), Is.EqualTo(box midpoint))
+            Assert.That(calls |> Seq.exists (List.exists (fun a -> a.StartsWith("--add-") || a.StartsWith("--remove-"))), Is.False))
 
     [<Test>]
     member _.``Runtime repair refuses multiple or foreign selector changes before mutation``() =
@@ -1041,9 +1135,17 @@ type FirewalldRecoveryProofTests() =
             setCurrent (selectorValues after)
             let writes () = calls |> Seq.filter (List.exists (fun arg -> arg.StartsWith("--remove-rich-rule="))) |> Seq.length
             let beforeRetry = writes ()
-            let retry () = restore { Previous = saved; Persist = fun _ -> Assert.Fail "A retry spent authority already relinquished." }
-            if completionStored then retry ()
-            else Assert.Throws<InvalidOperationException>(TestDelegate retry) |> ignore
+            let retry () = restore { Previous = saved; Persist = fun receipt -> saved <- Some receipt }
+            // Either the native result is ambiguous, or mutation authority is
+            // exhausted but the full preimage was never durably verified.
+            Assert.Throws<InvalidOperationException>(TestDelegate retry) |> ignore
+            if completionStored then
+                Assert.That(saved.Value.PreimageVerified, Is.False)
+                setCurrent (selectorValues before)
+                retry ()
+                Assert.That(saved.Value.PreimageVerified, Is.True)
+                setCurrent (selectorValues after)
+                retry ()
             Assert.That(writes (), Is.EqualTo beforeRetry)
             Assert.That((current ())["rich rules"], Is.EquivalentTo((selectorValues after)["rich rules"])))
 

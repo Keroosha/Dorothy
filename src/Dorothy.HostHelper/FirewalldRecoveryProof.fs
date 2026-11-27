@@ -2028,52 +2028,57 @@ module FirewalldRecoveryProof =
             fail ("Firewalld native activation command emitted stderr; refusing to attribute the selector change: " + String.concat " " arguments)
         if result.Stdout.Trim() <> "success" then
             fail ("Firewalld native activation command did not confirm a selector change: " + String.concat " " arguments)
-    let private attributableStepCount
-        (progress: FirewalldLifecycle.NativeActivationProgress option)
-        (currentIndex: int)
-        (maximumSteps: int)
-        =
-        match progress with
-        | None when currentIndex = 0 -> 0
-        | None -> fail "A later firewalld selector checkpoint has no durable native command attribution."
-        | Some value when value.CompletedSteps < 0 || value.CompletedSteps > maximumSteps ->
-            fail "Invalid durable firewalld native activation progress."
-        | Some value ->
-            match value.InFlightStep with
-            | Some index when index < 0 || index >= maximumSteps || index <> value.CompletedSteps ->
-                fail "Invalid in-flight firewalld native activation progress."
-            | Some index when currentIndex > index ->
-                fail "The live firewalld selector may include a command without a confirmed native success."
-            | _ when currentIndex = value.CompletedSteps -> currentIndex
-            | _ -> fail "The live firewalld selector differs from the last durably attributed native checkpoint."
+    // Authority to issue a command and evidence permitting cleanup are distinct.
+    // This decision is made once under the writer lock, for both delta strategies.
+    type private ScopedRecovery =
+        | NeverActivated
+        | AlreadyVerified
+        | VerifyOnly
+        | Resume of remaining: int
+        | ActiveForward of completed: int
+        | OrderedStartup
 
-    let private remainingUndo
-        (tracking: FirewalldLifecycle.UndoJournal option)
-        current
-        maximum
-        hasCompletedForward
-        initial
-        =
-        match tracking with
-        | Some { Previous = Some receipt } ->
-            if receipt.InFlightStep.IsSome then
-                fail "The previous firewalld inverse command has no confirmed outcome; refusing to issue it again."
-            if receipt.RemainingSteps <> current || receipt.RemainingSteps > maximum then
-                fail "The live firewalld checkpoint differs from the durable inverse cursor; independent changes are not ours."
-            receipt.RemainingSteps
-        | Some { Previous = None; Persist = persist } when current = 0 && hasCompletedForward ->
-            persist { RemainingSteps = 0; InFlightStep = None }
+    let private scopedRecovery phase (progress: FirewalldLifecycle.NativeActivationProgress option)
+                               (tracking: FirewalldLifecycle.UndoJournal option) =
+        match tracking |> Option.bind _.Previous with
+        | Some r when r.InFlightStep.IsSome ->
+            fail "The previous firewalld inverse command has no confirmed outcome; refusing to issue it again."
+        | Some r when r.RemainingSteps = 0 -> if r.PreimageVerified then AlreadyVerified else VerifyOnly
+        | Some r -> Resume r.RemainingSteps
+        | None ->
+            match phase, progress with
+            | FirewalldLifecycle.BootAfterFirewalld, _ -> OrderedStartup
+            | FirewalldLifecycle.ActiveDaemon, Some p when p.InFlightStep.IsSome ->
+                fail "A native forward command has no confirmed outcome; refusing an active inverse."
+            | FirewalldLifecycle.ActiveDaemon, Some p when p.CompletedSteps = 0 -> NeverActivated
+            | FirewalldLifecycle.ActiveDaemon, Some p -> ActiveForward p.CompletedSteps
+            | _ -> fail "No durable native command attribution exists for scoped recovery."
+
+    let private persistUndo (tracking: FirewalldLifecycle.UndoJournal option) remaining flight verified =
+        let journal = tracking |> Option.defaultWith (fun () -> fail "A durable inverse journal is required.")
+        journal.Persist { RemainingSteps = remaining; InFlightStep = flight; PreimageVerified = verified }
+
+    let private remainingUndo state tracking current maximum startupIndex =
+        match state with
+        | VerifyOnly -> 0
+        | Resume count when count = current && count > 0 && count <= maximum -> count
+        | Resume _ -> fail "The live firewalld checkpoint differs from the durable inverse cursor; independent changes are not ours."
+        | ActiveForward n when n < 1 || n > maximum -> fail "Invalid durable firewalld native activation progress."
+        | (ActiveForward _ | OrderedStartup) when current = 0 ->
+            // Irrevocably relinquish even if the independent, full observation
+            // below fails. A retry has only read authority until reconciliation.
+            persistUndo tracking 0 None false
             0
-        | Some { Previous = None } when current = 0 -> 0
-        | Some _ -> initial ()
-        | None when current = 0 -> 0
-        | None -> fail "Legacy firewalld progress cannot identify a previous inverse; refusing a native write."
+        | ActiveForward n when n = current -> n
+        | OrderedStartup when current = startupIndex -> current
+        | OrderedStartup -> fail "Post-boot firewalld is outside the authenticated startup checkpoint."
+        | ActiveForward _ -> fail "The live firewalld selector differs from the last durably attributed native checkpoint."
+        | AlreadyVerified | NeverActivated -> fail "A cleanup-only state cannot authorize native rollback."
 
     let private undoStep (tracking: FirewalldLifecycle.UndoJournal option) index commandAndVerify =
-        let journal = tracking |> Option.defaultWith (fun () -> fail "A durable inverse journal is required.")
-        journal.Persist { RemainingSteps = index + 1; InFlightStep = Some index }
+        persistUndo tracking (index + 1) (Some index) false
         commandAndVerify ()
-        journal.Persist { RemainingSteps = index; InFlightStep = None }
+        persistUndo tracking index None false
 
     let private objectRepairStateIndex (repair: ObjectRepair) (snapshot: FirewalldRuntime.RuntimeSnapshot) =
         let values = objectSelectorValues snapshot |> Map.map (fun _ items -> Set.ofList items)
@@ -2220,14 +2225,14 @@ module FirewalldRecoveryProof =
         match phase with
         | FirewalldLifecycle.BootBeforeFirewalld -> ()
         | FirewalldLifecycle.ActiveDaemon | FirewalldLifecycle.BootAfterFirewalld ->
-            match strategy with
-            | "unchanged" -> ()
-            | ("object-delta" | "runtime-delta") when
-                    tracking |> Option.bind _.Previous |> Option.exists (fun p -> p.RemainingSteps = 0 && p.InFlightStep.IsNone) ->
-                // Authority is exhausted even if a foreign writer subsequently
-                // introduced an identical selector.
-                ()
-            | "reload-before" ->
+            let state =
+                if strategy = "object-delta" || strategy = "runtime-delta" then Some(scopedRecovery phase progress tracking)
+                else None
+            match strategy, state with
+            | "unchanged", _ -> ()
+            | _, Some NeverActivated -> () // The helper has no runtime effect to restore or verify.
+            | _, Some AlreadyVerified -> () // Only owner cleanup remains from this boot's verified observation.
+            | "reload-before", _ ->
                 if phase = FirewalldLifecycle.ActiveDaemon then
                     if loadedBeforeMatches then ()
                     elif targetProjectionMatches environment configuration node "after" then
@@ -2248,7 +2253,7 @@ module FirewalldRecoveryProof =
                         fail "Loaded target is neither the saved preimage nor the staged post-state; refusing rollback reload."
                 elif not loadedBeforeMatches then
                     fail "Post-boot firewalld did not load the restored target preimage."
-            | "object-delta" ->
+            | "object-delta", Some origin ->
                 let repair = decodeObjectRepair configuration effectiveCurrent node
                 let mutable current = inspect environment configuration
                 ensureCompleteSnapshot configuration current
@@ -2258,19 +2263,8 @@ module FirewalldRecoveryProof =
                 let inverseOnlyNarrows =
                     repair.Deltas
                     |> List.forall (fun delta -> inverseEffect delta.Effect = Restricts)
-                let allowForeignInterfaces =
-                    phase = FirewalldLifecycle.ActiveDaemon && currentIndex > 0 && inverseOnlyNarrows
-                if not (objectRuntimeRollbackStructureMatches environment repair.Before current allowForeignInterfaces) then
-                    fail "The live firewalld object structure differs from its recorded preimage; refusing a scoped inverse."
-                if phase = FirewalldLifecycle.BootAfterFirewalld && currentIndex <> 0 then
-                    fail "Post-boot firewalld did not load the restored scoped object preimage."
-                let inverseCount =
-                    remainingUndo tracking currentIndex repair.Deltas.Length
-                        (progress |> Option.exists (fun value -> value.CompletedSteps > 0))
-                        (fun () ->
-                            if phase = FirewalldLifecycle.BootAfterFirewalld then 0
-                            elif currentIndex = 0 then 0
-                            else attributableStepCount progress currentIndex repair.Deltas.Length)
+                let inverseCount = remainingUndo origin tracking currentIndex repair.Deltas.Length 0
+                let allowForeignInterfaces = phase = FirewalldLifecycle.ActiveDaemon && inverseCount > 0 && inverseOnlyNarrows
                 if inverseCount > 0 then
                     for index in inverseCount - 1 .. -1 .. 0 do
                         if objectRepairStateIndex repair current <> Some(index + 1)
@@ -2290,28 +2284,30 @@ module FirewalldRecoveryProof =
                     else objectRuntimeMatchesPreimage environment repair.Before current
                 if not returnedToPreimage || objectRepairStateIndex repair current <> Some 0 then
                     fail "The scoped firewalld object did not return to its recorded runtime preimage."
-            | "runtime-delta" ->
+                persistUndo tracking 0 None true
+            | "runtime-delta", Some origin ->
                 let repair = decodeRuntimeRepair configuration node
                 let states = repair.StateFingerprints
                 let lastIndex = repair.Deltas.Length
                 let mutable current = inspect environment configuration
                 ensureCompleteSnapshot configuration current
-                let currentIndex =
-                    ownedFingerprintForRepair environment configuration repair current
-                    |> fun hash ->
-                        states
-                        |> List.tryFindIndex ((=) hash)
-                        |> Option.defaultWith (fun () -> fail "Runtime owned selectors are outside the recorded repair checkpoints.")
-                if phase = FirewalldLifecycle.BootAfterFirewalld && (tracking |> Option.bind _.Previous).IsNone && currentIndex <> 0 && currentIndex <> lastIndex then
-                    fail "Post-boot firewalld did not load the staged permanent candidate; refusing an unproved inverse."
-                observeAdjusted environment configuration current
+                let atPreimage () = ownedFingerprintForRepair environment configuration repair current = states.Head
                 let inverseCount =
-                    remainingUndo tracking currentIndex lastIndex
-                        (progress |> Option.exists (fun value -> value.CompletedSteps > 0))
-                        (fun () ->
-                            if phase = FirewalldLifecycle.BootAfterFirewalld then currentIndex
-                            elif currentIndex > 0 then attributableStepCount progress currentIndex lastIndex
-                            else 0)
+                    if origin = VerifyOnly then 0
+                    else
+                        // A missing independent grant changes the full hash, not
+                        // the fact that all additions are already absent. Retire
+                        // that authority before trying to certify the full hash.
+                        let values = actualSelectorValues current
+                        let atZero = repair.Deltas |> List.forall (fun d -> not (List.contains d.Value values[d.Field]))
+                        let index =
+                            if atZero then 0
+                            else
+                                let hash = ownedFingerprintForRepair environment configuration repair current
+                                states |> List.tryFindIndex ((=) hash)
+                                |> Option.defaultWith (fun () -> fail "Runtime owned selectors are outside the recorded repair checkpoints.")
+                        remainingUndo origin tracking index lastIndex lastIndex
+                observeAdjusted environment configuration current
                 if inverseCount > 0 then
                     for index = inverseCount - 1 downto 0 do
                         if ownedFingerprintForRepair environment configuration repair current <> states[index + 1] then
@@ -2323,4 +2319,7 @@ module FirewalldRecoveryProof =
                             if ownedFingerprintForRepair environment configuration repair current <> states[index] then
                                 fail "firewalld did not restore the recorded selector checkpoint."
                             observeAdjusted environment configuration current)
+                if not (atPreimage ()) then
+                    fail "The working runtime preimage is unverified; reconcile the independent change and retry without replaying native selectors."
+                persistUndo tracking 0 None true
             | _ -> fail "Invalid firewalld recovery strategy."
