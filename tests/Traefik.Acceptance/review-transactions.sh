@@ -547,11 +547,16 @@ if [[ \${0##*/} == busctl && " \$* " == *' RestartUnit ss keroosha-traefik.servi
     /usr/bin/busctl "\$@" > "\$root/job-original.reply"
     job=\$(sed -n 's,^o "/org/freedesktop/systemd1/job/\\([0-9]*\\)"$,\\1,p' "\$root/job-original.reply")
     [[ -n \$job ]]
+    started=
     for _ in {1..60}; do
-        /usr/bin/journalctl -b _PID=1 UNIT=keroosha-traefik.service JOB_ID="\$job" JOB_RESULT=done -n1 -o json --no-pager | jq -e .INVOCATION_ID >/dev/null && break
+        started=\$(/usr/bin/journalctl -b _PID=1 UNIT=keroosha-traefik.service JOB_ID="\$job" JOB_TYPE=start JOB_RESULT=done MESSAGE_ID=39f53479d3a045ac8e11786248231fbf -n1 -o json --no-pager | jq -er .INVOCATION_ID) && [[ \$started =~ ^[0-9a-f]{32}$ ]] && break
         sleep .1
     done
+    [[ \$started =~ ^[0-9a-f]{32}$ && \$(/usr/bin/systemctl show keroosha-traefik.service -p InvocationID --value) == "\$started" ]]
     /usr/bin/systemctl restart keroosha-traefik.service
+    replaced=\$(/usr/bin/systemctl show keroosha-traefik.service -p InvocationID --value)
+    [[ \$replaced =~ ^[0-9a-f]{32}$ && \$replaced != "\$started" ]]
+    printf '%s\\n' "\$started" "\$replaced" > "\$root/logs/replaced-invocations"
     rm -- "\$root/.job-substitute"; cat "\$root/job-original.reply"; exit 0
 fi
 if [[ \${0##*/} == busctl && " \$* " == *' RestartUnit ss keroosha-traefik.service fail '* && -e "\$root/.restart-interrupt-pending" ]]; then
