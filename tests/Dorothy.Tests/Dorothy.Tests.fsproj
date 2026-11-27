@@ -23,6 +23,7 @@
     <Compile Include="UfwBackendTests.fs" />
     <Compile Include="FirewalldCommandFixture.fs" />
     <Compile Include="FirewalldSettingsTests.fs" />
+    <Compile Include="FirewalldCreateReceiptTests.fs" />
     <Compile Include="FirewalldTests.fs" />
     <Compile Include="FirewalldGuardTests.fs" />
     <Compile Include="FirewalldBindingTransferTests.fs" />

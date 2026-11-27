@@ -387,8 +387,10 @@ type FirewalldRuntimeTests() =
         let output =
             zoneOutput "ssh" "192.0.2.0/24 02:00:00:00:00:01 ipset:trusted" [ "port=443:proto=tcp:toport=8443:toaddr=192.0.2.9"; "port=8080:proto=udp:toport=None:toaddr=2001:db8::3" ] [ rule ]
         let run executable arguments _ =
-            if executable = "firewall-cmd" && arguments = [ "--zone=quiet"; "--list-all" ] then commandResult output
-            else failwith "Unexpected fixture command."
+            match executable, arguments with
+            | "firewall-cmd", [ "--zone=quiet"; "--list-all" ] -> commandResult output
+            | "firewall-cmd", [ "--zone=quiet"; "--list-interfaces" ] -> commandResult ""
+            | _ -> failwith "Unexpected fixture command."
         let environment, root = makeEnvironment run
         try
             Directory.CreateDirectory root |> ignore

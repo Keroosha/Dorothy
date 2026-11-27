@@ -19,7 +19,10 @@ module FirewalldRecoveryProof =
 
     type private RuntimeRepair =
         { Deltas: RuntimeDelta list
-          StateFingerprints: string list }
+          StateFingerprints: string list
+          Version: int
+          DeclaredInterfaces: string list
+          DeclaredNativeInterfaces: string list }
 
     let private fail message = raise (InvalidOperationException(message))
 
@@ -152,6 +155,66 @@ module FirewalldRecoveryProof =
         && snapshotComplete right
         && fingerprint left = fingerprint right
 
+    let private interfaceEvidence (snapshot: FirewalldRuntime.RuntimeSnapshot) =
+        if snapshot.Kind <> "zone" then Some([], [])
+        else
+            match Map.tryFind "interfaces" snapshot.NativeFields with
+            | None -> None
+            | Some nativeValues ->
+                let typed =
+                    FirewalldRuntime.normalizeFieldValues "zone" "interfaces" snapshot.Interfaces
+                    |> sorted
+                let native =
+                    FirewalldRuntime.normalizeFieldValues "zone" "interfaces" nativeValues
+                    |> sorted
+                if typed = native then Some(typed, native) else None
+
+    let private projectLiveInterfaces
+        (environment: HostEnvironment)
+        (declaredInterfaces: string list)
+        (actualLive: FirewalldRuntime.RuntimeSnapshot)
+        =
+        if actualLive.Kind <> "zone" then Some actualLive
+        else
+            match interfaceEvidence actualLive with
+            | None -> None
+            | Some(liveInterfaces, _) when Set.isSubset (Set.ofList declaredInterfaces) (Set.ofList liveInterfaces) ->
+                let declared = Set.ofList declaredInterfaces
+                let extra = Set.difference (Set.ofList liveInterfaces) declared
+                let networkManagerOwned =
+                    extra
+                    |> Set.forall (fun interfaceName ->
+                        FirewalldRuntime.networkManagerAssignsZone environment interfaceName actualLive.Name)
+                if not networkManagerOwned then None
+                else
+                    let nativeValue =
+                        if declaredInterfaces.IsEmpty then []
+                        else [ String.concat " " declaredInterfaces ]
+                    Some
+                        { actualLive with
+                            Interfaces = declaredInterfaces
+                            NativeFields = Map.add "interfaces" nativeValue actualLive.NativeFields }
+            | Some _ -> None
+
+    /// Compares a live snapshot to the effective disk projection after proving
+    /// that only firewalld interfaces assigned by NetworkManager are added.
+    let matchesLoadedProjection
+        (environment: HostEnvironment)
+        (expectedDiskSnapshot: FirewalldRuntime.RuntimeSnapshot)
+        (actualLive: FirewalldRuntime.RuntimeSnapshot)
+        : bool =
+        if expectedDiskSnapshot.Kind <> actualLive.Kind
+           || expectedDiskSnapshot.Name <> actualLive.Name
+           || not (snapshotComplete expectedDiskSnapshot)
+           || not (snapshotComplete actualLive) then false
+        else
+            match interfaceEvidence expectedDiskSnapshot with
+            | None -> false
+            | Some(declaredInterfaces, _) ->
+                projectLiveInterfaces environment declaredInterfaces actualLive
+                |> Option.exists (snapshotsEqual expectedDiskSnapshot)
+
+
     let private elementAttribute key (element: FirewalldModel.Element) =
         Map.tryFind key element.Attributes
 
@@ -159,6 +222,14 @@ module FirewalldRecoveryProof =
         configuration.Elements
         |> List.filter (fun element -> element.Name = name)
         |> List.choose (elementAttribute key)
+    let private declaredInterfaceEvidence (configuration: FirewalldModel.Configuration) =
+        if configuration.Kind <> "zone" then [], []
+        else
+            let declared =
+                configuration.Interfaces @ directValues configuration "interface" "name"
+                |> FirewalldRuntime.normalizeFieldValues "zone" "interfaces"
+                |> sorted
+            declared, declared
 
     let private directPorts (configuration: FirewalldModel.Configuration) name =
         configuration.Elements
@@ -244,7 +315,7 @@ module FirewalldRecoveryProof =
             else current |> List.filter ((<>) delta.Value)
         setRuntimeField configuration snapshot delta.Field next
 
-    let private ownedFingerprint
+    let private ownedFingerprintRaw
         (configuration: FirewalldModel.Configuration)
         (snapshot: FirewalldRuntime.RuntimeSnapshot)
         =
@@ -253,9 +324,39 @@ module FirewalldRecoveryProof =
             snapshot.RichRules
             |> List.filter (fun rule -> Set.contains rule expectedRich)
             |> sorted
-        // Complete-snapshot checks validate NativeFields; step hashes use the canonical
-        // typed projection rather than duplicate CLI formatting for those same values.
         fingerprint { snapshot with RichRules = ownedRich; NativeFields = Map.empty }
+
+    let private ownedFingerprint
+        (environment: HostEnvironment)
+        (configuration: FirewalldModel.Configuration)
+        (declaredInterfaces: string list)
+        (snapshot: FirewalldRuntime.RuntimeSnapshot)
+        =
+        let snapshot =
+            if configuration.Kind = "zone" then
+                projectLiveInterfaces environment declaredInterfaces snapshot
+                |> Option.defaultWith (fun () -> fail "Runtime interfaces are missing declared bindings or contain non-NetworkManager extras.")
+            else snapshot
+        let expectedRich = expectedSelectorValues configuration |> Map.find "rich rules" |> Set.ofList
+        let ownedRich =
+            snapshot.RichRules
+            |> List.filter (fun rule -> Set.contains rule expectedRich)
+            |> sorted
+        let nativeFields =
+            if configuration.Kind = "zone" then
+                let interfaces = if declaredInterfaces.IsEmpty then [] else [ String.concat " " declaredInterfaces ]
+                Map.ofList [ "interfaces", interfaces ]
+            else Map.empty
+        fingerprint { snapshot with RichRules = ownedRich; NativeFields = nativeFields }
+
+    let private ownedFingerprintForRepair
+        (environment: HostEnvironment)
+        (configuration: FirewalldModel.Configuration)
+        (repair: RuntimeRepair)
+        (snapshot: FirewalldRuntime.RuntimeSnapshot)
+        =
+        if repair.Version = 1 then ownedFingerprintRaw configuration snapshot
+        else ownedFingerprint environment configuration repair.DeclaredInterfaces snapshot
 
     let private adjustedConfiguration
         (configuration: FirewalldModel.Configuration)
@@ -347,6 +448,12 @@ module FirewalldRecoveryProof =
         (snapshot: FirewalldRuntime.RuntimeSnapshot)
         =
         ensureCompleteSnapshot configuration snapshot
+        let declaredInterfaces, declaredNativeInterfaces = declaredInterfaceEvidence configuration
+        let snapshot =
+            if configuration.Kind = "zone" then
+                projectLiveInterfaces environment declaredInterfaces snapshot
+                |> Option.defaultWith (fun () -> fail "Live zone interfaces are missing declared bindings or include non-NetworkManager additions.")
+            else snapshot
         let expected = expectedSelectorValues configuration
         let actual = actualSelectorValues snapshot
         let deltas =
@@ -378,25 +485,39 @@ module FirewalldRecoveryProof =
         let currentSnapshot =
             FirewalldRuntime.inspectRuntime environment configuration.Kind configuration.Name
             |> Option.defaultWith (fun () -> fail "Unable to re-observe the loaded firewalld object before staging its runtime repair.")
+            |> fun current ->
+                if configuration.Kind = "zone" then
+                    projectLiveInterfaces environment declaredInterfaces current
+                    |> Option.defaultWith (fun () -> fail "Live zone interfaces changed outside the declared/NM-backed projection.")
+                else current
         ensureCompleteSnapshot configuration currentSnapshot
         if fingerprint currentSnapshot <> fingerprint snapshot then
             fail "Runtime firewalld selectors changed while preparing the rollback proof."
         let permanentSnapshot =
             FirewalldRuntime.inspectPermanent environment configuration.Kind configuration.Name
             |> Option.defaultWith (fun () -> fail "Unable to observe the permanent firewalld object required for boot rollback proof.")
+            |> fun permanent ->
+                if configuration.Kind = "zone" then
+                    projectLiveInterfaces environment declaredInterfaces permanent
+                    |> Option.defaultWith (fun () -> fail "Permanent zone interfaces differ outside the declared/NM-backed projection.")
+                else permanent
         ensureCompleteSnapshot configuration permanentSnapshot
         let permanentBefore =
             deltas |> List.fold (fun state delta -> applyDelta configuration state delta false) permanentSnapshot
-        if ownedFingerprint configuration permanentBefore <> ownedFingerprint configuration snapshot then
+        if ownedFingerprint environment configuration declaredInterfaces permanentBefore
+           <> ownedFingerprint environment configuration declaredInterfaces snapshot then
             fail "Live owned selectors differ from their permanent preimage outside the reversible native deltas."
         let mutable state = snapshot
         let fingerprints = ResizeArray<string>()
-        fingerprints.Add(ownedFingerprint configuration state)
+        fingerprints.Add(ownedFingerprint environment configuration declaredInterfaces state)
         for delta in deltas do
             state <- applyDelta configuration state delta true
-            fingerprints.Add(ownedFingerprint configuration state)
+            fingerprints.Add(ownedFingerprint environment configuration declaredInterfaces state)
         { Deltas = deltas
-          StateFingerprints = List.ofSeq fingerprints }
+          StateFingerprints = List.ofSeq fingerprints
+          Version = 2
+          DeclaredInterfaces = declaredInterfaces
+          DeclaredNativeInterfaces = declaredNativeInterfaces }
 
     let private proofBase (configuration: FirewalldModel.Configuration) (strategy: string) =
         let node = JsonObject()
@@ -407,6 +528,45 @@ module FirewalldRecoveryProof =
         node["strategy"] <- JsonValue.Create strategy
         node
 
+    let private interfaceArray (values: string list) =
+        let array = JsonArray()
+        for value in values do array.Add(JsonValue.Create value)
+        array
+
+    let private writeInterfaceEvidence (node: JsonObject) (prefix: string) (snapshot: FirewalldRuntime.RuntimeSnapshot option) =
+        let typed, native =
+            match snapshot with
+            | None -> [], []
+            | Some value ->
+                interfaceEvidence value
+                |> Option.defaultWith (fun () -> fail "The declared interface projection is inconsistent.")
+        node[prefix + "Interfaces"] <- interfaceArray typed
+        node[prefix + "NativeInterfaces"] <- interfaceArray native
+
+    let private readInterfaceArray (node: JsonObject) (key: string) =
+        let values =
+            match node[key] with
+            | :? JsonArray as array ->
+                array
+                |> Seq.map (fun value ->
+                    if isNull value then fail ("Invalid interface evidence " + key + ".")
+                    value.GetValue<string>())
+                |> List.ofSeq
+            | _ -> fail ("Missing interface evidence " + key + ".")
+        if values.Length > 4096
+           || (values |> List.exists String.IsNullOrWhiteSpace)
+           || values <> sorted values
+           || (values |> List.distinct).Length <> values.Length then
+            fail ("Invalid or noncanonical interface evidence " + key + ".")
+        values
+
+    let private readInterfaceEvidence (node: JsonObject) (prefix: string) =
+        let typed = readInterfaceArray node (prefix + "Interfaces")
+        let native = readInterfaceArray node (prefix + "NativeInterfaces")
+        if typed <> native then fail ("Typed and native interface evidence differ for " + prefix + ".")
+        typed, native
+
+
     let reloadProof
         (environment: HostEnvironment)
         (configuration: FirewalldModel.Configuration)
@@ -414,12 +574,14 @@ module FirewalldRecoveryProof =
         (effectiveAfter: string option)
         =
         let node = proofBase configuration "reload-before"
+        node["version"] <- JsonValue.Create 2
         let diskBefore =
             match FirewalldRuntime.snapshotFromXml configuration.Kind configuration.Name effectiveBefore with
             | Error reason -> fail ("Cannot project the effective on-disk firewalld preimage: " + reason)
             | Ok None -> None
             | Ok(Some snapshot) when snapshotComplete snapshot -> Some snapshot
             | Ok(Some _) -> fail "The effective on-disk firewalld preimage has unknown native selectors."
+        writeInterfaceEvidence node "before" diskBefore
         match FirewalldRuntime.queryPermanent environment configuration.Kind configuration.Name,
               FirewalldRuntime.queryRuntime environment configuration.Kind configuration.Name with
         | Error reason, _ -> fail ("Cannot prove the permanent firewalld preimage before reload: " + reason)
@@ -431,18 +593,21 @@ module FirewalldRecoveryProof =
             let disk =
                 diskBefore
                 |> Option.defaultWith (fun () -> fail "The loaded firewalld preimage exists but its effective on-disk definition is absent.")
-            if not (snapshotsEqual disk permanent && snapshotsEqual disk live) then
-                fail "The loaded firewalld selectors or permanent selectors differ from the exact effective on-disk preimage; refusing daemon-wide recovery by reload."
+            if not (matchesLoadedProjection environment disk permanent
+                    && matchesLoadedProjection environment disk live) then
+                fail "Permanent or loaded selectors differ from the effective disk projection outside NetworkManager-restored interfaces; refusing daemon-wide recovery by reload."
             node["beforePresent"] <- JsonValue.Create true
-            node["beforeFingerprint"] <- JsonValue.Create(fingerprint live)
+            node["beforeFingerprint"] <- JsonValue.Create(fingerprint disk)
         | _ ->
             fail "The loaded firewalld target presence differs from the effective on-disk preimage; refusing daemon-wide recovery by reload."
         match FirewalldRuntime.snapshotFromXml configuration.Kind configuration.Name effectiveAfter with
         | Error reason -> fail ("Cannot project the post-transaction firewalld target: " + reason)
         | Ok None ->
+            writeInterfaceEvidence node "after" None
             node["afterPresent"] <- JsonValue.Create false
             node["afterFingerprint"] <- null
         | Ok(Some after) when snapshotComplete after ->
+            writeInterfaceEvidence node "after" (Some after)
             node["afterPresent"] <- JsonValue.Create true
             node["afterFingerprint"] <- JsonValue.Create(fingerprint after)
         | Ok(Some _) -> fail "The post-transaction firewalld target has unknown native selectors."
@@ -460,6 +625,7 @@ module FirewalldRecoveryProof =
         =
         let repair = planRuntimeRepair environment configuration snapshot
         let node = proofBase configuration "runtime-delta"
+        node["version"] <- JsonValue.Create 2
         let deltas = JsonArray()
         for delta in repair.Deltas do
             let item = JsonObject()
@@ -471,6 +637,8 @@ module FirewalldRecoveryProof =
         for fingerprint in repair.StateFingerprints do states.Add(JsonValue.Create fingerprint)
         node["deltas"] <- deltas
         node["stateFingerprints"] <- states
+        node["declaredInterfaces"] <- interfaceArray repair.DeclaredInterfaces
+        node["declaredNativeInterfaces"] <- interfaceArray repair.DeclaredNativeInterfaces
         node
 
     let private readProof (configuration: FirewalldModel.Configuration) (proof: JsonObject option) =
@@ -479,19 +647,26 @@ module FirewalldRecoveryProof =
             match node[key] with
             | null -> fail ("Missing firewalld rollback proof field " + key + ".")
             | value -> value.GetValue<string>()
-        if isNull node["version"]
-           || node["version"].GetValue<int>() <> 1
+        if isNull node["version"] then fail "Missing firewalld rollback proof version."
+        let version = node["version"].GetValue<int>()
+        if not (List.contains version [ 1; 2 ])
            || getString "scope" <> "object"
            || getString "kind" <> configuration.Kind
            || getString "name" <> configuration.Name then
             fail "Firewalld transaction rollback proof belongs to a different object or version."
         let strategy = getString "strategy"
         let expectedKeys =
-            if strategy = "runtime-delta" then
+            if strategy = "runtime-delta" && version = 1 then
                 set [ "version"; "scope"; "kind"; "name"; "strategy"; "deltas"; "stateFingerprints" ]
-            elif strategy = "reload-before" then
+            elif strategy = "runtime-delta" && version = 2 then
+                set [ "version"; "scope"; "kind"; "name"; "strategy"; "deltas"; "stateFingerprints"
+                      "declaredInterfaces"; "declaredNativeInterfaces" ]
+            elif strategy = "reload-before" && version = 1 then
                 set [ "version"; "scope"; "kind"; "name"; "strategy"; "beforePresent"; "beforeFingerprint"; "afterPresent"; "afterFingerprint" ]
-            elif strategy = "unchanged" then
+            elif strategy = "reload-before" && version = 2 then
+                set [ "version"; "scope"; "kind"; "name"; "strategy"; "beforePresent"; "beforeFingerprint"; "afterPresent"; "afterFingerprint"
+                      "beforeInterfaces"; "beforeNativeInterfaces"; "afterInterfaces"; "afterNativeInterfaces" ]
+            elif strategy = "unchanged" && version = 1 then
                 set [ "version"; "scope"; "kind"; "name"; "strategy" ]
             else Set.empty
         let actualKeys = node |> Seq.map (fun pair -> pair.Key) |> Set.ofSeq
@@ -510,9 +685,23 @@ module FirewalldRecoveryProof =
                         fail ("Invalid firewalld " + label + " selector fingerprint.")
             elif not (isNull node[fingerprintKey]) then
                 fail ("Absent firewalld " + label + " target cannot have a selector fingerprint.")
+        let validateInterfaceProjection label present =
+            let typed, native = readInterfaceEvidence node label
+            if typed <> native
+               || (configuration.Kind <> "zone" && not typed.IsEmpty)
+               || (not present && not typed.IsEmpty) then
+                fail ("Invalid declared interface evidence for " + label + ".")
         if strategy = "reload-before" then
             validateProjection "before"
             validateProjection "after"
+            if version = 2 then
+                validateInterfaceProjection "before" (node["beforePresent"].GetValue<bool>())
+                validateInterfaceProjection "after" (node["afterPresent"].GetValue<bool>())
+        if strategy = "runtime-delta" && version = 2 then
+            let typed, native = readInterfaceEvidence node "declared"
+            let expectedTyped, expectedNative = declaredInterfaceEvidence configuration
+            if typed <> expectedTyped || native <> expectedNative then
+                fail "Runtime-delta declared interface evidence differs from the saved configuration."
         if strategy = "runtime-delta" then
             let deltas =
                 match node["deltas"] with
@@ -567,8 +756,15 @@ module FirewalldRecoveryProof =
             fail "Firewalld runtime delta list is duplicated, unordered, or non-monotone."
         if effects = set [ Steers ] && deltas.Length > 1 then
             fail "Multiple NAT/forward-port steering deltas have no proved safe intermediate order."
-        let stateFingerprints = node["stateFingerprints"].AsArray() |> Seq.map (fun item -> item.GetValue<string>()) |> List.ofSeq
-        { Deltas = deltas; StateFingerprints = stateFingerprints }
+        let version = node["version"].GetValue<int>()
+        let declaredInterfaces, declaredNativeInterfaces =
+            if version = 2 then readInterfaceEvidence node "declared"
+            else [], []
+        { Deltas = deltas
+          StateFingerprints = node["stateFingerprints"].AsArray() |> Seq.map (fun item -> item.GetValue<string>()) |> List.ofSeq
+          Version = version
+          DeclaredInterfaces = declaredInterfaces
+          DeclaredNativeInterfaces = declaredNativeInterfaces }
 
     let private checkedCommand (environment: HostEnvironment) arguments =
         let result = environment.Run "firewall-cmd" arguments None
@@ -588,13 +784,20 @@ module FirewalldRecoveryProof =
         =
         let presentKey, fingerprintKey = label + "Present", label + "Fingerprint"
         let expectedPresent = proof[presentKey].GetValue<bool>()
+        let version = proof["version"].GetValue<int>()
         match FirewalldRuntime.queryRuntime environment configuration.Kind configuration.Name with
         | Error reason -> fail ("Unable to observe the firewalld " + label + " target: " + reason)
         | Ok None -> not expectedPresent
         | Ok(Some snapshot) ->
-            expectedPresent
-            && snapshotComplete snapshot
-            && fingerprint snapshot = proof[fingerprintKey].GetValue<string>()
+            if not expectedPresent || not (snapshotComplete snapshot) then false
+            else
+                let projected =
+                    if version = 1 then Some snapshot
+                    else
+                        let declared, _ = readInterfaceEvidence proof label
+                        projectLiveInterfaces environment declared snapshot
+                projected
+                |> Option.exists (fun value -> fingerprint value = proof[fingerprintKey].GetValue<string>())
 
     let private verifyEffectiveProjection
         (configuration: FirewalldModel.Configuration)
@@ -603,13 +806,25 @@ module FirewalldRecoveryProof =
         (label: string)
         =
         let expectedPresent = proof[label + "Present"].GetValue<bool>()
+        let version = proof["version"].GetValue<int>()
+        let verifySnapshot (snapshot: FirewalldRuntime.RuntimeSnapshot) =
+            if not (snapshotComplete snapshot) then
+                fail ("Effective on-disk firewalld " + label + " target has incomplete selectors.")
+            if version = 2 then
+                let expectedTyped, expectedNative = readInterfaceEvidence proof label
+                match interfaceEvidence snapshot with
+                | Some(typed, native) when typed = expectedTyped && native = expectedNative -> ()
+                | _ -> fail ("Effective on-disk firewalld " + label + " interface evidence differs from its rollback proof.")
+            if fingerprint snapshot <> proof[label + "Fingerprint"].GetValue<string>() then
+                fail ("Effective on-disk firewalld target differs from the recorded " + label + " preimage.")
         match FirewalldRuntime.snapshotFromXml configuration.Kind configuration.Name effectiveXml with
-        | Error reason -> fail ("Unable to project the effective on-disk firewalld " + label + " target: " + reason)
-        | Ok None when not expectedPresent -> ()
-        | Ok(Some snapshot)
-            when expectedPresent
-                 && snapshotComplete snapshot
-                 && fingerprint snapshot = proof[label + "Fingerprint"].GetValue<string>() -> ()
+        | Error reason -> fail ("Cannot project the effective on-disk firewalld " + label + " target: " + reason)
+        | Ok None when not expectedPresent ->
+            if version = 2 then
+                let typed, native = readInterfaceEvidence proof label
+                if not typed.IsEmpty || not native.IsEmpty then
+                    fail ("Absent firewalld " + label + " target has interface evidence.")
+        | Ok(Some snapshot) when expectedPresent -> verifySnapshot snapshot
         | _ -> fail ("Effective on-disk firewalld target differs from the recorded " + label + " preimage.")
     let private verifyTargetProjection environment configuration proof label =
         if not (targetProjectionMatches environment configuration proof label) then
@@ -644,7 +859,7 @@ module FirewalldRecoveryProof =
         if strategy <> "runtime-delta" then fail "Expected a reversible runtime repair proof."
         let repair = decodeRuntimeRepair configuration node
         let stateIndex snapshot =
-            let hash = ownedFingerprint configuration snapshot
+            let hash = ownedFingerprintForRepair environment configuration repair snapshot
             repair.StateFingerprints |> List.tryFindIndex ((=) hash)
         let snapshot = inspect environment configuration
         ensureCompleteSnapshot configuration snapshot
@@ -655,24 +870,25 @@ module FirewalldRecoveryProof =
             observeAdjusted environment configuration snapshot
             let mutable current = snapshot
             for index in currentIndex .. repair.Deltas.Length - 1 do
-                if ownedFingerprint configuration current <> repair.StateFingerprints[index] then
+                if ownedFingerprintForRepair environment configuration repair current <> repair.StateFingerprints[index] then
                     fail "Runtime selector membership changed before the next repair step."
                 checkedCommand environment (selectorArguments configuration repair.Deltas[index] "add")
                 current <- inspect environment configuration
                 ensureCompleteSnapshot configuration current
-                if ownedFingerprint configuration current <> repair.StateFingerprints[index + 1] then
+                if ownedFingerprintForRepair environment configuration repair current <> repair.StateFingerprints[index + 1] then
                     fail "firewalld did not apply the recorded runtime selector step."
                 observeAdjusted environment configuration current
         let observation = FirewalldRuntime.observe environment configuration
         if not observation.Observed || not observation.InSync then
             fail "The repaired firewalld object did not converge to its declared selectors."
 
-    let restoreRuntime
+    let restoreRuntimeWithPreReload
         (environment: HostEnvironment)
         (configuration: FirewalldModel.Configuration)
         (effectiveCurrent: string option)
         (proof: JsonObject option)
         (phase: FirewalldLifecycle.RecoveryPhase)
+        (preReload: unit -> unit)
         =
         let strategy, node = readProof configuration proof
         if strategy = "reload-before" then verifyEffectiveProjection configuration effectiveCurrent node "before"
@@ -685,6 +901,7 @@ module FirewalldRecoveryProof =
                 if phase = FirewalldLifecycle.ActiveDaemon then
                     if targetProjectionMatches environment configuration node "before" then ()
                     elif targetProjectionMatches environment configuration node "after" then
+                        preReload ()
                         match FirewalldRuntime.validateReloadExcludingTargetObject environment configuration.Kind configuration.Name with
                         | Ok () -> ()
                         | Error reason ->
@@ -710,7 +927,7 @@ module FirewalldRecoveryProof =
                 let mutable current = inspect environment configuration
                 ensureCompleteSnapshot configuration current
                 let currentIndex =
-                    ownedFingerprint configuration current
+                    ownedFingerprintForRepair environment configuration repair current
                     |> fun hash ->
                         states
                         |> List.tryFindIndex ((=) hash)
@@ -720,12 +937,12 @@ module FirewalldRecoveryProof =
                 observeAdjusted environment configuration current
                 if currentIndex > 0 then
                     for index = currentIndex - 1 downto 0 do
-                        if ownedFingerprint configuration current <> states[index + 1] then
+                        if ownedFingerprintForRepair environment configuration repair current <> states[index + 1] then
                             fail "Runtime selector membership changed before its recorded inverse."
                         checkedCommand environment (selectorArguments configuration repair.Deltas[index] "remove")
                         current <- inspect environment configuration
                         ensureCompleteSnapshot configuration current
-                        if ownedFingerprint configuration current <> states[index] then
+                        if ownedFingerprintForRepair environment configuration repair current <> states[index] then
                             fail "firewalld did not restore the recorded selector checkpoint."
                         observeAdjusted environment configuration current
             | _ -> fail "Invalid firewalld recovery strategy."

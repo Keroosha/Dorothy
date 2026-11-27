@@ -165,9 +165,9 @@ type FirewalldGuardTests() =
                 [ name; "  ports: " + ports; "  protocols:"; "  source-ports:"; "  modules:"
                   "  destination:"; "  includes:"; "  helpers:" ]
         try
-            for directory in [ "usr/lib/firewalld/zones"; "usr/lib/firewalld/services"; "usr/lib/firewalld/ipsets"; "run/lock" ] do
+            for directory in [ "etc/firewalld"; "usr/lib/firewalld/zones"; "usr/lib/firewalld/services"; "usr/lib/firewalld/ipsets"; "run/lock" ] do
                 Directory.CreateDirectory(Path.Combine(root, directory)) |> ignore
-            File.WriteAllText(Path.Combine(root, "usr/lib/firewalld/firewalld.conf"), "DefaultZone=public\nFlushAllOnReload=no\n")
+            File.WriteAllText(Path.Combine(root, "etc/firewalld/firewalld.conf"), "DefaultZone=public\nFlushAllOnReload=no\n")
             File.WriteAllText(Path.Combine(root, "usr/lib/firewalld/zones/public.xml"), "<zone><service name=\"ssh\"/></zone>")
             File.WriteAllText(Path.Combine(root, "usr/lib/firewalld/zones/source-net.xml"), "<zone><source address=\"192.0.2.0/24\"/><service name=\"ssh\"/></zone>")
             File.WriteAllText(Path.Combine(root, "usr/lib/firewalld/zones/offroute.xml"), "<zone target=\"DROP\"><interface name=\"wg+\"/></zone>")
@@ -194,6 +194,8 @@ type FirewalldGuardTests() =
                       Stderr = "" }
                 | "firewall-cmd", [ "--info-service=ssh" ] -> { ExitCode = 0; Stdout = serviceInfo "ssh" "22/tcp"; Stderr = "" }
                 | "firewall-cmd", [ "--info-service=stale-svc" ] -> { ExitCode = 0; Stdout = serviceInfo "stale-svc" "22/tcp"; Stderr = "" }
+                | "firewall-cmd", [ ("--zone=public" | "--zone=source-net"); "--list-interfaces" ] ->
+                    { ExitCode = 0; Stdout = ""; Stderr = "" }
                 | "firewall-cmd", [ "--zone=public"; "--list-all" ] -> { ExitCode = 0; Stdout = runtimeZone; Stderr = "" }
                 | "firewall-cmd", [ "--zone=source-net"; "--list-all" ] -> { ExitCode = 0; Stdout = runtimeSourceZone; Stderr = "" }
                 | "firewall-cmd", [ "--policy=runtime-block"; "--list-all" ] -> { ExitCode = 0; Stdout = runtimePolicy; Stderr = "" }

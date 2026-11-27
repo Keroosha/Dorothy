@@ -14,6 +14,14 @@ open System.Xml.Linq
 module Firewalld =
     type BackendError(message: string) =
         inherit Exception(message)
+    type PreStageRefusal(operation: string, ownerId: string, reason: string) =
+        inherit BackendError(reason)
+        member _.Operation = operation
+        member _.OwnerId = ownerId
+        member _.Reason = reason
+
+    type private JournalOwnerConflict() =
+        inherit BackendError("Firewalld object is owned by another resource or its journal is invalid.")
 
     let private fail message = raise (BackendError message)
     let private xn name = XName.Get name
@@ -658,11 +666,6 @@ module Firewalld =
             if List.contains "+" configured then paths
             else paths @ [ [ { Name = defaultZone; NdpMayBeNeeded = true } ] ]
 
-    let private interfaceCandidates network defaultZone priorityName zones =
-        interfaceCandidatePaths network defaultZone priorityName zones
-        |> List.collect id
-        |> mergeZoneCandidates
-
     let private classifyZoneCandidates priorityName (zones: Map<string, XElement>) sourceStatuses interfaceCandidates =
         let definite = sourceStatuses |> List.choose (fun (name, result) -> if result = Match then Some name else None)
         let uncertain = sourceStatuses |> List.choose (fun (name, result) -> if result = Unknown then Some name else None)
@@ -951,8 +954,8 @@ module Firewalld =
             if policy.Elements() |> Seq.exists (fun element -> not (known.Contains element.Name.LocalName)) then
                 fail "An unknown policy element may affect the SSH management path."
             let forwards = policy.Elements(xn "forward-port") |> Seq.map (forwardPortMatches packet) |> Seq.toList
-            if List.contains Match forwards then fail "A host policy forward-port can redirect the SSH connection."
-            if List.contains Unknown forwards then fail "Cannot prove that a host policy forward-port is disjoint from SSH."
+            if List.contains Match forwards then fail "A policy forward-port can redirect management SSH in PREROUTING."
+            if List.contains Unknown forwards then fail "Cannot prove that a PREROUTING policy forward-port is disjoint from management SSH."
             let rules = policy.Elements(xn "rule") |> Seq.map (richRulePreRoutingResult serviceXml ipsetXml packet) |> Seq.toList
             if List.contains RuleBlocks rules then fail "A matching policy DNAT can redirect the SSH connection."
             if List.contains RuleUnknown rules then fail "Cannot prove that a policy PREROUTING mark or DNAT leaves SSH unchanged."
@@ -980,7 +983,8 @@ module Firewalld =
                 policyDecision zoneExplicitlyAllows serviceXml ipsetXml inbound candidate.Name policies
             policyPreRoutingDecision serviceXml ipsetXml inbound candidate.Name parsedZones policies
             if not inboundAllowed && not inboundPolicyAllowed then
-                fail ("Final zone " + candidate.Name + " and its host policies do not allow current SSH port " + string context.Port + "/tcp; refusing mutation.")
+                fail ("SSH on port " + string context.Port + "/tcp is not authorized on possible ingress zone "
+                      + candidate.Name + " by its zone or HOST policies. A reply route does not prove inbound classification; refusing mutation.")
         for candidate in egressCandidates do
             let egress =
                 parsedZones |> Map.tryFind candidate.Name |> Option.defaultWith (fun () -> fail ("SSH reply zone is missing: " + candidate.Name))
@@ -1393,14 +1397,8 @@ module Firewalld =
     let private firewall environment arguments = command environment "firewall-cmd" arguments
 
     let private regularPath environment logical =
-        let physical = path environment logical
-        let rec parents (item: string) =
-            if item <> Path.GetPathRoot item then
-                if File.GetAttributes(item).HasFlag FileAttributes.ReparsePoint then fail "Symlinks are not accepted for firewalld state paths."
-                parents (Path.GetDirectoryName item)
-        if File.Exists physical || Directory.Exists physical then parents physical
-        else parents (Path.GetDirectoryName physical)
-        physical
+        try FirewalldLifecycle.regularPath environment logical
+        with :? InvalidOperationException as error -> fail error.Message
 
     let private readFile environment logical =
         let physical = path environment logical
@@ -1474,8 +1472,10 @@ module Firewalld =
                     Set.union required
                         (set [ "baselineMode"; "managedMode"; "deleteOnConfirm" ] |> Set.union settingsFields)
                 if not (Set.isSubset required keys) || not (Set.isSubset keys allowed)
-                   || journal["version"].GetValue<int>() <> 1
-                   || getString journal "ownerId" <> owner then
+                   || journal["version"].GetValue<int>() <> 1 then
+                    fail "Firewalld object is owned by another resource or its journal is invalid."
+                let storedOwner = getString journal "ownerId"
+                if String.IsNullOrWhiteSpace storedOwner || storedOwner |> Seq.exists Char.IsControl then
                     fail "Firewalld object is owned by another resource or its journal is invalid."
                 if c.Kind = "settings" then
                     if journal.ContainsKey "settingsScopeVersion"
@@ -1495,8 +1495,22 @@ module Firewalld =
                     fail "Settings ownership metadata is attached to a non-settings firewalld journal."
                 optionalString journal "baseline" |> ignore
                 optionalString journal "managed" |> ignore
+                if storedOwner <> owner then raise (JournalOwnerConflict())
                 Some journal
 
+    let private loadMutationJournal environment (c: FirewalldModel.Configuration) owner operation =
+        if operation <> "apply" then loadJournal environment c owner
+        else
+            let canRefuse = FirewalldLifecycle.canClassifyPreStageRefusal environment
+            try loadJournal environment c owner
+            with :? JournalOwnerConflict when canRefuse ->
+                raise (
+                    PreStageRefusal(
+                        operation,
+                        owner,
+                        "A different resource generation already owns this firewalld object; no changes were made."
+                    )
+                )
     let private saveJournal environment c (journal: JsonObject) =
         let parent = path environment "/var/lib/keroosha-iac"
         if not (Directory.Exists parent) then Directory.CreateDirectory(parent, mode700) |> ignore
@@ -1745,17 +1759,6 @@ module Firewalld =
         result["inSync"] <- JsonValue.Create(permanentInSync && runtimeObserved && runtimeInSync && not pending)
         result :> JsonNode
 
-    let private activateRecovered (environment: HostEnvironment) (c: FirewalldModel.Configuration) =
-        let arguments = [ "is-active"; "firewalld.service" ]
-        let state = environment.Run "/usr/bin/systemctl" arguments None
-        match state.ExitCode, state.Stdout.Trim() with
-        | 0, "active" when c.Kind = "settings" ->
-            command environment "/usr/bin/systemctl" [ "restart"; "firewalld.service" ] |> ignore
-        | 0, "active" ->
-            firewall environment [ "--check-config" ] |> ignore
-            firewall environment [ "--reload" ] |> ignore
-        | _ -> command environment "/usr/bin/systemctl" [ "restart"; "firewalld.service" ] |> ignore
-
     let private objectReadState (scope: JsonObject option) (contents: string option) =
         if scope.IsSome then fail "Firewalld object transaction cannot use a scoped file state."
         contents
@@ -1791,8 +1794,8 @@ module Firewalld =
             match disk, FirewalldRuntime.queryPermanent environment c.Kind c.Name, FirewalldRuntime.queryRuntime environment c.Kind c.Name with
             | Ok None, Ok None, Ok None -> ()
             | Ok(Some expected), Ok(Some permanent), Ok(Some live)
-                when FirewalldRecoveryProof.snapshotsEqual expected permanent
-                  && FirewalldRecoveryProof.snapshotsEqual expected live -> ()
+                when FirewalldRecoveryProof.matchesLoadedProjection environment expected permanent
+                  && FirewalldRecoveryProof.matchesLoadedProjection environment expected live -> ()
             | Error reason, _, _ -> fail ("Unable to prove restored firewalld XML: " + reason)
             | _, Error reason, _ -> fail ("Unable to prove restored permanent firewalld object: " + reason)
             | _, _, Error reason -> fail ("Unable to prove restored runtime firewalld object: " + reason)
@@ -1801,27 +1804,31 @@ module Firewalld =
     let private restoreObjectRuntime
         (environment: HostEnvironment)
         (c: FirewalldModel.Configuration)
+        (preReload: unit -> unit)
         (transaction: FirewalldLifecycle.PendingTransaction)
         (phase: FirewalldLifecycle.RecoveryPhase)
         =
         let effectiveCurrent = effective environment c.Kind c.Name
-        FirewalldRecoveryProof.restoreRuntime environment c effectiveCurrent transaction.RollbackProof phase
+        FirewalldRecoveryProof.restoreRuntimeWithPreReload environment c effectiveCurrent transaction.RollbackProof phase preReload
 
-    let private recover environment (c: FirewalldModel.Configuration) (journal: JsonObject) =
+    let private recover environment (c: FirewalldModel.Configuration) (journal: JsonObject) (preReload: unit -> unit) =
         let logical = objectPath "/etc/firewalld" c.Kind c.Name
         let readState scope contents = objectReadState scope contents
         let writeState scope expectedCurrent target mode =
             objectWriteState environment c logical scope expectedCurrent target mode
         try
-            FirewalldLifecycle.recover environment c journal logical readState writeState (restoreObjectRuntime environment c)
+            FirewalldLifecycle.recover environment c journal logical readState writeState (restoreObjectRuntime environment c preReload)
         with :? InvalidOperationException as error ->
             fail error.Message
 
-    let private transact environment (c: FirewalldModel.Configuration) (journal: JsonObject) releaseOnRollback deleteOnConfirm desired afterMode =
+    let private transact environment (c: FirewalldModel.Configuration) (journal: JsonObject) releaseOnRollback deleteOnConfirm desired afterMode (preflightSettings: unit -> unit) =
         if releaseOnRollback then
             match effective environment c.Kind c.Name with
             | Some baseline when not (FieldRuntime.safeAdoption c baseline) ->
-                fail "Existing firewalld definition contains unrepresented baseline fields; refusing to replace it."
+                let reason = "Existing firewalld definition contains unrepresented baseline fields; refusing to replace it."
+                if FirewalldLifecycle.canClassifyPreStageRefusal environment then
+                    raise (PreStageRefusal("apply", getString journal "ownerId", reason))
+                else fail reason
             | _ -> ()
         let logical = objectPath "/etc/firewalld" c.Kind c.Name
         let before = readFile environment logical
@@ -1846,12 +1853,14 @@ module Firewalld =
             observation.Observed && observation.InSync
         let rollbackProof, activate =
             if before <> desired then
+                preflightSettings()
                 requireReloadProof environment
                 let effectiveBefore = effective environment c.Kind c.Name
                 let effectiveAfter =
                     desired |> Option.orElseWith (fun () -> readFile environment (objectPath "/usr/lib/firewalld" c.Kind c.Name))
                 prove (fun () -> FirewalldRecoveryProof.reloadProof environment c effectiveBefore effectiveAfter),
                 (fun () ->
+                    preflightSettings()
                     firewall environment [ "--check-config" ] |> ignore
                     firewall environment [ "--reload" ] |> ignore)
             elif runtimeMatches () then
@@ -1869,7 +1878,7 @@ module Firewalld =
         try
             FirewalldLifecycle.transact
                 environment c journal releaseOnRollback deleteOnConfirm logical None before beforeMode desired afterMode
-                managedBefore desired (Some rollbackProof) readState writeState validate activate (restoreObjectRuntime environment c)
+                managedBefore desired (Some rollbackProof) readState writeState validate activate (restoreObjectRuntime environment c preflightSettings)
         with :? InvalidOperationException as error ->
             fail error.Message
 
@@ -2783,6 +2792,16 @@ module Firewalld =
         elif counts |> List.forall not then Some "no"
         else None
 
+    let private strictValueFromRuntime runtime =
+        match runtime.Backend, runtime.Nft, runtime.Iptables, runtime.Ipv6Enabled, runtime.Iptables6 with
+        | "nftables", Some state, _, _, _ -> nftStrictValue state
+        | "iptables", _, Some rules, Some false, _ -> iptablesStrictValue rules
+        | "iptables", _, Some ipv4Rules, Some true, Some ipv6Rules ->
+            match iptablesStrictValue ipv4Rules, iptablesStrictValue ipv6Rules with
+            | Some ipv4, Some ipv6 when ipv4 = ipv6 -> Some ipv4
+            | _ -> None
+        | _ -> None
+
     let private runtimeSettingValue (environment: HostEnvironment) key =
         let tryCommand executable arguments =
             try Some(command environment executable arguments)
@@ -2793,16 +2812,7 @@ module Firewalld =
         | "FirewallBackend" ->
             runtimeFirewall environment |> Option.map _.Backend
         | "StrictForwardPorts" ->
-            runtimeFirewall environment
-            |> Option.bind (fun runtime ->
-                match runtime.Backend, runtime.Nft, runtime.Iptables, runtime.Ipv6Enabled, runtime.Iptables6 with
-                | "nftables", Some state, _, _, _ -> nftStrictValue state
-                | "iptables", _, Some rules, Some false, _ -> iptablesStrictValue rules
-                | "iptables", _, Some ipv4Rules, Some true, Some ipv6Rules ->
-                    match iptablesStrictValue ipv4Rules, iptablesStrictValue ipv6Rules with
-                    | Some ipv4, Some ipv6 when ipv4 = ipv6 -> Some ipv4
-                    | _ -> None
-                | _ -> None)
+            runtimeFirewall environment |> Option.bind strictValueFromRuntime
         | "NftablesFlowtable" ->
             runtimeFirewall environment
             |> Option.bind (fun runtime -> runtime.Nft |> Option.bind (fun state -> state.Flowtable))
@@ -2824,6 +2834,22 @@ module Firewalld =
             |> Option.exists (fun value -> normalizedBoolean value = Some "yes")
         with _ -> false
 
+    let private requireLoadedSecuritySettings (environment: HostEnvironment) (skipKey: string option) =
+        let etcContents = readSettingsFile environment strictConfigPath
+        let compare key loaded =
+            if skipKey <> Some key then
+                match effectiveSettingValue key etcContents, loaded with
+                | Some expected, Some actual when settingValuesEqual key (Some expected) (Some actual) -> ()
+                | Some _, Some _ -> fail ("Loaded " + key + " differs from its effective system configuration; refusing daemon-wide activation.")
+                | None, _ -> fail ("Unable to establish effective " + key + " before daemon-wide activation.")
+                | _, None -> fail ("Unable to verify loaded " + key + " before daemon-wide activation.")
+        compare "DefaultZone" (runtimeSettingValue environment "DefaultZone")
+        let runtime =
+            runtimeFirewall environment
+            |> Option.defaultWith (fun () -> fail "Unable to establish one complete loaded firewall backend snapshot before daemon-wide activation.")
+        compare "FirewallBackend" (Some runtime.Backend)
+        compare "StrictForwardPorts" (strictValueFromRuntime runtime)
+
 
 
     let private settingRuntimeObservable key = Set.contains key observableSettings
@@ -2844,6 +2870,7 @@ module Firewalld =
         guardMutation environment c proposed
 
     let private activateSettings (environment: HostEnvironment) key =
+        requireLoadedSecuritySettings environment (Some key)
         firewall environment [ "--check-config" ] |> ignore
         if key = "FirewallBackend" then
             command environment "/usr/bin/systemctl" [ "restart"; "firewalld" ] |> ignore
@@ -3200,7 +3227,7 @@ module Firewalld =
             JsonObject() :> JsonNode
         elif operation = "apply" || operation = "delete" then
             use _lock = HostFiles.lockFile lockFile
-            let existingJournal = loadJournal environment c owner
+            let existingJournal = loadMutationJournal environment c owner operation
             if operation = "delete" && existingJournal.IsNone then
                 let unchanged = JsonObject()
                 unchanged["unchanged"] <- JsonValue.Create true
@@ -3342,6 +3369,7 @@ module Firewalld =
                                 | Some _, None -> 0o600
                                 | None, _ -> currentMode
                             requireReloadProof environment
+                            requireLoadedSecuritySettings environment None
                             let nonce =
                                 FirewalldLifecycle.transact
                                     environment c journal isNewOwner false strictConfigPath scope
@@ -3395,6 +3423,7 @@ module Firewalld =
                             | Some _, None -> 0o600
                             | None, _ -> currentMode
                         requireReloadProof environment
+                        requireLoadedSecuritySettings environment None
                         let nonce =
                             FirewalldLifecycle.transact
                                 environment c journal false true strictConfigPath scope
@@ -3431,7 +3460,7 @@ module Firewalld =
                     else objectWriteState environment c logical scope expectedCurrent target mode
                 let restoreRuntime transaction recoveryPhase =
                     if c.Kind = "settings" then restoreSettingsRuntimeWithJournal environment transaction recoveryPhase ownerJournal
-                    else restoreObjectRuntime environment c transaction recoveryPhase
+                    else restoreObjectRuntime environment c (fun () -> requireLoadedSecuritySettings environment None) transaction recoveryPhase
                 FirewalldLifecycle.recoverPendingTransaction
                     environment c journal logical phase readState writeState restoreRuntime
             match phase with
@@ -3520,7 +3549,7 @@ module Firewalld =
                 JsonObject() :> JsonNode
             elif operation = "apply" || operation = "delete" then
                 use _lock = HostFiles.lockFile lockFile
-                let existingJournal = loadJournal environment c owner
+                let existingJournal = loadMutationJournal environment c owner operation
                 if operation = "delete" && existingJournal.IsNone then
                     let result = JsonObject()
                     result["unchanged"] <- JsonValue.Create true
@@ -3531,7 +3560,8 @@ module Firewalld =
                     let initialJournal =
                         existingJournal
                         |> Option.defaultWith (fun () -> newJournal owner (readFile environment logical))
-                    recover environment c initialJournal
+                    let preflightSettings () = requireLoadedSecuritySettings environment None
+                    recover environment c initialJournal preflightSettings
                     let currentJournal = loadJournal environment c owner
                     if operation = "delete" && currentJournal.IsNone then
                         let result = JsonObject()
@@ -3543,7 +3573,7 @@ module Firewalld =
                             |> Option.defaultWith (fun () -> newJournal owner (readFile environment logical))
                         if operation = "apply" then
                             let desiredMode = objectFileMode environment logical
-                            let nonce = transact environment c journal currentJournal.IsNone false (Some(render c)) desiredMode
+                            let nonce = transact environment c journal currentJournal.IsNone false (Some(render c)) desiredMode preflightSettings
                             let result = snapshot environment c (Some journal)
                             if not (result["permanentInSync"].GetValue<bool>())
                                || not (result["runtimeObserved"].GetValue<bool>())
@@ -3563,7 +3593,7 @@ module Firewalld =
                                     journal["baselineMode"].GetValue<int>()
                                 elif baseline.IsNone then int mode644
                                 else fail "Legacy firewalld journal lacks the original override mode; refusing Delete."
-                            let nonce = transact environment c journal false true baseline baselineMode
+                            let nonce = transact environment c journal false true baseline baselineMode preflightSettings
                             let result = JsonObject()
                             result["transactionNonce"] <- JsonValue.Create nonce
                             result :> JsonNode

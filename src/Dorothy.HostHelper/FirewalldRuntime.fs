@@ -69,6 +69,17 @@ module FirewalldRuntime =
         |> Option.bind (fun args -> run environment args)
         |> Option.map (fun output -> words [ output ] |> List.distinct |> List.sort)
 
+    let private listZoneInterfaces (environment: HostEnvironment) (permanent: bool) (zone: string) =
+        let mode = if permanent then [ "--permanent" ] else []
+        run environment (mode @ [ "--zone=" + zone; "--list-interfaces" ])
+        |> Option.map (fun output -> words [ output ] |> List.distinct |> List.sort)
+
+    let listRuntimeInterfaces (environment: HostEnvironment) (zone: string) =
+        listZoneInterfaces environment false zone
+
+    let listPermanentInterfaces (environment: HostEnvironment) (zone: string) =
+        listZoneInterfaces environment true zone
+
 
 
     let private parseFields (text: string) : Map<string, string list> =
@@ -327,63 +338,74 @@ module FirewalldRuntime =
                 validateRuntimeName kind name
                 let selector = if kind = "zone" then "--zone=" + name else "--policy=" + name
                 match run environment (mode @ [ selector; "--list-all" ]) with
-
                 | None -> None
                 | Some output ->
-                    let fields = parseFields output
-                    let known = if kind = "zone" then knownZoneFields else knownPolicyFields
-                    let rules = Map.tryFind "rich rules" fields |> Option.defaultValue []
-                    let sourceValues = if kind = "zone" then Map.tryFind "sources" fields |> Option.defaultValue [] |> words else []
-                    let parsedSources = sourceValues |> List.choose sourceElement
-                    let sourceUnknown = sourceValues |> List.filter (sourceElement >> Option.isNone)
-                    let forwardPortValues = Map.tryFind "forward-ports" fields |> Option.defaultValue []
-                    let parsedForwardPorts = forwardPortValues |> List.choose forwardPortElement
-                    let forwardPortUnknown = forwardPortValues |> List.filter (forwardPortElement >> Option.isNone)
-                    let mutable unknown = unknownFields known fields
-                    if not sourceUnknown.IsEmpty then unknown <- Map.add "source-selectors" sourceUnknown unknown
-                    if not forwardPortUnknown.IsEmpty then unknown <- Map.add "forward-ports" forwardPortUnknown unknown
-                    for key in known do
-                        if not (Map.containsKey key fields) then unknown <- Map.add key [] unknown
-                    let target = scalar fields "target" |> Option.defaultValue ""
-                    let priority = integer fields "priority"
-                    let ingressPriority = integer fields "ingress-priority"
-                    let egressPriority = integer fields "egress-priority"
-                    let icmpInversion = boolField fields "icmp-block-inversion"
-                    let forward = boolField fields "forward"
-                    let masquerade = boolField fields "masquerade"
-                    let scalarUnknown =
-                        [ "target", scalar fields "target" |> Option.isNone
-                          "priority", (kind = "policy" && priority.IsNone)
-                          "ingress-priority", (kind = "zone" && ingressPriority.IsNone)
-                          "egress-priority", (kind = "zone" && egressPriority.IsNone)
-                          "icmp-block-inversion", (kind = "zone" && icmpInversion.IsNone)
-                          "forward", (kind = "zone" && forward.IsNone)
-                          "masquerade", masquerade.IsNone ]
-                    for key, missing in scalarUnknown do
-                        if missing && not (Map.containsKey key unknown) then
-                            unknown <- Map.add key (Map.tryFind key fields |> Option.defaultValue []) unknown
-                    Some
-                        { emptySnapshot kind name unknown with
-                            NativeFields = fields
-                            Target = target
-                            Priority = priority
-                            IngressPriority = ingressPriority
-                            EgressPriority = egressPriority
-                            Ingress = Map.tryFind "ingress-zones" fields |> Option.defaultValue [] |> words
-                            Egress = Map.tryFind "egress-zones" fields |> Option.defaultValue [] |> words
-                            Interfaces = Map.tryFind "interfaces" fields |> Option.defaultValue [] |> words
-                            SourcesRaw = sourceValues
-                            Sources = parsedSources
-                            Services = Map.tryFind "services" fields |> Option.defaultValue [] |> words
-                            Ports = Map.tryFind "ports" fields |> Option.defaultValue [] |> words
-                            Protocols = Map.tryFind "protocols" fields |> Option.defaultValue [] |> words
-                            SourcePorts = Map.tryFind "source-ports" fields |> Option.defaultValue [] |> words
-                            ForwardPorts = parsedForwardPorts
-                            Masquerade = defaultArg masquerade false
-                            Forward = defaultArg forward false
-                            IcmpBlocks = Map.tryFind "icmp-blocks" fields |> Option.defaultValue [] |> words
-                            IcmpBlockInversion = defaultArg icmpInversion false
-                            RichRules = rules |> List.filter (String.IsNullOrWhiteSpace >> not) }
+                    let interfaceValues =
+                        if kind = "zone" then listZoneInterfaces environment permanent name
+                        else Some []
+                    match interfaceValues with
+                    | None -> None
+                    | Some interfaces ->
+                        let fields = parseFields output
+                        let fields =
+                            if kind = "zone" then
+                                let interfaceField =
+                                    if interfaces.IsEmpty then [] else [ String.concat " " interfaces ]
+                                Map.add "interfaces" interfaceField fields
+                            else fields
+                        let known = if kind = "zone" then knownZoneFields else knownPolicyFields
+                        let rules = Map.tryFind "rich rules" fields |> Option.defaultValue []
+                        let sourceValues = if kind = "zone" then Map.tryFind "sources" fields |> Option.defaultValue [] |> words else []
+                        let parsedSources = sourceValues |> List.choose sourceElement
+                        let sourceUnknown = sourceValues |> List.filter (sourceElement >> Option.isNone)
+                        let forwardPortValues = Map.tryFind "forward-ports" fields |> Option.defaultValue []
+                        let parsedForwardPorts = forwardPortValues |> List.choose forwardPortElement
+                        let forwardPortUnknown = forwardPortValues |> List.filter (forwardPortElement >> Option.isNone)
+                        let mutable unknown = unknownFields known fields
+                        if not sourceUnknown.IsEmpty then unknown <- Map.add "source-selectors" sourceUnknown unknown
+                        if not forwardPortUnknown.IsEmpty then unknown <- Map.add "forward-ports" forwardPortUnknown unknown
+                        for key in known do
+                            if not (Map.containsKey key fields) then unknown <- Map.add key [] unknown
+                        let target = scalar fields "target" |> Option.defaultValue ""
+                        let priority = integer fields "priority"
+                        let ingressPriority = integer fields "ingress-priority"
+                        let egressPriority = integer fields "egress-priority"
+                        let icmpInversion = boolField fields "icmp-block-inversion"
+                        let forward = boolField fields "forward"
+                        let masquerade = boolField fields "masquerade"
+                        let scalarUnknown =
+                            [ "target", scalar fields "target" |> Option.isNone
+                              "priority", (kind = "policy" && priority.IsNone)
+                              "ingress-priority", (kind = "zone" && ingressPriority.IsNone)
+                              "egress-priority", (kind = "zone" && egressPriority.IsNone)
+                              "icmp-block-inversion", (kind = "zone" && icmpInversion.IsNone)
+                              "forward", (kind = "zone" && forward.IsNone)
+                              "masquerade", masquerade.IsNone ]
+                        for key, missing in scalarUnknown do
+                            if missing && not (Map.containsKey key unknown) then
+                                unknown <- Map.add key (Map.tryFind key fields |> Option.defaultValue []) unknown
+                        Some
+                            { emptySnapshot kind name unknown with
+                                NativeFields = fields
+                                Target = target
+                                Priority = priority
+                                IngressPriority = ingressPriority
+                                EgressPriority = egressPriority
+                                Ingress = Map.tryFind "ingress-zones" fields |> Option.defaultValue [] |> words
+                                Egress = Map.tryFind "egress-zones" fields |> Option.defaultValue [] |> words
+                                Interfaces = interfaces
+                                SourcesRaw = sourceValues
+                                Sources = parsedSources
+                                Services = Map.tryFind "services" fields |> Option.defaultValue [] |> words
+                                Ports = Map.tryFind "ports" fields |> Option.defaultValue [] |> words
+                                Protocols = Map.tryFind "protocols" fields |> Option.defaultValue [] |> words
+                                SourcePorts = Map.tryFind "source-ports" fields |> Option.defaultValue [] |> words
+                                ForwardPorts = parsedForwardPorts
+                                Masquerade = defaultArg masquerade false
+                                Forward = defaultArg forward false
+                                IcmpBlocks = Map.tryFind "icmp-blocks" fields |> Option.defaultValue [] |> words
+                                IcmpBlockInversion = defaultArg icmpInversion false
+                                RichRules = rules |> List.filter (String.IsNullOrWhiteSpace >> not) }
             | "service" | "icmptype" | "helper" ->
                 validateRuntimeName kind name
                 match run environment (mode @ [ infoArguments kind name ]) with
@@ -1075,13 +1097,15 @@ module FirewalldRuntime =
     let private unavailable : RuntimeObservation =
         { Observed = false; InSync = false }
 
-    let private networkManagerAssignsZone (environment: HostEnvironment) (interfaceName: string) (zone: string) =
-        match environment.Run "nmcli" [ "-g"; "GENERAL.CON-UUID"; "device"; "show"; interfaceName ] None with
-        | { ExitCode = 0; Stdout = connection } when fst (Guid.TryParseExact(connection.Trim(), "D")) ->
-            match environment.Run "nmcli" [ "-g"; "connection.zone"; "connection"; "show"; "uuid"; connection.Trim() ] None with
-            | { ExitCode = 0; Stdout = configuredZone } -> configuredZone.Trim() = zone
+    let networkManagerAssignsZone (environment: HostEnvironment) (interfaceName: string) (zone: string) : bool =
+        try
+            match environment.Run "nmcli" [ "-g"; "GENERAL.CON-UUID"; "device"; "show"; interfaceName ] None with
+            | { ExitCode = 0; Stdout = connection } when fst (Guid.TryParseExact(connection.Trim(), "D")) ->
+                match environment.Run "nmcli" [ "-g"; "connection.zone"; "connection"; "show"; "uuid"; connection.Trim() ] None with
+                | { ExitCode = 0; Stdout = configuredZone } -> configuredZone.Trim() = zone
+                | _ -> false
             | _ -> false
-        | _ -> false
+        with _ -> false
 
     let private observeZonePolicy (allowCoexistingAdditions: bool) (environment: HostEnvironment) (c: FirewalldModel.Configuration) =
         match inspectRuntime environment c.Kind c.Name with
@@ -1093,10 +1117,7 @@ module FirewalldRuntime =
             match expectedRichRules with
             | None -> unavailable
             | Some expectedRules ->
-                let selector = if c.Kind = "zone" then "--zone=" + c.Name else "--policy=" + c.Name
-                let interfaces =
-                    if c.Kind = "zone" then run environment [ selector; "--list-interfaces" ] |> Option.map listValues
-                    else Some []
+                let interfaces = if c.Kind = "zone" then Some runtime.Interfaces else Some []
                 match interfaces with
                 | None -> unavailable
                 | Some currentInterfaces ->
@@ -1180,11 +1201,8 @@ module FirewalldRuntime =
             let fieldsMatch =
                 normalizeCompleteFields expected.Kind actual.NativeFields = normalizeCompleteFields expected.Kind expected.NativeFields
             let interfacesMatch =
-                if expected.Kind <> "zone" then true
-                else
-                    run environment [ "--zone=" + expected.Name; "--list-interfaces" ]
-                    |> Option.map (fun output -> Set.ofList (listValues output) = Set.ofList expected.Interfaces)
-                    |> Option.defaultValue false
+                expected.Kind <> "zone"
+                || Set.ofList actual.Interfaces = Set.ofList expected.Interfaces
             let sourcesMatch =
                 let normalized sources = sources |> Seq.map normalizeSource |> Set.ofSeq
                 normalized actual.SourcesRaw = normalized expected.SourcesRaw
@@ -1230,10 +1248,6 @@ module FirewalldRuntime =
         let fields = normalizeCompleteFields kind snapshot.NativeFields
         if kind = "zone" then Map.remove "interfaces" fields else fields
 
-    let private normalizedInterfaces (environment: HostEnvironment) (permanent: bool) (zone: string) =
-        let mode = if permanent then [ "--permanent" ] else []
-        run environment (mode @ [ "--zone=" + zone; "--list-interfaces" ])
-        |> Option.map listValues
 
     let private referencesFromZonePolicy (snapshot: RuntimeSnapshot) =
         let fieldValues name =
@@ -1296,7 +1310,6 @@ module FirewalldRuntime =
                 | Some("ipset", _) -> runtimeIpSets, permanentIpSets
                 | Some(kind, _) -> names kind false, names kind true
                 | None -> [], []
-            let sameNames left right = Set.ofList left = Set.ofList right
             let namesMatch kind left right =
                 let leftNames, rightNames = Set.ofList left, Set.ofList right
                 match excludedTarget with
@@ -1366,14 +1379,11 @@ module FirewalldRuntime =
                     let interfacesMatch =
                         if isExcluded || kind <> "zone" then true
                         else
-                            match normalizedInterfaces environment false name, normalizedInterfaces environment true name with
-                            | Some liveValues, Some permanentValues ->
-                                let live = Set.ofList liveValues
-                                let disk = Set.ofList permanentValues
-                                Set.isSubset disk live
-                                && (Set.difference live disk
-                                    |> Set.forall (fun interfaceName -> networkManagerAssignsZone environment interfaceName name))
-                            | _ -> false
+                            let live = Set.ofList runtime.Interfaces
+                            let disk = Set.ofList permanent.Interfaces
+                            let changed = Set.union (Set.difference disk live) (Set.difference live disk)
+                            changed
+                            |> Set.forall (fun interfaceName -> networkManagerAssignsZone environment interfaceName name)
                     if not fieldsMatch || not interfacesMatch then
                         refuse ("Reload would change unpersisted live selectors in firewalld " + kind + " " + name + ".")
                     if not isExcluded && not (recordReferences runtime) then

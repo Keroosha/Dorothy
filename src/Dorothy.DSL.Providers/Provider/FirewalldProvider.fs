@@ -249,6 +249,41 @@ module internal FirewalldCreateReceipts =
         receipt
 
     let importId (receipt: Receipt) = ticketPrefix + receipt.Ticket
+    let private safeFailureSummary (receipt: Receipt) (error: exn) =
+        let sensitive =
+            [ receipt.Urn
+              receipt.Address
+              receipt.User
+              string receipt.Port
+              receipt.Configuration
+              receipt.OwnerId
+              receipt.Ticket ]
+            @ (receipt.IdentityFile |> Option.toList |> List.collect (fun path -> [ path; path + ".pub"; path + "-cert.pub" ]))
+        let mutable message = error.Message
+        for value in sensitive do
+            if not (String.IsNullOrWhiteSpace value) then
+                message <- message.Replace(value, "[redacted]", StringComparison.Ordinal)
+        message <-
+            System.Text.RegularExpressions.Regex.Replace(
+                message,
+                "-----BEGIN [^-]*-----[\\s\\S]*?-----END [^-]*-----",
+                "[key material redacted]"
+            )
+        message <- System.Text.RegularExpressions.Regex.Replace(message, "SHA256:[A-Za-z0-9+/=]+", "SHA256:[redacted]")
+        let sanitized =
+            message
+            |> Seq.map (fun character -> if Char.IsControl character then ' ' else character)
+            |> Array.ofSeq
+            |> fun characters -> String(characters)
+        if String.IsNullOrWhiteSpace sanitized then error.GetType().Name
+        elif sanitized.Length <= 512 then sanitized
+        else sanitized.Substring(0, 512)
+
+    let recoveryFailureMessage (receipt: Receipt) (error: exn) =
+        let recoveryTicket = importId receipt
+        "Firewalld Create failed (" + safeFailureSummary receipt error + "); the remote outcome may be ambiguous. "
+        + "Recovery ticket: " + recoveryTicket
+        + ". Recover only with `pulumi import --protect=false <type> <resource-name> " + recoveryTicket + "`."
 
     let pathForTicket ticket = Path.Combine(receiptDirectory (), ticket + ".json")
 
@@ -613,15 +648,21 @@ type FirewalldProvider() =
                     response.Id <- receipt.OwnerId
                     response.Outputs <- FirewalldProviderLogic.outputs values (Some snapshot)
                     return response
-                with error ->
-                    Console.Error.WriteLine(
-                        "Firewalld Create outcome may be ambiguous; recovery ticket: "
-                        + FirewalldCreateReceipts.importId receipt
-                        + ". Recover only with `pulumi import --protect=false <type> <resource-name> "
-                        + FirewalldCreateReceipts.importId receipt
-                        + "`."
-                    )
-                    return raise error
+                with
+                | :? FirewalldPreStageRefusalException as refusal ->
+                    let cleanupFailed =
+                        try
+                            FirewalldCreateReceipts.acknowledgeOwner request.Urn request.Type receipt.OwnerId
+                            false
+                        with _ -> true
+                    let message =
+                        if cleanupFailed then "Firewalld Create was refused before staging; local receipt cleanup failed."
+                        else "Firewalld Create was refused before staging: " + refusal.Message
+                    return raise (InvalidOperationException(message, refusal))
+                | error ->
+                    let message = FirewalldCreateReceipts.recoveryFailureMessage receipt error
+                    Console.Error.WriteLine message
+                    return raise (InvalidOperationException(message))
             })
 
     override _.Update(request, ct) =

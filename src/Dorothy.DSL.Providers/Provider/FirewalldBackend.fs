@@ -16,6 +16,8 @@ type FirewalldSnapshot =
       PermanentInSync: bool
       RuntimeObserved: bool
       RuntimeInSync: bool }
+type FirewalldPreStageRefusalException(message: string) =
+    inherit InvalidOperationException(message)
 
 module FirewalldBackend =
     let private hostGates = ConcurrentDictionary<string, SemaphoreSlim>(StringComparer.OrdinalIgnoreCase)
@@ -45,6 +47,22 @@ module FirewalldBackend =
 
     let private propertyNames (root: JsonElement) =
         root.EnumerateObject() |> Seq.map (fun property -> property.Name) |> Set.ofSeq
+    let internal validatePreStageEnvelope (operation: string) (ownerId: string) (root: JsonElement) =
+        if root.ValueKind = JsonValueKind.Object then
+            let properties = propertyNames root
+            if properties.Contains "kind" then
+                let expected = set [ "kind"; "version"; "operation"; "ownerId"; "status"; "reason" ]
+                if properties <> expected
+                   || root.GetProperty("kind").GetString() <> "firewalld-pre-stage-refusal"
+                   || root.GetProperty("version").GetInt32() <> 1
+                   || root.GetProperty("operation").GetString() <> operation
+                   || root.GetProperty("ownerId").GetString() <> ownerId
+                   || root.GetProperty("status").GetString() <> "refused-before-stage" then
+                    invalidOp "Invalid Firewalld pre-stage refusal envelope."
+                let reason = root.GetProperty("reason").GetString()
+                if String.IsNullOrWhiteSpace reason || reason.Length > 512 || reason |> Seq.exists Char.IsControl then
+                    invalidOp "Invalid Firewalld pre-stage refusal reason."
+                raise (FirewalldPreStageRefusalException(reason))
 
     let private readBool (root: JsonElement) (name: string) = root.GetProperty(name).GetBoolean()
 
@@ -119,6 +137,7 @@ module FirewalldBackend =
             let! output = invoke true "apply" connection ownerId configuration None ct
             use document = JsonDocument.Parse output
             let root = document.RootElement
+            validatePreStageEnvelope "apply" ownerId root
             if propertyNames root <> set [ "unchanged" ] || not (readBool root "unchanged") then
                 let nonce = readNonce root
                 let staged = parseSnapshot output
@@ -143,6 +162,7 @@ module FirewalldBackend =
             let! output = invoke true "delete" connection ownerId configuration None ct
             use document = JsonDocument.Parse output
             let root = document.RootElement
+            validatePreStageEnvelope "delete" ownerId root
             if root.ValueKind <> JsonValueKind.Object then invalidOp "Invalid firewalld delete response."
             let fields = propertyNames root
             if fields = set [ "unchanged" ] && readBool root "unchanged" then ()

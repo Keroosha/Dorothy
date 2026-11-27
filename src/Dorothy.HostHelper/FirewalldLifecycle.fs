@@ -85,7 +85,7 @@ module FirewalldLifecycle =
             fail ("Firewalld recovery command failed: " + executable + " " + String.concat " " arguments + " (exit " + string result.ExitCode + "): " + diagnostic details)
         result.Stdout.Trim()
 
-    let private regularPath (environment: HostEnvironment) logical =
+    let internal regularPath (environment: HostEnvironment) logical =
         let physical = logicalPath environment logical
         let rec inspect item =
             if not (String.IsNullOrEmpty item) then
@@ -377,6 +377,15 @@ module FirewalldLifecycle =
                     let journal = JsonNode.Parse(text).AsObject()
                     if hasOwnerPending journal then
                         fail "An owner journal contains an unpaired firewalld transaction; refusing new mutations."
+
+    let canClassifyPreStageRefusal (environment: HostEnvironment) =
+        try
+            match pending environment with
+            | Some _ -> false
+            | None ->
+                ensureNoOrphanedOwnerPending environment
+                true
+        with _ -> false
 
     let private ensureNoLegacyPending (journal: JsonObject) =
         if hasOwnerPending journal then

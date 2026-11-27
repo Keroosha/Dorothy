@@ -11,6 +11,10 @@ type FirewalldRecoveryProofTests() =
     let commandResult (stdout: string) : CommandResult =
         { ExitCode = 0; Stdout = stdout; Stderr = "" }
 
+    let restoreWithoutReload environment configuration xml proof phase =
+        FirewalldRecoveryProof.restoreRuntimeWithPreReload environment configuration xml proof phase
+            (fun () -> Assert.Fail "A scoped inverse must not reload the daemon.")
+
     let configuration =
         { FirewalldModel.empty "zone" "quiet" with
             Services = [ "ssh" ]
@@ -207,6 +211,17 @@ type FirewalldRecoveryProofTests() =
     [<Test>]
     member _.``Reload preimage must match exact effective disk XML and live selectors``() =
         withSelectorRuntime configuration (selectorValues configuration) (fun environment calls _ _ ->
+            let originalRun = environment.Run
+            let interfaceUuid = "c9442404-b0ac-40fe-9bd0-ddbcb382196f"
+            let run executable arguments input =
+                match executable, arguments with
+                | "firewall-cmd", [ "--zone=quiet"; "--list-interfaces" ]
+                | "firewall-cmd", [ "--permanent"; "--zone=quiet"; "--list-interfaces" ] -> commandResult "eth0"
+                | "nmcli", [ "-g"; "GENERAL.CON-UUID"; "device"; "show"; "eth0" ] -> commandResult interfaceUuid
+                | "nmcli", [ "-g"; "connection.zone"; "connection"; "show"; "uuid"; value ]
+                    when value = interfaceUuid -> commandResult "quiet"
+                | _ -> originalRun executable arguments input
+            let environment = { environment with Run = run }
             let matchingXml = FieldRuntime.render configuration
             let proof = FirewalldRecoveryProof.reloadProof environment configuration (Some matchingXml) (Some matchingXml)
             Assert.That(proof["beforePresent"].GetValue<bool>(), Is.True)
@@ -220,7 +235,7 @@ type FirewalldRecoveryProofTests() =
                 |> ignore)
             |> ignore
             Assert.Throws<InvalidOperationException>(fun () ->
-                FirewalldRecoveryProof.restoreRuntime
+                restoreWithoutReload
                     environment
                     configuration
                     (Some(FieldRuntime.render driftedDisk))
@@ -228,6 +243,31 @@ type FirewalldRecoveryProofTests() =
                     FirewalldLifecycle.ActiveDaemon
                 |> ignore)
             |> ignore
+            Assert.That(calls |> Seq.exists (fun args -> List.contains "--reload" args), Is.False))
+
+    [<Test>]
+    member _.``Reload rollback must pass the safety check before any reload``() =
+        let preimage = { configuration with Ports = [] }
+        withSelectorRuntime preimage (selectorValues preimage) (fun environment calls _ setCurrent ->
+            let preimageXml = Some(FieldRuntime.render preimage)
+            let postimageXml = Some(FieldRuntime.render configuration)
+            let proof = FirewalldRecoveryProof.reloadProof environment preimage preimageXml postimageXml
+            setCurrent (selectorValues configuration)
+            let mutable checkedSafety = false
+            let error =
+                Assert.Throws<InvalidOperationException>(fun () ->
+                    FirewalldRecoveryProof.restoreRuntimeWithPreReload
+                        environment
+                        preimage
+                        preimageXml
+                        (Some proof)
+                        FirewalldLifecycle.ActiveDaemon
+                        (fun () ->
+                            checkedSafety <- true
+                            raise (InvalidOperationException("blocked by reload safety preflight")))
+                    |> ignore)
+            Assert.That(error.Message, Is.EqualTo "blocked by reload safety preflight")
+            Assert.That(checkedSafety, Is.True)
             Assert.That(calls |> Seq.exists (fun args -> List.contains "--reload" args), Is.False))
 
     [<Test>]
@@ -253,15 +293,15 @@ type FirewalldRecoveryProofTests() =
             FirewalldRecoveryProof.activateRuntimeRepair environment configuration proof
             let repaired = FirewalldRuntime.inspectRuntime environment "zone" "quiet" |> Option.get
             Assert.That(repaired.Ports, Is.EquivalentTo [ "443/tcp" ])
-            FirewalldRecoveryProof.restoreRuntime environment configuration None (Some proof) FirewalldLifecycle.ActiveDaemon
+            restoreWithoutReload environment configuration None (Some proof) FirewalldLifecycle.ActiveDaemon
             let rolledBack = FirewalldRuntime.inspectRuntime environment "zone" "quiet" |> Option.get
             Assert.That(rolledBack.Ports, Is.Empty)
             FirewalldRecoveryProof.activateRuntimeRepair environment configuration proof
             setPorts [ "443/tcp" ]
-            FirewalldRecoveryProof.restoreRuntime environment configuration None (Some proof) FirewalldLifecycle.BootBeforeFirewalld
+            restoreWithoutReload environment configuration None (Some proof) FirewalldLifecycle.BootBeforeFirewalld
             let daemonReady = FirewalldRuntime.inspectRuntime environment "zone" "quiet" |> Option.get
             Assert.That(daemonReady.Ports, Is.EquivalentTo [ "443/tcp" ])
-            FirewalldRecoveryProof.restoreRuntime environment configuration None (Some proof) FirewalldLifecycle.BootAfterFirewalld
+            restoreWithoutReload environment configuration None (Some proof) FirewalldLifecycle.BootAfterFirewalld
             let postbootRollback = FirewalldRuntime.inspectRuntime environment "zone" "quiet" |> Option.get
             Assert.That(postbootRollback.Ports, Is.Empty))
 
@@ -285,7 +325,7 @@ type FirewalldRecoveryProofTests() =
             FirewalldRecoveryProof.activateRuntimeRepair environment configuration proof
             let repaired = FirewalldRuntime.inspectRuntime environment "zone" "quiet" |> Option.get
             Assert.That(repaired.Services, Is.EquivalentTo [ "ssh" ])
-            FirewalldRecoveryProof.restoreRuntime environment configuration None (Some proof) FirewalldLifecycle.ActiveDaemon
+            restoreWithoutReload environment configuration None (Some proof) FirewalldLifecycle.ActiveDaemon
             let restored = FirewalldRuntime.inspectRuntime environment "zone" "quiet" |> Option.get
             Assert.That(restored.Services, Is.Empty))
 
@@ -314,7 +354,7 @@ type FirewalldRecoveryProofTests() =
             for field in [ "services"; "ports"; "source-ports"; "protocols"; "forward-ports" ] do
                 Assert.That(repaired[field], Is.EquivalentTo expected[field], field)
             Assert.That(repaired["rich rules"], Does.Contain foreignBan)
-            FirewalldRecoveryProof.restoreRuntime environment config None (Some proof) FirewalldLifecycle.ActiveDaemon
+            restoreWithoutReload environment config None (Some proof) FirewalldLifecycle.ActiveDaemon
             let rolledBack = current ()
             for field in Map.keys expected do
                 if field = "rich rules" then
@@ -322,10 +362,10 @@ type FirewalldRecoveryProofTests() =
                 else Assert.That(rolledBack[field], Is.Empty, field)
             FirewalldRecoveryProof.activateRuntimeRepair environment config proof
             let callCountBeforeBoot = calls.Count
-            FirewalldRecoveryProof.restoreRuntime environment config None (Some proof) FirewalldLifecycle.BootBeforeFirewalld
+            restoreWithoutReload environment config None (Some proof) FirewalldLifecycle.BootBeforeFirewalld
             Assert.That(calls.Count, Is.EqualTo callCountBeforeBoot)
             setCurrent expected
-            FirewalldRecoveryProof.restoreRuntime environment config None (Some proof) FirewalldLifecycle.BootAfterFirewalld
+            restoreWithoutReload environment config None (Some proof) FirewalldLifecycle.BootAfterFirewalld
             let postboot = current ()
             for field in Map.keys expected do Assert.That(postboot[field], Is.Empty, field))
 
@@ -347,7 +387,7 @@ type FirewalldRecoveryProofTests() =
             FirewalldRecoveryProof.activateRuntimeRepair environment config proof
             let repaired = current ()
             Assert.That(repaired["forward-ports"], Is.EquivalentTo expected["forward-ports"])
-            FirewalldRecoveryProof.restoreRuntime environment config None (Some proof) FirewalldLifecycle.ActiveDaemon
+            restoreWithoutReload environment config None (Some proof) FirewalldLifecycle.ActiveDaemon
             let restored = current ()
             Assert.That(restored["forward-ports"], Is.Empty)
             Assert.That(calls, Does.Contain [ "firewall-cmd"; "--zone=quiet"; "--add-forward-port=" + expected["forward-ports"].Head ])
@@ -372,7 +412,7 @@ type FirewalldRecoveryProofTests() =
             let repaired = current ()
             for field in Map.keys expected do
                 Assert.That(repaired[field], Is.EquivalentTo expected[field], field)
-            FirewalldRecoveryProof.restoreRuntime environment restrictive None (Some proof) FirewalldLifecycle.ActiveDaemon
+            restoreWithoutReload environment restrictive None (Some proof) FirewalldLifecycle.ActiveDaemon
             Assert.That(current (), Is.EqualTo(box empty)))
 
         let mixed =
@@ -405,6 +445,47 @@ type FirewalldRecoveryProofTests() =
             FirewalldRecoveryProof.activateRuntimeRepair environment inverted proof
             let repaired = current ()
             Assert.That(repaired["icmp-blocks"], Is.EquivalentTo expected["icmp-blocks"])
-            FirewalldRecoveryProof.restoreRuntime environment inverted None (Some proof) FirewalldLifecycle.ActiveDaemon
+            restoreWithoutReload environment inverted None (Some proof) FirewalldLifecycle.ActiveDaemon
             let restored = current ()
             Assert.That(restored["icmp-blocks"], Is.Empty))
+
+    [<Test>]
+    member _.``Loaded projection accepts only UUID-authorized NetworkManager interfaces``() =
+        let configuration = { FirewalldModel.empty "zone" "quiet" with Services = [ "ssh" ] }
+        let project (configuration: FirewalldModel.Configuration) =
+            match FirewalldRuntime.snapshotFromXml configuration.Kind configuration.Name (Some(FieldRuntime.render configuration)) with
+            | Ok(Some snapshot) -> snapshot
+            | _ -> failwith "Fixture XML did not project to a complete zone snapshot."
+        let expected = project configuration
+        let authorizedUuid = "c9442404-b0ac-40fe-9bd0-ddbcb382196f"
+        let foreignUuid = "c9442404-b0ac-40fe-9bd0-ddbcb3821960"
+        let mutable listedInterfaces = []
+        let run executable arguments _ =
+            match executable, arguments with
+            | "firewall-cmd", [ "--zone=quiet"; "--list-interfaces" ] -> commandResult (String.concat " " listedInterfaces)
+            | "firewall-cmd", [ "--permanent"; "--zone=quiet"; "--list-interfaces" ] -> commandResult (String.concat " " listedInterfaces)
+            | "nmcli", [ "-g"; "GENERAL.CON-UUID"; "device"; "show"; "eth0" ] -> commandResult authorizedUuid
+            | "nmcli", [ "-g"; "GENERAL.CON-UUID"; "device"; "show"; "eth1" ] -> commandResult foreignUuid
+            | "nmcli", [ "-g"; "connection.zone"; "connection"; "show"; "uuid"; value ]
+                when value = authorizedUuid -> commandResult "quiet"
+            | "nmcli", [ "-g"; "connection.zone"; "connection"; "show"; "uuid"; value ]
+                when value = foreignUuid -> commandResult "public"
+            | _ -> failwith ("Unexpected NetworkManager projection command: " + executable + " " + String.concat " " arguments)
+        let environment =
+            { Root = Path.Combine(Path.GetTempPath(), "dorothy-firewalld-loaded-projection")
+              Run = run
+              UtcNow = fun () -> DateTimeOffset.UnixEpoch }
+        let withInterfaces (snapshot: FirewalldRuntime.RuntimeSnapshot) (interfaces: string list) =
+            { snapshot with
+                Interfaces = interfaces
+                NativeFields =
+                    Map.add "interfaces"
+                        (if interfaces.IsEmpty then [] else [ String.concat " " interfaces ])
+                        snapshot.NativeFields }
+        listedInterfaces <- [ "eth0" ]
+        Assert.That(FirewalldRecoveryProof.matchesLoadedProjection environment expected (withInterfaces expected [ "eth0" ]), Is.True)
+        listedInterfaces <- [ "eth1" ]
+        Assert.That(FirewalldRecoveryProof.matchesLoadedProjection environment expected (withInterfaces expected [ "eth1" ]), Is.False)
+        listedInterfaces <- []
+        let diskRequiresInterface = project { configuration with Interfaces = [ "eth0" ] }
+        Assert.That(FirewalldRecoveryProof.matchesLoadedProjection environment diskRequiresInterface expected, Is.False)

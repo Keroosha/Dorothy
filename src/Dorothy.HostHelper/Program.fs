@@ -132,6 +132,27 @@ module Program =
             Console.Error.WriteLine("keroosha-iac-helper: backend error: " + sanitized)
         | _ ->
             Console.Error.WriteLine("keroosha-iac-helper: request failed.")
+    let internal serializePreStageRefusal (refusal: Firewalld.PreStageRefusal) =
+        if refusal.Operation <> "apply"
+           || String.IsNullOrWhiteSpace refusal.OwnerId
+           || refusal.OwnerId |> Seq.exists Char.IsControl then
+            invalidOp "Invalid Firewalld pre-stage refusal identity."
+        let reason =
+            refusal.Reason
+            |> Seq.truncate 512
+            |> Seq.map (fun character -> if Char.IsControl character then ' ' else character)
+            |> Array.ofSeq
+            |> fun characters -> String(characters)
+        if String.IsNullOrWhiteSpace reason then invalidOp "Invalid Firewalld pre-stage refusal reason."
+        let value = JsonObject()
+        value["kind"] <- JsonValue.Create "firewalld-pre-stage-refusal"
+        value["version"] <- JsonValue.Create 1
+        value["operation"] <- JsonValue.Create refusal.Operation
+        value["ownerId"] <- JsonValue.Create refusal.OwnerId
+        value["status"] <- JsonValue.Create "refused-before-stage"
+        value["reason"] <- JsonValue.Create reason
+        value
+
 
     [<EntryPoint>]
     let main (arguments: string array) =
@@ -197,7 +218,11 @@ module Program =
                     let response: JsonNode = dispatch command document.RootElement
                     Console.Out.WriteLine(response.ToJsonString())
                     0
-                with error ->
+                with
+                | :? Firewalld.PreStageRefusal as refusal when command = "firewalld" ->
+                    Console.Out.WriteLine((serializePreStageRefusal refusal).ToJsonString())
+                    0
+                | error ->
                     reportFailure error
                     1
             | _ -> usage ()

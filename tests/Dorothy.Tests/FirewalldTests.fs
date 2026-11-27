@@ -382,7 +382,7 @@ type FirewalldTests() =
             File.WriteAllText(configPath, "DefaultZone=public\nStrictForwardPorts=yes\n")
             this.InvokeOwner env oldOwner "apply" strictConfiguration |> ignore
             let before = File.ReadAllText configPath
-            Assert.Throws<NativeFirewalld.BackendError>(fun () -> this.InvokeOwner env newOwner "apply" strictConfiguration |> ignore) |> ignore
+            Assert.Throws<NativeFirewalld.PreStageRefusal>(fun () -> this.InvokeOwner env newOwner "apply" strictConfiguration |> ignore) |> ignore
             Assert.That(File.ReadAllText configPath, Is.EqualTo before)
             let observed = this.InvokeOwner env oldOwner "read" strictConfiguration
             Assert.That(observed["actual"].GetValue<string>(), Is.EqualTo "yes")
@@ -406,7 +406,7 @@ type FirewalldTests() =
             this.InvokeOwner env "old-policy-generation" "apply" config |> ignore
             let policyPath = Path.Combine(root, "etc/firewalld/policies/blockdocker.xml")
             let before = File.ReadAllText policyPath
-            Assert.Throws<NativeFirewalld.BackendError>(fun () -> this.InvokeOwner env "new-policy-generation" "apply" config |> ignore) |> ignore
+            Assert.Throws<NativeFirewalld.PreStageRefusal>(fun () -> this.InvokeOwner env "new-policy-generation" "apply" config |> ignore) |> ignore
             Assert.That(File.ReadAllText policyPath, Is.EqualTo before)
             let observed = this.InvokeOwner env "old-policy-generation" "read" config
             Assert.That(observed["inSync"].GetValue<bool>(), Is.True))
@@ -504,9 +504,9 @@ type FirewalldTests() =
     [<Test>]
     member this.``Unsafe SSH candidate leaves configuration and journal untouched``() =
         this.WithHost(fun env root calls ->
-            let config = (zone "external" { interfaces [ "eth0" ]; target FirewalldTarget.Drop }).Configuration
+            let config = (zone "ssh-denied" { interfaces [ "eth0" ]; target FirewalldTarget.Drop }).Configuration
             Assert.Throws<NativeFirewalld.BackendError>(fun () -> this.Invoke env "apply" config |> ignore) |> ignore
-            Assert.That(File.Exists(Path.Combine(root, "etc/firewalld/zones/external.xml")), Is.False)
+            Assert.That(File.Exists(Path.Combine(root, "etc/firewalld/zones/ssh-denied.xml")), Is.False)
             Assert.That(Directory.Exists(Path.Combine(root, "var/lib/keroosha-iac")), Is.False)
             Assert.That(calls |> Seq.exists (fun args -> args = [ "firewall-cmd"; "--check-config" ] || args = [ "firewall-cmd"; "--reload" ]), Is.False))
 
@@ -568,8 +568,11 @@ type FirewalldTests() =
     member this.``Runtime-only SSH binding is guarded before any permanent write``() =
         this.WithHost(fun env root calls ->
             let file = Path.Combine(root, "etc/firewalld/zones/runtime.xml")
-            let before = "<zone><service name=\"ssh\"/></zone>"
-            File.WriteAllText(file, before)
+            File.WriteAllText(file, "<zone><service name=\"ssh\"/></zone>")
+            let initial = (zone "runtime" { services [ "ssh" ] }).Configuration
+            this.Invoke env "apply" initial |> ignore
+            let before = File.ReadAllText file
+            calls.Clear()
             let mutable extraBinding = true
             let runtime =
                 { env with
@@ -657,7 +660,7 @@ type FirewalldTests() =
             let baseline =
                 "<zone target=\"DROP\"><interface name=\"eth0\"/><service name=\"ssh\"/><port port=\"9090\" protocol=\"tcp\"/></zone>\n"
             File.WriteAllText(file, baseline)
-            Assert.Throws<NativeFirewalld.BackendError>(fun () -> this.Invoke env "apply" zoneConfiguration |> ignore) |> ignore
+            Assert.Throws<NativeFirewalld.PreStageRefusal>(fun () -> this.Invoke env "apply" zoneConfiguration |> ignore) |> ignore
             Assert.That(File.ReadAllText file, Is.EqualTo baseline)
             Assert.That(calls, Does.Not.Contain [ "firewall-cmd"; "--reload" ])
             Assert.That(File.Exists(Path.Combine(root, "var/lib/keroosha-iac/firewalld/zone-external.json")), Is.False))
@@ -667,7 +670,7 @@ type FirewalldTests() =
             let file = Path.Combine(root, "etc/firewalld/zones/external.xml")
             let baseline = """<zone><service name="ssh"/><rule family="ipv6"><port port="10544" protocol="udp"/><drop/></rule></zone>"""
             File.WriteAllText(file, baseline)
-            Assert.Throws<NativeFirewalld.BackendError>(fun () -> this.Invoke env "apply" zoneConfiguration |> ignore) |> ignore
+            Assert.Throws<NativeFirewalld.PreStageRefusal>(fun () -> this.Invoke env "apply" zoneConfiguration |> ignore) |> ignore
             this.Invoke env "delete" zoneConfiguration |> ignore
             Assert.That(File.ReadAllText file, Is.EqualTo baseline)
             Assert.That(calls, Does.Not.Contain [ "firewall-cmd"; "--reload" ])
@@ -866,6 +869,25 @@ type FirewalldTests() =
             Assert.That(staged["transactionNonce"].GetValue<string>(), Is.Not.Empty))
 
     [<Test>]
+    member this.``An unrelated XML change cannot activate a weaker staged strict setting``() =
+        this.WithHost(fun env root calls ->
+            let settings = Path.Combine(root, "etc/firewalld/firewalld.conf")
+            File.WriteAllText(settings, "StrictForwardPorts=yes\n")
+            env.Run "firewall-cmd" [ "--reload" ] None |> ignore
+            File.WriteAllText(settings, "StrictForwardPorts=no\n")
+            calls.Clear()
+            let spec = { FirewalldModel.empty "service" "status" with Ports = [ "8080/tcp" ] } |> FirewalldModel.toJson
+            Assert.Throws<NativeFirewalld.BackendError>(fun () -> this.Invoke env "apply" spec |> ignore) |> ignore
+            Assert.That(NativeFirewalld.strictForwardPortsLoaded env, Is.True)
+            Assert.That(File.Exists(Path.Combine(root, "etc/firewalld/services/status.xml")), Is.False)
+            Assert.That(File.Exists(Path.Combine(root, "var/lib/keroosha-iac/firewalld/service-status.json")), Is.False)
+            Assert.That(Dorothy.HostHelper.FirewalldLifecycle.pending env, Is.EqualTo None)
+            Assert.That(calls, Does.Not.Contain [ "firewall-cmd"; "--reload" ])
+            File.WriteAllText(settings, "StrictForwardPorts=yes\n")
+            let repaired = this.Invoke env "apply" spec
+            Assert.That(repaired["inSync"].GetValue<bool>(), Is.True))
+
+    [<Test>]
     member this.``Unrepresentable runtime drift refuses before writing or staging rollback``() =
         this.WithHost(fun env root calls ->
             let config =
@@ -901,7 +923,7 @@ type FirewalldTests() =
             this.Invoke env "apply" zoneConfiguration |> ignore
             let before = File.ReadAllText(Path.Combine(root, "etc/firewalld/zones/external.xml"))
             for operation in [ "apply"; "delete"; "read" ] do
-                Assert.Throws<NativeFirewalld.BackendError>(fun () -> this.InvokeOwner env "other-owner" operation zoneConfiguration |> ignore) |> ignore
+                Assert.Catch<NativeFirewalld.BackendError>(fun () -> this.InvokeOwner env "other-owner" operation zoneConfiguration |> ignore) |> ignore
             Assert.That(File.ReadAllText(Path.Combine(root, "etc/firewalld/zones/external.xml")), Is.EqualTo before))
 
     [<Test>]
@@ -955,7 +977,8 @@ type FirewalldTests() =
             let journalPath = Path.Combine(root, "var/lib/keroosha-iac/firewalld/zone-external.json")
             use pending = JsonDocument.Parse(File.ReadAllText journalPath)
             Assert.That(pending.RootElement.GetProperty("pending").ValueKind, Is.EqualTo JsonValueKind.Object)
-            Assert.Throws<NativeFirewalld.BackendError>(fun () -> this.InvokeOwner env "other-owner" "apply" zoneConfiguration |> ignore) |> ignore
+            let conflict = Assert.Catch<NativeFirewalld.BackendError>(fun () -> this.InvokeOwner env "other-owner" "apply" zoneConfiguration |> ignore)
+            Assert.That(conflict, Is.Not.InstanceOf<NativeFirewalld.PreStageRefusal>())
             // The failed acknowledgement did not transfer the old owner's authority.
             NativeFirewalld.recoverPending env
             Assert.That(File.Exists journalPath, Is.False)

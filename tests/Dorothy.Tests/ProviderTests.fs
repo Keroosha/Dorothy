@@ -1,7 +1,6 @@
 namespace Dorothy.Tests
 
 open System
-open System.IO
 open System.Collections.Generic
 open System.Collections.Immutable
 open System.Threading
@@ -260,56 +259,3 @@ type ProviderTests() =
         Assert.That(response.DetailedDiff.ContainsKey("routers.example.backend"), Is.True)
         Assert.That(response.DetailedDiff.ContainsKey("adminPort"), Is.True)
 
-
-[<TestFixture; NonParallelizable>]
-type FirewalldCreateReceiptTests() =
-    let withReceiptHome (action: string -> unit) =
-        let home = Path.Combine(Path.GetTempPath(), "dorothy-firewalld-receipts-" + Guid.NewGuid().ToString("N"))
-        let oldHome = Environment.GetEnvironmentVariable "PULUMI_HOME"
-        Environment.SetEnvironmentVariable("PULUMI_HOME", home)
-        try action home
-        finally
-            Environment.SetEnvironmentVariable("PULUMI_HOME", oldHome)
-            if Directory.Exists home then Directory.Delete(home, true)
-
-    let urn = Pulumi.Urn("urn:pulumi:unit::unit::keroosha:debian:FirewalldZone::receipt")
-    let token = FirewalldProvider.ZoneToken
-    let connection =
-        { Address = "192.0.2.40"; User = "root"; Port = 22; IdentityFile = Some "/private/ssh/key" }
-    let configuration = FirewalldModel.empty "zone" "receipt" |> FirewalldModel.toJson
-
-    [<Test>]
-    member _.``Each Create has a unique private ticket and only exact owner import works``() =
-        withReceiptHome (fun _ ->
-            let first = FirewalldCreateReceipts.create urn token connection configuration
-            let second = FirewalldCreateReceipts.create urn token connection configuration
-            Assert.That(first.OwnerId, Is.Not.EqualTo second.OwnerId)
-            Assert.That(first.Ticket, Is.Not.EqualTo second.Ticket)
-            Assert.That(first.OwnerId.EndsWith("::" + first.Ticket, StringComparison.Ordinal), Is.True)
-            let firstPath = FirewalldCreateReceipts.pathForTicket first.Ticket
-            let secondPath = FirewalldCreateReceipts.pathForTicket second.Ticket
-            if not (OperatingSystem.IsWindows()) then
-                Assert.That(int (File.GetUnixFileMode firstPath), Is.EqualTo 0o600)
-                Assert.That(int (File.GetUnixFileMode(Path.GetDirectoryName firstPath)), Is.EqualTo 0o700)
-            let imported = FirewalldCreateReceipts.readTicket urn token (FirewalldCreateReceipts.importId first)
-            Assert.That(imported.OwnerId, Is.EqualTo first.OwnerId)
-            Assert.That(File.Exists firstPath, Is.True)
-            Assert.Throws<InvalidOperationException>(fun () ->
-                FirewalldCreateReceipts.readTicket (Pulumi.Urn("urn:pulumi:other::unit::keroosha:debian:FirewalldZone::receipt")) token
-                    (FirewalldCreateReceipts.importId first)
-                |> ignore)
-            |> ignore
-            FirewalldCreateReceipts.acknowledgeOwner urn token first.OwnerId
-            Assert.That(File.Exists firstPath, Is.False)
-            Assert.That(File.Exists secondPath, Is.True))
-
-    [<Test>]
-    member _.``Invalid local receipt is retained and cannot invalidate remote acknowledgement``() =
-        withReceiptHome (fun _ ->
-            let receipt = FirewalldCreateReceipts.create urn token connection configuration
-            let path = FirewalldCreateReceipts.pathForTicket receipt.Ticket
-            File.WriteAllText(path, "not a receipt")
-            FirewalldCreateReceipts.acknowledgeOwner urn token receipt.OwnerId
-            Assert.That(File.ReadAllText(path), Is.EqualTo "not a receipt")
-            Assert.That((fun () -> FirewalldCreateReceipts.readTicket urn token (FirewalldCreateReceipts.importId receipt) |> ignore),
-                        Throws.InstanceOf<System.Text.Json.JsonException>()))
