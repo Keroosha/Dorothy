@@ -64,12 +64,18 @@ tcp_exchange() {
     timeout 8 perl -MIO::Socket::INET -e '
         use strict;
         use warnings;
-        my ($port, $source, $mode, $expected, $output) = @ARGV;
+        use Errno qw(ECONNRESET);
+        my ($port, $source, $mode, $expected, $output, $nonce) = @ARGV;
         my $socket = IO::Socket::INET->new(
             PeerAddr => "127.0.0.1", PeerPort => $port, LocalAddr => $source,
             Proto => "tcp", Timeout => 3,
         ) or die "connect: $!";
         binmode($socket);
+        if ($mode =~ /^middleware-/) {
+            open(my $peer, ">", "$output.peer") or die "open peer: $!";
+            print {$peer} $socket->sockhost . ":" . $socket->sockport or die "write peer: $!";
+            close($peer) or die "close peer: $!";
+        }
         my $payload = "review-proxy-payload-$mode";
         my $packet;
         if ($mode eq "v1-trusted" || $mode eq "v1-untrusted") {
@@ -82,7 +88,7 @@ tcp_exchange() {
             $packet = $signature . pack("CCnNNnn", 0x21, 0x11, 12,
                 0xcb00714d, 0x7f000001, 45678, $port) . $payload;
         } else {
-            $packet = "review-tcp-middleware-$mode";
+            $packet = $nonce;
         }
         my $offset = 0;
         while ($offset < length($packet)) {
@@ -96,8 +102,10 @@ tcp_exchange() {
             my $readable = "";
             vec($readable, fileno($socket), 1) = 1;
             my $ready = select($readable, undef, undef, 3);
+            die "middleware connection timed out or select failed" if $mode =~ /^middleware-/ && (!defined($ready) || !$ready);
             last if !defined($ready) || $ready == 0;
             my $count = sysread($socket, my $chunk, 4096);
+            last if !defined($count) && $! == ECONNRESET && $mode eq "middleware-denied" && !length($response);
             defined($count) or die "read: $!";
             last if $count == 0;
             $response .= $chunk;
@@ -142,7 +150,7 @@ tcp_exchange() {
         } elsif ($mode eq "middleware-denied") {
             length($response) == 0 or die "TCP allow-list forwarded a denied peer payload";
         }
-    ' "$port" "$source" "$packet_mode" "$expected_source" "$output" \
+    ' "$port" "$source" "$packet_mode" "$expected_source" "$output" "${6:-}" \
         > "$root/logs/review-tcp-$label.log" 2>&1 || fail "TCP probe $label did not satisfy its wire assertion"
 }
 udp_exchange() {
@@ -272,8 +280,29 @@ case "$mode" in
         ;;
     positive)
         check_http_routes
-        tcp_exchange middleware-allowed 19012 127.0.0.1 middleware-allowed ''
-        tcp_exchange middleware-denied 19012 127.0.0.2 middleware-denied ''
+        (
+            allowed=$(openssl rand -hex 12); denied=$(openssl rand -hex 12)
+            cap="$root/logs/middleware-backend.pcap"; stats="$root/logs/middleware-capture.log"
+            tcpdump --immediate-mode -U -i lo -s 0 -w - 'tcp dst port 19001' > "$cap" 2> "$stats" &
+            pid=$!; trap 'kill -INT "$pid" 2>/dev/null || :; wait "$pid" 2>/dev/null || :' EXIT
+            for _ in $(seq 1 40); do grep -q 'listening on' "$stats" && break; sleep .05; done
+            grep -q 'listening on' "$stats" || fail 'backend capture unavailable'
+            tcp_exchange middleware-allowed 19012 127.0.0.1 middleware-allowed '' "$allowed"
+            cursor=$(journalctl -u keroosha-traefik.service -n 1 --show-cursor -o cat --no-pager | sed -n 's/^-- cursor: //p')
+            [[ -n $cursor ]] || fail 'missing pre-connect journal cursor'
+            tcp_exchange middleware-denied 19012 127.0.0.2 middleware-denied '' "$denied"
+            peer=$(<"$root/logs/review-tcp-middleware-denied.bin.peer")
+            [[ $peer =~ ^127\.0\.0\.2:[0-9]+$ ]] || fail 'unexpected connected peer'
+            journalctl --sync
+            journalctl -u keroosha-traefik.service --after-cursor="$cursor" -o cat --no-pager |
+                jq -Rse --arg peer "$peer" 'any(split("\n")[] | fromjson?; .middlewareName=="review-tcp-loopback-only@file" and .middlewareType=="IPAllowListerTCP" and .error==("\""+$peer+"\" matched none of the trusted IPs"))' >/dev/null || fail 'missing fresh tuple-specific deny'
+            sleep 1
+            kill -INT "$pid"; wait "$pid"; trap - EXIT
+            grep -Fxq '0 packets dropped by kernel' "$stats" || fail 'incomplete backend capture'
+            tcpdump -nn -A -r "$cap" > "$root/logs/middleware-backend.txt" 2>/dev/null
+            grep -Fq "$allowed" "$root/logs/middleware-backend.txt" || fail 'allowed nonce missing from backend'
+            if grep -Fq "$denied" "$root/logs/middleware-backend.txt"; then fail 'denied nonce reached backend'; fi
+        )
         tcp_exchange proxy-v1-trusted 19010 127.0.0.1 v1-trusted 203.0.113.55
         tcp_exchange proxy-v1-untrusted 19010 127.0.0.2 v1-untrusted 127.0.0.2
         tcp_exchange proxy-v2-trusted 19011 127.0.0.1 v2-trusted 203.0.113.77
