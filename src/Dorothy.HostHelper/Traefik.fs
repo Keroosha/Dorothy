@@ -46,8 +46,16 @@ module private TraefikNativeInterop =
     [<DllImport("libc", EntryPoint = "linkat", SetLastError = true)>]
     extern int nativeLinkAt(int oldDirectory, string oldPath, int newDirectory, string newPath, int flags)
 
-    [<DllImport("libc", EntryPoint = "rename", SetLastError = true)>]
-    extern int nativeRename(string oldPath, string newPath)
+
+    [<DllImport("libc", EntryPoint = "renameat2", SetLastError = true)>]
+    extern int nativeRenameAt2(int oldDir, string oldPath, int newDir, string newPath, uint32 flags)
+
+    [<DllImport("libc", EntryPoint = "mkdir", SetLastError = true)>]
+    extern int nativeMkdir(string path, uint32 mode)
+
+    // asm-generic and arm64 use different O_DIRECTORY / O_NOFOLLOW values.
+    let directoryFlag, noFollowFlag =
+        if RuntimeInformation.ProcessArchitecture = Architecture.Arm64 then 0x4000, 0x8000 else 0x10000, 0x20000
 
     [<DllImport("libc", EntryPoint = "fchmod", SetLastError = true)>]
     extern int nativeFchmod(int descriptor, uint32 mode)
@@ -777,6 +785,20 @@ module Traefik =
         sink.FlushFinalBlock()
         Convert.ToHexStringLower(hash.Hash)
 
+    let private dualGenerationRuleLength = (TraefikHttpGraphModel.generatedAdminRuleWithGeneration (String('0',128))).Length
+
+    let internal stampDynamicGeneration (dynamicConfig: JsonObject) =
+        let admin = dynamicConfig["http"].["routers"].["keroosha-admin"].AsObject()
+        use hash = SHA256.Create()
+        use sink = new CryptoStream(Stream.Null, hash, CryptoStreamMode.Write)
+        use writer = new Utf8JsonWriter(sink, jsonWriterOptions)
+        writeSortedNode writer dynamicConfig
+        writer.Flush()
+        sink.FlushFinalBlock()
+        let rule = TraefikHttpGraphModel.generatedAdminRuleWithGeneration (Convert.ToHexStringLower(hash.Hash) + opaqueDigest dynamicConfig)
+        admin["rule"] <- JsonValue.Create(rule)
+        rule
+
     let private renderDynamicFormat markLegacy (normalized: Request) (paths: RuntimePaths) =
         let mergedDynamic =
             normalized.MergedDynamic
@@ -830,20 +852,7 @@ module Traefik =
         tlsRoot["certificates"] <- certificates
         dynamicConfig["tls"] <- tlsRoot
 
-        if markLegacy || normalized.Configuration.IsSome then
-            let http = dynamicConfig["http"] :?> JsonObject
-            let routers = http["routers"] :?> JsonObject
-            let admin = routers["keroosha-admin"] :?> JsonObject
-            // Some file-provider settings (e.g. transports) have no public API collection.
-            // A changed rule on this private router acknowledges the generation, not acceptance.
-            use hash = SHA256.Create()
-            use sink = new CryptoStream(Stream.Null, hash, CryptoStreamMode.Write)
-            use writer = new Utf8JsonWriter(sink, jsonWriterOptions)
-            writeSortedNode writer dynamicConfig
-            writer.Flush()
-            sink.FlushFinalBlock()
-            let generation = Convert.ToHexStringLower(hash.Hash)
-            admin["rule"] <- JsonValue.Create(TraefikHttpGraphModel.generatedAdminRuleWithGeneration (generation + opaqueDigest dynamicConfig))
+        if markLegacy || normalized.Configuration.IsSome then stampDynamicGeneration dynamicConfig |> ignore
 
         // validateRequest already validated the merged graph, including trusted generated routes,
         // before resolving certificate aliases. Native certFile/keyFile are outputs of the
@@ -1145,7 +1154,7 @@ module Traefik =
 
     let private openChecked (path: string) (directory: bool) : int =
         // Metadata syscalls work on read-only descriptors; O_RDWR rejects running executables.
-        let flags = 0x80000 ||| 0x20000 ||| (if directory then 0x10000 else 0x800)
+        let flags = 0x80000 ||| noFollowFlag ||| (if directory then directoryFlag else 0x800)
         let descriptor = nativeOpen(path, flags, 0)
         if descriptor < 0 then fail "cannot safely open Traefik owned path"
         try
@@ -1226,49 +1235,107 @@ module Traefik =
                 fail "cannot secure Traefik file ownership"
         finally nativeClose(descriptor) |> ignore
 
-    let private writeAtomic (environment: HostEnvironment) (path: string) (data: byte[]) (mode: int) (groupId: int option) =
-        let parent = Path.GetDirectoryName(path)
-        if not (assertDirectory environment parent "Traefik configuration directory") then
-            fail "Traefik configuration directory is unavailable"
-        assertRegular environment path "Traefik owned file" |> ignore
-        let uid = runOk environment "cannot secure Traefik file ownership" "id" [ "-u" ] |> fun result -> Int32.Parse(result.Stdout.Trim(), CultureInfo.InvariantCulture)
-        let gid = defaultArg groupId (runOk environment "cannot secure Traefik file ownership" "id" [ "-g" ] |> fun result -> Int32.Parse(result.Stdout.Trim(), CultureInfo.InvariantCulture))
-        let temporaryPath = Path.Combine(parent, ".keroosha-traefik-write-" + Guid.NewGuid().ToString("N"))
-        let mutable temporaryExists = false
-        try
-            let options = FileStreamOptions()
-            options.Mode <- FileMode.CreateNew
-            options.Access <- FileAccess.Write
-            options.Share <- FileShare.None
-            options.BufferSize <- 4096
-            options.Options <- FileOptions.WriteThrough
-            options.UnixCreateMode <- Nullable<UnixFileMode>(unixMode mode)
-            do
-                use output = new FileStream(temporaryPath, options)
-                temporaryExists <- true
-                output.Write(data, 0, data.Length)
-                output.Flush(true)
-            chown environment temporaryPath uid gid
-            setMode environment temporaryPath mode false
-            assertRegular environment path "Traefik owned file" |> ignore
-            File.Move(temporaryPath, path, true)
-            temporaryExists <- false
-            HostFiles.syncDirectory parent
-        finally
-            if temporaryExists then
-                try File.Delete(temporaryPath) with _ -> ()
-
-    let private chmod (environment: HostEnvironment) (path: string) (mode: int) =
-        setMode environment path mode false
-
-
     let private fsyncDirectory (path: string) =
-        let descriptor = nativeOpen(path, 0x80000 ||| 0x20000 ||| 0x10000, 0)
+        let descriptor = nativeOpen(path, 0x80000 ||| noFollowFlag ||| directoryFlag, 0)
         if descriptor < 0 then fail "cannot synchronize Traefik directory"
         try
             if nativeFsync(descriptor) <> 0 then fail "cannot synchronize Traefik directory"
         finally
             nativeClose(descriptor) |> ignore
+    let private parseIdCommand (environment: HostEnvironment) (optionName: string) : int =
+        let result = runOk environment "cannot inspect Traefik host identity" "id" [ optionName ]
+        Int32.Parse(result.Stdout.Trim(), CultureInfo.InvariantCulture)
+    let metadataMatches (environment: HostEnvironment) (path: string) (expectedKind: string) (mode: int) (uid: int) (gid: int) : bool =
+        match tryStat environment path with
+        | Some item ->
+            let validKind =
+                if expectedKind = "directory" then item.Kind = "directory"
+                else item.Kind = "regular file" || item.Kind = "regular empty file"
+            validKind && item.Mode = mode && item.Uid = uid && item.Gid = gid
+        | None -> false
+    let private hostOwner (environment: HostEnvironment) : int * int =
+        let uid = parseIdCommand environment "-u"
+        let gid = parseIdCommand environment "-g"
+        if uid = 0 then 0, 0 else uid, gid
+    let private binarySha256 (environment: HostEnvironment) (binaryPath: string) : string =
+        if not (assertRegular environment binaryPath "Traefik binary") then fail "cannot hash installed Traefik binary"
+        let descriptor = openChecked binaryPath false
+        try
+            let handle = new SafeFileHandle(nativeint descriptor, false)
+            use stream = new FileStream(handle, FileAccess.Read)
+            SHA256.HashData(stream)
+            |> Convert.ToHexString
+            |> fun value -> value.ToLowerInvariant()
+        finally
+            nativeClose descriptor |> ignore
+    let private publicationDirectory environment (paths: RuntimePaths) (path: string) =
+        let within (root: string) = path = root || path.StartsWith(root + "/", StringComparison.Ordinal)
+        let parent =
+            if within paths.ConfigDir then Path.GetDirectoryName(paths.ConfigDir)
+            elif within paths.InstallDir then Path.GetDirectoryName(paths.InstallDir)
+            elif within paths.StateDir then Path.GetDirectoryName(paths.StateDir)
+            else Path.GetDirectoryName(paths.UnitPath)
+        let dir = Path.Combine(parent, ".dorothy-traefik-recovery")
+        let uid, gid = hostOwner environment
+        match tryStat environment parent with
+        | Some p when p.Kind = "directory" && p.Uid = uid && (p.Mode &&& 0o022) = 0 -> ()
+        | _ -> fail "publication directory parent is not private to the administrator"
+        Directory.CreateDirectory(dir, unixMode 0o700) |> ignore
+        if not (metadataMatches environment dir "directory" 0o700 uid gid) then fail "unsafe publication directory"
+        fsyncDirectory parent
+        dir
+
+    // Anonymous until complete; the only named staging inode is in a 0700
+    // directory outside the resource tree. No wildcard grants cleanup rights.
+    type private Publication = SealAtName | CreateNew | ReplaceOwned
+
+    let private publish environment dir generation (path: string) digest mode uid gid publication check inspect (write: FileStream -> unit) =
+        let stage =
+            if publication <> SealAtName then Path.Combine(dir, "stage-" + sha256Text (generation + "\n" + path + "\n" + digest))
+            else path
+        let verifyStage () =
+            if not (metadataMatches environment stage "file" mode uid gid) || binarySha256 environment stage <> digest then
+                fail "publication collision; preserving existing file"
+        match tryStat environment stage with
+        | Some _ -> verifyStage ()
+        | None ->
+            let fd = nativeOpen(dir, 0x400000 ||| directoryFlag ||| 2 ||| 0x80000 ||| noFollowFlag, 0o600)
+            if fd < 0 then fail "Traefik publication requires anonymous tmpfile support"
+            use handle = new SafeFileHandle(nativeint fd, true)
+            use output = new FileStream(handle, FileAccess.Write)
+            write output
+            output.Flush(true)
+            if nativeFchown(fd, uint32 uid, uint32 gid) <> 0 || nativeFchmod(fd, uint32 mode) <> 0 || nativeFsync(fd) <> 0 then fail "cannot secure staged file"
+            check ()
+            if nativeLinkAt(fd, "", -100, stage, 0x1000) <> 0 then fail "cannot link staged file without overwrite"
+        fsyncDirectory dir
+        if publication <> SealAtName then
+            verifyStage ()
+            inspect stage
+            check ()
+            let flags = if publication = CreateNew then 1u else 0u
+            if nativeRenameAt2(-100, stage, -100, path, flags) <> 0 then fail "cannot commit Traefik publication; destination changed or is on a different filesystem"
+            fsyncDirectory (Path.GetDirectoryName(path))
+            fsyncDirectory dir
+
+    let private publishOrdinary environment (path: string) digest mode group beforeCommit checkStage write =
+        let dir = publicationDirectory environment (pathsFor environment) path
+        let uid, gid = hostOwner environment
+        let snapshot () = if assertRegular environment path "Traefik owned file" then Some(binarySha256 environment path) else None
+        let before = snapshot ()
+        let check () =
+            beforeCommit ()
+            if snapshot () <> before then fail "destination changed during ordinary publication"
+        publish environment dir "ordinary" path digest mode uid (defaultArg group gid) (if before.IsSome then ReplaceOwned else CreateNew) check checkStage write
+
+    let private writeAtomic environment path (data: byte[]) mode group =
+        publishOrdinary environment path (sha256Bytes data) mode group ignore ignore (fun stream -> stream.Write(data.AsSpan()))
+
+
+    let private chmod (environment: HostEnvironment) (path: string) (mode: int) =
+        setMode environment path mode false
+
+
 
     let private removeCredentialFile (environment: HostEnvironment) (paths: RuntimePaths) : unit =
         match tryStat environment paths.CredentialsPath with
@@ -1352,17 +1419,19 @@ module Traefik =
         try Directory.EnumerateFileSystemEntries(directory) |> Seq.map (fun (entry: string) -> Path.GetFileName(entry)) |> Seq.toArray
         with _ -> fail "cannot inspect Traefik directory"
 
-    let private validateOwnedConfigContents (environment: HostEnvironment) (paths: RuntimePaths) =
+    let private validateOwnedConfigContents (environment: HostEnvironment) (paths: RuntimePaths) ownerId =
         let allowedRoot = set [ ".keroosha-owner"; ".keroosha-rollback.json"; ".keroosha-static-receipt"; "static.yml"; "dns-credentials.env"; "dynamic" ]
         try
             let rootEntries = entries paths.ConfigDir |> Set.ofArray
             if not (Set.isEmpty (Set.difference rootEntries allowedRoot)) then
                 fail "configuration directory contains unknown files"
             if assertDirectory environment paths.DynamicDir "dynamic configuration directory" then
+                checkDirectoryOwnership environment paths.DynamicDir ownerId "dynamic configuration directory" |> ignore
                 let dynamicEntries = entries paths.DynamicDir |> Set.ofArray
                 if not (Set.isEmpty (Set.difference dynamicEntries (set [ ".keroosha-owner"; "current.yml"; "certificates" ]))) then
                     fail "dynamic configuration directory contains unknown files"
             if assertDirectory environment paths.CertificateDir "certificate directory" then
+                checkDirectoryOwnership environment paths.CertificateDir ownerId "certificate directory" |> ignore
                 for filename in entries paths.CertificateDir do
                     if filename <> ".keroosha-owner" then
                         if not (certificateFilenamePattern.IsMatch(filename)) then fail "certificate directory contains unknown files"
@@ -1402,7 +1471,7 @@ module Traefik =
             paths.RollbackPath, "activation rollback journal"
             paths.StaticReceipt, "static activation receipt"
         ] do assertRegular environment path description |> ignore
-        if configStatus = "owned" then validateOwnedConfigContents environment paths
+        if configStatus = "owned" then validateOwnedConfigContents environment paths ownerId
         if installStatus = "owned" then
             let known = set [ ".keroosha-owner"; ".keroosha-release.json"; Version ]
             if not (Set.isEmpty (Set.difference (Set.ofArray (entries paths.InstallDir)) known)) then
@@ -1438,15 +1507,25 @@ module Traefik =
     let private createOwnedDirectory (environment: HostEnvironment) (path: string) (ownerId: string) (mode: int) (groupId: int option) : string =
         let status = markerStatus environment path ownerId
         if status = "unmarked" || status = "foreign" then fail "Traefik directory collides with an unowned path"
-        ensureDirectory environment path mode groupId
         if status = "absent" then
-            let marker = Encoding.ASCII.GetBytes(ownerDigest ownerId + "\n")
-            writeAtomic environment (Path.Combine(path, ".keroosha-owner")) marker 0o644 None
+            let parent = Path.GetDirectoryName(path)
+            if not (assertDirectory environment parent "owned directory parent") then ensureDirectory environment parent 0o755 None
+            let spool = publicationDirectory environment (pathsFor environment) path
+            let stage = Path.Combine(spool, "directory-" + Guid.NewGuid().ToString("N"))
+            if nativeMkdir(stage, 0o700u) <> 0 then fail "cannot reserve new directory publication"
+            let uid, gid = hostOwner environment
+            let marker = Path.Combine(stage, ".keroosha-owner")
+            let data = Encoding.ASCII.GetBytes(ownerDigest ownerId + "\n")
+            publish environment spool "owner" marker (sha256Bytes data) 0o644 uid gid SealAtName ignore ignore (fun output -> output.Write(data.AsSpan()))
+            setMode environment stage mode true
+            chown environment stage uid (defaultArg groupId gid)
+            fsyncDirectory stage
+            if nativeRenameAt2(-100, stage, -100, path, 1u) <> 0 then fail "cannot publish marked directory without replacing an existing path"
+            fsyncDirectory parent
+            fsyncDirectory spool
+        ensureDirectory environment path mode groupId
         status
 
-    let private parseIdCommand (environment: HostEnvironment) (optionName: string) : int =
-        let result = runOk environment "cannot inspect Traefik host identity" "id" [ optionName ]
-        Int32.Parse(result.Stdout.Trim(), CultureInfo.InvariantCulture)
 
     let private lookupUser (environment: HostEnvironment) : ServiceAccount option =
         let result = run environment "getent" [ "passwd"; ServiceUser ]
@@ -1500,6 +1579,9 @@ module Traefik =
             | _ -> fail "cannot create dedicated non-root Traefik service account"
 
     let private ensureLayout (environment: HostEnvironment) (paths: RuntimePaths) (ownerId: string) (existingOwned: bool) : ServiceAccount * int =
+        if not existingOwned then
+            if (lookupUser environment).IsSome || (lookupGroup environment).IsSome then fail "dedicated Traefik service account collides with an unowned account"
+            createOwnedDirectory environment paths.ConfigDir ownerId 0o700 None |> ignore
         let user, groupId = ensureServiceUser environment existingOwned paths.StateDir
         createOwnedDirectory environment paths.ConfigDir ownerId 0o750 (Some groupId) |> ignore
         createOwnedDirectory environment paths.DynamicDir ownerId 0o750 (Some groupId) |> ignore
@@ -1524,19 +1606,7 @@ module Traefik =
             | _ -> fail "cannot secure Traefik DNS credentials"
         user, groupId
 
-    let metadataMatches (environment: HostEnvironment) (path: string) (expectedKind: string) (mode: int) (uid: int) (gid: int) : bool =
-        match tryStat environment path with
-        | Some item ->
-            let validKind =
-                if expectedKind = "directory" then item.Kind = "directory"
-                else item.Kind = "regular file" || item.Kind = "regular empty file"
-            validKind && item.Mode = mode && item.Uid = uid && item.Gid = gid
-        | None -> false
 
-    let private hostOwner (environment: HostEnvironment) : int * int =
-        let uid = parseIdCommand environment "-u"
-        let gid = parseIdCommand environment "-g"
-        if uid = 0 then 0, 0 else uid, gid
 
     let private credentialSnapshotMatches (environment: HostEnvironment) (paths: RuntimePaths) (expected: byte[] option) : bool =
         try
@@ -1566,15 +1636,9 @@ module Traefik =
         | _ -> fail "Traefik binary is supported only on Linux amd64 and arm64"
 
     let private createTemporaryFile () =
-        let path = Path.Combine(Path.GetTempPath(), "dorothy-traefik-" + Guid.NewGuid().ToString("N"))
-        let options = FileStreamOptions()
-        options.Mode <- FileMode.CreateNew
-        options.Access <- FileAccess.ReadWrite
-        options.Share <- FileShare.None
-        options.BufferSize <- 65536
-        options.Options <- FileOptions.DeleteOnClose ||| FileOptions.SequentialScan
-        options.UnixCreateMode <- Nullable<UnixFileMode>(UnixFileMode.UserRead ||| UnixFileMode.UserWrite)
-        new FileStream(path, options)
+        let fd = nativeOpen(Path.GetTempPath(), 0x400000 ||| directoryFlag ||| 2 ||| 0x80000 ||| noFollowFlag, 0o600)
+        if fd < 0 then fail "release extraction requires anonymous temporary storage"
+        new FileStream(new SafeFileHandle(nativeint fd, true), FileAccess.ReadWrite, 65536)
 
     /// Copies a release archive with bounded buffers and verifies its compressed size and SHA-256.
     /// Leaves both streams open; callers must discard the destination if verification fails.
@@ -1745,17 +1809,6 @@ module Traefik =
                 |> Array.exists (fun line -> Regex.IsMatch(line.TrimEnd('\r'), "^Version:\\s+" + Regex.Escape(Version) + "\\s*$", RegexOptions.CultureInvariant)))
         with _ -> false
 
-    let private binarySha256 (environment: HostEnvironment) (binaryPath: string) : string =
-        if not (assertRegular environment binaryPath "Traefik binary") then fail "cannot hash installed Traefik binary"
-        let descriptor = openChecked binaryPath false
-        try
-            let handle = new SafeFileHandle(nativeint descriptor, false)
-            use stream = new FileStream(handle, FileAccess.Read)
-            SHA256.HashData(stream)
-            |> Convert.ToHexString
-            |> fun value -> value.ToLowerInvariant()
-        finally
-            nativeClose descriptor |> ignore
 
     let private installBinary (environment: HostEnvironment) (paths: RuntimePaths) (ownerId: string) (architecture: string) : bool =
         let archive =
@@ -1763,45 +1816,25 @@ module Traefik =
             |> fun work -> work.GetAwaiter().GetResult()
 
         use archive = archive
-        let temporaryBinary = createTemporaryFile ()
-        let mutable stagedBinaryPath: string option = None
+        use temporaryBinary = createTemporaryFile ()
+        let _, binaryHash = extractBinary archive temporaryBinary
+        temporaryBinary.Flush(true)
+        temporaryBinary.Position <- 0L
+        let _, rootGid = hostOwner environment
+        createOwnedDirectory environment paths.InstallDir ownerId 0o755 (Some rootGid) |> ignore
+        ensureDirectory environment (Path.GetDirectoryName(paths.BinaryPath)) 0o755 (Some rootGid)
+        publishOrdinary environment paths.BinaryPath binaryHash 0o755 (Some rootGid) ignore
+            (fun stage -> if not (binaryVersion environment stage) then fail "pinned binary version did not match")
+            (fun stream -> temporaryBinary.CopyTo(stream))
 
-        try
-            use temporaryBinary = temporaryBinary
-            let _, binaryHash = extractBinary archive temporaryBinary
-            temporaryBinary.Flush(true)
-
-            let rootUid, rootGid = hostOwner environment
-            createOwnedDirectory environment paths.InstallDir ownerId 0o755 (Some rootGid) |> ignore
-            let versionDir = Path.GetDirectoryName(paths.BinaryPath)
-            ensureDirectory environment versionDir 0o755 (Some rootGid)
-            let stagedBinary = Path.Combine(versionDir, ".traefik-install-" + Guid.NewGuid().ToString("N"))
-            stagedBinaryPath <- Some stagedBinary
-            temporaryBinary.Position <- 0L
-            HostFiles.atomicWriteStream stagedBinary temporaryBinary (unixMode 0o700)
-
-            if not (binaryVersion environment stagedBinary) then
-                fail "installed Traefik binary version could not be verified"
-
-            chown environment stagedBinary rootUid rootGid
-            chmod environment stagedBinary 0o755
-            assertRegular environment paths.BinaryPath "Traefik binary" |> ignore
-            File.Move(stagedBinary, paths.BinaryPath, true)
-            stagedBinaryPath <- None
-            fsyncDirectory versionDir
-
-            let marker = JsonObject()
-            marker["owner"] <- JsonValue.Create(ownerDigest ownerId)
-            marker["version"] <- JsonValue.Create(Version)
-            marker["architecture"] <- JsonValue.Create(architecture)
-            marker["archiveSha256"] <- JsonValue.Create(archiveChecksums[architecture])
-            marker["binarySha256"] <- JsonValue.Create(binaryHash)
-            writeAtomic environment (Path.Combine(paths.InstallDir, ".keroosha-release.json")) (Encoding.UTF8.GetBytes(jsonText marker)) 0o644 (Some rootGid)
-            true
-        finally
-            match stagedBinaryPath with
-            | Some path -> try File.Delete path with _ -> ()
-            | None -> ()
+        let marker = JsonObject()
+        marker["owner"] <- JsonValue.Create(ownerDigest ownerId)
+        marker["version"] <- JsonValue.Create(Version)
+        marker["architecture"] <- JsonValue.Create(architecture)
+        marker["archiveSha256"] <- JsonValue.Create(archiveChecksums[architecture])
+        marker["binarySha256"] <- JsonValue.Create(binaryHash)
+        writeAtomic environment (Path.Combine(paths.InstallDir, ".keroosha-release.json")) (Encoding.UTF8.GetBytes(jsonText marker)) 0o644 (Some rootGid)
+        true
 
     let private pinnedReleaseMatches environment (paths: RuntimePaths) ownerId arch (hash: string option) =
         try
@@ -1894,7 +1927,8 @@ module Traefik =
     and private showUnit (environment: HostEnvironment) (properties: string list) : Map<string, string> option =
         let arguments = [ "show"; ServiceName; "--no-pager" ] @ (properties |> List.map (fun property -> "--property=" + property))
         let result = run environment "systemctl" arguments
-        if result.ExitCode <> 0 then None
+        let notFound = result.ExitCode = 4 && List.contains "LoadState" properties && Array.contains "LoadState=not-found" (result.Stdout.Split('\n'))
+        if result.ExitCode <> 0 && not notFound then None
         else
             result.Stdout.Split('\n', StringSplitOptions.RemoveEmptyEntries)
             |> Seq.choose (fun line ->
@@ -1933,6 +1967,15 @@ module Traefik =
             && mainProcessIsStopped values
             && jobFinished values
         | None -> false
+
+    let private admissionInvocation environment =
+        match showUnit environment [ "LoadState"; "ActiveState"; "SubState"; "InvocationID"; "MainPID"; "Job" ] with
+        | Some values when jobFinished values ->
+            match values.TryFind("ActiveState"), values.TryFind("SubState"), values.TryFind("InvocationID") with
+            | Some "inactive", Some "dead", _ when mainProcessIsStopped values -> None
+            | Some "active", _, Some id when id.Length = 32 && Seq.forall Uri.IsHexDigit id && id <> String('0',32) -> Some id
+            | _ -> fail "cannot establish a stable Traefik service invocation"
+        | _ -> fail "cannot establish a settled Traefik service job"
 
     let private isSettled (environment: HostEnvironment) : bool =
         match showUnit environment [ "ActiveState"; "SubState"; "Job"; "MainPID" ] with
@@ -2447,7 +2490,30 @@ module Traefik =
                 tryDurationNanoseconds (if interval.ValueKind = JsonValueKind.String then interval.GetString() else null)))
            = Some 100000000M
 
-    let private defaultValueForMissingExpected (path: string list) (name: string) (actual: JsonElement) =
+    type private ComparisonScope = Other | HttpService | TcpService | HttpMiddleware
+
+    // v3.7.16 pkg/config/dynamic/{middlewares,http_config,tcp_config}.go:
+    // bool + json omitempty; *bool (e.g. trustForwardHeader) preserves false.
+    let private omitsFalse scope path name =
+        match scope, path, name with
+        | HttpMiddleware, [ ("basicAuth" | "digestAuth") ], "removeHeader"
+        | HttpMiddleware, [ ("redirectRegex" | "redirectScheme") ], "permanent"
+        | HttpMiddleware, [ "forwardAuth" ], ("forwardBody" | "preserveLocationHeader" | "preserveRequestMethod")
+        | HttpMiddleware, [ "tls"; "forwardAuth" ], "insecureSkipVerify"
+        | HttpMiddleware, [ "headers" ], ("accessControlAllowCredentials" | "addVaryHeader" | "stsIncludeSubdomains" | "stsPreload" | "forceSTSHeader" | "frameDeny" | "contentTypeNosniff" | "browserXssFilter" | "isDevelopment")
+        | HttpMiddleware, [ "encodedCharacters" ], ("allowEncodedSlash" | "allowEncodedBackSlash" | "allowEncodedNullCharacter" | "allowEncodedSemicolon" | "allowEncodedPercent" | "allowEncodedQuestionMark" | "allowEncodedHash")
+        | HttpMiddleware, [ "passTLSClientCert" ], "pem"
+        | HttpMiddleware, [ "info"; "passTLSClientCert" ], ("notAfter" | "notBefore" | "sans" | "serialNumber")
+        | HttpMiddleware, [ ("issuer" | "subject"); "info"; "passTLSClientCert" ], ("country" | "province" | "locality" | "organization" | "commonName" | "serialNumber" | "domainComponent")
+        | HttpMiddleware, [ "subject"; "info"; "passTLSClientCert" ], "organizationalUnit"
+        | HttpMiddleware, [ "sourceCriterion"; ("rateLimit" | "inFlightReq") ], "requestHost"
+        | HttpMiddleware, [ "retry" ], ("disableRetryOnNetworkError" | "retryNonIdempotentMethod")
+        | HttpService, [ "cookie"; "sticky"; ("loadBalancer" | "weighted") ], ("secure" | "httpOnly")
+        | HttpService, [ "[]"; "servers"; "loadBalancer" ], "preservePath"
+        | TcpService, [ "[]"; "servers"; "loadBalancer" ], "tls" -> true
+        | _ -> false
+
+    let private defaultValueForMissingExpected scope (path: string list) (name: string) (actual: JsonElement) =
         let isInteger expected =
             let mutable found = 0L
             actual.ValueKind = JsonValueKind.Number && actual.TryGetInt64(&found) && found = expected
@@ -2472,10 +2538,10 @@ module Traefik =
         | "errors" :: "failover" :: _, "maxRequestBodyBytes" -> isInteger -1L
         | "observability" :: _, _ -> false
         | _, _ when actual.ValueKind = JsonValueKind.False ->
-            not (Set.contains name defaultTrueBooleanFields)
+            omitsFalse scope path name
         | _ -> false
 
-    let rec private jsonConfigMatches (path: string list) (expected: JsonElement) (actual: JsonElement) : bool =
+    let rec private scopedConfigMatches scope (path: string list) (expected: JsonElement) (actual: JsonElement) : bool =
         match expected.ValueKind, actual.ValueKind with
         | JsonValueKind.Object, JsonValueKind.Object ->
             let wantedNames = objectNames expected
@@ -2506,11 +2572,10 @@ module Traefik =
                         match tryDurationNanoseconds (property.Value.GetString()), tryDurationNanoseconds (found.GetString()) with
                         | Some wanted, Some found -> wanted = found
                         | _ -> false
-                    | _, Some found -> jsonConfigMatches propertyPath property.Value found
+                    | _, Some found -> scopedConfigMatches scope propertyPath property.Value found
                     // Do not treat an arbitrary absent field as a native zero
                     // value: Traefik may have rejected this entire file.
-                    | ("secure" | "httpOnly"), None when property.Value.ValueKind = JsonValueKind.False
-                                                         && (path = [ "cookie"; "sticky"; "loadBalancer" ] || path = [ "cookie"; "sticky"; "weighted" ]) -> true
+                    | _, None when property.Value.ValueKind = JsonValueKind.False -> omitsFalse scope path property.Name
                     | _ -> false)
             let unexpectedPropertiesMatch =
                 actual.EnumerateObject()
@@ -2524,14 +2589,14 @@ module Traefik =
                          && property.Value.ValueKind = JsonValueKind.Array then
                         property.Value.EnumerateArray() |> Seq.forall (fun message -> message.ValueKind = JsonValueKind.String)
                     else
-                        defaultValueForMissingExpected path property.Name property.Value)
+                        defaultValueForMissingExpected scope path property.Name property.Value)
             mapKeysMatch && expectedPropertiesMatch && unexpectedPropertiesMatch
         | JsonValueKind.Array, JsonValueKind.Array ->
             let wanted = expected.EnumerateArray() |> Seq.toArray
             let found = actual.EnumerateArray() |> Seq.toArray
             if wanted.Length <> found.Length then false
             else
-                Array.map2 (fun left right -> jsonConfigMatches ("[]" :: path) left right) wanted found
+                Array.map2 (fun left right -> scopedConfigMatches scope ("[]" :: path) left right) wanted found
                 |> Array.forall id
         | JsonValueKind.String, JsonValueKind.String ->
             match path with
@@ -2550,6 +2615,8 @@ module Traefik =
         | JsonValueKind.False, JsonValueKind.False
         | JsonValueKind.Null, JsonValueKind.Null -> true
         | _ -> false
+
+    let private jsonConfigMatches path expected actual = scopedConfigMatches Other path expected actual
 
     let private tlsRouterMatches (expected: JsonElement option) (actual: JsonElement option) : bool =
         match expected, actual with
@@ -2774,6 +2841,7 @@ module Traefik =
         users
 
     let private serviceMatches
+        scope
         purpose
         (expectedRouters: Map<string, JsonElement>)
         (name: string)
@@ -2792,7 +2860,7 @@ module Traefik =
         statusMatches purpose actual
         && providerIsFile actual
         && typeMatches
-        && jsonConfigMatches [] expected actual
+        && scopedConfigMatches scope [] expected actual
         && apiUsers actual = Some(serviceUsers expectedRouters name)
     let private defaultHttpLoadBalancerMatches (expected: JsonElement) (actual: JsonElement) : bool =
         match tryProperty expected "loadBalancer", tryProperty actual "loadBalancer" with
@@ -2801,7 +2869,7 @@ module Traefik =
             let onlyDefaults =
                 actualBalancer.EnumerateObject()
                 |> Seq.forall (fun property ->
-                    defaultValueForMissingExpected [ "loadBalancer" ] property.Name property.Value)
+                    defaultValueForMissingExpected HttpService [ "loadBalancer" ] property.Name property.Value)
             onlyDefaults
         | None, _ -> false
         | Some _, None -> false
@@ -2829,7 +2897,7 @@ module Traefik =
         (expected: JsonElement)
         (actual: JsonElement)
         : bool =
-        serviceMatches purpose expectedRouters name expected actual
+        serviceMatches HttpService purpose expectedRouters name expected actual
         && defaultHttpLoadBalancerMatches expected actual
 
     /// Mirrors the pinned PopulateUsedBy relationship index: router-level HTTP middleware occurrences only.
@@ -2866,7 +2934,7 @@ module Traefik =
             && (expectedConfigurations
                 |> Array.forall (fun property ->
                     tryProperty actual property.Name
-                    |> Option.exists (jsonConfigMatches [ property.Name ] property.Value)))
+                    |> Option.exists (scopedConfigMatches (if countRouterUsers then HttpMiddleware else Other) [ property.Name ] property.Value)))
         let expectedUsers = if countRouterUsers then middlewareUsers expectedRouters name else Map.empty
         let actualType = tryString actual "type"
         let typeMatches =
@@ -3200,8 +3268,8 @@ module Traefik =
                         routesMatch && servicesMatch && middlewaresMatch
                     | _ -> false
                 domainMatches "http" (set [ "routers"; "services"; "middlewares"; "serversTransports" ]) "routers" "services" "middlewares" httpServiceMatches HttpProtocol true
-                && domainMatches "tcp" (set [ "routers"; "services"; "middlewares"; "serversTransports" ]) "tcpRouters" "tcpServices" "tcpMiddlewares" serviceMatches TcpProtocol false
-                && domainMatches "udp" (set [ "routers"; "services" ]) "udpRouters" "udpServices" "" serviceMatches UdpProtocol false
+                && domainMatches "tcp" (set [ "routers"; "services"; "middlewares"; "serversTransports" ]) "tcpRouters" "tcpServices" "tcpMiddlewares" (serviceMatches TcpService) TcpProtocol false
+                && domainMatches "udp" (set [ "routers"; "services" ]) "udpRouters" "udpServices" "" (serviceMatches Other) UdpProtocol false
     let private apiEntrypoints (element: JsonElement) : Map<string, JsonElement> option =
         if element.ValueKind <> JsonValueKind.Array then None
         else
@@ -4703,6 +4771,7 @@ module Traefik =
         (wasEnabled: bool)
         (restartRequired: bool)
         (certificateFiles: string list)
+        confirmPreimage
         =
         let journal = JsonObject()
         journal["version"] <- JsonValue.Create(3)
@@ -4720,7 +4789,8 @@ module Traefik =
         let files = JsonArray()
         for filename in certificateFiles |> List.sortWith (fun (left: string) (right: string) -> StringComparer.Ordinal.Compare(left, right)) do files.Add(JsonValue.Create(filename))
         journal["certificateFiles"] <- files
-        writeAtomic environment paths.RollbackPath (Encoding.UTF8.GetBytes(jsonText journal)) 0o600 None
+        let bytes = Encoding.UTF8.GetBytes(jsonText journal)
+        publishOrdinary environment paths.RollbackPath (sha256Bytes bytes) 0o600 None confirmPreimage ignore (fun output -> output.Write(bytes.AsSpan()))
 
     let private jsonInt (element: JsonElement) : int option =
         let mutable value = 0
@@ -4742,50 +4812,9 @@ module Traefik =
                 Some bytes
             with _ -> fail "Traefik rollback journal is invalid"
 
-    let private recoveryDirectory environment (paths: RuntimePaths) =
-        let parent = Path.GetDirectoryName(paths.ConfigDir)
-        let dir = Path.Combine(parent, ".dorothy-traefik-recovery")
-        let uid, gid = hostOwner environment
-        match tryStat environment parent with
-        | Some p when p.Kind = "directory" && p.Uid = uid && (p.Mode &&& 0o022) = 0 -> ()
-        | _ -> fail "recovery directory parent is not private to the administrator"
-        Directory.CreateDirectory(dir, unixMode 0o700) |> ignore
-        if not (metadataMatches environment dir "directory" 0o700 uid gid) then fail "unsafe recovery directory"
-        fsyncDirectory parent
-        dir
-
-    // SIGKILL during write leaves no name. After linkat only a complete,
-    // content-addressed inode exists in the root-only administrative directory.
-    // No filename wildcard or sweep is a source of deletion authority.
-    let private writeRecoveryFile environment paths generation (path: string) (data: byte[]) mode gid replace check =
-        let dir = recoveryDirectory environment paths
-        let uid, _ = hostOwner environment
-        let stage =
-            if replace then Path.Combine(dir, "stage-" + sha256Text (generation + "\n" + path + "\n" + sha256Bytes data))
-            else path
-        let verifyStage () =
-            if not (metadataMatches environment stage "file" mode uid gid) || readOptional environment stage <> Some data then
-                fail "recovery staging collision; preserving existing file"
-        match tryStat environment stage with
-        | Some _ -> verifyStage (); fsyncDirectory dir
-        | None ->
-            // O_TMPFILE | O_RDWR | O_CLOEXEC | O_NOFOLLOW
-            let fd = nativeOpen(dir, 0x410000 ||| 2 ||| 0x80000 ||| 0x20000, 0o600)
-            if fd < 0 then fail "recovery requires a filesystem supporting anonymous tmpfiles"
-            use handle = new SafeFileHandle(nativeint fd, true)
-            use stream = new FileStream(handle, FileAccess.Write)
-            stream.Write(data.AsSpan())
-            stream.Flush(true)
-            if nativeFchown(fd, uint32 uid, uint32 gid) <> 0 || nativeFchmod(fd, uint32 mode) <> 0 || nativeFsync(fd) <> 0 then fail "cannot secure recovery output"
-            check ()
-            if nativeLinkAt(fd, "", -100, stage, 0x1000) <> 0 then fail "cannot publish recovery output without overwrite"
-            fsyncDirectory dir
-        if replace then
-            verifyStage ()
-            check ()
-            if nativeRename(stage, path) <> 0 then fail "cannot atomically commit recovery output; paths must share a filesystem"
-            fsyncDirectory (Path.GetDirectoryName(path))
-            fsyncDirectory dir
+    let private writeRecoveryFile environment paths generation path (data: byte[]) mode gid replace check =
+        let dir = publicationDirectory environment paths paths.StaticReceipt
+        publish environment dir generation path (sha256Bytes data) mode (fst (hostOwner environment)) gid (if replace then ReplaceOwned else SealAtName) check ignore (fun stream -> stream.Write(data.AsSpan()))
 
     let private transactionPreimage (journal: JsonObject) =
         let prior = journal.DeepClone().AsObject()
@@ -4965,19 +4994,9 @@ module Traefik =
                 let root = document.RootElement
                 let rule = root.GetProperty("http").GetProperty("routers").GetProperty("keroosha-admin").GetProperty("rule").GetString()
                 let opaqueConfirmed =
-                    if rule = TraefikHttpGraphModel.adminRuleBase then
-                        let noTransport key = tryProperty root key |> Option.bind (fun section -> tryProperty section "serversTransports") |> Option.isNone
-                        let emptyTls =
-                            match tryProperty root "tls" with
-                            | None -> true
-                            | Some tls when tls.ValueKind = JsonValueKind.Object ->
-                                tls.EnumerateObject() |> Seq.forall (fun p -> p.Name = "certificates" && p.Value.ValueKind = JsonValueKind.Array && p.Value.GetArrayLength() = 0)
-                            | _ -> false
-                        noTransport "http" && noTransport "tcp" && emptyTls
-                    else
-                        generationRuleMatches root
-                        || (TraefikHttpGraphModel.isGeneratedAdminRule rule
-                            && rule.EndsWith(opaqueDigest (JsonNode.Parse(bytes).AsObject()) + "`)", StringComparison.Ordinal))
+                    rule <> TraefikHttpGraphModel.adminRuleBase && TraefikHttpGraphModel.isGeneratedAdminRule rule &&
+                    (generationRuleMatches root ||
+                     (rule.Length = dualGenerationRuleLength && rule.EndsWith(opaqueDigest (JsonNode.Parse(bytes).AsObject()) + "`)", StringComparison.Ordinal)))
                 jsonHasUniqueProperties root && opaqueConfirmed
                 && apiDynamicMatches Attribution observed None root true
             with :? JsonException | :? KeyNotFoundException | :? InvalidOperationException -> false
@@ -4988,6 +5007,8 @@ module Traefik =
         | Some journal when journal.Recovery.IsSome -> fail "pending recovery start requires scoped dynamic repair"
         | Some journal ->
             let currentUnit = safeUnitStatus environment paths.UnitPath ownerId
+            if not journal.WasActive && (admissionInvocation environment).IsSome then
+                fail "interrupted stopped baseline now has an independent invocation; no stop or write attempted"
             if currentUnit.IsSome then
                 if not (unitMatches environment paths) then fail "interrupted transaction has a different effective unit"
             elif isActive environment || isEnabled environment then fail "interrupted Traefik service has no owned unit"
@@ -5078,7 +5099,13 @@ module Traefik =
         let staticPath = Path.Combine(paths.ConfigDir, "static.yml")
         let dynamicPath = Path.Combine(paths.DynamicDir, "current.yml")
         let hasPending = assertRegular environment paths.RollbackPath "activation rollback journal"
+        validateActualOwner environment paths request.OwnerId |> ignore
         let pending = recoverPendingTransaction environment paths request.OwnerId requestElement activationTimeout
+        let admitted = admissionInvocation environment
+        let verifyInvocation () =
+            if admissionInvocation environment <> admitted then fail "service invocation changed since admission; preserving the process and files"
+        if pending |> Option.exists (fun tx -> tx.WasActive <> admitted.IsSome) then
+            fail "current invocation does not belong to the interrupted service baseline"
         let capture () = struct (readOptional environment staticPath, readOptional environment dynamicPath)
         let initial = capture ()
         match initial with
@@ -5103,7 +5130,7 @@ module Traefik =
         let configStatus, stateStatus, installStatus, currentUnit = validateActualOwner environment paths request.OwnerId
         if currentUnit.IsSome then ensureEffectiveUnit environment paths
         if currentUnit.IsNone && (isActive environment || isEnabled environment) then fail "Traefik service name collides with an unowned systemd unit"
-        let wasActive = pending |> Option.map (fun transaction -> transaction.WasActive) |> Option.defaultWith (fun () -> isActive environment)
+        let wasActive = admitted.IsSome
         let wasEnabled = pending |> Option.map (fun transaction -> transaction.WasEnabled) |> Option.defaultWith (fun () -> isEnabled environment)
         let struct (oldStatic, oldDynamic) =
             match pending with
@@ -5171,16 +5198,19 @@ module Traefik =
             | Some transaction -> Set.ofList transaction.CertificateFiles
             | None -> entries paths.CertificateDir |> Set.ofArray
         let confirmUnchanged () =
+            verifyInvocation ()
+            if markerStatus environment paths.DynamicDir request.OwnerId <> "owned" || markerStatus environment paths.CertificateDir request.OwnerId <> "owned" then
+                fail "nested Traefik owner changed during admission"
             if capture () <> initial then
                 fail "Apply refused: rollback files changed after inspection; preserve concurrent edits and retry with a reconciled configuration."
         confirmUnchanged ()
-        savePendingTransaction environment paths request.OwnerId oldStatic oldDynamic oldCredentials oldUnitBytes oldReleaseMarker oldBinaryExists oldBinaryHash wasActive wasEnabled restartRequired (Set.toList oldCertificateFiles)
+        savePendingTransaction environment paths request.OwnerId oldStatic oldDynamic oldCredentials oldUnitBytes oldReleaseMarker oldBinaryExists oldBinaryHash wasActive wasEnabled restartRequired (Set.toList oldCertificateFiles) confirmUnchanged
         let stagedJournal = readBytes environment paths.RollbackPath
         // A conflict here is not an activation failure: no candidate file was installed.
         // The generic rollback handler must not replace the newly observed external bytes.
         try confirmUnchanged ()
         with error ->
-            if not hasPending then removePendingTransaction environment paths request.OwnerId
+            if not hasPending && admissionInvocation environment = admitted then removePendingTransaction environment paths request.OwnerId
             raise error
         let mutable binaryChanged = false
         let mutable restartAttempted = false
@@ -5196,6 +5226,7 @@ module Traefik =
                 writeAtomic environment paths.UnitPath currentUnitText 0o644 (Some rootGid)
                 daemonReload environment
             if not (isEnabled environment) then enableService environment
+            verifyInvocation ()
             let needsStart = not (isActive environment)
             if (needsStart || restartRequired || binaryChanged) &&
                (capture () <> struct (Some staticData, Some dynamicData) || readCredentialSnapshot environment paths <> desiredCredentials ||
@@ -5220,6 +5251,8 @@ module Traefik =
                 | _ -> error.GetType().Name
             let rollbackFailure =
                 try
+                    if candidateJob.IsNone then verifyInvocation ()
+                    validateActualOwner environment paths request.OwnerId |> ignore
                     if isActive environment && (candidateJob |> Option.exists (fun job -> (managedJobInvocation environment job).IsNone)) then
                         fail "active invocation does not belong to the candidate job; rollback refused before stopping or writing"
                     let currentOwnedUnit = safeUnitStatus environment paths.UnitPath request.OwnerId
@@ -5466,6 +5499,7 @@ module Traefik =
         let ownerHash = ownerDigest owner
         if not (fingerprintPattern.IsMatch(expected)) then fail "expected full lowercase journal SHA-256"
         use guard = HostFiles.lockFile "/run/lock/keroosha-iac-traefik.lock"
+        validateActualOwner environment paths owner |> ignore
         let uid, gid = hostOwner environment
         let _, serviceGroup = serviceAccountOwner environment
         let verifyStopped () =

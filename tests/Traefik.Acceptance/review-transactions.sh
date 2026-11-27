@@ -14,6 +14,8 @@ shift 2
 case "$mode" in
     recovery-tamper|recovery-restore) [[ $# == 1 && $1 =~ ^(static|credentials|unit|binary)$ ]] || usage ;;
     recovery-interrupt) [[ $# == 1 && $1 =~ ^(bound|anonymous|linked|written)$ ]] || usage ;;
+    ordinary-interrupt) [[ $# == 1 && $1 =~ ^(anonymous|linked|committed)$ ]] || usage ;;
+    ordinary-assert|ordinary-foreign|ordinary-independent-start|legacy-unregistered-inject|nested-foreign|nested-restore|safety-witness) [[ $# == 0 ]] || usage ;;
     recovery-assert-bound|recovery-negative-inject|recovery-stale-assert|recovery-historical) [[ $# == 0 ]] || usage ;;
     legacy-certificate-inject|legacy-tls-inject|legacy-opaque-restore) [[ $# == 0 ]] || usage ;;
     job-substitute-install|service-error-inject|opaque-false-inject|opaque-null-inject) [[ $# == 0 ]] || usage ;;
@@ -517,13 +519,32 @@ restart_interrupt_install() {
     done
     digest_file "$static_file" > "$root/logs/restart-interrupt-static.before.sha256"
     chmod 600 "$root/logs/restart-interrupt-static.before.sha256"
-    main_pid > "$root/logs/restart-interrupt-pid.before"
+    /usr/bin/systemctl show keroosha-traefik.service -p MainPID --value > "$root/logs/restart-interrupt-pid.before"
     chmod 600 "$root/logs/restart-interrupt-pid.before"
     local shim="$root/systemctl-interposer.sh" sha
     cat > "$shim" <<EOF
 #!/usr/bin/env bash
 set -euo pipefail
 root='$root'
+if [[ -f "\$root/.ordinary-interrupt" && "\${1:-}" == show && \$(readlink /proc/\$PPID/exe) == "/var/cache/keroosha-iac/helper/linux-x64/\$(<"\$root/product-helper-sha")" ]]; then
+    point=\$(<"\$root/.ordinary-interrupt"); j=/etc/keroosha-iac/traefik/.keroosha-rollback.json; spool=/etc/keroosha-iac/.dorothy-traefik-recovery
+    for candidate in /proc/\$PPID/fd/* "\$spool"/stage-* "\$j"; do
+        case "\$point" in
+          anonymous) [[ ! -e \$j && \$(readlink "\$candidate" || :) == "\$spool"/\\#*' (deleted)' ]] || continue ;;
+          linked) [[ ! -e \$j && \$candidate == "\$spool"/stage-* ]] || continue ;;
+          committed) [[ \$candidate == "\$j" ]] || continue ;;
+        esac
+        [[ -f "\$candidate" && \$(stat -Lc '%a:%u:%g' "\$candidate") == 600:0:0 ]] || continue
+        jq -e --arg owner "\$(</etc/keroosha-iac/traefik/.keroosha-owner)" '.version==3 and .owner==\$owner and (.credentials|type)=="string" and (.dynamic|type)=="string"' "\$candidate" >/dev/null 2>&1 || continue
+        sha=\$(sha256sum "\$candidate"|cut -d' ' -f1)
+        if [[ \$point == linked ]]; then
+            expected=\$(printf 'ordinary\\n%s\\n%s' "\$j" "\$sha"|sha256sum|cut -d' ' -f1)
+            [[ "\$candidate" == "\$spool/stage-\$expected" ]] || continue
+        fi
+        printf '%s %s\\n' "\$point" "\$sha" > "\$root/logs/ordinary-\$point.evidence"
+        rm -- "\$root/.ordinary-interrupt"; kill -KILL "\$PPID"; exit 137
+    done
+fi
 if [[ -f "\$root/.recovery-interrupt" && "\${1:-}" == show ]]; then
     j=/etc/keroosha-iac/traefik/.keroosha-rollback.json
     target=\$(jq -er '.recovery.target // empty' "\$j" 2>/dev/null || :)
@@ -839,6 +860,58 @@ case "$mode" in
         invocation=$(systemctl show keroosha-traefik.service -p InvocationID --value)
         [[ $invocation =~ ^[0-9a-f]{32}$ ]]
         if [[ $mode == verify-receipt ]]; then [[ $(sed -n 2p "$r") == "$invocation" ]]; else [[ $(sed -n 2p "$r") != "$invocation" ]]; fi ;;
+    ordinary-foreign)
+        verify_owned_service >/dev/null
+        foreign=/etc/keroosha-iac/.dorothy-traefik-recovery/stage-$(printf 'f%.0s' {1..64})
+        [[ ! -e $foreign && ! -L $foreign ]]
+        printf 'unrelated private fixture\n' > "$foreign"; chmod 600 "$foreign"
+        digest_file "$foreign" > "$root/ordinary-foreign.sha256" ;;
+    ordinary-interrupt)
+        [[ ! -e "$journal_file" && ! -e "$root/.ordinary-interrupt" ]]
+        restart_interrupt_install
+        rm -- "$root/.restart-interrupt-pending"
+        printf '%s\n' "$1" > "$root/.ordinary-interrupt"
+        printf '%s\n' "$1" > "$root/ordinary-phase" ;;
+    ordinary-assert)
+        phase=$(<"$root/ordinary-phase")
+        [[ ! -e "$root/.ordinary-interrupt" ]]
+        read -r recorded sha < "$root/logs/ordinary-$phase.evidence"
+        [[ $recorded == "$phase" && $sha =~ ^[a-f0-9]{64}$ ]]
+        if [[ $phase == committed ]]; then
+            jq -e '.wasActive==false' "$journal_file" >/dev/null
+            [[ $(digest_file "$journal_file") == "$sha" ]]
+        else
+            [[ ! -e "$journal_file" && ! -L "$journal_file" ]]
+            stage=/etc/keroosha-iac/.dorothy-traefik-recovery/stage-$(printf 'ordinary\n%s\n%s' "$journal_file" "$sha"|sha256sum|cut -d' ' -f1)
+            if [[ $phase == linked ]]; then [[ $(digest_file "$stage") == "$sha" && $(stat -c '%a:%u:%g' "$stage") == 600:0:0 ]]; else [[ ! -e $stage ]]; fi
+        fi
+        foreign=/etc/keroosha-iac/.dorothy-traefik-recovery/stage-$(printf 'f%.0s' {1..64})
+        [[ $(digest_file "$foreign") == "$(<"$root/ordinary-foreign.sha256")" ]] ;;
+    ordinary-independent-start)
+        jq -e '.wasActive==false' "$journal_file" >/dev/null
+        cmp "$dynamic_file" <(jq -er .dynamic "$journal_file"|base64 -d)
+        cmp "$static_file" <(jq -er .static "$journal_file"|base64 -d)
+        [[ $(systemctl show keroosha-traefik.service -p ActiveState --value) == inactive ]]
+        systemctl start keroosha-traefik.service; main_pid ;;
+    nested-foreign)
+        verify_owned_service >/dev/null; marker="$config_dir/dynamic/.keroosha-owner"
+        [[ ! -e "$root/nested-marker.original" && ! -L $marker && $(<"$marker") == "$(<"$owner_marker")" ]]
+        cp -p "$marker" "$root/nested-marker.original"; printf 'different-fixture-owner' | sha256sum | cut -d' ' -f1 > "$marker" ;;
+    nested-restore)
+        marker="$config_dir/dynamic/.keroosha-owner"
+        [[ ! -L $marker && $(<"$marker") == "$(printf 'different-fixture-owner'|sha256sum|cut -d' ' -f1)" ]]
+        cp -p "$root/nested-marker.original" "$marker"; rm "$root/nested-marker.original" ;;
+    safety-witness)
+        systemctl show keroosha-traefik.service -p MainPID -p InvocationID -p ActiveState -p UnitFileState
+        sha256sum "$static_file" "$dynamic_file" "$credentials_file" "$unit_file" "$owner_marker" "$config_dir/dynamic/.keroosha-owner" "$config_dir/.keroosha-static-receipt"
+        if [[ -e "$journal_file" ]]; then sha256sum "$journal_file"; else echo no-journal; fi ;;
+    legacy-unregistered-inject)
+        verify_owned_service >/dev/null
+        [[ ! -e "$root/empty-registrations.yml" && ! -e "$journal_file" ]]
+        jq -e 'select(.tls.certificates|length>0) | del(.tls)' "$dynamic_file" > "$root/empty-registrations.yml"
+        cp --attributes-only --preserve=ownership,mode "$dynamic_file" "$root/empty-registrations.yml"
+        mount --bind "$root/empty-registrations.yml" "$dynamic_file"
+        jq -e 'has("tls")|not' "$dynamic_file" >/dev/null ;;
     legacy-static-inject)
         verify_owned_service >/dev/null
         [[ ! -e "$config_dir/.keroosha-static-receipt" && ! -e "$journal_file" && ! -e "$root/legacy-static-before" ]]
@@ -856,6 +929,7 @@ case "$mode" in
         systemctl show keroosha-traefik.service -p InvocationID -p MainPID
         stat -c '%i %y %z %s' "$static_file" "$dynamic_file"
         sha256sum "$static_file" "$dynamic_file"
+        timeout 5 openssl s_client -connect 127.0.0.1:443 -servername example.org </dev/null 2>/dev/null | openssl x509 -noout -fingerprint -sha256
         body=$(curl -kfsS --max-time 4 --noproxy '*' --resolve example.org:443:127.0.0.1 https://example.org/)
         [[ $body == 'http-backend:/;forwarded:127.0.0.1' ]]; printf '%s\n' "$body" ;;
     opaque-tls-inject|opaque-transport-inject|opaque-false-inject|opaque-null-inject)

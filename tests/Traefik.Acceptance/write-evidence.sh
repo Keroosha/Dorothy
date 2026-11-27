@@ -339,7 +339,18 @@ cmp "$state_dir/expected-issued-stores.txt" "$state_dir/acme-stores-after-delete
 cmp "$state_dir/legacy-refusal-before.txt" "$state_dir/legacy-refusal-after.txt"
 for kind in tls transport false null; do cmp "$state_dir/opaque-$kind-before.json" "$state_dir/opaque-$kind-after.json"; done
 cmp "$state_dir/partial-third-before.txt" "$state_dir/partial-third-after.txt"
+for case_name in nested-delete nested-maintenance stopped-independent legacy-unregistered; do
+    cmp "$state_dir/$case_name-before.txt" "$state_dir/$case_name-after.txt"
+done
+for point in anonymous linked; do cmp "$state_dir/ordinary-initial.txt" "$state_dir/ordinary-$point-after.txt"; done
+read -r _ anonymous_digest < "$state_dir/ordinary-anonymous.evidence"
+read -r _ linked_digest < "$state_dir/ordinary-linked.evidence"
+[[ $anonymous_digest =~ ^[0-9a-f]{64}$ && $anonymous_digest == "$linked_digest" ]]
 artifact_digests=$(jq -n \
+    --arg ordinary "$anonymous_digest" --arg explicitDefaults "$(file_sha256 "$state_dir/logs/explicit-default-native.log")" \
+    --arg nestedDelete "$(file_sha256 "$state_dir/nested-delete-after.txt")" --arg nestedMaintenance "$(file_sha256 "$state_dir/nested-maintenance-after.txt")" \
+    --arg independent "$(file_sha256 "$state_dir/stopped-independent-after.txt")" --arg legacyAbsent "$(file_sha256 "$state_dir/legacy-unregistered-after.txt")" \
+    --arg boundHandoff "$(file_sha256 "$state_dir/logs/failed-bound-maintenance-up.log")" --arg staleHandoff "$(file_sha256 "$state_dir/logs/stale-witness-maintenance-up.log")" \
     --arg maintenance "$(<"$state_dir/maintenance.sha256")" \
     --arg denyPcap "$(file_sha256 "$state_dir/middleware-deny.pcap")" --arg denyLine "$(file_sha256 "$state_dir/middleware-deny.json")" \
     --arg thirdStatic "$(file_sha256 "$state_dir/partial-third-after.txt")" \
@@ -369,6 +380,12 @@ artifact_digests=$(jq -n \
     --arg reviewClientIdentityAcceptedLogSha256 "$review_identity_accepted_sha" \
     --arg reviewTlsMetricsSha256 "$review_tls_sha" \
     '{
+      explicitDefaultRawDataAndTrafficSha256:$explicitDefaults,
+      ordinaryAnonymousAndLinkedJournalSha256:$ordinary,
+      nestedOwnerRefusals:{deleteWitnessSha256:$nestedDelete,stoppedMaintenanceWitnessSha256:$nestedMaintenance},
+      independentlyStartedStoppedJournalWitnessSha256:$independent,
+      removedLegacyRegistrationsWitnessSha256:$legacyAbsent,
+      stoppedOperatorHandoffs:{boundRepairLogSha256:$boundHandoff,staleInvocationLogSha256:$staleHandoff},
       standaloneMaintenanceSha256:$maintenance,
       tcpDenial:{pcapSha256:$denyPcap,journalRecordSha256:$denyLine},
       interruptedForeignStaticWitnessSha256:$thirdStatic,

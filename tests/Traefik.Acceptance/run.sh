@@ -1598,6 +1598,51 @@ run_pulumi rotate historical-maintenance-up.log up --refresh --stack acceptance 
 tx_control verify-receipt; tx_control disabled-repaired
 export_checkpoint "$state_dir/after-maintenance-checkpoint.json"
 [[ $(resource_urn "$state_dir/after-maintenance-checkpoint.json") == "$legacy_urn" && $(resource_id "$state_dir/after-maintenance-checkpoint.json") == "$legacy_id" ]]
+
+# Kill ordinary Apply inside its first journal write, not inside recovery.
+tx_control ordinary-foreign
+tx_control safety-witness > "$state_dir/ordinary-initial.txt"
+for point in anonymous linked; do
+    remote "bash '$GUEST_ROOT/review-transactions.sh' ordinary-interrupt '$GUEST_ROOT' '$point'"
+    expect_pulumi_failure withdraw-udp "ordinary-$point-up.log" up --stack acceptance --yes --skip-preview --non-interactive --parallel 1
+    tx_control restart-interrupt-remove; tx_control ordinary-assert
+    tx_control safety-witness > "$state_dir/ordinary-$point-after.txt"
+    cmp "$state_dir/ordinary-initial.txt" "$state_dir/ordinary-$point-after.txt"
+    copy_from_guest "$GUEST_ROOT/logs/ordinary-$point.evidence" "$state_dir/ordinary-$point.evidence" "$state_dir/logs/ordinary-$point-copy.log"
+done
+run_pulumi withdraw-udp ordinary-retry.log up --stack acceptance --yes --skip-preview --non-interactive --parallel 1
+tx_control verify-receipt
+run_pulumi rotate ordinary-retry-restore.log up --stack acceptance --yes --skip-preview --non-interactive --parallel 1
+tx_control disabled-repaired
+
+# A stopped baseline journal cannot authorize a new, independent live start.
+tx_control maintenance-stop
+remote "bash '$GUEST_ROOT/review-transactions.sh' ordinary-interrupt '$GUEST_ROOT' committed"
+expect_pulumi_failure rollback-udp stopped-apply-killed.log up --stack acceptance --yes --skip-preview --non-interactive --parallel 1
+tx_control restart-interrupt-remove; tx_control ordinary-assert; tx_control ordinary-independent-start
+tx_control safety-witness > "$state_dir/stopped-independent-before.txt"
+expect_pulumi_failure rollback-udp stopped-independent-refusal.log up --stack acceptance --yes --skip-preview --non-interactive --parallel 1
+grep -Fq 'stopped baseline now has an independent invocation' "$state_dir/logs/stopped-independent-refusal.log"
+tx_control safety-witness > "$state_dir/stopped-independent-after.txt"
+cmp "$state_dir/stopped-independent-before.txt" "$state_dir/stopped-independent-after.txt"
+tx_control disabled-repaired
+
+# Only the child owner changes. Protect it for both Delete and the offline exit.
+tx_control nested-foreign
+tx_control safety-witness > "$state_dir/nested-delete-before.txt"
+expect_pulumi_failure delete nested-delete-refusal.log up --stack acceptance --yes --skip-preview --non-interactive --parallel 1
+grep -Fq 'dynamic configuration directory collides with an unowned' "$state_dir/logs/nested-delete-refusal.log"
+tx_control safety-witness > "$state_dir/nested-delete-after.txt"
+cmp "$state_dir/nested-delete-before.txt" "$state_dir/nested-delete-after.txt"
+tx_control nested-restore; handoff stop; tx_control nested-foreign
+tx_control safety-witness > "$state_dir/nested-maintenance-before.txt"
+handoff nested-negative > "$state_dir/logs/nested-maintenance-refusal.log" 2>&1
+grep -Fq 'dynamic configuration directory collides with an unowned' "$state_dir/logs/nested-maintenance-refusal.log"
+tx_control safety-witness > "$state_dir/nested-maintenance-after.txt"
+cmp "$state_dir/nested-maintenance-before.txt" "$state_dir/nested-maintenance-after.txt"
+tx_control nested-restore; handoff finish
+run_pulumi rotate nested-handoff-up.log up --refresh --stack acceptance --yes --non-interactive --parallel 1
+tx_control verify-receipt; tx_control disabled-repaired
 remote 'find /var/lib/keroosha-traefik -maxdepth 1 -type f -name "acme-*.json" -size +0c -print | sort' \
     > "$state_dir/acme-stores-before-delete.txt"
 while read -r name port; do

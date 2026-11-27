@@ -42,16 +42,22 @@ control legacy-witness > "$state/legacy-refusal-after.txt"
 cmp "$state/legacy-refusal-before.txt" "$state/legacy-refusal-after.txt"
 control legacy-static-reconcile
 export TRAEFIK_ACCEPTANCE_PHASE=review-pagination
-for field in certificate tls; do
+control legacy-witness > "$state/registered-serving.txt"
+for field in certificate tls unregistered; do
     control "legacy-$field-inject"
     control legacy-witness > "$state/legacy-$field-before.txt"
+    if [[ $field == unregistered ]]; then
+        cmp <(grep -i fingerprint "$state/registered-serving.txt") <(grep -i fingerprint "$state/legacy-unregistered-before.txt")
+    fi
     if p up --refresh --target "$urn" --stack acceptance --yes --non-interactive > "$state/logs/legacy-$field-refusal.log" 2>&1; then
         echo 'Unmarked masked TLS bytes were incorrectly accepted' >&2; exit 1
     fi
     grep -Fq 'cannot establish that the dynamic rollback file represents the running graph' "$state/logs/legacy-$field-refusal.log"
     control legacy-witness > "$state/legacy-$field-after.txt"
     cmp "$state/legacy-$field-before.txt" "$state/legacy-$field-after.txt"
-    control legacy-opaque-restore
+    if [[ $field == unregistered ]]; then
+        /usr/bin/ssh -F "$SSH_CONFIG" -p "$SSH_PORT" "$SSH_USER@$SSH_HOST" "set -eu; f=/etc/keroosha-iac/traefik/dynamic/current.yml; mountpoint -q \"\$f\"; cmp \"\$f\" '$GUEST_ROOT/empty-registrations.yml'; umount \"\$f\""
+    else control legacy-opaque-restore; fi
 done
 export TRAEFIK_ACCEPTANCE_PHASE=legacy
 # Keep the historical writer through its final multi-SNI fixture. No trusted

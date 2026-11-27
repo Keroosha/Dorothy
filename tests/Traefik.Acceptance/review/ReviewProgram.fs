@@ -147,6 +147,12 @@ module ReviewProgram =
                             httpRouterEntryPoints [ httpEntryPoint "review-front"; httpEntryPoint "review-secure" ]
                             httpRouterService (httpServiceRef "review-main")
                         }
+                        httpRouter "review-explicit-default" {
+                            httpRule (hostRule [ "auth.acceptance.test" ])
+                            httpRouterEntryPoints [ httpEntryPoint "review-front" ]
+                            httpRouterMiddlewares [ httpMiddlewareRef "review-basic-default" ]
+                            httpRouterService (httpServiceRef "review-main")
+                        }
                         httpRouter "review-method-get" {
                             httpRule (andRule (hostRule [ "sni-proof.acceptance.test" ]) (andRule (pathPrefixRule "/method") (methodRule "GET")))
                             httpRouterEntryPoints [ httpEntryPoint "review-front" ]
@@ -251,6 +257,20 @@ module ReviewProgram =
                         }
                     }
                     httpMiddlewares {
+                        httpMiddleware "review-basic-default" {
+                            nativeField "basicAuth" (nativeObject {
+                                nativeField "users" (nativeArray [ nativeString "review:{SHA}mKYbIi4AGgGAq0uJBC7BFn15Xi8=" ])
+                                nativeField "removeHeader" (nativeBoolean false)
+                            })
+                        }
+                        httpMiddleware "review-forward-default" {
+                            nativeField "forwardAuth" (nativeObject {
+                                nativeField "address" (nativeString "http://127.0.0.1:8080/")
+                                nativeField "trustForwardHeader" (nativeBoolean false)
+                                nativeField "forwardBody" (nativeBoolean false)
+                            })
+                        }
+                        httpMiddleware "review-redirect-default" { httpMiddlewareRedirectScheme "https" false }
                         httpMiddleware "review-front-default" {
                             nativeField "headers" (nativeObject {
                                 nativeField "customResponseHeaders" (nativeObject {

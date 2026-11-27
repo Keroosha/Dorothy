@@ -12,6 +12,9 @@ bin=/usr/local/sbin/dorothy-traefik-maintenance; cfg=/etc/keroosha-iac/traefik; 
 [[ $(<"$cfg/.keroosha-owner") == "$owner_hash" && ! -L $cfg && ! -L $j && -s $j ]]
 hash=$(sum "$j"); archive=/etc/keroosha-iac/.dorothy-traefik-recovery/$owner_hash-$hash.journal
 case "$mode" in
+    nested-negative)
+        if "$bin" recover-stopped "$owner" "$hash"; then exit 1; fi
+        [[ -s $j && $(sum "$j") == "$hash" && ! -e $archive ]] ;;
     install)
         [[ ! -e $bin && ! -L $bin ]]; install -m700 -o root -g root "$root/maintenance-bin" "$bin"
         [[ $(sum "$bin") == "$(<"$root/maintenance-sha")" ]];

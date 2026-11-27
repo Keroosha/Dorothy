@@ -224,6 +224,9 @@ copy_script "$script_dir/../review-listeners.sh" "$GUEST_ROOT/review-listeners.s
 
 
 run_phase structured up --yes --skip-preview --parallel 1
+remote 'set -eu; file=/etc/keroosha-iac/traefik/dynamic/current.yml; jq -e '\''.http.middlewares["review-basic-default"].basicAuth.removeHeader == false and .http.middlewares["review-redirect-default"].redirectScheme.permanent == false'\'' "$file" >/dev/null; curl --noproxy "*" -fsS http://127.0.0.1:19080/api/rawdata | jq -ec '\''.middlewares as $m | {basicAbsent:($m["review-basic-default@file"].basicAuth | has("removeHeader")|not), redirectAbsent:($m["review-redirect-default@file"].redirectScheme|has("permanent")|not), forwardBodyAbsent:($m["review-forward-default@file"].forwardAuth|has("forwardBody")|not), forwardedFalse:($m["review-forward-default@file"].forwardAuth.trustForwardHeader==false)} | select(all(.[];.==true))'\''; url=http://127.0.0.1:18445/explicit-default; test "$(curl -sS -o /dev/null -w "%{http_code}" -H "Host: auth.acceptance.test" "$url")" = 401; curl -fsS -u review:fixture-only -H "Host: auth.acceptance.test" "$url" | grep -F "http-backend:/explicit-default"' > "$state_dir/logs/explicit-default-native.log"
+run_phase structured refresh --yes
+run_phase structured preview --refresh=false --expect-no-changes
 run_guest_client positive
 if ! remote "bash '$GUEST_ROOT/native-dynamic-graph-check.sh' '$GUEST_ROOT' 18445" \
     > "$state_dir/logs/review-native-dynamic-graph.log" 2>&1; then

@@ -1404,6 +1404,15 @@ type TraefikBackendTests() =
             ]"""
         let apiFor raw =
             apiConfigurationFromJson 19080 raw entryPoints """{"Version":"3.7.16"}"""
+        Assert.That(Traefik.loadedRollbackGraph (Some(apiFor rawData)) (Some(Encoding.UTF8.GetBytes(dynamic))), Is.False,
+                    "An unmarked file without TLS cannot attest that the running process has no certificate registrations.")
+        let marked = JsonNode.Parse(dynamic).AsObject()
+        marked["http"].["middlewares"].["mark"].["headers"].["frameDeny"] <- JsonValue.Create(false)
+        let rule = Traefik.stampDynamicGeneration marked
+        let dynamic = marked.ToJsonString()
+        let api = JsonNode.Parse(rawData)
+        api["routers"].["keroosha-admin@file"].["rule"] <- JsonValue.Create(rule)
+        let rawData = api.ToJsonString()
         let matches raw =
             Traefik.apiMatchesDynamic
                 (Some(apiFor raw))
@@ -1419,6 +1428,9 @@ type TraefikBackendTests() =
             let changed = JsonNode.Parse(dynamic)
             changed["http"].["services"].["app"].["loadBalancer"].AsObject().Add("unknownNativeKey", JsonNode.Parse(value))
             Assert.That(recoverable (changed.ToJsonString()), Is.False, $"Unobserved field {value} must not attribute the file.")
+            changed["http"].["services"].["app"].["loadBalancer"].AsObject().Remove("unknownNativeKey") |> ignore
+            changed["http"].["middlewares"].["mark"].["headers"].AsObject().Add("removeHeader", JsonNode.Parse(value))
+            Assert.That(recoverable (changed.ToJsonString()), Is.False, "A known auth boolean is not a headers default.")
         for status in [ "warning"; "disabled" ] do
             let live = JsonNode.Parse(rawData)
             let route = live["routers"].["a-app@file"]
