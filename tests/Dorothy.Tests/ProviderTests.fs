@@ -87,16 +87,11 @@ type ProviderTests() =
 
     let aptPackages (packageValues: seq<string * PropertyValue>) = ProviderTestValues.map packageValues
 
-    let aptInput (address: string) (packages: PropertyValue) (strictDockerBootstrap: bool option) =
-        let entries = [
+    let aptInput (address: string) (packages: PropertyValue) =
+        ProviderTestValues.inputMap [
             "connection", connection address "root"
             "packages", packages
         ]
-        let entries =
-            match strictDockerBootstrap with
-            | Some value -> ("strictDockerBootstrap", ProviderTestValues.boolean value) :: entries
-            | None -> entries
-        ProviderTestValues.inputMap entries
     let ufwInput (port: int) =
         ProviderTestValues.inputMap [
             "connection", connection "192.0.2.1" "root"
@@ -137,7 +132,7 @@ type ProviderTests() =
         // Arrange
         let provider = DorothyProvider()
         let packages = aptPackages [ "nginx", ProviderTestValues.emptyMap ]
-        let inputs = aptInput "192.0.2.10" packages None
+        let inputs = aptInput "192.0.2.10" packages
 
         // Act
         let response = check provider "keroosha:debian:AptPackageSet" inputs
@@ -150,52 +145,6 @@ type ProviderTests() =
         Assert.That(hasPort, Is.True)
         Assert.That(port, Is.EqualTo(22.0))
         Assert.That((ProviderTestValues.mapContents response.Inputs["packages"]).ContainsKey("nginx"), Is.True)
-    [<Test>]
-    member _.``Provider Check accepts only optional boolean strict Docker bootstrap input``() =
-        let provider = DorothyProvider()
-        let packages = aptPackages [ "nginx", ProviderTestValues.emptyMap ]
-
-        let absent = check provider "keroosha:debian:AptPackageSet" (aptInput "192.0.2.10" packages None)
-        let disabled = check provider "keroosha:debian:AptPackageSet" (aptInput "192.0.2.10" packages (Some false))
-        let enabled = check provider "keroosha:debian:AptPackageSet" (aptInput "192.0.2.10" packages (Some true))
-        let unknown =
-            ProviderTestValues.inputMap [
-                "connection", connection "192.0.2.10" "root"
-                "packages", packages
-                "strictDockerBootstrap", PropertyValue.Computed
-            ]
-        let unknownResponse = check provider "keroosha:debian:AptPackageSet" unknown
-        let invalid =
-            ProviderTestValues.inputMap [
-                "connection", connection "192.0.2.10" "root"
-                "packages", packages
-                "strictDockerBootstrap", ProviderTestValues.string "true"
-            ]
-        let rejected = check provider "keroosha:debian:AptPackageSet" invalid
-
-        Assert.That(absent.Failures, Is.Empty)
-        Assert.That(absent.Inputs.ContainsKey("strictDockerBootstrap"), Is.False)
-        Assert.That(disabled.Failures, Is.Empty)
-        Assert.That(disabled.Inputs.ContainsKey("strictDockerBootstrap"), Is.False)
-        Assert.That(enabled.Failures, Is.Empty)
-        let mutable strictDockerBootstrap = false
-        Assert.That(enabled.Inputs["strictDockerBootstrap"].TryGetBool(&strictDockerBootstrap), Is.True)
-        Assert.That(strictDockerBootstrap, Is.True)
-        Assert.That(unknownResponse.Failures, Is.Empty)
-        Assert.That(unknownResponse.Inputs["strictDockerBootstrap"].IsComputed, Is.True)
-        Assert.That(rejected.Failures |> Seq.exists (fun failure -> failure.Property = "strictDockerBootstrap"), Is.True)
-
-    [<Test>]
-    member _.``Provider Check schema exposes optional strict Docker bootstrap boolean``() =
-        use schema = System.Text.Json.JsonDocument.Parse(AptProvider.Schema)
-        let aptSet = schema.RootElement.GetProperty("resources").GetProperty("keroosha:debian:AptPackageSet")
-        let strictBootstrap = aptSet.GetProperty("inputProperties").GetProperty("strictDockerBootstrap")
-        let required =
-            aptSet.GetProperty("requiredInputs").EnumerateArray()
-            |> Seq.exists (fun property -> property.GetString() = "strictDockerBootstrap")
-
-        Assert.That(strictBootstrap.GetProperty("type").GetString(), Is.EqualTo("boolean"))
-        Assert.That(required, Is.False)
 
     [<Test>]
     member _.``Provider Check rejects malformed UFW rule arguments``() =
@@ -249,8 +198,8 @@ type ProviderTests() =
         let provider = DorothyProvider()
         let oldPackages = aptPackages [ "mc", ProviderTestValues.map [ "version", ProviderTestValues.string "4.8.33" ] ]
         let newPackages = aptPackages [ "mc", ProviderTestValues.map [ "version", ProviderTestValues.string "4.8.34" ] ]
-        let oldInputs = aptInput "192.0.2.1" oldPackages None
-        let newInputs = aptInput "192.0.2.1" newPackages None
+        let oldInputs = aptInput "192.0.2.1" oldPackages
+        let newInputs = aptInput "192.0.2.1" newPackages
         let oldOutputs =
             ProviderTestValues.inputMap [
                 "installedVersions", ProviderTestValues.map [ "mc", ProviderTestValues.string "4.8.33" ]
@@ -266,24 +215,6 @@ type ProviderTests() =
         Assert.That(response.Diffs.Contains("packages"), Is.True)
         Assert.That(response.DetailedDiff.ContainsKey("packages[\"mc\"].version"), Is.True)
 
-    [<Test>]
-    member _.``Provider Diff reports strict Docker bootstrap input changes``() =
-        let provider = DorothyProvider()
-        let packages = aptPackages [ "nginx", ProviderTestValues.emptyMap ]
-        let oldInputs = aptInput "192.0.2.1" packages None
-        let newInputs = aptInput "192.0.2.1" packages (Some true)
-        let oldOutputs =
-            ProviderTestValues.inputMap [
-                "installedVersions", ProviderTestValues.emptyMap
-                "managedPackages", ProviderTestValues.array [ ProviderTestValues.string "nginx" ]
-            ]
-
-        let response = diff provider "keroosha:debian:AptPackageSet" "owned-id" oldInputs oldOutputs newInputs
-
-        Assert.That(response.Changes.HasValue, Is.True)
-        Assert.That(response.Changes.Value, Is.True)
-        Assert.That(response.Diffs.Contains("strictDockerBootstrap"), Is.True)
-        Assert.That(response.DetailedDiff.ContainsKey("strictDockerBootstrap"), Is.True)
 
     [<Test>]
     member _.``Provider Diff reports a nested UFW port update``() =

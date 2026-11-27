@@ -107,6 +107,7 @@ module private AptProviderLogic =
           "type": "array",
           "items": { "type": "string" }
         }
+      },
       "required": ["connection", "packages", "installedVersions", "managedPackages"]
     }
   }

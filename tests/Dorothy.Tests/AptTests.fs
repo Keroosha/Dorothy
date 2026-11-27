@@ -1,11 +1,16 @@
 namespace Dorothy.Tests
 
 open System
+open System.Collections.Immutable
+open System.Threading
 open System.IO
 open System.Text.Json
 open System.Text.Json.Nodes
+open Dorothy.DSL.Provider
 open Dorothy.HostHelper
 open NUnit.Framework
+open Pulumi.Experimental
+open Pulumi.Experimental.Provider
 
 module private AptTestHelpers =
     let packageState status version essential protectedPackage =
@@ -159,6 +164,72 @@ module private AptTestHelpers =
         finally
             if Directory.Exists(root) then
                 Directory.Delete(root, true)
+
+[<RequireQualifiedAccess>]
+module private AptProviderTestValues =
+    let map (entries: seq<string * PropertyValue>) =
+        let builder = ImmutableDictionary.CreateBuilder<string, PropertyValue>(StringComparer.Ordinal)
+        for key, value in entries do
+            builder.Add(key, value)
+        PropertyValue(builder.ToImmutable())
+
+    let inputMap (entries: seq<string * PropertyValue>) =
+        let builder = ImmutableDictionary.CreateBuilder<string, PropertyValue>(StringComparer.Ordinal)
+        for key, value in entries do
+            builder.Add(key, value)
+        builder.ToImmutable()
+
+    let array (values: seq<PropertyValue>) = PropertyValue(ImmutableArray.CreateRange(values))
+    let text (value: string) = PropertyValue(value)
+    let boolean (value: bool) = PropertyValue(value)
+    let emptyMap = map Seq.empty
+
+    let connection address =
+        map [
+            "address", text address
+            "user", text "root"
+        ]
+
+    let inputs (strictDockerBootstrap: bool option) =
+        let entries = [
+            "connection", connection "192.0.2.10"
+            "packages", map [ "nginx", emptyMap ]
+        ]
+        let entries =
+            match strictDockerBootstrap with
+            | Some value -> ("strictDockerBootstrap", boolean value) :: entries
+            | None -> entries
+        inputMap entries
+
+    let urn = Pulumi.Urn("urn:pulumi:unit::unit::keroosha:debian:AptPackageSet::apt-provider-test")
+
+    let check (provider: DorothyProvider) inputs =
+        let request =
+            CheckRequest(
+                urn,
+                ImmutableDictionary<string, PropertyValue>.Empty,
+                inputs,
+                ImmutableArray<byte>.Empty
+            )
+        provider.Check(request, CancellationToken.None).GetAwaiter().GetResult()
+
+    let diff (provider: DorothyProvider) oldInputs newInputs =
+        let oldOutputs =
+            inputMap [
+                "installedVersions", emptyMap
+                "managedPackages", array [ text "nginx" ]
+            ]
+        let request =
+            DiffRequest(
+                urn,
+                "apt-provider-test",
+                oldOutputs,
+                newInputs,
+                ImmutableArray<string>.Empty,
+                oldInputs
+            )
+        provider.Diff(request, CancellationToken.None).GetAwaiter().GetResult()
+
 
 [<TestFixture>]
 type AptTests() =
@@ -528,3 +599,68 @@ type AptTests() =
                 installArguments
                 |> List.exists (fun argument -> argument.StartsWith("docker.io=", StringComparison.Ordinal)),
                 Is.False))
+
+[<TestFixture>]
+type AptProviderTests() =
+    [<Test>]
+    member _.``Combined provider schema exposes optional strict Docker bootstrap inputs and outputs``() =
+        let response =
+            DorothyProvider().GetSchema(GetSchemaRequest(0, "", ""), CancellationToken.None).GetAwaiter().GetResult()
+        use schema = JsonDocument.Parse(response.Schema)
+        let resources = schema.RootElement.GetProperty("resources")
+        let aptPackageSet = resources.GetProperty("keroosha:debian:AptPackageSet")
+        let inputFlag = aptPackageSet.GetProperty("inputProperties").GetProperty("strictDockerBootstrap")
+        let outputFlag = aptPackageSet.GetProperty("properties").GetProperty("strictDockerBootstrap")
+        let requiredInputs = aptPackageSet.GetProperty("requiredInputs")
+        let required = aptPackageSet.GetProperty("required")
+        let names (values: JsonElement) =
+            values.EnumerateArray() |> Seq.map _.GetString() |> Seq.toArray
+
+        Assert.That(inputFlag.GetProperty("type").ValueEquals("boolean"), Is.True)
+        Assert.That(outputFlag.GetProperty("type").ValueEquals("boolean"), Is.True)
+        Assert.That(names requiredInputs, Is.EquivalentTo([| "connection"; "packages" |]))
+        Assert.That(names required, Is.EquivalentTo([| "connection"; "packages"; "installedVersions"; "managedPackages" |]))
+        Assert.That(resources.GetProperty("keroosha:debian:Ufw").ValueKind, Is.EqualTo(JsonValueKind.Object))
+
+    [<Test>]
+    member _.``Combined provider Check accepts optional strict Docker bootstrap without host access``() =
+        let provider = DorothyProvider()
+        let absent = AptProviderTestValues.check provider (AptProviderTestValues.inputs None)
+        let disabled = AptProviderTestValues.check provider (AptProviderTestValues.inputs (Some false))
+        let enabled = AptProviderTestValues.check provider (AptProviderTestValues.inputs (Some true))
+        let unknownInputs =
+            (AptProviderTestValues.inputs None).SetItem("strictDockerBootstrap", PropertyValue.Computed)
+        let unknown = AptProviderTestValues.check provider unknownInputs
+        let invalidInputs =
+            (AptProviderTestValues.inputs None).SetItem("strictDockerBootstrap", AptProviderTestValues.text "true")
+        let invalid = AptProviderTestValues.check provider invalidInputs
+        let mutable enabledFlag = false
+
+        Assert.That(absent.Failures, Is.Empty)
+        Assert.That(absent.Inputs.ContainsKey("strictDockerBootstrap"), Is.False)
+        Assert.That(disabled.Failures, Is.Empty)
+        Assert.That(disabled.Inputs.ContainsKey("strictDockerBootstrap"), Is.False)
+        Assert.That(enabled.Failures, Is.Empty)
+        Assert.That(enabled.Inputs["strictDockerBootstrap"].TryGetBool(&enabledFlag), Is.True)
+        Assert.That(enabledFlag, Is.True)
+        Assert.That(unknown.Failures, Is.Empty)
+        Assert.That(unknown.Inputs["strictDockerBootstrap"].IsComputed, Is.True)
+        Assert.That(invalid.Failures |> Seq.exists (fun failure -> failure.Property = "strictDockerBootstrap"), Is.True)
+
+    [<Test>]
+    member _.``Combined provider Diff reports strict Docker bootstrap input changes without host access``() =
+        let provider = DorothyProvider()
+
+        let changes =
+            [ None; Some false ]
+            |> List.map (fun oldStrict ->
+                AptProviderTestValues.diff
+                    provider
+                    (AptProviderTestValues.inputs oldStrict)
+                    (AptProviderTestValues.inputs (Some true)))
+
+        for response in changes do
+            Assert.That(response.Changes.HasValue, Is.True)
+            Assert.That(response.Changes.Value, Is.True)
+            Assert.That(response.Diffs.Contains("strictDockerBootstrap"), Is.True)
+            Assert.That(response.DetailedDiff.ContainsKey("strictDockerBootstrap"), Is.True)
