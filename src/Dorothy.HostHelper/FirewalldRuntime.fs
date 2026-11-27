@@ -246,6 +246,15 @@ module FirewalldRuntime =
                 forwardPortElement value |> Option.map (fun _ -> value)
         with _ -> None
 
+    /// list-all prints missing optional fields as "None"; that is not a valid
+    /// address or port in an add/remove command. Retain the listing format for
+    /// fingerprints, and construct argv only from a decoded typed selector.
+    let forwardPortCommandValue displayValue =
+        forwardPortElement displayValue |> Option.map (fun e ->
+            let optional name flag = Map.tryFind name e.Attributes |> Option.map (fun v -> ":" + flag + "=" + v) |> Option.defaultValue ""
+            "port=" + e.Attributes["port"] + ":proto=" + e.Attributes["protocol"]
+            + optional "to-port" "toport" + optional "to-addr" "toaddr")
+
     let private emptySnapshot (kind: string) (name: string) (unknown: Map<string, string list>) : RuntimeSnapshot =
         { Kind = kind
           Name = name

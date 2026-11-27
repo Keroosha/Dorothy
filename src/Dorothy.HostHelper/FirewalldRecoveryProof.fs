@@ -893,6 +893,33 @@ module FirewalldRecoveryProof =
                 intervals |> List.pairwise |> List.forall (fun ((_, previousEnd), (nextStart, _)) -> previousEnd < nextStart)
 
 
+    let private independentLocalRedirects (before: FirewalldRuntime.RuntimeSnapshot) (after: FirewalldRuntime.RuntimeSnapshot) (deltas: ObjectDelta list) =
+        let eligible = deltas.Length > 1 && deltas.Length <= 4096 && (before.Kind = "zone" || before.Kind = "policy")
+                       && List.forall (fun d -> d.Field = "forward-ports" && d.Add = deltas.Head.Add) deltas
+                       && before.RichRules.IsEmpty && after.RichRules.IsEmpty && not before.Masquerade && not after.Masquerade
+        if not eligible then false
+        else
+            // Every packet must see either the former or the final redirect.
+            // Do not batch overlapping inputs, remote address changes, or a
+            // translation whose destination is an input to another redirect.
+            let superset = if deltas.Head.Add then after.ForwardPorts else before.ForwardPorts
+            let range (text: string) =
+                let bounds = text.Split('-')
+                Int32.Parse(bounds[0]), Int32.Parse(bounds[bounds.Length-1])
+            let redirects = superset |> List.choose (fun e ->
+                match Map.tryFind "to-port" e.Attributes, Map.tryFind "to-addr" e.Attributes with
+                | Some target, None -> Some(e.Attributes["protocol"], range e.Attributes["port"], range target)
+                | _ -> None)
+            List.length redirects = List.length superset &&
+            (redirects |> List.groupBy (fun (proto, _, _) -> proto) |> List.forall (fun (_, group) ->
+                let inputs = group |> List.map (fun (_, input, _) -> input) |> List.sort |> List.toArray
+                let outputs = group |> List.map (fun (_, _, output) -> output) |> List.sort
+                let mutable i = 0
+                (inputs |> Seq.pairwise |> Seq.forall (fun ((_, last), (next, _)) -> last < next))
+                && (outputs |> List.forall (fun (first, last) ->
+                    while i < inputs.Length && snd inputs[i] < first do i <- i+1
+                    i = inputs.Length || fst inputs[i] > last))))
+
     let private objectDeltaProofCore
         (environment: HostEnvironment)
         (configuration: FirewalldModel.Configuration)
@@ -922,9 +949,10 @@ module FirewalldRecoveryProof =
                     let deltas = deriveObjectDeltas before after beforeConfiguration afterConfiguration
                     let effects = deltas |> List.map (fun delta -> delta.Effect) |> Set.ofList
                     let setBatchCandidate = safeStaticIpSetEntryBatch before after deltas
+                    let redirectBatch = independentLocalRedirects before after deltas
                     let unsafeSteeringMix =
                         Set.contains Steers effects
-                        && (effects.Count > 1 || (deltas.Length > 1 && not setBatchCandidate))
+                        && (effects.Count > 1 || (deltas.Length > 1 && not (setBatchCandidate || redirectBatch)))
                     if unsafeSteeringMix || deltas.Length > 4096 then None
                     else
                         match FirewalldRuntime.queryPermanent environment configuration.Kind configuration.Name,
@@ -932,11 +960,11 @@ module FirewalldRecoveryProof =
                         | Ok(Some permanent), Some live
                             when matchesLoadedProjection environment before permanent
                                  && objectRuntimeMatchesCheckpointZero environment before deltas live ->
-                            let steeringBatch = setBatchCandidate && authorizeSetBatch ()
+                            let steeringBatch = redirectBatch || (setBatchCandidate && authorizeSetBatch ())
                             if setBatchCandidate && not steeringBatch then None
                             else
                                 let node = proofBase configuration "object-delta"
-                                node["version"] <- JsonValue.Create 5
+                                node["version"] <- JsonValue.Create(if redirectBatch then 6 else 5)
                                 node["steeringBatch"] <- JsonValue.Create steeringBatch
                                 node["afterConfiguration"] <- JsonValue.Create(FirewalldModel.toJson afterConfiguration)
                                 node["beforePresent"] <- JsonValue.Create true
@@ -1361,7 +1389,7 @@ module FirewalldRecoveryProof =
             | value -> value.GetValue<string>()
         if isNull node["version"] then fail "Missing firewalld rollback proof version."
         let version = node["version"].GetValue<int>()
-        if not (List.contains version [ 1; 2; 3; 4; 5 ])
+        if not (List.contains version [ 1; 2; 3; 4; 5; 6 ])
            || getString "scope" <> "object"
            || getString "kind" <> configuration.Kind
            || getString "name" <> configuration.Name then
@@ -1378,18 +1406,18 @@ module FirewalldRecoveryProof =
             elif strategy = "reload-before" && version = 2 then
                 set [ "version"; "scope"; "kind"; "name"; "strategy"; "beforePresent"; "beforeFingerprint"; "afterPresent"; "afterFingerprint"
                       "beforeInterfaces"; "beforeNativeInterfaces"; "afterInterfaces"; "afterNativeInterfaces" ]
-            elif strategy = "object-delta" && (version = 3 || version = 4 || version = 5) then
+            elif strategy = "object-delta" && version >= 3 then
                 let fields = set [ "version"; "scope"; "kind"; "name"; "strategy"; "beforePresent"; "beforeFingerprint"; "afterPresent"; "afterFingerprint"
                                    "beforeInterfaces"; "beforeNativeInterfaces"; "afterInterfaces"; "afterNativeInterfaces"; "deltas"; "stateFingerprints" ]
                 let fields = if version >= 4 then Set.add "afterConfiguration" fields else fields
-                if version = 5 then Set.add "steeringBatch" fields else fields
+                if version >= 5 then Set.add "steeringBatch" fields else fields
             elif strategy = "unchanged" && version = 1 then
                 set [ "version"; "scope"; "kind"; "name"; "strategy" ]
             else Set.empty
         let actualKeys = node |> Seq.map (fun pair -> pair.Key) |> Set.ofSeq
         if expectedKeys.IsEmpty || actualKeys <> expectedKeys then
             fail "Invalid firewalld native rollback proof fields."
-        if strategy = "object-delta" && version = 5 then
+        if strategy = "object-delta" && version >= 5 then
             node["steeringBatch"].GetValue<bool>() |> ignore
         let validateProjection label =
             let presentKey, fingerprintKey = label + "Present", label + "Fingerprint"
@@ -1557,9 +1585,12 @@ module FirewalldRecoveryProof =
         let expectedDeltas = deriveObjectDeltas before after beforeConfiguration afterConfiguration
         let effects = deltas |> List.map (fun delta -> delta.Effect) |> Set.ofList
         let steeringBatch =
-            node["version"].GetValue<int>() = 5
+            node["version"].GetValue<int>() >= 5
             && node["steeringBatch"].GetValue<bool>()
-        if steeringBatch && not (safeStaticIpSetEntryBatch before after deltas) then
+        let redirectFormat = node["version"].GetValue<int>() = 6
+        if redirectFormat && not (steeringBatch && independentLocalRedirects before after deltas) then
+            fail "The recorded redirections are not independent local destination ports."
+        if steeringBatch && not redirectFormat && not (safeStaticIpSetEntryBatch before after deltas) then
             fail "The recorded ipset batch no longer has disjoint static IPv4 membership semantics."
         let unsafeSteeringMix =
             Set.contains Steers effects && (effects.Count > 1 || (deltas.Length > 1 && not steeringBatch))
@@ -1769,7 +1800,11 @@ module FirewalldRecoveryProof =
                 "source"
             | "entries" when configuration.Kind = "ipset" -> "entry"
             | _ -> fail "Unsupported selector in firewalld rollback proof."
-        [ selector; "--" + action + "-" + optionName + "=" + delta.Value ]
+        let argument =
+            if delta.Field = "forward-ports" then
+                FirewalldRuntime.forwardPortCommandValue delta.Value |> Option.defaultWith (fun () -> fail "Invalid scoped forward-port command.")
+            else delta.Value
+        [ selector; "--" + action + "-" + optionName + "=" + argument ]
 
     let activateReload (environment: HostEnvironment) (configuration: FirewalldModel.Configuration) (proof: JsonObject) =
         let strategy, node = readProof configuration (Some proof)
