@@ -1055,6 +1055,8 @@ type FirewalldLifecycleTests() =
             Assert.That(commands |> Seq.exists (fun args -> List.contains (List.head args) [ "daemon-reload"; "enable"; "start" ]), Is.False))
 
     [<TestCase("disk-wants"); TestCase("disk-hard"); TestCase("live-wants"); TestCase("live-hard")>]
+    [<TestCase("disk-boot-prefix-wants"); TestCase("disk-short-prefix-requires")>]
+    [<TestCase("disk-timer-upholds"); TestCase("disk-service-wants"); TestCase("disk-dbus-alias-requires")>]
     member _.``Unattributed recovery dependencies refuse before publication or activation``(source: string) =
         let boot = "keroosha-iac-firewalld-boot-recovery.service"
         let foreign = "independent.service"
@@ -1069,6 +1071,11 @@ type FirewalldLifecycleTests() =
                 match source with
                 | "disk-wants" -> Some(physical root ("/etc/systemd/system/" + boot + ".wants/" + foreign), "../" + foreign)
                 | "disk-hard" -> Some(physical root ("/run/systemd/system/firewalld.service.requires/" + boot), "../" + boot)
+                | "disk-boot-prefix-wants" -> Some(physical root ("/run/systemd/system/keroosha-iac-firewalld-boot-.service.wants/" + foreign), "../" + foreign)
+                | "disk-short-prefix-requires" -> Some(physical root ("/etc/systemd/system/keroosha-.service.requires/" + foreign), "../" + foreign)
+                | "disk-timer-upholds" -> Some(physical root ("/run/systemd/system/timer.upholds/" + foreign), "../" + foreign)
+                | "disk-service-wants" -> Some(physical root ("/etc/systemd/system/service.wants/" + foreign), "../" + foreign)
+                | "disk-dbus-alias-requires" -> Some(physical root ("/run/systemd/system/dbus-.service.requires/" + boot), "../" + boot)
                 | _ -> None
             for path, target in Option.toList link do
                 Directory.CreateDirectory(Path.GetDirectoryName path) |> ignore

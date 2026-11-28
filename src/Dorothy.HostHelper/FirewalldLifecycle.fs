@@ -647,18 +647,20 @@ module FirewalldLifecycle =
             fail "PID 1 UnitPath does not contain the authenticated firewalld unit directory."
         paths
 
-    let private systemdDropInNames (unitName: string) =
-        let extension = unitName.LastIndexOf('.')
-        if extension <= 0 || extension = unitName.Length - 1 then
-            fail "Invalid firewalld systemd unit name."
-        let stem = unitName.Substring(0, extension)
-        let unitType = unitName.Substring(extension + 1)
-        let names = ResizeArray<string>()
-        names.Add unitName
-        names.Add unitType
-        for index in 0 .. stem.Length - 1 do
-            if stem[index] = '-' then names.Add(stem.Substring(0, index + 1) + "." + unitType)
-        names |> Seq.distinct |> Seq.map (fun name -> name + ".d") |> Seq.toList
+    // systemd v257.13 unit_file_find_dirs / unit_file_find_dropin_paths.
+    // These recovery units and the daemon are plain units, never instances.
+    let private systemdLookupNames (unitName: string) =
+        let dot = unitName.LastIndexOf('.')
+        if dot <= 0 || Path.GetFileName(unitName) <> unitName || unitName.Contains('@') ||
+           not (unitName.EndsWith(".service", StringComparison.Ordinal) || unitName.EndsWith(".timer", StringComparison.Ordinal)) then
+            raise (HostPrerequisiteError("Cannot classify a systemd lookup name for a plain recovery or firewall unit."))
+        let extension = unitName.Substring(dot)
+        [| yield unitName
+           // Chop the rightmost interior dash each time; neither an initial
+           // dash nor one already at the end of the stem adds a lookup name.
+           for i = dot - 2 downto 1 do
+               if unitName[i] = '-' then yield unitName.Substring(0, i + 1) + extension
+           yield unitName.Substring(dot + 1) |]
 
     let private systemdEntryExists (path: string) =
         File.Exists path || Directory.Exists path || not (isNull (FileInfo(path).LinkTarget))
@@ -678,7 +680,7 @@ module FirewalldLifecycle =
             let candidate = Path.GetFullPath(Path.Combine(directory, unitName))
             if candidate <> expected && systemdEntryExists candidate then
                 refuseUnit unitName "unowned systemd fragment in the recovery unit search path."
-        let dropIns = systemdDropInNames unitName
+        let dropIns = systemdLookupNames unitName |> Array.map (fun name -> name + ".d")
         for root in unitPaths do
             for name in dropIns do
                 let candidate = Path.Combine(root, name)
@@ -726,6 +728,15 @@ module FirewalldLifecycle =
             Directory.EnumerateFileSystemEntries dir
         | _ -> refuseUnit id "unowned dependency directory."
 
+    let private inspectDependencyDirectories id aliases paths inspectEntry =
+        let names = aliases |> Seq.collect systemdLookupNames |> Seq.distinct
+        for name in names do
+            for suffix in [ ".wants"; ".requires"; ".upholds" ] do
+                let directory = name + suffix
+                for root in paths do
+                    for entry in dependencyEntries id (Path.Combine(root, directory)) do
+                        inspectEntry suffix entry
+
     let private checkRecoveryDependencies environment paths (units: RecoveryUnit list) (legacyLink: string option) requireLoaded =
         let names = units |> List.map (fun u -> Path.GetFileName u.LogicalPath)
         let daemon = "firewalld.service"
@@ -753,15 +764,16 @@ module FirewalldLifecycle =
                 if props["LoadState"] <> "loaded" then refuseUnit id "cannot inspect the running firewall's recovery dependencies."
                 let aliases = words "Names"
                 if not (Array.contains daemon aliases) then refuseUnit daemon "unknown firewall alias inventory."
-                for alias in aliases do
-                    if Path.GetFileName alias <> alias then refuseUnit id "uninspectable firewall alias."
-                    for root in paths do
-                        let dir = Path.Combine(root, alias + ".requires")
-                        for edge in dependencyEntries id dir do
-                            let target = FileInfo(edge).LinkTarget
-                            if (Path.GetFileName edge = bootServiceName ||
-                                (not (isNull target) && Path.GetFileName target = bootServiceName)) && Some edge <> legacyLink then
-                                refuseUnit id "unowned hard dependency on preboot."
+                if aliases |> Array.exists (fun alias -> not (alias.EndsWith(".service", StringComparison.Ordinal))) then
+                    refuseUnit id "uninspectable firewall alias."
+                inspectDependencyDirectories id aliases paths (fun suffix edge ->
+                    // Soft edges and unrelated daemon dependencies are not
+                    // Dorothy's to claim. Only a hard edge to preboot matters.
+                    if suffix = ".requires" then
+                        let target = FileInfo(edge).LinkTarget
+                        if (Path.GetFileName edge = bootServiceName ||
+                            (not (isNull target) && Path.GetFileName target = bootServiceName)) && Some edge <> legacyLink then
+                            refuseUnit id "unowned hard dependency on preboot.")
                 for key in [ "Requires"; "Requisite"; "BindsTo" ] do
                     if words key |> Array.contains bootServiceName && (key <> "Requires" || legacyLink.IsNone) then
                         refuseUnit id "unowned effective hard dependency on preboot."
@@ -781,11 +793,8 @@ module FirewalldLifecycle =
                     refuseUnit id "uninspectable recovery dependency state."
                 if props["LoadState"] = "loaded" && (props["DropInPaths"] <> "" || props["FragmentPath"] <> logicalPath environment ("/etc/systemd/system/" + id)) then
                     refuseUnit id "unowned effective recovery fragment or drop-in."
-                for root in paths do
-                    for suffix in [ ".wants"; ".requires"; ".upholds" ] do
-                        let dir = Path.Combine(root,id + suffix)
-                        if not (Seq.isEmpty (dependencyEntries id dir)) then
-                            refuseUnit id "unowned recovery dependency directory entries."
+                inspectDependencyDirectories id [ id ] paths (fun _ _ ->
+                    refuseUnit id "unowned recovery dependency directory entries.")
                 for key in [ "Wants"; "Requires"; "Requisite"; "BindsTo"; "Upholds"; "OnFailure"; "OnSuccess"; "Conflicts"; "Triggers" ] do
                     for target in words key do
                         let allowed =
