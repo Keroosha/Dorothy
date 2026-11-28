@@ -33,16 +33,31 @@ type FirewalldLifecycleTests() =
         value["managedMode"] <- JsonValue.Create 0o644
         value
 
-    let withHostForSystemctlStateAndCommands
+    let recoveryUnitNames = FirewalldCommandFixture.recoveryUnitNames
+    let dependencyQueryArguments = FirewalldCommandFixture.dependencyQueryArguments
+    let unitPathArguments = FirewalldCommandFixture.unitPathArguments
+
+    let withHostForNativeCommands
         (systemctlState: CommandResult option)
         (initialBootState: string)
-        (action: HostEnvironment -> string -> ResizeArray<string list> -> unit)
+        (dependencyOverrides: Map<string, Map<string, string>>)
+        (action: HostEnvironment -> string -> ResizeArray<string list> -> ResizeArray<string list> -> unit)
         =
         let root = Path.Combine(Path.GetTempPath(), "dorothy-firewalld-lifecycle-" + Guid.NewGuid().ToString("N"))
         for directory in [ "etc/firewalld/zones"; "etc/systemd/system"; "run/lock"; "var/lib" ] do
             Directory.CreateDirectory(Path.Combine(root, directory)) |> ignore
         let systemctlCommands = ResizeArray<string list>()
+        let busctlCommands = ResizeArray<string list>()
         let mutable bootState = initialBootState
+        let unitRelativePath name =
+            match name with
+            | "keroosha-iac-firewalld-rollback.service" -> "etc/systemd/system/keroosha-iac-firewalld-rollback.service"
+            | "keroosha-iac-firewalld-rollback.timer" -> "etc/systemd/system/keroosha-iac-firewalld-rollback.timer"
+            | "keroosha-iac-firewalld-boot-recovery.service" -> "etc/systemd/system/keroosha-iac-firewalld-boot-recovery.service"
+            | "keroosha-iac-firewalld-postboot-recovery.service" -> "etc/systemd/system/keroosha-iac-firewalld-postboot-recovery.service"
+            | "keroosha-iac-firewalld-boot-containment.service" -> "etc/systemd/system/keroosha-iac-firewalld-boot-containment.service"
+            | _ -> invalidArg (nameof name) "Unexpected recovery fixture unit."
+        let unitPhysicalPath name = Path.Combine(root, unitRelativePath name)
         let run (executable: string) (arguments: string list) (_input: string option) : CommandResult =
             if executable = "stat" then
                 if List.contains "%u:%g" arguments then
@@ -52,8 +67,11 @@ type FirewalldLifecycleTests() =
                     let mode = File.GetUnixFileMode target |> int |> fun value -> Convert.ToString(value, 8)
                     { ExitCode = 0; Stdout = "0:" + mode; Stderr = "" }
             elif executable = "/usr/bin/busctl" then
-                { ExitCode = 0; Stderr = ""
-                  Stdout = """{"type":"as","data":["/etc/systemd/system.control","/etc/systemd/system","/run/systemd/system.attached","/run/systemd/system","/usr/lib/systemd/system"]}""" }
+                busctlCommands.Add arguments
+                if arguments = unitPathArguments then
+                    { ExitCode = 0; Stderr = ""; Stdout = FirewalldCommandFixture.unitPathResponse }
+                else
+                    invalidOp ("Unexpected busctl command: " + String.concat " " arguments)
             elif executable = "/usr/bin/systemctl" then
                 systemctlCommands.Add arguments
                 let mutable response: CommandResult = { ExitCode = 0; Stdout = "success"; Stderr = "" }
@@ -62,17 +80,14 @@ type FirewalldLifecycleTests() =
                     let link = Path.Combine(directory, name)
                     if isNull (FileInfo(link).LinkTarget) && not (File.Exists link || Directory.Exists link) then
                         File.CreateSymbolicLink(link, target) |> ignore
-                let unitRelativePath name =
-                    match name with
-                    | "keroosha-iac-firewalld-rollback.service" -> "etc/systemd/system/keroosha-iac-firewalld-rollback.service"
-                    | "keroosha-iac-firewalld-rollback.timer" -> "etc/systemd/system/keroosha-iac-firewalld-rollback.timer"
-                    | "keroosha-iac-firewalld-boot-recovery.service" -> "etc/systemd/system/keroosha-iac-firewalld-boot-recovery.service"
-                    | "keroosha-iac-firewalld-postboot-recovery.service" -> "etc/systemd/system/keroosha-iac-firewalld-postboot-recovery.service"
-                    | _ -> "etc/systemd/system/keroosha-iac-firewalld-boot-containment.service"
-                let unitPhysicalPath name = Path.Combine(root, unitRelativePath name)
                 match arguments with
                 | [ "show"; "--property=ActiveState"; "--value"; "firewalld.service" ] ->
                     response <- systemctlState |> Option.defaultValue response
+                | args when args = dependencyQueryArguments ->
+                    response <-
+                        { ExitCode = 0
+                          Stdout = FirewalldCommandFixture.systemdDependencyOutput root dependencyOverrides
+                          Stderr = "" }
                 | [ "show"; "--all"; "-p"; _; "--"; name ] ->
                     let path = unitPhysicalPath name
                     let loaded = File.Exists path
@@ -111,9 +126,21 @@ type FirewalldLifecycleTests() =
             { Root = root
               Run = run
               UtcNow = fun () -> DateTimeOffset.UnixEpoch }
-        try action environment root systemctlCommands
+        try action environment root systemctlCommands busctlCommands
         finally
             if Directory.Exists root then Directory.Delete(root, true)
+    let withHostForSystemctlStateAndCommands
+        (systemctlState: CommandResult option)
+        (initialBootState: string)
+        (action: HostEnvironment -> string -> ResizeArray<string list> -> unit)
+        =
+        withHostForNativeCommands systemctlState initialBootState Map.empty (fun environment root systemctl _ ->
+            action environment root systemctl)
+    let withHostForDependencyOverrides
+        (dependencyOverrides: Map<string, Map<string, string>>)
+        (action: HostEnvironment -> string -> ResizeArray<string list> -> ResizeArray<string list> -> unit)
+        =
+        withHostForNativeCommands None "inactive" dependencyOverrides action
     let withHostForSystemctlState (systemctlState: CommandResult option) (action: HostEnvironment -> string -> unit) =
         withHostForSystemctlStateAndCommands systemctlState "inactive" (fun environment root _ -> action environment root)
     let withHost (action: HostEnvironment -> string -> unit) =
@@ -903,7 +930,7 @@ type FirewalldLifecycleTests() =
                 Dorothy.HostHelper.Firewalld.ensureNoSplitZones environment) |> ignore)
     [<Test>]
     member _.``Bootstrap recovery provisions owned units without arming a transaction watchdog``() =
-        withHostForSystemctlStateAndCommands None "inactive" (fun environment root commands ->
+        withHostForDependencyOverrides Map.empty (fun environment root commands _ ->
             let journalPath, journalText = saveBootstrapSettingsOwner root owner
             Firewalld.ensureBootstrapRecovery environment owner
             Assert.That(File.ReadAllText(physical root journalPath), Is.EqualTo journalText)
@@ -1026,3 +1053,131 @@ type FirewalldLifecycleTests() =
             Assert.That(File.ReadAllText(physical root "/var/lib/keroosha-iac/firewalld/pending-transaction.json"), Is.EqualTo markerText)
             Assert.That(File.Exists(physical root "/etc/systemd/system/keroosha-iac-firewalld-rollback.timer"), Is.False)
             Assert.That(commands |> Seq.exists (fun args -> List.contains (List.head args) [ "daemon-reload"; "enable"; "start" ]), Is.False))
+
+    [<TestCase("disk-wants"); TestCase("disk-hard"); TestCase("live-wants"); TestCase("live-hard")>]
+    member _.``Unattributed recovery dependencies refuse before publication or activation``(source: string) =
+        let boot = "keroosha-iac-firewalld-boot-recovery.service"
+        let foreign = "independent.service"
+        let edges =
+            match source with
+            | "live-wants" -> Map.ofList [ boot, Map.ofList [ "Wants", foreign ] ]
+            | "live-hard" -> Map.ofList [ "firewalld.service", Map.ofList [ "Requires", "dbus.socket " + boot ] ]
+            | _ -> Map.empty
+        withHostForDependencyOverrides edges (fun env root commands _ ->
+            let journalPath, original = saveBootstrapSettingsOwner root owner
+            let link =
+                match source with
+                | "disk-wants" -> Some(physical root ("/etc/systemd/system/" + boot + ".wants/" + foreign), "../" + foreign)
+                | "disk-hard" -> Some(physical root ("/run/systemd/system/firewalld.service.requires/" + boot), "../" + boot)
+                | _ -> None
+            for path, target in Option.toList link do
+                Directory.CreateDirectory(Path.GetDirectoryName path) |> ignore
+                File.CreateSymbolicLink(path, target) |> ignore
+            Assert.Throws<HostPrerequisiteError>(fun () -> Firewalld.ensureBootstrapRecovery env owner) |> ignore
+            for path, target in Option.toList link do Assert.That(FileInfo(path).LinkTarget, Is.EqualTo target)
+            for name in recoveryUnitNames do Assert.That(File.Exists(physical root ("/etc/systemd/system/" + name)), Is.False)
+            Assert.That(File.ReadAllText(physical root journalPath), Is.EqualTo original)
+            Assert.That(commands |> Seq.exists (function ("enable" | "start" | "daemon-reload") :: _ -> true | _ -> false), Is.False))
+
+    [<Test>]
+    member _.``Bootstrap recovery upgrades the exact f4a8310 boot unit``() =
+        withHostForSystemctlStateAndCommands None "inactive" (fun environment root _ ->
+            saveBootstrapSettingsOwner root owner |> ignore
+            let oldHelper = "/var/cache/keroosha-iac/helper/linux-x64/" + String.replicate 64 "a"
+            let historical =
+                String.concat "\n"
+                    [ "# Dorothy firewalld transaction recovery"
+                      "[Unit]"
+                      "Description=Dorothy firewalld boot recovery"
+                      "DefaultDependencies=no"
+                      "After=local-fs.target"
+                      "Before=firewalld.service"
+                      "[Service]"
+                      "Type=oneshot"
+                      "ExecStart=" + oldHelper + " firewalld-recover-boot"
+                      "[Install]"
+                      "WantedBy=multi-user.target"
+                      "" ]
+            let unitPath = "/etc/systemd/system/keroosha-iac-firewalld-boot-recovery.service"
+            writeFile root unitPath historical 0o644
+            Firewalld.ensureBootstrapRecovery environment owner
+            let upgraded = File.ReadAllText(physical root unitPath)
+            Assert.That(upgraded, Does.Contain("ExecStart=" + Environment.ProcessPath + " firewalld-recover-boot"))
+            Assert.That(upgraded, Is.Not.EqualTo historical))
+
+    [<Test>]
+    member _.``Bootstrap recovery refuses a lookalike historical boot helper path``() =
+        withHostForSystemctlStateAndCommands None "inactive" (fun environment root commands ->
+            saveBootstrapSettingsOwner root owner |> ignore
+            let lookalikeHelper = "/var/cache/keroosha-iac/helper/linux-x64/not-a-sha256"
+            let lookalike =
+                String.concat "\n"
+                    [ "# Dorothy firewalld transaction recovery"
+                      "[Unit]"
+                      "Description=Dorothy firewalld boot recovery"
+                      "DefaultDependencies=no"
+                      "After=local-fs.target"
+                      "Before=firewalld.service"
+                      "[Service]"
+                      "Type=oneshot"
+                      "ExecStart=" + lookalikeHelper + " firewalld-recover-boot"
+                      "[Install]"
+                      "WantedBy=multi-user.target"
+                      "" ]
+            writeFile root "/etc/systemd/system/keroosha-iac-firewalld-boot-recovery.service" lookalike 0o644
+            Assert.Throws<HostPrerequisiteError>(fun () ->
+                Firewalld.ensureBootstrapRecovery environment owner) |> ignore
+            Assert.That(commands |> Seq.exists (fun args -> args = [ "start"; "keroosha-iac-firewalld-boot-recovery.service" ]), Is.False))
+
+    [<Test>]
+    member _.``Bootstrap recovery accepts the exact containment unit``() =
+        withHostForSystemctlStateAndCommands None "inactive" (fun environment root _ ->
+            saveBootstrapSettingsOwner root owner |> ignore
+            let containment =
+                String.concat "\n"
+                    [ "# Dorothy firewalld transaction recovery"
+                      "[Unit]"
+                      "Description=Quarantine an unverifiable firewalld boot transaction"
+                      "DefaultDependencies=no"
+                      "Wants=firewalld.service keroosha-iac-firewalld-boot-recovery.service keroosha-iac-firewalld-postboot-recovery.service"
+                      "After=firewalld.service keroosha-iac-firewalld-boot-recovery.service keroosha-iac-firewalld-postboot-recovery.service"
+                      "Before=network-pre.target"
+                      "ConditionPathExists=/var/lib/keroosha-iac/firewalld/pending-transaction.json"
+                      "[Service]"
+                      "Type=oneshot"
+                      "ExecCondition=/usr/bin/systemctl --quiet is-failed keroosha-iac-firewalld-boot-recovery.service keroosha-iac-firewalld-postboot-recovery.service"
+                      "ExecStart=/usr/bin/firewall-cmd --panic-on"
+                      "[Install]"
+                      "WantedBy=multi-user.target"
+                      "" ]
+            let unitPath = "/etc/systemd/system/keroosha-iac-firewalld-boot-containment.service"
+            writeFile root unitPath containment 0o644
+            Firewalld.ensureBootstrapRecovery environment owner
+            Assert.That(File.ReadAllText(physical root unitPath), Is.EqualTo containment))
+
+    [<Test>]
+    member _.``Bootstrap recovery refuses a changed containment executable path``() =
+        withHostForSystemctlStateAndCommands None "inactive" (fun environment root commands ->
+            saveBootstrapSettingsOwner root owner |> ignore
+            let lookalikeHelper = "/var/cache/keroosha-iac/helper/linux-x64/" + String.replicate 64 "b"
+            let containment =
+                String.concat "\n"
+                    [ "# Dorothy firewalld transaction recovery"
+                      "[Unit]"
+                      "Description=Quarantine an unverifiable firewalld boot transaction"
+                      "DefaultDependencies=no"
+                      "Wants=firewalld.service keroosha-iac-firewalld-boot-recovery.service keroosha-iac-firewalld-postboot-recovery.service"
+                      "After=firewalld.service keroosha-iac-firewalld-boot-recovery.service keroosha-iac-firewalld-postboot-recovery.service"
+                      "Before=network-pre.target"
+                      "ConditionPathExists=/var/lib/keroosha-iac/firewalld/pending-transaction.json"
+                      "[Service]"
+                      "Type=oneshot"
+                      "ExecCondition=/usr/bin/systemctl --quiet is-failed keroosha-iac-firewalld-boot-recovery.service keroosha-iac-firewalld-postboot-recovery.service"
+                      "ExecStart=" + lookalikeHelper + " --panic-on"
+                      "[Install]"
+                      "WantedBy=multi-user.target"
+                      "" ]
+            writeFile root "/etc/systemd/system/keroosha-iac-firewalld-boot-containment.service" containment 0o644
+            Assert.Throws<HostPrerequisiteError>(fun () ->
+                Firewalld.ensureBootstrapRecovery environment owner) |> ignore
+            Assert.That(commands |> Seq.exists (fun args -> args = [ "start"; "keroosha-iac-firewalld-boot-recovery.service" ]), Is.False))

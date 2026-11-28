@@ -594,7 +594,7 @@ module FirewalldLifecycle =
                 [ ownerMarker; "[Unit]"; "Description=Dorothy firewalld transaction rollback"; "DefaultDependencies=no"; "After=local-fs.target"; "[Service]"; "Type=oneshot"; "ExecStart=" + helper + " firewalld-recover"; "" ]
         let legacyBootServiceText =
             String.concat "\n"
-                [ ownerMarker; "[Unit]"; "Description=Dorothy firewalld boot recovery"; "DefaultDependencies=no"; "After=local-fs.target"; "Before=firewalld.service"; "[Service]"; "Type=oneshot"; "ExecStart=" + helper + " firewalld-recover-boot"; "[Install]"; "WantedBy=multi-user.target"; "RequiredBy=firewalld.service"; "" ]
+                [ ownerMarker; "[Unit]"; "Description=Dorothy firewalld boot recovery"; "DefaultDependencies=no"; "After=local-fs.target"; "Before=firewalld.service"; "[Service]"; "Type=oneshot"; "ExecStart=" + helper + " firewalld-recover-boot"; "[Install]"; "WantedBy=multi-user.target"; "" ]
         [ { LogicalPath = servicePath; Text = serviceText; LegacyTexts = [ previousServiceText; legacyServiceText ] }
           { LogicalPath = bootServicePath; Text = bootServiceText; LegacyTexts = [ previousBootServiceText; legacyBootServiceText ] }
           { LogicalPath = postBootServicePath; Text = postBootServiceText; LegacyTexts = [ previousPostBootServiceText ] }
@@ -617,8 +617,10 @@ module FirewalldLifecycle =
                 else
                     let arguments = expectedCommand.Substring(expectedSpace)
                     let actualArguments = actualCommand.Substring(actualSpace)
+                    let expectedExecutable = expectedCommand.Substring(0, expectedSpace)
                     let oldExecutable = actualCommand.Substring(0, actualSpace)
                     actualArguments = arguments
+                    && expectedExecutable = helper
                     && (oldExecutable = helper
                         || Regex.IsMatch(oldExecutable, "^/var/cache/keroosha-iac/helper/(linux-x64|linux-arm64)/[0-9a-f]{64}$", RegexOptions.CultureInvariant))
         expectedLines.Length = actualLines.Length
@@ -708,6 +710,104 @@ module FirewalldLifecycle =
             | _ -> refuseUnit name "recovery unit failed or has not settled."
         | _ -> refuseUnit name "unowned or unclassifiable recovery unit."
 
+    // A missing fragment can hide .wants/.requires links from PID 1 until
+    // daemon-reload. Inspect just these units' directories as well as the
+    // effective graph. Do not traverse or activate the dependency targets.
+    let private dependencyProperties =
+        "Id,Names,LoadState,NeedDaemonReload,Wants,Requires,Requisite,BindsTo,Upholds,OnFailure,OnSuccess,Conflicts,Triggers,FragmentPath,DropInPaths"
+
+    let private dependencyEntries id (dir: string) =
+        let attributes =
+            try Some(File.GetAttributes dir)
+            with :? FileNotFoundException | :? DirectoryNotFoundException -> None
+        match attributes with
+        | None -> Seq.empty
+        | Some a when a.HasFlag FileAttributes.Directory && not (a.HasFlag FileAttributes.ReparsePoint) ->
+            Directory.EnumerateFileSystemEntries dir
+        | _ -> refuseUnit id "unowned dependency directory."
+
+    let private checkRecoveryDependencies environment paths (units: RecoveryUnit list) (legacyLink: string option) requireLoaded =
+        let names = units |> List.map (fun u -> Path.GetFileName u.LogicalPath)
+        let daemon = "firewalld.service"
+        let requested = daemon :: names |> Set.ofList
+        let result = environment.Run "/usr/bin/systemctl"
+                         ([ "show"; "--all"; "-p"; dependencyProperties; "--" ] @ names @ [ daemon ]) None
+        if result.Stderr <> "" || (result.ExitCode <> 0 && result.ExitCode <> 4) then
+            refuseUnit bootServiceName "cannot determine effective recovery dependencies."
+        let queried = dependencyProperties.Split(',')
+        let mutable seen = Set.empty
+        for block in result.Stdout.TrimEnd('\n').Split("\n\n", StringSplitOptions.RemoveEmptyEntries) do
+            let props = Collections.Generic.Dictionary<string,string>(StringComparer.Ordinal)
+            for line in block.Split('\n') do
+                let i = line.IndexOf '='
+                if i < 1 || not (props.TryAdd(line.Substring(0,i), line.Substring(i+1))) then
+                    refuseUnit bootServiceName "malformed systemd dependency observation."
+            if props.Count <> queried.Length || not (Array.forall props.ContainsKey queried) then
+                refuseUnit bootServiceName "incomplete systemd dependency observation."
+            let id = props["Id"]
+            if not (Set.contains id requested) || Set.contains id seen then refuseUnit bootServiceName "unexpected systemd dependency identity."
+            seen <- Set.add id seen
+            let words key = props[key].Split(' ', StringSplitOptions.RemoveEmptyEntries)
+            if props["NeedDaemonReload"] <> "no" then refuseUnit id "stale dependency configuration."
+            if id = daemon then
+                if props["LoadState"] <> "loaded" then refuseUnit id "cannot inspect the running firewall's recovery dependencies."
+                let aliases = words "Names"
+                if not (Array.contains daemon aliases) then refuseUnit daemon "unknown firewall alias inventory."
+                for alias in aliases do
+                    if Path.GetFileName alias <> alias then refuseUnit id "uninspectable firewall alias."
+                    for root in paths do
+                        let dir = Path.Combine(root, alias + ".requires")
+                        for edge in dependencyEntries id dir do
+                            let target = FileInfo(edge).LinkTarget
+                            if (Path.GetFileName edge = bootServiceName ||
+                                (not (isNull target) && Path.GetFileName target = bootServiceName)) && Some edge <> legacyLink then
+                                refuseUnit id "unowned hard dependency on preboot."
+                for key in [ "Requires"; "Requisite"; "BindsTo" ] do
+                    if words key |> Array.contains bootServiceName && (key <> "Requires" || legacyLink.IsNone) then
+                        refuseUnit id "unowned effective hard dependency on preboot."
+                if legacyLink.IsSome then
+                    // The same edge can come from both a link and a directive.
+                    // Only the qualified stock fragment has known provenance.
+                    let vendor = logicalPath environment "/usr/lib/systemd/system/firewalld.service"
+                    if props["DropInPaths"] <> "" || props["FragmentPath"] <> vendor then
+                        refuseUnit id "cannot attribute its hard preboot dependency to the historical enable link."
+                    use stream = File.OpenRead vendor
+                    if Convert.ToHexStringLower(Security.Cryptography.SHA256.HashData stream) <>
+                       "80bb5029f6711ab6b6ab744f36915c3b6a8929373d05bfcd9ef9b7c8cf6f9d29" then
+                        refuseUnit id "cannot attribute the legacy preboot edge on an unqualified firewalld fragment."
+            else
+                if words "Names" <> [| id |] then refuseUnit id "unattributed recovery unit alias."
+                if props["LoadState"] <> "loaded" && (requireLoaded || props["LoadState"] <> "not-found") then
+                    refuseUnit id "uninspectable recovery dependency state."
+                if props["LoadState"] = "loaded" && (props["DropInPaths"] <> "" || props["FragmentPath"] <> logicalPath environment ("/etc/systemd/system/" + id)) then
+                    refuseUnit id "unowned effective recovery fragment or drop-in."
+                for root in paths do
+                    for suffix in [ ".wants"; ".requires"; ".upholds" ] do
+                        let dir = Path.Combine(root,id + suffix)
+                        if not (Seq.isEmpty (dependencyEntries id dir)) then
+                            refuseUnit id "unowned recovery dependency directory entries."
+                for key in [ "Wants"; "Requires"; "Requisite"; "BindsTo"; "Upholds"; "OnFailure"; "OnSuccess"; "Conflicts"; "Triggers" ] do
+                    for target in words key do
+                        let allowed =
+                            match key, target with
+                            | "Requires", "system.slice" -> id <> timerName
+                            | "Requires", "sysinit.target" | "Conflicts", "shutdown.target" -> id = timerName
+                            | "Triggers", target -> id = timerName && target = serviceName
+                            | "Requires", target -> id = postBootServiceName && target = daemon
+                            | "Wants", target -> id = containmentName && (target = daemon || target = bootServiceName || target = postBootServiceName)
+                            | _ -> false
+                        if not allowed then refuseUnit id ("unowned effective " + key + " dependency.")
+        if seen <> requested then refuseUnit bootServiceName "missing recovery dependency observations."
+
+    let private requireHistoricalHardEdge environment units helper =
+        let boot = units |> List.find (fun unit -> unit.LogicalPath = bootServicePath)
+        let file = regularPath environment bootServicePath
+        if not (File.Exists file) then refuseUnit bootServiceName "hard enable link has no installed historical template."
+        let actual = File.ReadAllText file
+        if not (boot.LegacyTexts |> List.exists (fun text ->
+            text.Contains("\nRequiredBy=firewalld.service\n", StringComparison.Ordinal) && matchesOwnedUnit helper text actual)) then
+            refuseUnit bootServiceName "hard enable link is not attributable to the installed historical template."
+
     let private provisionRecoveryUnits (environment: HostEnvironment) (verifySystemd: bool) =
         let units, helper = recoveryUnitTemplates ()
         let systemctl arguments = run environment "/usr/bin/systemctl" arguments
@@ -745,15 +845,16 @@ module FirewalldLifecycle =
                 else Some(unit, strictUtf8.GetBytes unit.Text))
         let mutable reloadRequired = false
         let mutable latched = false
-        let inspect requireLoaded =
+        let inspect requireLoaded legacyEdge =
             let paths = systemdUnitPaths environment
+            checkRecoveryDependencies environment paths units legacyEdge requireLoaded
             for unit in units do
                 inspectSystemdSearchPaths environment paths unit
-                let loaded, completed = inspectRecoveryUnit environment unit
-                if requireLoaded && not loaded then fail "The published recovery unit is not loaded."
-                if not loaded && File.Exists(logicalPath environment unit.LogicalPath) then reloadRequired <- true
-                if unit.LogicalPath = bootServicePath then latched <- completed
-        if verifySystemd then inspect false
+                if verifySystemd then
+                    let loaded, completed = inspectRecoveryUnit environment unit
+                    if requireLoaded && not loaded then fail "The published recovery unit is not loaded."
+                    if not loaded && File.Exists(logicalPath environment unit.LogicalPath) then reloadRequired <- true
+                    if unit.LogicalPath = bootServicePath then latched <- completed
         let enableSpecs =
             [ bootServiceName,
                 [ "/etc/systemd/system/multi-user.target.wants/" + bootServiceName, bootServicePath
@@ -771,17 +872,22 @@ module FirewalldLifecycle =
             inspectEnableLink
                 ("/etc/systemd/system/firewalld.service.requires/" + bootServiceName)
                 bootServicePath
+        let legacyEdge =
+            if not legacyRequires then None
+            else
+                requireHistoricalHardEdge environment units helper
+                Some(logicalPath environment ("/etc/systemd/system/firewalld.service.requires/" + bootServiceName))
+        inspect false legacyEdge
+        for oldLink in legacyEdge |> Option.toList do
+            File.Delete oldLink
+            HostFiles.syncDirectory (Path.GetDirectoryName oldLink)
         if not unitWrites.IsEmpty then
             ensureDirectory environment "/etc/systemd/system" (int unitDirectoryMode) |> ignore
             for unit, bytes in unitWrites do
                 HostFiles.atomicWrite (regularPath environment unit.LogicalPath) bytes fileMode
-        if legacyRequires then
-            let oldLink = logicalPath environment ("/etc/systemd/system/firewalld.service.requires/" + bootServiceName)
-            File.Delete oldLink
-            HostFiles.syncDirectory (Path.GetDirectoryName oldLink)
         let changed = not unitWrites.IsEmpty || legacyRequires || reloadRequired
         if not verifySystemd || changed then systemctl [ "daemon-reload" ] |> ignore
-        if verifySystemd && changed then inspect true
+        if verifySystemd && changed then inspect true None
         let mutable enabled = false
         for name, links in linkStates do
             if name <> timerName && (not verifySystemd || (links |> List.exists (fun (_, _, exists) -> not exists))) then
@@ -790,11 +896,11 @@ module FirewalldLifecycle =
                 if verifySystemd then
                     for link, target, _ in links do
                         if not (inspectEnableLink link target) then fail "Missing owned recovery enable link."
-        if verifySystemd && enabled then inspect true
+        if enabled || (not verifySystemd && changed) then inspect true None
         if not latched then
             systemctl [ "start"; bootServiceName ] |> ignore
             if verifySystemd then
-                inspect true
+                inspect true None
                 if not latched then fail "The boot recovery decision was not latched."
 
 
@@ -880,6 +986,9 @@ module FirewalldLifecycle =
                   "/etc/systemd/system/multi-user.target.wants/" + postBootServiceName, postBootServicePath
                   "/etc/systemd/system/timers.target.wants/" + timerName, timerPath ]
                 |> List.choose (fun (logicalLink, logicalTarget) -> ownedEnableLink environment logicalLink logicalTarget)
+            if List.contains (logicalPath environment ("/etc/systemd/system/firewalld.service.requires/" + bootServiceName)) links then
+                let units, helper = recoveryUnitTemplates ()
+                requireHistoricalHardEdge environment units helper
             for link in links do
                 File.Delete link
                 HostFiles.syncDirectory (Path.GetDirectoryName link)

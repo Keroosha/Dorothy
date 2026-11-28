@@ -7,6 +7,76 @@ open System.Xml.Linq
 /// Minimal native command surface for ownership/transaction tests. Disk edits do not update
 /// the simulated daemon until activation. The Debian guest tests exercise the daemon itself.
 module internal FirewalldCommandFixture =
+    let recoveryUnitNames =
+        [ "keroosha-iac-firewalld-rollback.service"
+          "keroosha-iac-firewalld-boot-recovery.service"
+          "keroosha-iac-firewalld-postboot-recovery.service"
+          "keroosha-iac-firewalld-boot-containment.service"
+          "keroosha-iac-firewalld-rollback.timer" ]
+    let dependencyProperties =
+        [ "Id"; "Names"; "LoadState"; "NeedDaemonReload"; "Wants"; "Requires"; "Requisite"
+          "BindsTo"; "Upholds"; "OnFailure"; "OnSuccess"; "Conflicts"; "Triggers"
+          "FragmentPath"; "DropInPaths" ]
+    let dependencyQuery = String.concat "," dependencyProperties
+    let dependencyQueryArguments =
+        [ "show"; "--all"; "-p"; dependencyQuery; "--" ] @ recoveryUnitNames @ [ "firewalld.service" ]
+    let unitPathArguments =
+        [ "--system"; "--json=short"; "get-property"; "org.freedesktop.systemd1"
+          "/org/freedesktop/systemd1"; "org.freedesktop.systemd1.Manager"; "UnitPath" ]
+    let unitPathResponse =
+        """{"type":"as","data":["/etc/systemd/system.control","/etc/systemd/system","/run/systemd/system.attached","/run/systemd/system","/usr/lib/systemd/system"]}"""
+
+    let systemdDependencyOutput (root: string) (dependencyOverrides: Map<string, Map<string, string>>) =
+        let entryExists path =
+            File.Exists path || Directory.Exists path || not (isNull (FileInfo(path).LinkTarget))
+        let block name =
+            let isFirewalld = name = "firewalld.service"
+            let physical =
+                if isFirewalld then Path.Combine(root, "usr/lib/systemd/system/firewalld.service")
+                else Path.Combine(root, "etc/systemd/system", name)
+            let loaded = isFirewalld || File.Exists physical
+            let requires, wants, conflicts, triggers =
+                if not loaded then "", "", "", ""
+                else
+                    match name with
+                    | "keroosha-iac-firewalld-rollback.service" -> "system.slice", "", "", ""
+                    | "keroosha-iac-firewalld-boot-recovery.service" -> "system.slice", "", "", ""
+                    | "keroosha-iac-firewalld-postboot-recovery.service" -> "system.slice firewalld.service", "", "", ""
+                    | "keroosha-iac-firewalld-boot-containment.service" ->
+                        "system.slice", "firewalld.service keroosha-iac-firewalld-boot-recovery.service keroosha-iac-firewalld-postboot-recovery.service", "", ""
+                    | "keroosha-iac-firewalld-rollback.timer" -> "sysinit.target", "", "shutdown.target", "keroosha-iac-firewalld-rollback.service"
+                    | _ when isFirewalld ->
+                        let legacy = Path.Combine(root, "etc/systemd/system/firewalld.service.requires/keroosha-iac-firewalld-boot-recovery.service")
+                        let wanted = Path.Combine(root, "etc/systemd/system/firewalld.service.wants/keroosha-iac-firewalld-boot-recovery.service")
+                        let ordinaryRequires = "system.slice sysinit.target dbus.socket"
+                        (if entryExists legacy then ordinaryRequires + " keroosha-iac-firewalld-boot-recovery.service" else ordinaryRequires),
+                        (if entryExists wanted then "network-pre.target keroosha-iac-firewalld-boot-recovery.service" else "network-pre.target"), "", ""
+                    | _ -> "", "", "", ""
+            let values =
+                [ "Id", name
+                  "Names", if isFirewalld then "firewalld.service dbus-org.fedoraproject.FirewallD1.service" else name
+                  "LoadState", if loaded then "loaded" else "not-found"
+                  "NeedDaemonReload", "no"
+                  "Wants", wants
+                  "Requires", requires
+                  "Requisite", ""
+                  "BindsTo", ""
+                  "Upholds", ""
+                  "OnFailure", ""
+                  "OnSuccess", ""
+                  "Conflicts", conflicts
+                  "Triggers", triggers
+                  "FragmentPath", if loaded then physical else ""
+                  "DropInPaths", "" ]
+                |> Map.ofList
+            let overrides = dependencyOverrides |> Map.tryFind name |> Option.defaultValue Map.empty
+            dependencyProperties
+            |> List.map (fun property ->
+                property + "=" + (overrides |> Map.tryFind property |> Option.defaultValue (Map.find property values)))
+            |> String.concat "\n"
+        recoveryUnitNames @ [ "firewalld.service" ]
+        |> List.map block
+        |> String.concat "\n\n"
     let commands (root: string) =
         let kernel = Directory.CreateDirectory(Path.Combine(root, "proc/sys/kernel/random"))
         File.WriteAllText(Path.Combine(kernel.FullName, "boot_id"), "12345678-1234-4234-8234-123456789012")
@@ -165,6 +235,9 @@ module internal FirewalldCommandFixture =
                     if fields.Length = 2 && fields[0] = key then Some fields[1] else None)
                 |> Option.defaultValue fallback
             match executable, arguments with
+            | "/usr/bin/busctl", args when args = unitPathArguments -> Some unitPathResponse
+            | "/usr/bin/systemctl", args when args = dependencyQueryArguments ->
+                Some(systemdDependencyOutput root Map.empty)
             | "firewall-cmd", [ "--direct"; ("--get-all-rules" | "--get-all-chains" | "--get-all-passthroughs") ] -> Some ""
             | "/usr/bin/busctl", args when List.tryLast args = Some "IPv6_rpfilter" ->
                 Some(if List.contains (setting "IPv6_rpfilter" "strict") [ "no"; "false" ] then "b false" else "b true")
