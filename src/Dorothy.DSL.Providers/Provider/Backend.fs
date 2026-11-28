@@ -738,6 +738,7 @@ module AptBackend =
         (ownerId: string)
         (previousNames: string list)
         (desiredVersions: Map<string, string option>)
+        (strictDockerBootstrap: bool)
         =
         serializePayload "apply" (fun writer ->
             writer.WriteString("ownerId", ownerId)
@@ -756,7 +757,9 @@ module AptBackend =
                 | Some exactVersion -> writer.WriteStringValue(exactVersion)
                 | None -> writer.WriteNullValue()
 
-            writer.WriteEndObject())
+            writer.WriteEndObject()
+            if strictDockerBootstrap then writer.WriteBoolean("strictDockerBootstrap", true)
+            )
     let private parseSnapshot
         (expectedNames: Set<string>)
         (requireManagedExactly: bool)
@@ -869,6 +872,8 @@ module AptBackend =
         (ownerId: string)
         (previousNames: string list)
         (desiredVersions: Map<string, string option>)
+        (strictDockerBootstrap: bool)
+
         (cancellationToken: CancellationToken)
         : Task<AptSnapshot> =
         let expectedNames = desiredVersions |> Map.toSeq |> Seq.map fst |> Set.ofSeq
@@ -878,5 +883,5 @@ module AptBackend =
             expectedNames
             true
             true
-            (applyPayload ownerId previousNames desiredVersions)
+            (applyPayload ownerId previousNames desiredVersions strictDockerBootstrap)
             cancellationToken

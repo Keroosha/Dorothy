@@ -361,7 +361,7 @@ type HostContentTests() =
         assertRejected invalidApp
         assertRejected invalidUseOnly
         let undeclaredPolicy =
-            Dorothy.DSL.Firewalld.policy "unowned-docker-block" {
+            Dorothy.DSL.Firewalld.policy "unowned-block" {
                 Dorothy.DSL.Firewalld.ingressZones [ "public" ]
                 Dorothy.DSL.Firewalld.egressZones [ "docker" ]
                 Dorothy.DSL.Firewalld.target FirewalldTarget.Drop

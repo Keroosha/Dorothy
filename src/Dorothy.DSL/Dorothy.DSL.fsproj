@@ -10,6 +10,7 @@
         <Compile Include="Quantities.fs" />
         <Compile Include="Ufw.fs" />
         <Compile Include="FirewalldModel.fs" />
+        <Compile Include="FirewalldGateModel.fs" />
         <Compile Include="TraefikPathModel.fs" />
         <Compile Include="TraefikHttpGraphModel.fs" />
         <Compile Include="TraefikStatic.fs" />

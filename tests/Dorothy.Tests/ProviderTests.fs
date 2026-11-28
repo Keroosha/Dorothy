@@ -4,6 +4,7 @@ open System
 open System.Collections.Generic
 open System.Collections.Immutable
 open System.Threading
+open Dorothy.DSL
 open Dorothy.DSL.Provider
 open NUnit.Framework
 open Pulumi.Experimental
@@ -91,7 +92,6 @@ type ProviderTests() =
             "connection", connection address "root"
             "packages", packages
         ]
-
     let ufwInput (port: int) =
         ProviderTestValues.inputMap [
             "connection", connection "192.0.2.1" "root"
@@ -214,6 +214,7 @@ type ProviderTests() =
         Assert.That(response.Changes.Value, Is.True)
         Assert.That(response.Diffs.Contains("packages"), Is.True)
         Assert.That(response.DetailedDiff.ContainsKey("packages[\"mc\"].version"), Is.True)
+
 
     [<Test>]
     member _.``Provider Diff reports a nested UFW port update``() =
