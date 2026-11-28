@@ -4,6 +4,46 @@ set -euo pipefail; umask 077
 [[ $# == 2 && $1 =~ ^/var/tmp/dorothy-traefik-acceptance\.[[:alnum:]]+$ && $(<"$1/.owner") == dorothy-traefik-acceptance-guest-v1 ]]
 root=$1; mode=$2; cfg=/etc/keroosha-iac/traefik; dyn=$cfg/dynamic/current.yml; j=$cfg/.keroosha-rollback.json; unit=keroosha-traefik.service
 case $mode in
+ receipt-before-arm|receipt-after-arm)
+   point=${mode#receipt-}; point=${point%-arm}
+   dir="$root/receipt-interrupt"; mkdir -m700 -p "$dir"
+   [[ ! -L $dir && ! -e /usr/local/sbin/systemctl && ! -L /usr/local/sbin/systemctl && ! -e $dir/fired ]]
+   cat > "$dir/shim" <<EOF
+#!/bin/bash
+set -euo pipefail
+if [[ \${1:-} == show && -f '$j' && \$(readlink /proc/\$PPID/exe) == '/var/cache/keroosha-iac/helper/linux-x64/$(<"$root/product-helper-sha")' ]] && jq -e '.version==6 and .staged==true' '$j' >/dev/null; then
+    receipt='$cfg/.keroosha-static-receipt'
+    actual=null; if [[ -f \$receipt ]]; then actual=\$(sha256sum "\$receipt"|cut -d' ' -f1); fi
+    target=\$(jq -er .receiptCommit.next '$j'); prior=\$(jq -r .receiptCommit.prior '$j')
+    if [[ ( '$point' == after && \$actual == "\$target" ) || ( '$point' == before && \$actual == "\$prior" ) ]]; then
+        # No external service command runs between rename and directory fsync in
+        # the writer. This query is the subsequent commit/retirement check.
+        jq -c --arg observed "\$actual" --arg point '$point' '{generation,point:\$point,observedReceipt:\$observed,job:.receiptCommit.job,invocation:.receiptCommit.invocation,prior:.receiptCommit.prior,next:.receiptCommit.next,parent:.receiptCommit.parent}' '$j' > '$dir/fired'
+        kill -KILL "\$PPID"; exit 137
+    fi
+fi
+exec /usr/bin/systemctl "\$@"
+EOF
+   install -m755 "$dir/shim" /usr/local/sbin/systemctl ;;
+ receipt-disarm)
+   dir="$root/receipt-interrupt"; cmp /usr/local/sbin/systemctl "$dir/shim"; rm /usr/local/sbin/systemctl
+   jq -ec 'select(.invocation!=null and .next!=.prior and (if .point=="after" then .observedReceipt==.next else .observedReceipt==(.prior//"null") end))' "$dir/fired"
+   [[ $(jq -r .invocation "$dir/fired") == "$(systemctl show "$unit" -p InvocationID --value)" ]]
+   job=$(jq -er '.job' "$dir/fired"); id=$(jq -er '.invocation' "$dir/fired")
+   journalctl -b _PID=1 UNIT="$unit" JOB_ID="$job" JOB_TYPE=start JOB_RESULT=done MESSAGE_ID=39f53479d3a045ac8e11786248231fbf -o json --no-pager |
+       jq -se --arg id "$id" 'any(.[];.INVOCATION_ID==$id)' >/dev/null
+   rm "$dir/fired" ;;
+ commit-live)
+   systemctl show "$unit" -p InvocationID -p MainPID -p ActiveState
+   sha256sum "$dyn" "$cfg/static.yml" "$cfg/dns-credentials.env" "$cfg/.keroosha-static-receipt"
+   stat -c 'receipt %i %y %a %u:%g' "$cfg/.keroosha-static-receipt" ;;
+ receipt-tamper)
+   r="$cfg/.keroosha-static-receipt"; [[ ! -e $root/receipt.original && ! -L $r ]]
+   cp -p "$r" "$root/receipt.original"
+   prior="$root/old-confirmation"; [[ -s $prior && $(sed -n 2p "$prior") != "$(sed -n 2p "$r")" && $(sed -n 3p "$prior") == "$(sed -n 3p "$r")" ]]
+   cp -p "$prior" "$r"; sha256sum "$r" > "$root/receipt.tampered" ;;
+ receipt-reconcile)
+   sha256sum -c "$root/receipt.tampered"; cp -p "$root/receipt.original" "$cfg/.keroosha-static-receipt"; rm "$root/receipt.original" ;;
  http-inject)
    [[ ! -e $j && ! -e $root/tls-original ]]; cp -p "$dyn" "$root/tls-original"; tmp=$(mktemp "$dyn.fixture.XXXXXXXX"); jq -e '(.http.routers | to_entries | map(select(.value.tls | type=="object")) | first.key) as $r | select($r!=null) | .http.routers[$r].tls.passthrough=false' "$dyn" > "$tmp"; chmod --reference="$dyn" "$tmp"; chown --reference="$dyn" "$tmp"; mv -T "$tmp" "$dyn"; sha256sum "$dyn" > "$root/tls-edited.sha" ;;
  http-witness) [[ ! -e $j ]]; sha256sum -c "$root/tls-edited.sha"; systemctl show "$unit" -p MainPID -p InvocationID; curl -fsS --resolve shop.acceptance.test:18443:127.0.0.1 --cacert "$root/cold-root.pem" https://shop.acceptance.test:18443/secure/health | grep -F tls-backend:/secure/health ;;

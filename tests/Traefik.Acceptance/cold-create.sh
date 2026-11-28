@@ -2,7 +2,7 @@
 # Authorized, fresh Debian guest only. No frozen provider or preinstalled release.
 set -euo pipefail
 umask 077
-[[ $# == 3 ]]
+[[ $# == 3 || ( $# == 4 && $4 == receipt-commit ) ]]
 s=$(realpath -e "$1"); provider=$(realpath -e "$2"); archive=$(realpath -e "$3")
 f=$(dirname "$(realpath "$0")"); repo=$(realpath "$f/../..")
 [[ $s == /tmp/dorothy-traefik-acceptance.* && $(<"$s/.owner") == dorothy-traefik-acceptance-owned-state-v1 ]]
@@ -42,6 +42,10 @@ owner="$urn::192.0.2.1"
 operator=${TRAEFIK_ACCEPTANCE_MAINTENANCE_BIN:?standalone operator binary required}
 remote "umask 077; cat > '$GUEST_ROOT/maintenance-bin'" < "$operator"
 remote "printf '%s\\n' '$owner' > '$GUEST_ROOT/maintenance-owner'; printf '%s\\n' '$(sha256sum "$operator"|cut -d' ' -f1)' > '$GUEST_ROOT/maintenance-sha'; printf '%s\\n' '$(sha256sum "$provider/helper/linux-x64/keroosha-iac-helper"|cut -d' ' -f1)' > '$GUEST_ROOT/product-helper-sha'"
+if [[ ${4:-} == receipt-commit ]]; then
+    source "$f/receipt-commit.sh"
+    exit 0
+fi
 if TRAEFIK_ACCEPTANCE_PHASE=rollback up > "$log/failed-cold-create.log" 2>&1; then exit 1; fi
 grep -Fq 'activation failed from stopped baseline' "$log/failed-cold-create.log"
 p stack export --stack acceptance | jq -e --arg u "$urn" 'all(.deployment.resources[]; .urn!=$u or (.id//"")=="")' > "$log/failed-create-no-id.log"

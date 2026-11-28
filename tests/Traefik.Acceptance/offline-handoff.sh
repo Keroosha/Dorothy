@@ -68,7 +68,7 @@ EOF
         if "$bin" forward-stopped "$owner" "$hash"; then exit 1; fi
         [[ -s $j && $(sum "$j") == "$hash" && ! -e $archive ]] ;;
     retire)
-        [[ $verb == forward-stopped ]]; jq -e '.version==5 and .staged==true and .wasActive==false' "$j" >/dev/null
+        [[ $verb == forward-stopped ]]; jq -e '(.version==5 or .version==6) and .staged==true and .wasActive==false' "$j" >/dev/null
         snapshot(){ find "$cfg" /usr/local/libexec/keroosha-iac/traefik /var/lib/keroosha-traefik -type f ! -path "$j" -print0 | LC_ALL=C sort -z | xargs -0 sha256sum; sha256sum /etc/systemd/system/keroosha-traefik.service; }
         snapshot > "$root/forward-before"
         "$bin" "$verb" "$owner" "$hash"; "$bin" "$verb" "$owner" "$hash"

@@ -207,6 +207,14 @@ module Traefik =
           Preimage: string
           Target: string option }
 
+    // Durable authority to finish one verified start, not authority to start or stop a service.
+    type private ReceiptCommit =
+        { Job: string
+          Invocation: string
+          Prior: string option
+          Next: string
+          Request: string }
+
     type private PendingTransaction =
         { Static: byte[] option
           Dynamic: byte[] option
@@ -222,6 +230,7 @@ module Traefik =
           CertificateFiles: string list
           JournalSha256: string
           StoppedIntent: (string * bool) option
+          ReceiptCommit: ReceiptCommit option
           Recovery: RecoveryStart option }
 
     let pathsFor (environment: HostEnvironment) =
@@ -4859,7 +4868,7 @@ module Traefik =
         prior["version"] <- JsonValue.Create(3)
         sha256Text (jsonText prior)
 
-    let private persistRecovery environment (paths: RuntimePaths) (expected: byte[]) witness verify =
+    let private persistRecovery environment (paths: RuntimePaths) (expected: byte[]) (witness: RecoveryStart) verify =
         let uid, gid = hostOwner environment
         if not (metadataMatches environment paths.RollbackPath "file" 0o600 uid gid) || readOptional environment paths.RollbackPath <> Some expected then
             fail "recovery journal changed; refusing to advance its phase"
@@ -4896,6 +4905,7 @@ module Traefik =
                     | Some 3 -> Set.add "restartRequired" (Set.add "credentials" baseFields)
                     | Some 4 -> Set.union baseFields (set [ "credentials"; "restartRequired"; "recovery" ])
                     | Some 5 -> Set.union baseFields (set [ "credentials"; "restartRequired"; "generation"; "intent"; "staged" ])
+                    | Some 6 -> Set.union baseFields (set [ "credentials"; "restartRequired"; "generation"; "intent"; "staged"; "receiptCommit" ])
                     | _ -> fail "Traefik rollback journal is invalid"
                 if objectNames journal <> expected then fail "Traefik rollback journal is invalid"
                 let owner = tryString journal "owner"
@@ -4920,11 +4930,28 @@ module Traefik =
                 Some {
                     JournalSha256 = sha256Bytes bytes
                     StoppedIntent =
-                        if version <> Some 5 then None
+                        if version <> Some 5 && version <> Some 6 then None
                         else
                             let intent = tryString journal "intent"
                             if wasActive <> Some false || not (fingerprintPattern.IsMatch(intent)) || not (Regex.IsMatch(tryString journal "generation","^[0-9a-f]{32}$")) then fail "invalid stopped intent"
                             Some(intent, (get "staged").GetBoolean())
+                    ReceiptCommit =
+                        if version <> Some 6 then None
+                        else
+                            let node = get "receiptCommit"
+                            let job, invocation = tryString node "job", tryString node "invocation"
+                            let next, request = tryString node "next", tryString node "request"
+                            let parent = JsonNode.Parse(bytes).AsObject()
+                            parent.Remove("receiptCommit") |> ignore
+                            parent["version"] <- JsonValue.Create(5)
+                            let priorValue = node.GetProperty("prior")
+                            let prior = if priorValue.ValueKind = JsonValueKind.Null then None else Some(priorValue.GetString())
+                            if not ((get "staged").GetBoolean()) || objectNames node <> set [ "job"; "invocation"; "next"; "request"; "prior"; "parent" ]
+                               || not (Regex.IsMatch(job, "^[1-9][0-9]{0,9}$") && Regex.IsMatch(invocation, "^[0-9a-f]{32}$"))
+                               || not (fingerprintPattern.IsMatch(next) && fingerprintPattern.IsMatch(request))
+                               || prior = Some next || (prior |> Option.exists (fun digest -> not (fingerprintPattern.IsMatch(digest))))
+                               || tryString node "parent" <> sha256Text (jsonText parent) then fail "invalid receipt commit"
+                            Some { Job=job; Invocation=invocation; Prior=prior; Next=next; Request=request }
                     Recovery =
                         if version <> Some 4 then None
                         else
@@ -5078,25 +5105,89 @@ module Traefik =
         values.Add(inventory)
         sha256Text (jsonText values)
 
-    let private verifyStoppedManifest environment (paths: RuntimePaths) owner intent =
+    let private verifyStagingManifest environment (paths: RuntimePaths) owner intent verifyProcess terminal =
+        verifyProcess ()
         let c,s,i,unit = validateActualOwner environment paths owner
         let uid,gid = hostOwner environment
         let serviceOwner =
             match lookupUser environment, lookupGroup environment with
             | Some user, Some group when user.Uid <> 0 && user.Gid = group && user.Home = paths.StateDir && user.Shell = "/usr/sbin/nologin" -> user.Uid,group
             | _ -> fail "dedicated service identity changed"
-        if (c,s,i) <> ("owned","owned","owned") || not (isStopped environment && isEnabled environment && unitMatches environment paths && filesystemMetadataMatches environment paths) then fail "stopped staging ownership, metadata, enablement or unit mismatch"
+        if (c,s,i) <> ("owned","owned","owned") || not (isEnabled environment && unitMatches environment paths && filesystemMetadataMatches environment paths) then fail "staging ownership, metadata, enablement or unit mismatch"
         let expectedMarker = Encoding.ASCII.GetBytes(ownerDigest owner + "\n")
         for dir in [paths.ConfigDir;paths.DynamicDir;paths.CertificateDir;paths.InstallDir;paths.StateDir] do
             let marker = Path.Combine(dir,".keroosha-owner")
             if not (metadataMatches environment marker "file" 0o644 uid gid) || readBytes environment marker <> expectedMarker then fail "stopped staging marker mismatch"
         let receipt = readOptional environment paths.StaticReceipt
         if receipt.IsSome && not (metadataMatches environment paths.StaticReceipt "file" 0o600 uid gid) then fail "stopped staging receipt metadata mismatch"
-        let digest = manifestDigest serviceOwner (binarySha256 environment (Path.Combine(paths.ConfigDir,"static.yml"))) (binarySha256 environment (Path.Combine(paths.DynamicDir,"current.yml")))
+        let staticHash = binarySha256 environment (Path.Combine(paths.ConfigDir,"static.yml"))
+        let receiptBasis =
+            match terminal with
+            | None -> receipt |> Option.map sha256Bytes
+            | Some commit ->
+                let target = Encoding.UTF8.GetBytes(String.concat "\n" [owner; commit.Invocation; staticHash.ToUpperInvariant()])
+                if sha256Bytes target <> commit.Next ||
+                   (receipt <> Some target && (receipt |> Option.map sha256Bytes) <> commit.Prior) then
+                    fail "receipt is neither the previous confirmation nor this transaction's exact authorized receipt"
+                commit.Prior
+        let digest = manifestDigest serviceOwner staticHash (binarySha256 environment (Path.Combine(paths.DynamicDir,"current.yml")))
                          (readCredentialSnapshot environment paths |> Option.map sha256Bytes) (unit |> Option.map sha256Bytes |> Option.defaultWith (fun () -> fail "missing staged unit"))
                          (binarySha256 environment paths.BinaryPath) (binarySha256 environment (Path.Combine(paths.InstallDir,".keroosha-release.json")))
-                         (receipt |> Option.map sha256Bytes) (certificateDigests environment paths)
-        if digest <> intent then fail "stopped staging manifest mismatch; preserving journal and files"
+                         receiptBasis (certificateDigests environment paths)
+        if digest <> intent then fail "staging manifest mismatch; preserving journal and files"
+        verifyProcess ()
+
+    let private verifyStoppedManifest environment paths owner intent terminal =
+        verifyStagingManifest environment paths owner intent (fun () -> if not (isStopped environment) then fail "operator must stop the owned unit and wait for all jobs") terminal
+
+    let private desiredRequestDigest (request: JsonElement) =
+        let desired = JsonNode.Parse(request.GetRawText()).AsObject()
+        desired.Remove("previousUdpEntryPoints") |> ignore // historical Diff input, not desired state
+        sha256Text (jsonText desired)
+
+    let private verifyCompletion environment (paths: RuntimePaths) owner intent journalSha commit =
+        let verifyProcess () =
+            if admissionInvocation environment <> Some commit.Invocation || managedJobInvocation environment commit.Job <> Some commit.Invocation then
+                fail "receipt commit invocation changed; use stopped operator handoff"
+        let uid,gid = hostOwner environment
+        if not (metadataMatches environment paths.RollbackPath "file" 0o600 uid gid) || binarySha256 environment paths.RollbackPath <> journalSha then fail "receipt commit journal changed"
+        verifyStagingManifest environment paths owner intent verifyProcess (Some commit)
+
+    let private finishCompletion environment (paths: RuntimePaths) owner intent journalSha commit receipt =
+        let check () = verifyCompletion environment paths owner intent journalSha commit
+        if sha256Bytes receipt <> commit.Next then fail "unbound completion receipt"
+        check ()
+        if readOptional environment paths.StaticReceipt <> Some receipt then
+            writeRecoveryFile environment paths journalSha paths.StaticReceipt receipt 0o600 (snd (hostOwner environment)) true check
+            check ()
+        if readOptional environment paths.StaticReceipt <> Some receipt || binarySha256 environment paths.RollbackPath <> journalSha then fail "receipt commit changed before retirement"
+        File.Delete(paths.RollbackPath)
+        fsyncDirectory paths.ConfigDir
+
+    let private authorizeReceipt environment (paths: RuntimePaths) owner intent previous (staged:byte[]) request job (staticData:byte[]) =
+        let id = managedJobInvocation environment job |> Option.defaultWith (fun () -> fail "start job lost before receipt authorization")
+        let receipt = Encoding.UTF8.GetBytes(String.concat "\n" [owner; id; Convert.ToHexString(SHA256.HashData staticData)])
+        let parent = sha256Bytes staged
+        let commit = { Job=job; Invocation=id; Prior=previous; Next=sha256Bytes receipt; Request=desiredRequestDigest request }
+        if previous = Some commit.Next then fail "new receipt cannot be distinguished from prior confirmation"
+        let root = JsonNode.Parse(staged).AsObject()
+        let terminal = JsonObject()
+        terminal["parent"] <- JsonValue.Create(parent)
+        terminal["job"] <- JsonValue.Create(commit.Job)
+        terminal["invocation"] <- JsonValue.Create(commit.Invocation)
+        terminal["request"] <- JsonValue.Create(commit.Request)
+        terminal["prior"] <- match previous with None -> null | Some digest -> JsonValue.Create(digest)
+        terminal["next"] <- JsonValue.Create(commit.Next)
+        root["receiptCommit"] <- terminal
+        root["version"] <- JsonValue.Create(6)
+        let authorized = Encoding.UTF8.GetBytes(jsonText root)
+        let uid,gid = hostOwner environment
+        let checkJob () =
+            if admissionInvocation environment <> Some id || managedJobInvocation environment job <> Some id then fail "start job changed before receipt authorization"
+        writeRecoveryFile environment paths parent paths.RollbackPath authorized 0o600 gid true (fun () ->
+            verifyStagingManifest environment paths owner intent checkJob None
+            if not (metadataMatches environment paths.RollbackPath "file" 0o600 uid gid) || readOptional environment paths.RollbackPath <> Some staged then fail "staged generation changed before receipt authorization")
+        finishCompletion environment paths owner intent (sha256Bytes authorized) commit receipt
 
     let private recoverPendingTransaction (environment: HostEnvironment) (paths: RuntimePaths) (ownerId: string) (request: JsonElement) (activationTimeout: float) : PendingTransaction option =
         match loadPendingTransaction environment paths ownerId with
@@ -5317,6 +5408,7 @@ module Traefik =
             if capture () <> initial then
                 fail "Apply refused: rollback files changed after inspection; preserve concurrent edits and retry with a reconciled configuration."
         confirmUnchanged ()
+        let previousConfirmation = if wasActive then None else readOptional environment paths.StaticReceipt |> Option.map sha256Bytes
         let intent =
             if wasActive then None
             else
@@ -5326,7 +5418,7 @@ module Traefik =
                     certs <- certs.Add(stem+".crt",sha256Text cert.CertificatePem).Add(stem+".key",sha256Text cert.PrivateKeyPem)
                 let release = if isNull prepared then oldReleaseMarker |> Option.defaultWith (fun () -> fail "missing pinned release marker") else releaseBytes request.OwnerId (architecture ()) intendedBinary
                 Some(manifestDigest (serviceAccountOwner environment) (sha256Bytes staticData) (sha256Bytes dynamicData) (desiredCredentials |> Option.map sha256Bytes)
-                         (sha256Bytes currentUnitText) intendedBinary (sha256Bytes release) (readOptional environment paths.StaticReceipt |> Option.map sha256Bytes) certs)
+                         (sha256Bytes currentUnitText) intendedBinary (sha256Bytes release) previousConfirmation certs)
         savePendingTransaction environment paths request.OwnerId oldStatic oldDynamic oldCredentials oldUnitBytes oldReleaseMarker oldBinaryExists oldBinaryHash wasActive wasEnabled restartRequired (Set.toList oldCertificateFiles) intent confirmUnchanged
         let stagedJournal = readBytes environment paths.RollbackPath
         // A conflict here is not an activation failure: no candidate file was installed.
@@ -5338,7 +5430,7 @@ module Traefik =
         let mutable binaryChanged = false
         let mutable restartAttempted = false
         let mutable candidateJob = None
-        let mutable fullyStaged = false
+        let mutable completedStaging = None
         try
             binaryChanged <- ensureInstalledBinary environment paths request.OwnerId (not wasActive) (prepared,intendedBinary)
             writeCredentialFile environment paths request.Configuration
@@ -5359,11 +5451,12 @@ module Traefik =
                 let digest = intent.Value
                 let complete = JsonNode.Parse(stagedJournal).AsObject()
                 complete["staged"] <- JsonValue.Create(true)
-                writeRecoveryFile environment paths (sha256Bytes stagedJournal) paths.RollbackPath (Encoding.UTF8.GetBytes(jsonText complete)) 0o600 rootGid true (fun () ->
+                let completeBytes = Encoding.UTF8.GetBytes(jsonText complete)
+                writeRecoveryFile environment paths (sha256Bytes stagedJournal) paths.RollbackPath completeBytes 0o600 rootGid true (fun () ->
                     verifyInvocation ()
-                    verifyStoppedManifest environment paths request.OwnerId digest
+                    verifyStoppedManifest environment paths request.OwnerId digest None
                     if readOptional environment paths.RollbackPath <> Some stagedJournal then fail "stopped journal changed before completion")
-                fullyStaged <- true
+                completedStaging <- Some completeBytes
                 verifyInvocation ()
                 candidateJob <- Some(enqueueServiceJob environment false)
             elif binaryChanged || restartRequired then
@@ -5371,8 +5464,12 @@ module Traefik =
                 candidateJob <- Some(enqueueServiceJob environment true)
             let result = waitForActivation environment requestElement paths activationTimeout candidateJob
             if not (result["inSync"].GetValue<bool>()) then fail "Traefik activation did not satisfy the bounded readiness checks"
-            candidateJob |> Option.iter (fun job -> recordStart staticData (receiptForJob environment request.OwnerId staticData job))
-            removePendingTransaction environment paths request.OwnerId
+            match completedStaging, candidateJob with
+            | Some staged, Some job -> authorizeReceipt environment paths request.OwnerId intent.Value previousConfirmation staged requestElement job staticData
+            | Some _, None -> fail "missing managed start; cannot authorize receipt"
+            | None, _ ->
+                candidateJob |> Option.iter (fun job -> recordStart staticData (receiptForJob environment request.OwnerId staticData job))
+                removePendingTransaction environment paths request.OwnerId
             try removeUnusedCertificates environment paths request with :? BackendError -> ()
             result["actualConfigHash"] <- JsonValue.Create(actualConfigHash environment paths)
             result
@@ -5389,7 +5486,7 @@ module Traefik =
                     with :? BackendError -> "unknown"
                 fail ("Traefik activation failed from stopped baseline: " + failureReason
                       + "; rollback sample=" + sampled + "; no automatic stop, restore or journal retirement; "
-                      + (if fullyStaged then "completed staging: use local forward-stopped after backup and operator stop"
+                      + (if completedStaging.IsSome then "completed staging: retry an authorized receipt commit or use local forward-stopped after backup and operator stop"
                          else "staging completion not recorded: forward-stopped unavailable; preserve the preimage for operator reconciliation"))
             let rollbackFailure =
                 try
@@ -5493,7 +5590,7 @@ module Traefik =
         | None -> atPreimage
         | Some expected -> expected = target && (atPreimage || atTarget)
 
-    let private repairDynamic environment requestElement (request: Request) (paths: RuntimePaths) timeout (journal: PendingTransaction) phase =
+    let private repairDynamic environment requestElement (request: Request) (paths: RuntimePaths) timeout (journal: PendingTransaction) (phase: RecoveryStart) =
         let refuse message = fail ("dynamic recovery refused: " + message)
         let staticBytes = Option.defaultWith (fun () -> refuse "missing static preimage") journal.Static
         let desired = Encoding.UTF8.GetBytes(renderDynamic request paths)
@@ -5579,6 +5676,17 @@ module Traefik =
         let request = validateRequest requestElement
         let paths = pathsFor environment
         match loadPendingTransaction environment paths request.OwnerId with
+        | Some ({ ReceiptCommit = Some commit; StoppedIntent = Some(intent,true) } as journal) ->
+            if desiredRequestDigest requestElement <> commit.Request then fail "different declaration cannot finish pending receipt commit"
+            verifyCompletion environment paths request.OwnerId intent journal.JournalSha256 commit
+            let result = waitForActivation environment requestElement paths timeout (Some commit.Job)
+            if not (result["inSync"].GetValue<bool>()) then fail "receipt commit retry failed readiness; preserving pending evidence"
+            let staticData = readBytes environment (Path.Combine(paths.ConfigDir,"static.yml"))
+            let receipt = receiptForJob environment request.OwnerId staticData commit.Job |> Option.get
+            finishCompletion environment paths request.OwnerId intent journal.JournalSha256 commit receipt
+            try removeUnusedCertificates environment paths request with :? BackendError -> ()
+            result["actualConfigHash"] <- JsonValue.Create(actualConfigHash environment paths)
+            result
         | Some ({ Recovery = Some phase } as journal) -> repairDynamic environment requestElement request paths timeout journal phase
         | _ -> applyTransaction environment requestElement timeout
 
@@ -5661,7 +5769,7 @@ module Traefik =
             | Some(intent,true) when journal.JournalSha256 = expected ->
                 let bytes = readBytes environment paths.RollbackPath
                 let verify () =
-                    verifyStoppedManifest environment paths owner intent
+                    verifyStoppedManifest environment paths owner intent journal.ReceiptCommit
                     if not (metadataMatches environment paths.RollbackPath "file" 0o600 uid gid) || sha256Bytes bytes <> expected || readOptional environment paths.RollbackPath <> Some bytes then fail "forward handoff journal changed"
                 verify ()
                 writeRecoveryFile environment paths expected archive bytes 0o600 gid false verify
