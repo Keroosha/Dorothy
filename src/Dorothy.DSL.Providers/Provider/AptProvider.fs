@@ -24,8 +24,8 @@ module private AptProviderLogic =
         { Values: Dictionary<string, PropertyValue>
           Connection: SshConnection
           DesiredVersions: Map<string, string option>
-          PackageNames: string list }
-
+          PackageNames: string list
+          StrictDockerBootstrap: bool }
     let private packageNamePattern = Regex("^[a-z0-9][a-z0-9+.-]+$", RegexOptions.CultureInvariant)
 
     let private validPackageVersion (version: string) =
@@ -88,7 +88,8 @@ module private AptProviderLogic =
         "packages": {
           "type": "object",
           "additionalProperties": { "$ref": "#/types/keroosha:debian:AptPackage" }
-        }
+        },
+        "strictDockerBootstrap": { "type": "boolean" }
       },
       "requiredInputs": ["connection", "packages"],
       "properties": {
@@ -97,6 +98,7 @@ module private AptProviderLogic =
           "type": "object",
           "additionalProperties": { "$ref": "#/types/keroosha:debian:AptPackage" }
         },
+        "strictDockerBootstrap": { "type": "boolean" },
         "installedVersions": {
           "type": "object",
           "additionalProperties": { "type": "string" }
@@ -128,6 +130,10 @@ module private AptProviderLogic =
     let private tryGetString (value: PropertyValue) =
         let mutable result = Unchecked.defaultof<string>
         if value.TryGetString(&result) then Some result else None
+
+    let private tryGetBoolean (value: PropertyValue) =
+        let mutable result = false
+        if value.TryGetBool(&result) then Some result else None
 
     let rec private containsSecret (value: PropertyValue) =
         if value.IsSecret then
@@ -271,22 +277,51 @@ module private AptProviderLogic =
 
         hasUnknown, makeMapValue source (buildMap (normalized |> Seq.map (fun entry -> entry.Key, entry.Value)))
 
+    let private normalizeStrictDockerBootstrap
+        (values: ImmutableDictionary<string, PropertyValue>)
+        (normalized: Dictionary<string, PropertyValue>)
+        (failures: ResizeArray<CheckFailure>)
+        =
+        match values.TryGetValue("strictDockerBootstrap") with
+        | false, _ -> false
+        | true, value when value.IsComputed ->
+            normalized["strictDockerBootstrap"] <- value
+            true
+        | true, value when value.IsNull ->
+            normalized.Remove("strictDockerBootstrap") |> ignore
+            false
+        | true, value ->
+            match tryGetBoolean value with
+            | Some true ->
+                normalized["strictDockerBootstrap"] <- value
+                false
+            | Some false ->
+                normalized.Remove("strictDockerBootstrap") |> ignore
+                false
+            | None ->
+                addFailure failures "strictDockerBootstrap" "Expected a boolean."
+                false
+
     let normalizeInputs (values: ImmutableDictionary<string, PropertyValue>) =
         let normalized = inputDictionary values
         let failures = ResizeArray<CheckFailure>()
 
-        let unknownProperties = values.Keys |> Seq.filter (fun key -> key <> "connection" && key <> "packages") |> Seq.toArray
+        let unknownProperties =
+            values.Keys
+            |> Seq.filter (fun key -> key <> "connection" && key <> "packages" && key <> "strictDockerBootstrap")
+            |> Seq.toArray
         for key in unknownProperties do
             addFailure failures key "This resource property is not supported."
 
         if values.Values |> Seq.exists containsSecret then
-            for key in [ "connection"; "packages" ] do
+            for key in [ "connection"; "packages"; "strictDockerBootstrap" ] do
                 match values.TryGetValue(key) with
                 | true, value when containsSecret value -> addFailure failures key "Secret values are not supported by this resource."
                 | _ -> ()
             { Values = normalized; HasUnknowns = hasUnknownInputs values; Failures = failures }
         else
             let mutable hasUnknown = hasUnknownInputs values
+            hasUnknown <- hasUnknown || normalizeStrictDockerBootstrap values normalized failures
 
             match values.TryGetValue("connection") with
             | false, _ -> addFailure failures "connection" "This property is required."
@@ -353,6 +388,14 @@ module private AptProviderLogic =
             | true, value -> tryGetString value
             | false, _ -> None
 
+        let strictDockerBootstrap =
+            match values.TryGetValue("strictDockerBootstrap") with
+            | false, _ -> false
+            | true, value ->
+                match tryGetBoolean value with
+                | Some enabled -> enabled
+                | None -> invalidOp "strictDockerBootstrap must be a known boolean."
+
         let packageValues = getMap "packages" values
         let desiredVersions =
             packageValues
@@ -379,8 +422,8 @@ module private AptProviderLogic =
               Port = port
               IdentityFile = identityFile }
           DesiredVersions = desiredVersions
-          PackageNames = desiredVersions |> Map.toList |> List.map fst }
-
+          PackageNames = desiredVersions |> Map.toList |> List.map fst
+          StrictDockerBootstrap = strictDockerBootstrap }
     let private normalizedKnownInputs (source: ImmutableDictionary<string, PropertyValue>) =
         let normalized = normalizeInputs source
         failIfFailures normalized.Failures
@@ -389,7 +432,7 @@ module private AptProviderLogic =
 
     let private knownInputsFromOutputs (preferred: ImmutableDictionary<string, PropertyValue>) (fallback: ImmutableDictionary<string, PropertyValue>) =
         let result = Dictionary<string, PropertyValue>(StringComparer.Ordinal)
-        for key in [ "connection"; "packages" ] do
+        for key in [ "connection"; "packages"; "strictDockerBootstrap" ] do
             match preferred.TryGetValue(key) with
             | true, value -> result[key] <- value
             | false, _ ->
@@ -575,6 +618,8 @@ module private AptProviderLogic =
                 if oldInputs.Connection.Port <> newInputs.Connection.Port then add "connection" "connection.port" PropertyDiffKind.Update true
                 if oldInputs.Connection.User <> newInputs.Connection.User then add "connection" "connection.user" PropertyDiffKind.Update true
                 if oldInputs.Connection.IdentityFile <> newInputs.Connection.IdentityFile then add "connection" "connection.identityFile" PropertyDiffKind.Update true
+                if oldInputs.StrictDockerBootstrap <> newInputs.StrictDockerBootstrap then
+                    add "strictDockerBootstrap" "strictDockerBootstrap" PropertyDiffKind.Update true
 
                 let packageNames = Set.union previousOwned desiredOwned |> Set.toList |> List.sortWith (fun left right -> StringComparer.Ordinal.Compare(left, right))
                 for name in packageNames do
@@ -654,6 +699,8 @@ module private AptProviderLogic =
     let desiredVersions parsed = parsed.DesiredVersions
 
     let connection parsed = parsed.Connection
+    let strictDockerBootstrap parsed = parsed.StrictDockerBootstrap
+
 
 
     let isProviderMetadata key =
@@ -771,7 +818,7 @@ type AptProvider() =
                     let inputs = AptProviderLogic.normalizeForOperation request.Inputs
                     let connection = AptProviderLogic.connection inputs
                     let ownerId = AptProviderLogic.resourceId request.Urn connection
-                    let! snapshot = AptBackend.apply connection ownerId [] (AptProviderLogic.desiredVersions inputs) operationToken
+                    let! snapshot = AptBackend.apply connection ownerId [] (AptProviderLogic.desiredVersions inputs) (AptProviderLogic.strictDockerBootstrap inputs) operationToken
                     return AptProviderLogic.createResponse ownerId inputs snapshot
                 })
 
@@ -805,7 +852,7 @@ type AptProvider() =
                     let connection = AptProviderLogic.connection inputs
                     let ownerId = if String.IsNullOrEmpty(request.Id) then AptProviderLogic.resourceId request.Urn connection else request.Id
                     let oldManaged = AptProviderLogic.oldManagedNames request.OldOutputs request.OldInputs
-                    let! snapshot = AptBackend.apply connection ownerId oldManaged (AptProviderLogic.desiredVersions inputs) operationToken
+                    let! snapshot = AptBackend.apply connection ownerId oldManaged (AptProviderLogic.desiredVersions inputs) (AptProviderLogic.strictDockerBootstrap inputs) operationToken
                     return AptProviderLogic.updateResponse inputs snapshot
                 })
 
@@ -819,6 +866,6 @@ type AptProvider() =
                 let connection = AptProviderLogic.connection inputs
                 let ownerId = if String.IsNullOrEmpty(request.Id) then AptProviderLogic.resourceId request.Urn connection else request.Id
                 let managed = AptProviderLogic.managedNames request.OldOutputs (AptProviderLogic.packageNames inputs)
-                let! _ = AptBackend.apply connection ownerId managed Map.empty operationToken
+                let! _ = AptBackend.apply connection ownerId managed Map.empty (AptProviderLogic.strictDockerBootstrap inputs) operationToken
                 return ()
             }) :> Task

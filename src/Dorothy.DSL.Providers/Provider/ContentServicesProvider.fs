@@ -74,9 +74,21 @@ module private HostResourceInputs =
                || name |> Seq.exists (fun c -> not (Char.IsAsciiLetterOrDigit c || "_.@:-\\".Contains c)) then invalidOp "Invalid service name."
             let managed = node["managed"].GetValue<bool>()
             let config = jsonText node "configuration"
-            if managed && (String.IsNullOrWhiteSpace config || not (config.Contains "ExecStart=")) then invalidOp "A managed service requires ExecStart."
-            if not managed && config <> "" then invalidOp "A package service cannot own configuration."
-            if node.Count <> 3 then invalidOp "Unsupported service specification fields."
+            if node.ContainsKey "dockerFence" then
+                let hasRecoveryOwner = node.ContainsKey "recoveryOwner"
+                if node.Count <> 4 + (if hasRecoveryOwner then 1 else 0) || not managed || config <> "" then
+                    invalidOp "Expected a managed, typed Docker gate without a user-supplied unit."
+                if hasRecoveryOwner then
+                    let owner = jsonText node "recoveryOwner"
+                    if String.IsNullOrWhiteSpace owner || owner.Length > 4096 || owner |> Seq.exists Char.IsControl then
+                        invalidOp "Invalid firewalld recovery owner."
+                    if not (name.EndsWith("-docker-firewall-bootstrap.service", StringComparison.Ordinal)) then
+                        invalidOp "A recovery owner is valid only for the Docker bootstrap gate."
+                FirewalldGateModel.decodeService name node["dockerFence"] |> ignore
+            else
+                if managed && (String.IsNullOrWhiteSpace config || not (config.Contains "ExecStart=")) then invalidOp "A managed service requires ExecStart."
+                if not managed && config <> "" then invalidOp "A package service cannot own configuration."
+                if node.Count <> 3 then invalidOp "Unsupported service specification fields."
         else
             let kind = jsonText node "kind"
             if not (List.contains kind [ "archive"; "download"; "file"; "text"; "directory" ]) then invalidOp "Invalid content kind."
