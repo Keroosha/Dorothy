@@ -737,6 +737,42 @@ module FirewalldLifecycle =
                     for entry in dependencyEntries id (Path.Combine(root, directory)) do
                         inspectEntry suffix entry
 
+    // v257.13 unit_file_build_name_map records an alias → target *name*
+    // before resolving that target to a fragment. The reverse names map
+    // (and PID 1's Names) can omit the alias while its target is missing.
+    // Any chain that would acquire a plain recovery ID needs a last hop to
+    // that ID. `unit-files` matches the selectors against both ends of ids.
+    let private checkRecoveryNameMap environment (paths: string list) (units: RecoveryUnit list) names (daemonFragment: string) =
+        if paths |> List.exists (fun (p: string) -> p.Contains ':') then
+            refuseUnit bootServiceName "cannot encode PID 1 UnitPath for native alias inspection."
+        if not (Path.IsPathFullyQualified daemonFragment) || Path.GetFullPath daemonFragment <> daemonFragment ||
+           daemonFragment.IndexOfAny([| '*'; '?'; '[' |]) >= 0 || daemonFragment |> Seq.exists Char.IsControl then
+            refuseUnit bootServiceName "cannot use the loaded firewall fragment as an exact name-map witness."
+        let expected = Collections.Generic.HashSet<string>(StringComparer.Ordinal)
+        // Positive witness even when all five recovery fragments are absent.
+        expected.Add("ids: firewalld.service → " + daemonFragment) |> ignore
+        for unit in units do
+            let file = logicalPath environment unit.LogicalPath
+            if File.Exists file then
+                let name = Path.GetFileName file
+                expected.Add("ids: " + name + " → " + file) |> ignore
+                expected.Add("aliases: " + name + " ← " + name) |> ignore
+        let args =
+            [ "-i"; "LC_ALL=C"; "PATH=/usr/sbin:/usr/bin:/sbin:/bin"; "SYSTEMD_UNIT_PATH=" + String.concat ":" paths
+              "/usr/bin/systemd-analyze"; "--system"; "--no-pager"; "unit-files"; daemonFragment ] @ names
+        let r = environment.Run "/usr/bin/env" args None
+        if r.ExitCode <> 0 || r.Stderr <> "" || String.IsNullOrEmpty r.Stdout then
+            refuseUnit bootServiceName "cannot inspect the native recovery unit name map."
+        for row in r.Stdout.TrimEnd('\n').Split('\n') do
+            if not (expected.Remove row) then
+                let id =
+                    names |> List.tryFind (fun name ->
+                        row.EndsWith(" → " + name, StringComparison.Ordinal) ||
+                        row.StartsWith("aliases: " + name + " ← ", StringComparison.Ordinal) ||
+                        row.StartsWith("ids: " + name + " → ", StringComparison.Ordinal))
+                refuseUnit (defaultArg id "Firewalld recovery") "unowned recovery alias or unexpected disk identity."
+        if expected.Count <> 0 then refuseUnit bootServiceName "incomplete native recovery unit name map."
+
     let private checkRecoveryDependencies environment paths (units: RecoveryUnit list) (legacyLink: string option) requireLoaded =
         let names = units |> List.map (fun u -> Path.GetFileName u.LogicalPath)
         let daemon = "firewalld.service"
@@ -747,6 +783,7 @@ module FirewalldLifecycle =
             refuseUnit bootServiceName "cannot determine effective recovery dependencies."
         let queried = dependencyProperties.Split(',')
         let mutable seen = Set.empty
+        let mutable daemonFragment = ""
         for block in result.Stdout.TrimEnd('\n').Split("\n\n", StringSplitOptions.RemoveEmptyEntries) do
             let props = Collections.Generic.Dictionary<string,string>(StringComparer.Ordinal)
             for line in block.Split('\n') do
@@ -762,6 +799,7 @@ module FirewalldLifecycle =
             if props["NeedDaemonReload"] <> "no" then refuseUnit id "stale dependency configuration."
             if id = daemon then
                 if props["LoadState"] <> "loaded" then refuseUnit id "cannot inspect the running firewall's recovery dependencies."
+                daemonFragment <- props["FragmentPath"]
                 let aliases = words "Names"
                 if not (Array.contains daemon aliases) then refuseUnit daemon "unknown firewall alias inventory."
                 if aliases |> Array.exists (fun alias -> not (alias.EndsWith(".service", StringComparison.Ordinal))) then
@@ -807,6 +845,7 @@ module FirewalldLifecycle =
                             | _ -> false
                         if not allowed then refuseUnit id ("unowned effective " + key + " dependency.")
         if seen <> requested then refuseUnit bootServiceName "missing recovery dependency observations."
+        checkRecoveryNameMap environment paths units names daemonFragment
 
     let private requireHistoricalHardEdge environment units helper =
         let boot = units |> List.find (fun unit -> unit.LogicalPath = bootServicePath)

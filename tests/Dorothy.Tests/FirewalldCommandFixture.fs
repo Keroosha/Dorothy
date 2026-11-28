@@ -20,6 +20,28 @@ module internal FirewalldCommandFixture =
     let dependencyQuery = String.concat "," dependencyProperties
     let dependencyQueryArguments =
         [ "show"; "--all"; "-p"; dependencyQuery; "--" ] @ recoveryUnitNames @ [ "firewalld.service" ]
+    let private unitSearchPaths =
+        [ "/etc/systemd/system.control"; "/etc/systemd/system"; "/run/systemd/system.attached"
+          "/run/systemd/system"; "/usr/lib/systemd/system" ]
+    let private mapPath root (logical: string) = Path.Combine(root, logical.TrimStart('/'))
+    let unitFilesArguments root =
+        let physical = mapPath root
+        [ "-i"; "LC_ALL=C"; "PATH=/usr/sbin:/usr/bin:/sbin:/bin"
+          "SYSTEMD_UNIT_PATH=" + (unitSearchPaths |> List.map physical |> String.concat ":")
+          "/usr/bin/systemd-analyze"; "--system"; "--no-pager"; "unit-files"
+          physical "/usr/lib/systemd/system/firewalld.service" ] @ recoveryUnitNames
+    let systemdUnitFilesOutput root =
+        let physical = mapPath root
+        let firewall =
+            "ids: firewalld.service → " + physical "/usr/lib/systemd/system/firewalld.service" + "\n"
+        let ownedUnits =
+            recoveryUnitNames
+            |> List.choose (fun name ->
+                let path = physical ("/etc/systemd/system/" + name)
+                if File.Exists path then
+                    Some("ids: " + name + " → " + path + "\naliases: " + name + " ← " + name + "\n")
+                else None)
+        firewall + String.concat "" ownedUnits
     let unitPathArguments =
         [ "--system"; "--json=short"; "get-property"; "org.freedesktop.systemd1"
           "/org/freedesktop/systemd1"; "org.freedesktop.systemd1.Manager"; "UnitPath" ]
@@ -236,6 +258,8 @@ module internal FirewalldCommandFixture =
                 |> Option.defaultValue fallback
             match executable, arguments with
             | "/usr/bin/busctl", args when args = unitPathArguments -> Some unitPathResponse
+            | "/usr/bin/env", args when args = unitFilesArguments root ->
+                Some(systemdUnitFilesOutput root)
             | "/usr/bin/systemctl", args when args = dependencyQueryArguments ->
                 Some(systemdDependencyOutput root Map.empty)
             | "firewall-cmd", [ "--direct"; ("--get-all-rules" | "--get-all-chains" | "--get-all-passthroughs") ] -> Some ""

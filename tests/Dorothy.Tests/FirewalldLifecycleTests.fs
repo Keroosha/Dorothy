@@ -72,6 +72,11 @@ type FirewalldLifecycleTests() =
                     { ExitCode = 0; Stderr = ""; Stdout = FirewalldCommandFixture.unitPathResponse }
                 else
                     invalidOp ("Unexpected busctl command: " + String.concat " " arguments)
+            elif executable = "/usr/bin/env"
+                 && arguments = FirewalldCommandFixture.unitFilesArguments root then
+                { ExitCode = 0
+                  Stdout = FirewalldCommandFixture.systemdUnitFilesOutput root
+                  Stderr = "" }
             elif executable = "/usr/bin/systemctl" then
                 systemctlCommands.Add arguments
                 let mutable response: CommandResult = { ExitCode = 0; Stdout = "success"; Stderr = "" }
@@ -145,6 +150,19 @@ type FirewalldLifecycleTests() =
         withHostForSystemctlStateAndCommands systemctlState "inactive" (fun environment root _ -> action environment root)
     let withHost (action: HostEnvironment -> string -> unit) =
         withHostForSystemctlState None action
+    let withInjectedUnitFilesOutput (transform: string -> string) (action: HostEnvironment -> string -> ResizeArray<string list> -> unit) =
+        withHostForSystemctlStateAndCommands None "inactive" (fun environment root commands ->
+            let expectedArguments = FirewalldCommandFixture.unitFilesArguments root
+            let originalRun = environment.Run
+            let injectedEnvironment =
+                { environment with
+                    Run = fun executable arguments input ->
+                        if executable = "/usr/bin/env" && arguments = expectedArguments then
+                            { ExitCode = 0
+                              Stdout = transform (FirewalldCommandFixture.systemdUnitFilesOutput root)
+                              Stderr = "" }
+                        else originalRun executable arguments input }
+            action injectedEnvironment root commands)
 
     let saveBootstrapSettingsOwner (root: string) (settingsOwner: string) =
         let baseline = JsonObject()
@@ -161,6 +179,21 @@ type FirewalldLifecycleTests() =
         let path = "/var/lib/keroosha-iac/firewalld/settings-strict-forward-ports.json"
         writeFile root path text 0o600
         path, text
+    let historicalBootServiceText =
+        let oldHelper = "/var/cache/keroosha-iac/helper/linux-x64/" + String.replicate 64 "a"
+        String.concat "\n"
+            [ "# Dorothy firewalld transaction recovery"
+              "[Unit]"
+              "Description=Dorothy firewalld boot recovery"
+              "DefaultDependencies=no"
+              "After=local-fs.target"
+              "Before=firewalld.service"
+              "[Service]"
+              "Type=oneshot"
+              "ExecStart=" + oldHelper + " firewalld-recover-boot"
+              "[Install]"
+              "WantedBy=multi-user.target"
+              "" ]
 
     let configuration = FirewalldModel.empty "zone" "lifecycle"
     let logicalPath = "/etc/firewalld/zones/lifecycle.xml"
@@ -1087,24 +1120,67 @@ type FirewalldLifecycleTests() =
             Assert.That(commands |> Seq.exists (function ("enable" | "start" | "daemon-reload") :: _ -> true | _ -> false), Is.False))
 
     [<Test>]
+    member _.``Bootstrap recovery refuses a forward alias to a missing recovery unit``() =
+        let boot = "keroosha-iac-firewalld-boot-recovery.service"
+        withInjectedUnitFilesOutput
+            (fun output -> output + "ids: harmless-alias.service → " + boot + "\n")
+            (fun environment root commands ->
+                let journalPath, journalText = saveBootstrapSettingsOwner root owner
+                let aliasPath = physical root "/etc/systemd/system/harmless-alias.service"
+                File.CreateSymbolicLink(aliasPath, boot) |> ignore
+                let error = Assert.Throws<HostPrerequisiteError>(fun () ->
+                    Firewalld.ensureBootstrapRecovery environment owner)
+                Assert.That(error.Message, Does.Contain "unowned recovery alias")
+                Assert.That(FileInfo(aliasPath).LinkTarget, Is.EqualTo boot)
+                Assert.That(File.ReadAllText(physical root journalPath), Is.EqualTo journalText)
+                for name in recoveryUnitNames do
+                    Assert.That(File.Exists(physical root ("/etc/systemd/system/" + name)), Is.False, name)
+                for link in
+                    [ "/etc/systemd/system/multi-user.target.wants/" + boot
+                      "/etc/systemd/system/firewalld.service.wants/" + boot
+                      "/etc/systemd/system/multi-user.target.wants/keroosha-iac-firewalld-postboot-recovery.service"
+                      "/etc/systemd/system/multi-user.target.wants/keroosha-iac-firewalld-boot-containment.service"
+                      "/etc/systemd/system/timers.target.wants/keroosha-iac-firewalld-rollback.timer" ] do
+                    let path = physical root link
+                    Assert.That(FileInfo(path).LinkTarget, Is.Null, link)
+                    Assert.That(File.Exists path, Is.False, link)
+                Assert.That(commands |> Seq.exists (function ("daemon-reload" | "enable" | "start") :: _ -> true | _ -> false), Is.False))
+
+    [<TestCase("blank")>]
+    [<TestCase("incomplete")>]
+    member _.``Bootstrap recovery fails closed on blank or incomplete native unit-file output``(witness: string) =
+        let boot = "keroosha-iac-firewalld-boot-recovery.service"
+        let transform (output: string) =
+            if witness = "blank" then ""
+            else
+                let missingAlias = "aliases: " + boot + " ← " + boot + "\n"
+                if not (output.Contains(missingAlias, StringComparison.Ordinal)) then
+                    invalidOp "Expected owned boot unit alias record in generated native output."
+                output.Replace(missingAlias, "")
+        withInjectedUnitFilesOutput transform (fun environment root commands ->
+            let journalPath, journalText = saveBootstrapSettingsOwner root owner
+            let journalBefore = fileSnapshot (physical root journalPath)
+            let bootPath = physical root ("/etc/systemd/system/" + boot)
+            let existingBoot =
+                if witness = "incomplete" then
+                    writeFile root ("/etc/systemd/system/" + boot) historicalBootServiceText 0o644
+                    fileSnapshot bootPath
+                else None
+            Assert.Throws<HostPrerequisiteError>(fun () ->
+                Firewalld.ensureBootstrapRecovery environment owner) |> ignore
+            Assert.That(File.ReadAllText(physical root journalPath), Is.EqualTo journalText)
+            Assert.That(fileSnapshot (physical root journalPath), Is.EqualTo journalBefore)
+            Assert.That(fileSnapshot bootPath, Is.EqualTo existingBoot)
+            for name in recoveryUnitNames do
+                let expectedExists = witness = "incomplete" && name = boot
+                Assert.That(File.Exists(physical root ("/etc/systemd/system/" + name)), Is.EqualTo expectedExists, name)
+            Assert.That(commands |> Seq.exists (function ("daemon-reload" | "enable" | "start") :: _ -> true | _ -> false), Is.False))
+
+    [<Test>]
     member _.``Bootstrap recovery upgrades the exact f4a8310 boot unit``() =
         withHostForSystemctlStateAndCommands None "inactive" (fun environment root _ ->
             saveBootstrapSettingsOwner root owner |> ignore
-            let oldHelper = "/var/cache/keroosha-iac/helper/linux-x64/" + String.replicate 64 "a"
-            let historical =
-                String.concat "\n"
-                    [ "# Dorothy firewalld transaction recovery"
-                      "[Unit]"
-                      "Description=Dorothy firewalld boot recovery"
-                      "DefaultDependencies=no"
-                      "After=local-fs.target"
-                      "Before=firewalld.service"
-                      "[Service]"
-                      "Type=oneshot"
-                      "ExecStart=" + oldHelper + " firewalld-recover-boot"
-                      "[Install]"
-                      "WantedBy=multi-user.target"
-                      "" ]
+            let historical = historicalBootServiceText
             let unitPath = "/etc/systemd/system/keroosha-iac-firewalld-boot-recovery.service"
             writeFile root unitPath historical 0o644
             Firewalld.ensureBootstrapRecovery environment owner
