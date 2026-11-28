@@ -2,6 +2,10 @@ namespace Dorothy.Tests
 
 open System
 open System.Collections.Immutable
+open System.Threading
+open Dorothy.DSL.Provider
+open Pulumi.Experimental
+open Pulumi.Experimental.Provider
 open System.Threading.Tasks
 open Dorothy.DSL
 open Dorothy.DSL.Firewalld
@@ -94,6 +98,13 @@ type FirewalldDeploymentTests() =
             Assert.That(OutputUtilities.GetValueAsync(mainDeps).Result |> Seq.map name, Does.Contain bootstrap)
             Assert.That(dependencies bootstrap, Does.Contain "ordered-firewalld-strict-forward-ports")
             Assert.That(dependencies bootstrap, Does.Not.Contain "ordered-firewalld-policy-docker-block")
+            let bootstrapArgs = byName[bootstrap].Args :?> HostServiceArgs
+            let specification: Output<string> = Input<string>.op_Implicit bootstrapArgs.Specification
+            use bootstrapSpec = System.Text.Json.JsonDocument.Parse(OutputUtilities.GetValueAsync(specification).Result)
+            Assert.That(
+                bootstrapSpec.RootElement.GetProperty("recoveryOwner").GetString(),
+                Is.EqualTo "ordered-firewalld-strict-forward-ports-id"
+            )
         let packages = (main.Args :?> AptPackageSetArgs).Packages
         let packageOutput: Output<ImmutableDictionary<string, AptPackageArgs>> = InputMap<AptPackageArgs>.op_Implicit packages
         let resolvedPackages = OutputUtilities.GetValueAsync(packageOutput).Result
@@ -519,3 +530,58 @@ type FirewalldDeploymentTests() =
         Assert.That(zoneDependencies, Does.Contain("graph-firewalld-ipset-trusted"))
         let settingDependencies = firewalldResource "graph-firewalld-setting-DefaultZone" |> dependencies
         Assert.That(settingDependencies, Does.Contain("graph-firewalld-zone-public"))
+
+    [<Test>]
+    member _.``Typed bootstrap recovery owner upgrade is in-place and does not restart``() =
+        let provider = DorothyProvider()
+        let propertyMap (entries: seq<string * PropertyValue>) =
+            let values = ImmutableDictionary.CreateBuilder<string, PropertyValue>(StringComparer.Ordinal)
+            for key, value in entries do values.Add(key, value)
+            values.ToImmutable()
+        let serviceInput (specification: string) =
+            propertyMap [
+                "connection",
+                    PropertyValue(propertyMap [
+                        "address", PropertyValue("192.0.2.1")
+                        "user", PropertyValue("root")
+                    ])
+                "specification", PropertyValue(specification)
+                "triggers", PropertyValue("[]")
+                "restartOnChange", PropertyValue(true)
+            ]
+        let token = "keroosha:debian:Service"
+        let urn = Pulumi.Urn("urn:pulumi:unit::unit::" + token + "::bootstrap")
+        let check specification =
+            let request =
+                CheckRequest(
+                    urn,
+                    ImmutableDictionary<string, PropertyValue>.Empty,
+                    serviceInput specification,
+                    ImmutableArray<byte>.Empty
+                )
+            provider.Check(request, CancellationToken.None).GetAwaiter().GetResult()
+        let legacy =
+            """{"name":"ordered-docker-firewall-bootstrap.service","managed":true,"configuration":"","dockerFence":[]}"""
+        let upgraded =
+            """{"name":"ordered-docker-firewall-bootstrap.service","managed":true,"configuration":"","dockerFence":[],"recoveryOwner":"settings-resource-id"}"""
+        let oldChecked = check legacy
+        let newChecked = check upgraded
+        Assert.That(oldChecked.Failures, Is.Empty)
+        Assert.That(newChecked.Failures, Is.Empty)
+        let oldOutputs = propertyMap [ "inSync", PropertyValue(true) ]
+        let request =
+            DiffRequest(
+                urn,
+                "bootstrap-id",
+                oldOutputs,
+                ImmutableDictionary.CreateRange(newChecked.Inputs),
+                ImmutableArray<string>.Empty,
+                ImmutableDictionary.CreateRange(oldChecked.Inputs)
+            )
+        let response = provider.Diff(request, CancellationToken.None).GetAwaiter().GetResult()
+        Assert.That(response.Changes.HasValue, Is.True)
+        Assert.That(response.Changes.Value, Is.True)
+        Assert.That(response.Diffs, Does.Contain "specification")
+        Assert.That(response.Replaces, Is.Empty)
+        Assert.That(response.Diffs, Does.Not.Contain "triggers")
+        Assert.That(response.Diffs, Does.Not.Contain "restartOnChange")

@@ -105,6 +105,15 @@ module FirewalldDockerGate =
         | 1 -> ()
         | code -> fail ("Native firewalld panic query failed (exit " + string code + ").")
 
+    /// Prerequisites for safely repairing bootstrap recovery infrastructure.
+    /// Recovery units may be absent here; the authenticated repair owns that
+    /// distinction. Existing transaction intent must already be settled.
+    let verifyBootstrapPrerequisites (environment: HostEnvironment) =
+        verifyNativeFirewalldRunning environment
+        verifyPanicOff environment
+        if not (FirewalldLifecycle.canClassifyPreStageRefusal environment) then
+            fail "A pending, orphaned, or uninspectable Dorothy firewalld transaction prevents Docker recovery bootstrap."
+
     let private verifyRecoveryUnit (environment: HostEnvironment) (unitName: string) =
         let state = systemdProperties environment unitName [ "LoadState"; "ActiveState"; "Result"; "ExecMainStatus" ]
         if state["LoadState"] <> "loaded" then

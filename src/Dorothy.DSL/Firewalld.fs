@@ -574,13 +574,19 @@ module internal FirewalldGraph =
 module internal FirewalldGuardUnit =
     let name (hostName: string) = hostName + "-docker-firewall-guard.service"
 
-    let specification (unitName: string) (policies: FirewalldObjectSpec list) =
+    let private specificationWithOwner (unitName: string) (policies: FirewalldObjectSpec list) (recoveryOwner: string option) =
         let spec = System.Text.Json.Nodes.JsonObject()
         spec["name"] <- System.Text.Json.Nodes.JsonValue.Create unitName
         spec["managed"] <- System.Text.Json.Nodes.JsonValue.Create true
         spec["configuration"] <- System.Text.Json.Nodes.JsonValue.Create ""
         spec["dockerFence"] <- policies |> List.map (fun p -> FirewalldGateModel.ofPolicy p.Value) |> FirewalldGateModel.encode
+        recoveryOwner |> Option.iter (fun owner -> spec["recoveryOwner"] <- System.Text.Json.Nodes.JsonValue.Create owner)
         spec.ToJsonString()
+
+    let specification unitName policies = specificationWithOwner unitName policies None
+
+    let bootstrapSpecification unitName recoveryOwner =
+        specificationWithOwner unitName [] (Some recoveryOwner)
 
 type FirewalldBuilder internal () =
     member _.Yield(value: FirewalldObjectSpec) = [ FirewalldDeclaration.Object value ]

@@ -1491,7 +1491,10 @@ module Host =
                 let name = host.Name + "-docker-firewall-bootstrap"
                 let args = HostServiceArgs()
                 args.Connection <- Input<AptConnectionArgs>.op_Implicit connection
-                args.Specification <- Input<string>.op_Implicit(FirewalldGuardUnit.specification (name + ".service") [])
+                args.Specification <-
+                    settings.Id.Apply(Func<string, string>(fun owner ->
+                        FirewalldGuardUnit.bootstrapSpecification (name + ".service") owner))
+                    |> Input<string>.op_Implicit
                 // Recheck an earlier cold prerequisite in place, without requiring refresh.
                 args.Triggers <- Input<string>.op_Implicit "[\"cold-hook-proof-v3\"]"
                 Some(HostServiceResource(name, args, ProviderContract.resourceOptionsWithDependencies [ settings :> Resource ]) :> Resource)

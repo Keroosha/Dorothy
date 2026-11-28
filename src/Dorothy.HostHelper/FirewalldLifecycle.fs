@@ -76,6 +76,11 @@ module FirewalldLifecycle =
     let private privateFileMode = UnixFileMode.UserRead ||| UnixFileMode.UserWrite
     let private directoryMode = UnixFileMode.UserRead ||| UnixFileMode.UserWrite ||| UnixFileMode.UserExecute
     let private unitDirectoryMode = directoryMode ||| UnixFileMode.GroupRead ||| UnixFileMode.GroupExecute ||| UnixFileMode.OtherRead ||| UnixFileMode.OtherExecute
+    type private RecoveryUnit =
+        { LogicalPath: string
+          Text: string
+          LegacyTexts: string list }
+
 
     let private fail message = raise (InvalidOperationException(message))
     let private logicalPath (environment: HostEnvironment) path = HostEnvironment.path environment path
@@ -557,7 +562,7 @@ module FirewalldLifecycle =
             fail "Legacy firewalld host transaction lacks a durable runtime rollback proof; refusing recovery."
 
 
-    let private createRecoveryUnits (environment: HostEnvironment) =
+    let private recoveryUnitTemplates () =
         let helper = Environment.ProcessPath
         if String.IsNullOrWhiteSpace helper || not (Path.IsPathRooted helper) || helper |> Seq.exists (fun c -> Char.IsControl c || Char.IsWhiteSpace c) then
             fail "Cannot arm firewalld rollback without a canonical native helper executable path."
@@ -570,15 +575,11 @@ module FirewalldLifecycle =
         let previousPostBootServiceText =
             String.concat "\n"
                 [ ownerMarker; "[Unit]"; "Description=Dorothy firewalld post-boot recovery"; "DefaultDependencies=no"; "After=firewalld.service"; "Requires=firewalld.service"; "[Service]"; "Type=oneshot"; "TimeoutStartSec=90s"; "ExecStart=" + helper + " firewalld-recover-postboot"; "[Install]"; "WantedBy=multi-user.target"; "" ]
-        // Bound each external command, not the sum over a valid inventory.
         let serviceText = previousServiceText.Replace("TimeoutStartSec=3min", "TimeoutStartSec=infinity")
         let bootServiceText =
             previousBootServiceText.Replace("TimeoutStartSec=90s", "TimeoutStartSec=infinity")
                                    .Replace("WantedBy=multi-user.target\nRequiredBy=firewalld.service", "WantedBy=multi-user.target firewalld.service")
         let postBootServiceText = previousPostBootServiceText.Replace("TimeoutStartSec=90s", "TimeoutStartSec=infinity")
-        // No reference to the helper or its cache. If boot recovery actually
-        // failed with a reserved transaction, quarantine under the *running*
-        // native daemon before the normal network-pre barrier is released.
         let containmentText =
             String.concat "\n"
                 [ ownerMarker; "[Unit]"; "Description=Quarantine an unverifiable firewalld boot transaction"
@@ -593,93 +594,230 @@ module FirewalldLifecycle =
                 [ ownerMarker; "[Unit]"; "Description=Dorothy firewalld transaction rollback"; "DefaultDependencies=no"; "After=local-fs.target"; "[Service]"; "Type=oneshot"; "ExecStart=" + helper + " firewalld-recover"; "" ]
         let legacyBootServiceText =
             String.concat "\n"
-                [ ownerMarker; "[Unit]"; "Description=Dorothy firewalld boot recovery"; "DefaultDependencies=no"; "After=local-fs.target"; "Before=firewalld.service"; "[Service]"; "Type=oneshot"; "ExecStart=" + helper + " firewalld-recover-boot"; "[Install]"; "WantedBy=multi-user.target"; "" ]
-        let matchesOwnedUnit (expectedText: string) (actualText: string) =
-            let expectedLines = expectedText.Split('\n')
-            let actualLines = actualText.Split('\n')
-            let executableLine (expected: string) (actual: string) =
-                let prefix = "ExecStart="
-                if not (expected.StartsWith(prefix, StringComparison.Ordinal) && actual.StartsWith(prefix, StringComparison.Ordinal)) then false
-                else
-                    let expectedCommand = expected.Substring(prefix.Length)
-                    let actualCommand = actual.Substring(prefix.Length)
-                    let expectedSpace = expectedCommand.IndexOf(' ')
-                    let actualSpace = actualCommand.IndexOf(' ')
-                    if expectedSpace <= 0 || actualSpace <= 0 then false
-                    else
-                        let arguments = expectedCommand.Substring(expectedSpace)
-                        let actualArguments = actualCommand.Substring(actualSpace)
-                        let oldExecutable = actualCommand.Substring(0, actualSpace)
-                        actualArguments = arguments
-                        && (oldExecutable = helper
-                            || Regex.IsMatch(oldExecutable, "^/var/cache/keroosha-iac/helper/(linux-x64|linux-arm64)/[0-9a-f]{64}$", RegexOptions.CultureInvariant))
-            expectedLines.Length = actualLines.Length
-            && Array.forall2 (fun expected actual -> expected = actual || executableLine expected actual) expectedLines actualLines
-        let writeOwned (logical: string) (text: string) (legacyTexts: string list) =
-            let physical = regularPath environment logical
-            let expected = strictUtf8.GetBytes(text)
-            let currentBytes =
-                if File.Exists physical then
-                    let owner = run environment "stat" [ "-c"; "%u:%g"; "--"; physical ]
-                    if owner <> "0:0" || File.GetUnixFileMode physical <> fileMode then
-                        fail "A firewalld recovery systemd unit is not root-owned mode 0644."
-                    let bytes = File.ReadAllBytes physical
-                    let current = strictUtf8.GetString bytes
-                    if not (matchesOwnedUnit text current
-                            || legacyTexts |> List.exists (fun legacy -> matchesOwnedUnit legacy current)) then
-                        fail "A firewalld recovery systemd unit collides with an unowned or modified unit."
-                    Some bytes
-                elif Directory.Exists physical || not (isNull (FileInfo(physical).LinkTarget)) then
-                    fail "A firewalld recovery systemd unit path is not a regular file."
-                else None
-            if currentBytes <> Some expected then HostFiles.atomicWrite physical expected fileMode
+                [ ownerMarker; "[Unit]"; "Description=Dorothy firewalld boot recovery"; "DefaultDependencies=no"; "After=local-fs.target"; "Before=firewalld.service"; "[Service]"; "Type=oneshot"; "ExecStart=" + helper + " firewalld-recover-boot"; "[Install]"; "WantedBy=multi-user.target"; "RequiredBy=firewalld.service"; "" ]
+        [ { LogicalPath = servicePath; Text = serviceText; LegacyTexts = [ previousServiceText; legacyServiceText ] }
+          { LogicalPath = bootServicePath; Text = bootServiceText; LegacyTexts = [ previousBootServiceText; legacyBootServiceText ] }
+          { LogicalPath = postBootServicePath; Text = postBootServiceText; LegacyTexts = [ previousPostBootServiceText ] }
+          { LogicalPath = containmentPath; Text = containmentText; LegacyTexts = [] }
+          { LogicalPath = timerPath; Text = timerText; LegacyTexts = [ legacyTimerText ] } ],
+        helper
 
-        let validateEnableLink (logicalLink: string) (logicalTarget: string) =
-            let logicalParent = Path.GetDirectoryName logicalLink
-            regularPath environment logicalParent |> ignore
+    let private matchesOwnedUnit (helper: string) (expectedText: string) (actualText: string) =
+        let expectedLines = expectedText.Split('\n')
+        let actualLines = actualText.Split('\n')
+        let executableLine (expected: string) (actual: string) =
+            let prefix = "ExecStart="
+            if not (expected.StartsWith(prefix, StringComparison.Ordinal) && actual.StartsWith(prefix, StringComparison.Ordinal)) then false
+            else
+                let expectedCommand = expected.Substring(prefix.Length)
+                let actualCommand = actual.Substring(prefix.Length)
+                let expectedSpace = expectedCommand.IndexOf(' ')
+                let actualSpace = actualCommand.IndexOf(' ')
+                if expectedSpace <= 0 || actualSpace <= 0 then false
+                else
+                    let arguments = expectedCommand.Substring(expectedSpace)
+                    let actualArguments = actualCommand.Substring(actualSpace)
+                    let oldExecutable = actualCommand.Substring(0, actualSpace)
+                    actualArguments = arguments
+                    && (oldExecutable = helper
+                        || Regex.IsMatch(oldExecutable, "^/var/cache/keroosha-iac/helper/(linux-x64|linux-arm64)/[0-9a-f]{64}$", RegexOptions.CultureInvariant))
+        expectedLines.Length = actualLines.Length
+        && Array.forall2 (fun expected actual -> expected = actual || executableLine expected actual) expectedLines actualLines
+
+    let private systemdUnitPaths (environment: HostEnvironment) =
+        let result = environment.Run "/usr/bin/busctl"
+                         [ "--system"; "--json=short"; "get-property"; "org.freedesktop.systemd1"
+                           "/org/freedesktop/systemd1"; "org.freedesktop.systemd1.Manager"; "UnitPath" ] None
+        if result.ExitCode <> 0 || result.Stderr <> "" then
+            fail "Unable to inspect PID 1 UnitPath before provisioning firewalld recovery."
+        let reply = JsonNode.Parse(result.Stdout).AsObject()
+        if getString reply "type" <> "as" then fail "Unrecognized native systemd UnitPath type."
+        let paths =
+            reply["data"].AsArray()
+            |> Seq.map (fun item ->
+                let value = item.GetValue<string>()
+                if not (Path.IsPathFullyQualified value) || Path.GetFullPath value <> value || value |> Seq.exists Char.IsControl || value = "/" then
+                    fail "PID 1 UnitPath is opaque; refusing firewalld recovery provisioning."
+                regularPath environment value)
+            |> Seq.distinct
+            |> Seq.toList
+        if not (List.contains (logicalPath environment "/etc/systemd/system") paths) then
+            fail "PID 1 UnitPath does not contain the authenticated firewalld unit directory."
+        paths
+
+    let private systemdDropInNames (unitName: string) =
+        let extension = unitName.LastIndexOf('.')
+        if extension <= 0 || extension = unitName.Length - 1 then
+            fail "Invalid firewalld systemd unit name."
+        let stem = unitName.Substring(0, extension)
+        let unitType = unitName.Substring(extension + 1)
+        let names = ResizeArray<string>()
+        names.Add unitName
+        names.Add unitType
+        for index in 0 .. stem.Length - 1 do
+            if stem[index] = '-' then names.Add(stem.Substring(0, index + 1) + "." + unitType)
+        names |> Seq.distinct |> Seq.map (fun name -> name + ".d") |> Seq.toList
+
+    let private systemdEntryExists (path: string) =
+        File.Exists path || Directory.Exists path || not (isNull (FileInfo(path).LinkTarget))
+
+    let private refuseUnit (name: string) reason =
+        // Only the known unit basename and a fixed reason cross the helper boundary.
+        raise (HostPrerequisiteError(Path.GetFileName(name) + ": " + reason))
+
+    let private inspectSystemdSearchPaths
+        (environment: HostEnvironment)
+        (unitPaths: string list)
+        (unit: RecoveryUnit)
+        =
+        let unitName = Path.GetFileName unit.LogicalPath
+        let expected = Path.GetFullPath(logicalPath environment unit.LogicalPath)
+        for directory in unitPaths do
+            let candidate = Path.GetFullPath(Path.Combine(directory, unitName))
+            if candidate <> expected && systemdEntryExists candidate then
+                refuseUnit unitName "unowned systemd fragment in the recovery unit search path."
+        let dropIns = systemdDropInNames unitName
+        for root in unitPaths do
+            for name in dropIns do
+                let candidate = Path.Combine(root, name)
+                if not (isNull (FileInfo(candidate).LinkTarget)) || File.Exists candidate ||
+                   (Directory.Exists candidate && not (Directory.EnumerateFileSystemEntries candidate |> Seq.isEmpty)) then
+                    refuseUnit unitName "unowned recovery unit drop-in."
+
+    // One PID 1 response per unit. Exit 4 alone does not prove absence.
+    let private inspectRecoveryUnit environment (unit: RecoveryUnit) =
+        let name = Path.GetFileName unit.LogicalPath
+        let query = "Id,LoadState,ActiveState,SubState,Result,Job,FragmentPath,DropInPaths,NeedDaemonReload"
+        let r = environment.Run "/usr/bin/systemctl" [ "show"; "--all"; "-p"; query; "--"; name ] None
+        let fields = Collections.Generic.Dictionary<string,string>(StringComparer.Ordinal)
+        if (r.ExitCode <> 0 && r.ExitCode <> 4) || r.Stderr <> "" then refuseUnit name "cannot inspect recovery unit."
+        for line in r.Stdout.TrimEnd('\n').Split('\n') do
+            let i = line.IndexOf '='
+            if i < 1 || not (fields.TryAdd(line.Substring(0,i), line.Substring(i+1))) then refuseUnit name "malformed systemd observation."
+        if fields.Count <> 9 || query.Split(',') |> Array.exists (fields.ContainsKey >> not) then
+            refuseUnit name "incomplete systemd observation."
+        if fields["Id"] <> name || fields["DropInPaths"] <> "" || fields["Job"] <> "" || fields["NeedDaemonReload"] <> "no" then
+            refuseUnit name "unowned customization, pending job or stale recovery unit."
+        match fields["LoadState"], fields["FragmentPath"], fields["ActiveState"], fields["SubState"], fields["Result"] with
+        | "not-found", "", "inactive", "dead", "success" -> false, false
+        | "loaded", path, active, sub, result when r.ExitCode = 0 && path = logicalPath environment unit.LogicalPath && File.Exists path ->
+            match active, sub, result with
+            | "active", "exited", "success" when name = bootServiceName -> true, true
+            | "inactive", "dead", "success" -> true, false
+            | "inactive", "dead", "exec-condition" when name = containmentName -> true, false
+            | _ -> refuseUnit name "recovery unit failed or has not settled."
+        | _ -> refuseUnit name "unowned or unclassifiable recovery unit."
+
+    let private provisionRecoveryUnits (environment: HostEnvironment) (verifySystemd: bool) =
+        let units, helper = recoveryUnitTemplates ()
+        let systemctl arguments = run environment "/usr/bin/systemctl" arguments
+        let refuse path reason = if verifySystemd then refuseUnit path reason else fail reason
+        let inspectEnableLink (logicalLink: string) (logicalTarget: string) =
+            regularPath environment (Path.GetDirectoryName logicalLink) |> ignore
             let physicalLink = logicalPath environment logicalLink
             let expectedTarget = Path.GetFullPath(logicalPath environment logicalTarget)
             match FileInfo(physicalLink).LinkTarget with
             | null when File.Exists physicalLink || Directory.Exists physicalLink ->
-                fail "A firewalld recovery systemd enable link collides with an unowned path."
-            | null -> ()
+                refuse logicalTarget "Recovery enable link collides with an unowned path."
+            | null -> false
             | target ->
                 let actualTarget =
                     if Path.IsPathRooted target then Path.GetFullPath target
                     else Path.GetFullPath(Path.Combine(Path.GetDirectoryName physicalLink, target))
                 if actualTarget <> expectedTarget then
-                    fail "A firewalld recovery systemd enable link points to an unowned unit."
-        validateEnableLink ("/etc/systemd/system/multi-user.target.wants/" + bootServiceName) bootServicePath
-        validateEnableLink ("/etc/systemd/system/firewalld.service.requires/" + bootServiceName) bootServicePath
-        validateEnableLink ("/etc/systemd/system/firewalld.service.wants/" + bootServiceName) bootServicePath
-        validateEnableLink ("/etc/systemd/system/multi-user.target.wants/" + containmentName) containmentPath
-        validateEnableLink ("/etc/systemd/system/multi-user.target.wants/" + postBootServiceName) postBootServicePath
-        validateEnableLink ("/etc/systemd/system/timers.target.wants/" + timerName) timerPath
-        ensureDirectory environment "/etc/systemd/system" (int unitDirectoryMode) |> ignore
-        writeOwned servicePath serviceText [ previousServiceText; legacyServiceText ]
-        writeOwned bootServicePath bootServiceText [ previousBootServiceText; legacyBootServiceText ]
-        writeOwned postBootServicePath postBootServiceText [ previousPostBootServiceText ]
-        writeOwned containmentPath containmentText []
-        writeOwned timerPath timerText [ legacyTimerText ]
-        let oldLink = logicalPath environment ("/etc/systemd/system/firewalld.service.requires/" + bootServiceName)
-        if not (isNull (FileInfo(oldLink).LinkTarget)) then
+                    refuse logicalTarget "Recovery enable link points to an unowned unit."
+                true
+        let unitWrites =
+            units
+            |> List.choose (fun unit ->
+                let physical = regularPath environment unit.LogicalPath
+                if File.Exists physical then
+                    let owner = run environment "stat" [ "-c"; "%u:%g"; "--"; physical ]
+                    if owner <> "0:0" || File.GetUnixFileMode physical <> fileMode then
+                        refuse unit.LogicalPath "Recovery unit is not root-owned mode 0644."
+                    let current = strictUtf8.GetString(File.ReadAllBytes physical)
+                    if not (matchesOwnedUnit helper unit.Text current
+                            || unit.LegacyTexts |> List.exists (fun legacy -> matchesOwnedUnit helper legacy current)) then
+                        refuse unit.LogicalPath "Refusing to replace an unowned or modified recovery unit."
+                    if current = unit.Text then None else Some(unit, strictUtf8.GetBytes unit.Text)
+                elif Directory.Exists physical || not (isNull (FileInfo(physical).LinkTarget)) then
+                    refuse unit.LogicalPath "Recovery unit path is not a regular file."
+                else Some(unit, strictUtf8.GetBytes unit.Text))
+        let mutable reloadRequired = false
+        let mutable latched = false
+        let inspect requireLoaded =
+            let paths = systemdUnitPaths environment
+            for unit in units do
+                inspectSystemdSearchPaths environment paths unit
+                let loaded, completed = inspectRecoveryUnit environment unit
+                if requireLoaded && not loaded then fail "The published recovery unit is not loaded."
+                if not loaded && File.Exists(logicalPath environment unit.LogicalPath) then reloadRequired <- true
+                if unit.LogicalPath = bootServicePath then latched <- completed
+        if verifySystemd then inspect false
+        let enableSpecs =
+            [ bootServiceName,
+                [ "/etc/systemd/system/multi-user.target.wants/" + bootServiceName, bootServicePath
+                  "/etc/systemd/system/firewalld.service.wants/" + bootServiceName, bootServicePath ]
+              postBootServiceName,
+                [ "/etc/systemd/system/multi-user.target.wants/" + postBootServiceName, postBootServicePath ]
+              containmentName,
+                [ "/etc/systemd/system/multi-user.target.wants/" + containmentName, containmentPath ]
+              timerName,
+                [ "/etc/systemd/system/timers.target.wants/" + timerName, timerPath ] ]
+        let linkStates =
+            enableSpecs
+            |> List.map (fun (name, links) -> name, links |> List.map (fun (link, target) -> link, target, inspectEnableLink link target))
+        let legacyRequires =
+            inspectEnableLink
+                ("/etc/systemd/system/firewalld.service.requires/" + bootServiceName)
+                bootServicePath
+        if not unitWrites.IsEmpty then
+            ensureDirectory environment "/etc/systemd/system" (int unitDirectoryMode) |> ignore
+            for unit, bytes in unitWrites do
+                HostFiles.atomicWrite (regularPath environment unit.LogicalPath) bytes fileMode
+        if legacyRequires then
+            let oldLink = logicalPath environment ("/etc/systemd/system/firewalld.service.requires/" + bootServiceName)
             File.Delete oldLink
             HostFiles.syncDirectory (Path.GetDirectoryName oldLink)
-        run environment "/usr/bin/systemctl" [ "daemon-reload" ] |> ignore
-        run environment "/usr/bin/systemctl" [ "enable"; bootServiceName ] |> ignore
-        // Latch this boot before timer activation or staging. With RemainAfterExit=yes,
-        // a daemon restart cannot re-run the lock-taking preboot hook.
-        run environment "/usr/bin/systemctl" [ "start"; bootServiceName ] |> ignore
-        run environment "/usr/bin/systemctl" [ "enable"; postBootServiceName ] |> ignore
-        run environment "/usr/bin/systemctl" [ "enable"; containmentName ] |> ignore
-        // This caller holds the mutation lock and verified there is no pending
-        // intent. Cancel any previous generation's delayed callback before
-        // arming a new full confirmation interval; retry only FAILED recoveries.
+        let changed = not unitWrites.IsEmpty || legacyRequires || reloadRequired
+        if not verifySystemd || changed then systemctl [ "daemon-reload" ] |> ignore
+        if verifySystemd && changed then inspect true
+        let mutable enabled = false
+        for name, links in linkStates do
+            if name <> timerName && (not verifySystemd || (links |> List.exists (fun (_, _, exists) -> not exists))) then
+                systemctl [ "enable"; name ] |> ignore
+                enabled <- true
+                if verifySystemd then
+                    for link, target, _ in links do
+                        if not (inspectEnableLink link target) then fail "Missing owned recovery enable link."
+        if verifySystemd && enabled then inspect true
+        if not latched then
+            systemctl [ "start"; bootServiceName ] |> ignore
+            if verifySystemd then
+                inspect true
+                if not latched then fail "The boot recovery decision was not latched."
+
+
+    let private armTransactionTimer (environment: HostEnvironment) =
         run environment "/usr/bin/systemctl" [ "stop"; timerName ] |> ignore
         run environment "/usr/bin/systemctl" [ "stop"; serviceName ] |> ignore
         run environment "/usr/bin/systemctl" [ "enable"; timerName ] |> ignore
         run environment "/usr/bin/systemctl" [ "restart"; timerName ] |> ignore
 
+    let private createRecoveryUnits (environment: HostEnvironment) =
+        provisionRecoveryUnits environment false
+        armTransactionTimer environment
+
+    let internal ensureBootstrapRecovery
+        (environment: HostEnvironment)
+        (validateSettingsOwner: unit -> unit)
+        : unit =
+        use _lock = HostFiles.lockFile (logicalPath environment lockPath)
+        if (pending environment).IsSome then
+            fail "Cannot provision firewalld recovery while a transaction is pending."
+        ensureNoOrphanedOwnerPending environment
+        validateSettingsOwner ()
+        provisionRecoveryUnits environment true
     let private stopRetryTimer (environment: HostEnvironment) =
         let physical = regularPath environment timerPath
         if Directory.Exists physical then
@@ -789,9 +927,7 @@ module FirewalldLifecycle =
         if needsBootLinkMigration environment then
             if (pending environment).IsSome then fail "Cannot migrate recovery units over a pending intent."
             ensureNoOrphanedOwnerPending environment
-            createRecoveryUnits environment
-            stopRetryTimer environment
-
+            provisionRecoveryUnits environment true
     let private makeTransaction
         (c: FirewalldModel.Configuration)
         (journal: JsonObject)

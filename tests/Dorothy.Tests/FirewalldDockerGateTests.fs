@@ -158,7 +158,7 @@ type FirewalldDockerGateTests() =
     let applyBootstrapGate (environment: HostEnvironment) =
         use request =
             JsonDocument.Parse(
-                """{"operation":"apply","name":"dorothy-docker-firewall-bootstrap.service","managed":true,"configuration":"","restart":false,"dockerFence":[]}""")
+                """{"operation":"apply","name":"dorothy-docker-firewall-bootstrap.service","managed":true,"configuration":"","restart":false,"dockerFence":[],"recoveryOwner":"strict-settings-resource-id"}""")
         Services.handleWithExecutable bootstrapHelperPath environment request.RootElement |> ignore
 
     let assertNoBootstrapPublication (environment: HostEnvironment) (calls: ResizeArray<string * string list>) =
@@ -442,6 +442,26 @@ type FirewalldDockerGateTests() =
             Assert.That(error.Message, Does.Contain "native firewalld systemd unit is not loaded")
             Assert.That(calls |> Seq.exists (fun (executable, _) -> executable = "/usr/bin/dpkg-query"), Is.True)
             assertNoBootstrapPublication environment calls)
+    [<Test>]
+    member _.``Legacy bootstrap specifications remain read and delete compatible``() =
+        let dockerResult = { ExitCode = 1; Stdout = ""; Stderr = "docker.service absent" }
+        let packageResult = { ExitCode = 1; Stdout = ""; Stderr = "package absent" }
+        withBootstrapServiceHost dockerResult packageResult (fun environment calls ->
+            for operation in [ "read"; "delete" ] do
+                let request = JsonObject()
+                request["operation"] <- JsonValue.Create operation
+                request["name"] <- JsonValue.Create bootstrapUnitName
+                request["managed"] <- JsonValue.Create true
+                request["configuration"] <- JsonValue.Create ""
+                request["restart"] <- JsonValue.Create false
+                request["dockerFence"] <- JsonArray()
+                use document = JsonDocument.Parse(request.ToJsonString())
+                let response = Services.handleWithExecutable bootstrapHelperPath environment document.RootElement
+                if operation = "read" then
+                    Assert.That(response["inSync"].GetValue<bool>(), Is.False)
+            Assert.That(calls |> Seq.exists (fun (_, arguments) -> arguments.Head = "daemon-reload"), Is.False)
+            Assert.That(calls |> Seq.exists (fun (_, arguments) ->
+                not arguments.IsEmpty && List.contains arguments.Head [ "start"; "enable"; "reenable"; "restart" ]), Is.False))
     [<Test>]
     member _.``Cold generator profile requires explicit PID1 and manager environment data``() =
         withGeneratorHost (fun environment writeHostFile setManagerEnvironment _ ->

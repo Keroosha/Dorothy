@@ -186,6 +186,17 @@ module Services =
                 Some fences, unit, Some(path, body, hash, commands)
             | _ -> None, suppliedConfiguration, None
         if not managed && configuration <> "" then fail "Package units cannot have a managed configuration."
+        let recoveryOwner =
+            match request.TryGetProperty "recoveryOwner" with
+            | false, _ -> None
+            | true, value when value.ValueKind = JsonValueKind.String ->
+                let owner = value.GetString()
+                if String.IsNullOrWhiteSpace owner || owner.Length > 4096 || owner |> Seq.exists Char.IsControl then
+                    fail "Invalid firewalld recovery owner."
+                Some owner
+            | _ -> fail "Invalid firewalld recovery owner."
+        if recoveryOwner.IsSome && fences <> Some [] then
+            fail "A firewalld recovery owner is valid only for the typed Docker bootstrap gate."
         let path = HostEnvironment.path environment ("/etc/systemd/system/" + name)
         if managed then Content.ensureSafePath path
         let lockPath = HostEnvironment.path environment "/run/lock/keroosha-iac-services.lock"
@@ -314,6 +325,12 @@ module Services =
             // without publishing files or activating our bootstrap oneshot.
             if fences = Some [] && not (hookLoaded ()) && coldBootstrap then
                 fail "Cannot prove a required Docker bootstrap check in the prospective systemd configuration; refusing before package installation."
+            if fences = Some [] then
+                match recoveryOwner with
+                | Some owner ->
+                    FirewalldDockerGate.verifyBootstrapPrerequisites environment
+                    Firewalld.ensureBootstrapRecovery environment owner
+                | None -> ()
             fences |> Option.iter verifyGate
             let fileChanged = managed && (not (File.Exists path) || File.ReadAllText path <> configuration || int (File.GetUnixFileMode path) <> 0o644)
             let writeUnit () =

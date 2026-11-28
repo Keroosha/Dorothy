@@ -3482,6 +3482,37 @@ module Firewalld =
 
 
 
+    let internal ensureBootstrapRecovery (environment: HostEnvironment) (settingsOwner: string) =
+        let configuration =
+            { FirewalldModel.empty "settings" "strict-forward-ports" with
+                StrictForwardPorts = Some true }
+        let key = FirewalldModel.settingKey configuration
+        FirewalldLifecycle.ensureBootstrapRecovery environment (fun () ->
+            let journal =
+                loadJournal environment configuration settingsOwner
+                |> Option.defaultWith (fun () -> fail "The confirmed StrictForwardPorts settings owner journal is missing.")
+            if not (isNull journal["pending"]) then
+                fail "The StrictForwardPorts settings owner has an unconfirmed transaction."
+            if journal.ContainsKey "deleteOnConfirm" && journal["deleteOnConfirm"].GetValue<bool>() then
+                fail "The StrictForwardPorts settings owner journal is not confirmed."
+            let baseline =
+                optionalString journal "baseline"
+                |> Option.defaultWith (fun () -> fail "Missing StrictForwardPorts settings ownership baseline.")
+            parseSettingsBaseline key baseline |> ignore
+            let keyScoped =
+                journal.ContainsKey "settingsScopeVersion"
+                && journal["settingsScopeVersion"].GetValue<int>() = 1
+            let managed = managedSettingState key keyScoped (optionalString journal "managed")
+            if not (settingValuesEqual key managed.Value (Some "yes")) then
+                fail "The confirmed StrictForwardPorts settings owner does not manage an enabled value."
+            if journal.ContainsKey "settingsActivation" then
+                let proof = journal["settingsActivation"].AsObject()
+                if getString proof "key" <> key then
+                    fail "The StrictForwardPorts settings activation receipt does not match its owner."
+                optionalString proof "value" |> ignore
+                getString proof "source" |> ignore
+                if proof.ContainsKey "generation" then getString proof "generation" |> ignore)
+
     let private strictSettings
         (environment: HostEnvironment)
         (operation: string)

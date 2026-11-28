@@ -33,10 +33,16 @@ type FirewalldLifecycleTests() =
         value["managedMode"] <- JsonValue.Create 0o644
         value
 
-    let withHostForSystemctlState (systemctlState: CommandResult option) (action: HostEnvironment -> string -> unit) =
+    let withHostForSystemctlStateAndCommands
+        (systemctlState: CommandResult option)
+        (initialBootState: string)
+        (action: HostEnvironment -> string -> ResizeArray<string list> -> unit)
+        =
         let root = Path.Combine(Path.GetTempPath(), "dorothy-firewalld-lifecycle-" + Guid.NewGuid().ToString("N"))
         for directory in [ "etc/firewalld/zones"; "etc/systemd/system"; "run/lock"; "var/lib" ] do
             Directory.CreateDirectory(Path.Combine(root, directory)) |> ignore
+        let systemctlCommands = ResizeArray<string list>()
+        let mutable bootState = initialBootState
         let run (executable: string) (arguments: string list) (_input: string option) : CommandResult =
             if executable = "stat" then
                 if List.contains "%u:%g" arguments then
@@ -45,26 +51,58 @@ type FirewalldLifecycleTests() =
                     let target = List.last arguments
                     let mode = File.GetUnixFileMode target |> int |> fun value -> Convert.ToString(value, 8)
                     { ExitCode = 0; Stdout = "0:" + mode; Stderr = "" }
+            elif executable = "/usr/bin/busctl" then
+                { ExitCode = 0; Stderr = ""
+                  Stdout = """{"type":"as","data":["/etc/systemd/system.control","/etc/systemd/system","/run/systemd/system.attached","/run/systemd/system","/usr/lib/systemd/system"]}""" }
             elif executable = "/usr/bin/systemctl" then
+                systemctlCommands.Add arguments
                 let mutable response: CommandResult = { ExitCode = 0; Stdout = "success"; Stderr = "" }
                 let createLink directory name target =
                     Directory.CreateDirectory(directory) |> ignore
                     let link = Path.Combine(directory, name)
                     if isNull (FileInfo(link).LinkTarget) && not (File.Exists link || Directory.Exists link) then
                         File.CreateSymbolicLink(link, target) |> ignore
+                let unitRelativePath name =
+                    match name with
+                    | "keroosha-iac-firewalld-rollback.service" -> "etc/systemd/system/keroosha-iac-firewalld-rollback.service"
+                    | "keroosha-iac-firewalld-rollback.timer" -> "etc/systemd/system/keroosha-iac-firewalld-rollback.timer"
+                    | "keroosha-iac-firewalld-boot-recovery.service" -> "etc/systemd/system/keroosha-iac-firewalld-boot-recovery.service"
+                    | "keroosha-iac-firewalld-postboot-recovery.service" -> "etc/systemd/system/keroosha-iac-firewalld-postboot-recovery.service"
+                    | _ -> "etc/systemd/system/keroosha-iac-firewalld-boot-containment.service"
+                let unitPhysicalPath name = Path.Combine(root, unitRelativePath name)
                 match arguments with
                 | [ "show"; "--property=ActiveState"; "--value"; "firewalld.service" ] ->
                     response <- systemctlState |> Option.defaultValue response
+                | [ "show"; "--all"; "-p"; _; "--"; name ] ->
+                    let path = unitPhysicalPath name
+                    let loaded = File.Exists path
+                    let state = if name.EndsWith("-boot-recovery.service") then bootState else "inactive"
+                    let load = if state = "load-error" then "error" elif loaded then "loaded" else "not-found"
+                    let sub = match state with "inactive" -> "dead" | "active" -> "exited" | _ -> state
+                    response <-
+                        { ExitCode = if state = "error" then 1 elif loaded then 0 else 4
+                          Stderr = ""
+                          Stdout = String.concat "\n" [
+                              "Id=" + name; "LoadState=" + load; "ActiveState=" + state; "SubState=" + sub
+                              "Result=success"; "Job="; "DropInPaths="; "NeedDaemonReload=no"
+                              "FragmentPath=" + (if loaded then path else "") ] }
                 | [ "enable"; "keroosha-iac-firewalld-boot-recovery.service" ] ->
                     createLink (Path.Combine(root, "etc/systemd/system/multi-user.target.wants")) "keroosha-iac-firewalld-boot-recovery.service" "../keroosha-iac-firewalld-boot-recovery.service"
                     createLink (Path.Combine(root, "etc/systemd/system/firewalld.service.wants")) "keroosha-iac-firewalld-boot-recovery.service" "../keroosha-iac-firewalld-boot-recovery.service"
-                | [ "start"; "keroosha-iac-firewalld-boot-recovery.service" ] -> ()
+                | [ "start"; "keroosha-iac-firewalld-boot-recovery.service" ] ->
+                    if bootState = "failed" then
+                        response <- { ExitCode = 1; Stdout = ""; Stderr = "unit is failed" }
+                    else bootState <- "active"
                 | [ "enable"; "keroosha-iac-firewalld-postboot-recovery.service" ] ->
                     createLink (Path.Combine(root, "etc/systemd/system/multi-user.target.wants")) "keroosha-iac-firewalld-postboot-recovery.service" "../keroosha-iac-firewalld-postboot-recovery.service"
+                | [ "enable"; "keroosha-iac-firewalld-boot-containment.service" ] ->
+                    createLink (Path.Combine(root, "etc/systemd/system/multi-user.target.wants")) "keroosha-iac-firewalld-boot-containment.service" "../keroosha-iac-firewalld-boot-containment.service"
                 | [ "enable"; "keroosha-iac-firewalld-rollback.timer" ] ->
                     createLink (Path.Combine(root, "etc/systemd/system/timers.target.wants")) "keroosha-iac-firewalld-rollback.timer" (Path.Combine(root, "etc/systemd/system/keroosha-iac-firewalld-rollback.timer"))
+                | [ "start"; "keroosha-iac-firewalld-rollback.timer" ]
                 | [ "restart"; "keroosha-iac-firewalld-rollback.timer" ]
-                | [ "stop"; "keroosha-iac-firewalld-rollback.timer" ] -> ()
+                | [ "stop"; "keroosha-iac-firewalld-rollback.timer" ]
+                | [ "stop"; "keroosha-iac-firewalld-rollback.service" ] -> ()
                 | _ -> ()
                 response
             else
@@ -73,11 +111,29 @@ type FirewalldLifecycleTests() =
             { Root = root
               Run = run
               UtcNow = fun () -> DateTimeOffset.UnixEpoch }
-        try action environment root
+        try action environment root systemctlCommands
         finally
             if Directory.Exists root then Directory.Delete(root, true)
+    let withHostForSystemctlState (systemctlState: CommandResult option) (action: HostEnvironment -> string -> unit) =
+        withHostForSystemctlStateAndCommands systemctlState "inactive" (fun environment root _ -> action environment root)
     let withHost (action: HostEnvironment -> string -> unit) =
         withHostForSystemctlState None action
+
+    let saveBootstrapSettingsOwner (root: string) (settingsOwner: string) =
+        let baseline = JsonObject()
+        baseline["etcExists"] <- JsonValue.Create true
+        baseline["etcStrictValue"] <- JsonValue.Create "no"
+        baseline["etcMode"] <- JsonValue.Create 0o644
+        let value = JsonObject()
+        value["version"] <- JsonValue.Create 1
+        value["ownerId"] <- JsonValue.Create settingsOwner
+        value["baseline"] <- JsonValue.Create(baseline.ToJsonString())
+        value["managed"] <- JsonValue.Create "StrictForwardPorts=yes\n"
+        value["pending"] <- null
+        let text = value.ToJsonString()
+        let path = "/var/lib/keroosha-iac/firewalld/settings-strict-forward-ports.json"
+        writeFile root path text 0o600
+        path, text
 
     let configuration = FirewalldModel.empty "zone" "lifecycle"
     let logicalPath = "/etc/firewalld/zones/lifecycle.xml"
@@ -845,3 +901,128 @@ type FirewalldLifecycleTests() =
             File.WriteAllText(Path.Combine(directory, "20-local.xml"), "<zone><service name=\"ssh\"/></zone>")
             Assert.Throws<Dorothy.HostHelper.Firewalld.BackendError>(fun () ->
                 Dorothy.HostHelper.Firewalld.ensureNoSplitZones environment) |> ignore)
+    [<Test>]
+    member _.``Bootstrap recovery provisions owned units without arming a transaction watchdog``() =
+        withHostForSystemctlStateAndCommands None "inactive" (fun environment root commands ->
+            let journalPath, journalText = saveBootstrapSettingsOwner root owner
+            Firewalld.ensureBootstrapRecovery environment owner
+            Assert.That(File.ReadAllText(physical root journalPath), Is.EqualTo journalText)
+            let unitPaths =
+                [ "/etc/systemd/system/keroosha-iac-firewalld-rollback.service"
+                  "/etc/systemd/system/keroosha-iac-firewalld-rollback.timer"
+                  "/etc/systemd/system/keroosha-iac-firewalld-boot-recovery.service"
+                  "/etc/systemd/system/keroosha-iac-firewalld-postboot-recovery.service"
+                  "/etc/systemd/system/keroosha-iac-firewalld-boot-containment.service" ]
+            for path in unitPaths do Assert.That(File.Exists(physical root path), Is.True, path)
+            let firstPass = commands |> Seq.toList
+            Assert.That(firstPass |> List.exists (fun args -> args = [ "start"; "keroosha-iac-firewalld-boot-recovery.service" ]), Is.True)
+            Assert.That(firstPass |> List.exists (fun args -> args = [ "enable"; "keroosha-iac-firewalld-rollback.timer" ]), Is.False)
+            Assert.That(firstPass |> List.exists (fun args ->
+                args = [ "start"; "keroosha-iac-firewalld-rollback.timer" ]
+                || args = [ "restart"; "keroosha-iac-firewalld-rollback.timer" ]
+                || args = [ "stop"; "keroosha-iac-firewalld-rollback.timer" ]
+                || args = [ "start"; "keroosha-iac-firewalld-rollback.service" ]
+                || args = [ "stop"; "keroosha-iac-firewalld-rollback.service" ]
+                || args = [ "reset-failed"; "keroosha-iac-firewalld-boot-recovery.service" ]), Is.False)
+            Assert.That(File.Exists(physical root "/etc/systemd/system/timers.target.wants/keroosha-iac-firewalld-rollback.timer"), Is.False)
+            let beforeRetry = commands.Count
+            Firewalld.ensureBootstrapRecovery environment owner
+            let retryCommands = commands |> Seq.skip beforeRetry |> Seq.toList
+            Assert.That(retryCommands |> List.exists (fun args -> List.contains (List.head args) [ "daemon-reload"; "enable"; "start"; "stop"; "restart"; "reset-failed" ]), Is.False))
+
+    [<Test>]
+    member _.``Bootstrap recovery preflights late link collisions before writing units``() =
+        withHostForSystemctlStateAndCommands None "inactive" (fun environment root commands ->
+            let journalPath, journalText = saveBootstrapSettingsOwner root owner
+            let collision = "/etc/systemd/system/timers.target.wants/keroosha-iac-firewalld-rollback.timer"
+            writeFile root collision "foreign timer link target\n" 0o644
+            let originalCollision = fileSnapshot (physical root collision)
+            let failure =
+                Assert.Throws<HostPrerequisiteError>(fun () -> Firewalld.ensureBootstrapRecovery environment owner)
+            Assert.That(failure.Message, Does.Contain "keroosha-iac-firewalld-rollback.timer")
+            Assert.That(File.ReadAllText(physical root journalPath), Is.EqualTo journalText)
+            Assert.That(fileSnapshot (physical root collision), Is.EqualTo(box originalCollision))
+            for path in
+                [ "/etc/systemd/system/keroosha-iac-firewalld-rollback.service"
+                  "/etc/systemd/system/keroosha-iac-firewalld-rollback.timer"
+                  "/etc/systemd/system/keroosha-iac-firewalld-boot-recovery.service"
+                  "/etc/systemd/system/keroosha-iac-firewalld-postboot-recovery.service"
+                  "/etc/systemd/system/keroosha-iac-firewalld-boot-containment.service"
+                  "/etc/systemd/system/multi-user.target.wants/keroosha-iac-firewalld-boot-recovery.service"
+                  "/etc/systemd/system/firewalld.service.wants/keroosha-iac-firewalld-boot-recovery.service"
+                  "/etc/systemd/system/multi-user.target.wants/keroosha-iac-firewalld-postboot-recovery.service"
+                  "/etc/systemd/system/multi-user.target.wants/keroosha-iac-firewalld-boot-containment.service" ] do
+                Assert.That(File.Exists(physical root path), Is.False, path)
+            Assert.That(commands |> Seq.exists (fun args -> List.contains (List.head args) [ "daemon-reload"; "enable"; "start"; "stop"; "restart"; "reset-failed" ]), Is.False))
+
+    [<TestCase("/usr/lib/systemd/system/keroosha-iac-firewalld-rollback.service")>]
+    [<TestCase("/run/systemd/system/keroosha-iac-firewalld-rollback.service")>]
+    [<TestCase("/etc/systemd/system/keroosha-iac-firewalld-rollback.service")>]
+    [<TestCase("/etc/systemd/system/keroosha-iac-firewalld-boot-recovery.service.d/90-admin.conf")>]
+    [<TestCase("/etc/systemd/system.control/keroosha-iac-firewalld-boot-recovery.service.d/90-admin.conf")>]
+    [<TestCase("/run/systemd/system.attached/service.d/90-admin.conf")>]
+    [<TestCase("/usr/lib/systemd/system/keroosha-iac-.service.d/90-admin.conf")>]
+    member _.``Bootstrap recovery refuses unowned effective fragments and drop-ins``(logicalCollision: string) =
+        withHostForSystemctlStateAndCommands None "inactive" (fun environment root commands ->
+            let journalPath, journalText = saveBootstrapSettingsOwner root owner
+            writeFile root logicalCollision "unowned systemd customization\n" 0o644
+            let collisionPath = physical root logicalCollision
+            let collisionText = File.ReadAllText collisionPath
+            Assert.Throws<HostPrerequisiteError>(fun () ->
+                Firewalld.ensureBootstrapRecovery environment owner) |> ignore
+            Assert.That(File.ReadAllText(physical root journalPath), Is.EqualTo journalText)
+            Assert.That(File.ReadAllText collisionPath, Is.EqualTo collisionText)
+            Assert.That(File.Exists(physical root "/etc/systemd/system/keroosha-iac-firewalld-rollback.timer"), Is.False)
+            Assert.That(commands |> Seq.exists (fun args -> List.contains (List.head args) [ "daemon-reload"; "enable"; "start"; "stop"; "restart"; "reset-failed" ]), Is.False))
+
+    [<TestCase("load-error")>]
+    [<TestCase("failed")>]
+    [<TestCase("activating")>]
+    [<TestCase("error")>]
+    member _.``Bootstrap recovery refuses failed or unverified latches``(initialState: string) =
+        withHostForSystemctlStateAndCommands None initialState (fun environment root commands ->
+            let journalPath, journalText = saveBootstrapSettingsOwner root owner
+            Assert.Throws<HostPrerequisiteError>(fun () ->
+                Firewalld.ensureBootstrapRecovery environment owner) |> ignore
+            Assert.That(File.ReadAllText(physical root journalPath), Is.EqualTo journalText)
+            Assert.That(File.Exists(physical root "/etc/systemd/system/keroosha-iac-firewalld-rollback.timer"), Is.False)
+            Assert.That(commands |> Seq.exists (fun args ->
+                args = [ "start"; "keroosha-iac-firewalld-boot-recovery.service" ]
+                || args = [ "reset-failed"; "keroosha-iac-firewalld-boot-recovery.service" ]), Is.False))
+
+    [<Test>]
+    member _.``Bootstrap recovery refuses exact-owner conflicts and orphaned legacy pending journals``() =
+        withHostForSystemctlStateAndCommands None "inactive" (fun environment root commands ->
+            let journalPath, journalText = saveBootstrapSettingsOwner root "another-owner"
+            Assert.Catch<Dorothy.HostHelper.Firewalld.BackendError>(fun () ->
+                Firewalld.ensureBootstrapRecovery environment owner) |> ignore
+            Assert.That(File.Exists(physical root "/etc/systemd/system/keroosha-iac-firewalld-rollback.timer"), Is.False)
+            Assert.That(File.ReadAllText(physical root journalPath), Is.EqualTo journalText)
+            Assert.That(commands |> Seq.exists (fun args -> List.contains (List.head args) [ "daemon-reload"; "enable"; "start" ]), Is.False)
+            Assert.That(File.Exists(physical root journalPath), Is.True))
+        withHostForSystemctlStateAndCommands None "inactive" (fun environment root commands ->
+            let settingsPath, settingsText = saveBootstrapSettingsOwner root owner
+            let legacy = journal "old-zone-owner" None None
+            legacy["pending"] <- JsonObject()
+            let legacyPath = "/var/lib/keroosha-iac/firewalld/zone-old.json"
+            let legacyText = legacy.ToJsonString()
+            writeFile root legacyPath legacyText 0o600
+            Assert.Throws<InvalidOperationException>(fun () ->
+                Firewalld.ensureBootstrapRecovery environment owner) |> ignore
+            Assert.That(File.ReadAllText(physical root settingsPath), Is.EqualTo settingsText)
+            Assert.That(File.ReadAllText(physical root legacyPath), Is.EqualTo legacyText)
+            Assert.That(File.Exists(physical root "/etc/systemd/system/keroosha-iac-firewalld-rollback.timer"), Is.False)
+            Assert.That(commands |> Seq.exists (fun args -> List.contains (List.head args) [ "daemon-reload"; "enable"; "start" ]), Is.False))
+    [<Test>]
+    member _.``Bootstrap recovery refuses a global transaction reservation``() =
+        withHostForSystemctlStateAndCommands None "inactive" (fun environment root commands ->
+            let journalPath, journalText = saveBootstrapSettingsOwner root owner
+            let marker = pendingRecord 2 false false
+            let markerText = marker.ToJsonString()
+            savePendingRecord root marker
+            Assert.Throws<InvalidOperationException>(fun () ->
+                Firewalld.ensureBootstrapRecovery environment owner) |> ignore
+            Assert.That(File.ReadAllText(physical root journalPath), Is.EqualTo journalText)
+            Assert.That(File.ReadAllText(physical root "/var/lib/keroosha-iac/firewalld/pending-transaction.json"), Is.EqualTo markerText)
+            Assert.That(File.Exists(physical root "/etc/systemd/system/keroosha-iac-firewalld-rollback.timer"), Is.False)
+            Assert.That(commands |> Seq.exists (fun args -> List.contains (List.head args) [ "daemon-reload"; "enable"; "start" ]), Is.False))
