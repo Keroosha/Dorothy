@@ -1,0 +1,23 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>dorothy-traefik-maintenance</AssemblyName>
+    <PublishAot>true</PublishAot>
+    <OtherFlags>$(OtherFlags) --reflectionfree</OtherFlags>
+    <IlcTreatWarningsAsErrors>true</IlcTreatWarningsAsErrors>
+    <TrimmerSingleWarn>false</TrimmerSingleWarn>
+    <DefineConstants>$(DefineConstants);HOST_HELPER;TRAEFIK_MAINTENANCE</DefineConstants>
+  </PropertyGroup>
+  <ItemGroup>
+    <Compile Include="../Dorothy.HostHelper/Common.fs" Link="Common.fs" />
+    <Compile Include="../Dorothy.DSL/TraefikPathModel.fs" Link="TraefikPathModel.fs" />
+    <Compile Include="../Dorothy.DSL/TraefikHttpGraphModel.fs" Link="TraefikHttpGraphModel.fs" />
+    <Compile Include="../Dorothy.DSL/TraefikStatic.fs" Link="TraefikStatic.fs" />
+    <Compile Include="../Dorothy.DSL/TraefikTlsSettings.fs" Link="TraefikTlsSettings.fs" />
+    <Compile Include="../Dorothy.DSL/TraefikDynamic.fs" Link="TraefikDynamic.fs" />
+    <Compile Include="../Dorothy.DSL/TraefikSettings.fs" Link="TraefikSettings.fs" />
+    <Compile Include="../Dorothy.HostHelper/Traefik.fs" Link="Traefik.fs" />
+    <Compile Include="Program.fs" />
+  </ItemGroup>
+</Project>

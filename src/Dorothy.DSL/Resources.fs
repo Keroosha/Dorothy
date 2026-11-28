@@ -496,6 +496,9 @@ type TraefikCertificateArgs() =
     [<Input("fingerprint", true)>]
     member val Fingerprint: Input<string> = Unchecked.defaultof<_> with get, set
 
+    [<Input("usage")>]
+    member val Usage: Input<string> = Unchecked.defaultof<_> with get, set
+
 
 /// Native Pulumi arguments for keroosha:debian:Traefik.
 type TraefikArgs() =
@@ -518,6 +521,9 @@ type TraefikArgs() =
 
     [<Input("adminPort")>]
     member val AdminPort: Input<int> = Unchecked.defaultof<_> with get, set
+
+    [<Input("configuration")>]
+    member val Configuration: Input<string> = Unchecked.defaultof<_> with get, set
 
 /// Native output DTO for one resolver.
 [<OutputType>]
@@ -559,11 +565,12 @@ type TraefikRouterOutput
 
 /// Native output DTO for one normalized certificate; the map key carries its name.
 [<OutputType>]
-type TraefikCertificateOutput [<OutputConstructor>] (certificatePem: string, privateKeyPem: string, fingerprint: string)
+type TraefikCertificateOutput [<OutputConstructor>] (certificatePem: string, privateKeyPem: string, fingerprint: string, usage: string)
     =
     member _.CertificatePem = certificatePem
     member _.PrivateKeyPem = privateKeyPem
     member _.Fingerprint = fingerprint
+    member _.Usage = usage
 
 
 
@@ -1012,6 +1019,9 @@ type TraefikInstance(name: string, args: TraefikArgs, options: CustomResourceOpt
     [<DefaultValue>]
     val mutable private certificateFingerprints: Output<ImmutableDictionary<string, string>>
 
+    [<DefaultValue>]
+    val mutable private tlsProbeSummary: Output<ImmutableDictionary<string, int>>
+
     new(name: string, args: TraefikArgs) = TraefikInstance(name, args, ProviderContract.resourceOptions ())
 
     [<Output("entryPoints")>]
@@ -1053,6 +1063,12 @@ type TraefikInstance(name: string, args: TraefikArgs, options: CustomResourceOpt
     member this.CertificateFingerprints
         with get () = this.certificateFingerprints
         and private set value = this.certificateFingerprints <- value
+
+    /// Bounded TLS observation counts; only provided when using structured configuration.
+    [<Output("tlsProbeSummary")>]
+    member this.TlsProbeSummary
+        with get () = this.tlsProbeSummary
+        and private set value = this.tlsProbeSummary <- value
 
 module private TraefikResourceMappings =
     let private mapImmutableOutput
@@ -1104,6 +1120,8 @@ module private TraefikResourceMappings =
         args.CertificatePem <- Input<string>.op_Implicit value.CertificatePem
         args.PrivateKeyPem <- Input<string>.op_Implicit value.PrivateKeyPem
         args.Fingerprint <- Input<string>.op_Implicit value.Fingerprint
+        // Omission is the historical wire representation for an inbound server identity.
+        if value.Usage <> "server" then args.Usage <- Input<string>.op_Implicit value.Usage
         args
 
     let resolvers values = mapImmutableOutput values resolver
@@ -1921,6 +1939,10 @@ module Host =
                 InputMap<TraefikCertificateArgs>.op_Implicit(TraefikResourceMappings.certificates resolved.Certificates)
 
             args.AdminPort <- Input<int>.op_Implicit resolved.AdminPort
+
+            resolved.Configuration
+            |> Option.iter (fun configuration ->
+                args.Configuration <- Input<string>.op_Implicit configuration)
 
             let dependencies =
                 [ mainApt :> Resource ]

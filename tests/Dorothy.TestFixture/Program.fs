@@ -279,7 +279,7 @@ module Program =
         let resolver =
             acmeResolver "test-acme" {
                 email (Output.CreateSecret "admin@example.test")
-                challenge (Http01 "web")
+                challenge (AcmeChallenge.Http01 "web")
                 caServer (Output.CreateSecret "https://acme.example.test/directory")
             }
         let conflicts =
@@ -321,37 +321,37 @@ module Program =
                     host "inline.example.test"
                     entryPoint "web"
                     backend "http://127.0.0.1:8081"
-                    tls (Provided inlineCertificate)
+                    tls (TraefikTlsMode.Provided inlineCertificate)
                 }
                 router "encrypted" {
                     host (Output.CreateSecret(requiredEnvironment "PEM_HOST"))
                     entryPointOutput (Output.CreateSecret "web")
                     backend (Output.Create "http://127.0.0.1:8082")
-                    tls (Provided pemCertificateSpec)
+                    tls (TraefikTlsMode.Provided pemCertificateSpec)
                 }
                 router "stream" {
                     host "stream.example.test"
                     entryPoint "web"
                     backend "http://127.0.0.1:8083"
-                    tls (Provided pfxSpec)
+                    tls (TraefikTlsMode.Provided pfxSpec)
                 }
                 router "base64" {
                     host "base64.example.test"
                     entryPoint "web"
                     backend "http://127.0.0.1:8084"
-                    tls (Provided base64Certificate)
+                    tls (TraefikTlsMode.Provided base64Certificate)
                 }
                 router "wildcard" {
                     host "service.wildcard.example.test"
                     entryPoint "web"
                     backend "http://127.0.0.1:8086"
-                    tls (Provided wildcardCertificate)
+                    tls (TraefikTlsMode.Provided wildcardCertificate)
                 }
                 router "acme" {
                     host "acme.example.test"
                     entryPoint "web"
                     backend "http://127.0.0.1:8085"
-                    tls (Acme resolver)
+                    tls (TraefikTlsMode.Acme resolver)
                 }
                 yield! conflicts
             }

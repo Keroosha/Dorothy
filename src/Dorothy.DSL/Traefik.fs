@@ -38,20 +38,23 @@ type TraefikResolvedSpec =
       Resolvers: Output<ImmutableDictionary<string, TraefikResolver>>
       Routers: Output<ImmutableDictionary<string, TraefikRouter>>
       Certificates: Output<ImmutableDictionary<string, NormalizedCertificate>>
+      Configuration: Output<string> option
       AdminPort: int }
 
 type EntryPointDefinition =
     { Name: string
       Listen: int }
 
+[<RequireQualifiedAccess>]
 type internal CertificateDefinition =
     | PemCertificateMaterial of chain: CertificateContent * privateKey: CertificateContent * password: TraefikStringInput option
     | Pkcs12CertificateMaterial of bundle: CertificateContent * password: TraefikStringInput option
 
-/// One typed provided certificate declaration that can be referenced by a router.
+/// One typed server or outbound client certificate declaration.
 [<Sealed>]
-type TraefikCertificateSpec internal (name: string, definition: CertificateDefinition) =
+type TraefikCertificateSpec internal (name: string, usage: string, definition: CertificateDefinition) =
     member _.Name = name
+    member _.Usage = usage
     member internal _.Definition = definition
 
 /// One typed ACME resolver declaration that can be referenced by a router.
@@ -67,10 +70,12 @@ type TraefikAcmeResolverSpec internal (
     member internal _.HttpChallengeEntryPoint = httpChallengeEntryPoint
     member internal _.CaServer = caServer
 
+[<RequireQualifiedAccess>]
 type TraefikTlsMode =
     | NoTls
     | Acme of resolver: TraefikAcmeResolverSpec
     | Provided of certificate: TraefikCertificateSpec
+[<RequireQualifiedAccess>]
 type AcmeChallenge =
     | Http01 of entryPoint: string
     | Http01Output of entryPoint: Output<string>
@@ -122,6 +127,7 @@ type TraefikDeclaration =
     | Router of RouterDefinition
     | Resolver of TraefikAcmeResolverSpec
     | Certificate of TraefikCertificateSpec
+    | Configuration of TraefikConfigurationSpec
     | AdminPort of int
 
 [<Sealed>]
@@ -211,7 +217,7 @@ type AcmeResolverBuilder internal (name: string) =
         | None -> invalidArg "acmeResolver" "An ACME resolver requires an HTTP-01 challenge."
 
 [<Sealed>]
-type PemCertificateBuilder internal (name: string) =
+type PemCertificateBuilder internal (name: string, usage: string) =
     member _.Yield(part: CertificatePart) = [ part ]
     member _.YieldFrom(parts: seq<CertificatePart>) = Seq.toList parts
     member _.Zero() = []
@@ -232,11 +238,11 @@ type PemCertificateBuilder internal (name: string) =
 
         match chain, privateKey, bundle with
         | Some chainValue, Some keyValue, None ->
-            TraefikCertificateSpec(name, CertificateDefinition.PemCertificateMaterial(chainValue, keyValue, password))
+            TraefikCertificateSpec(name, usage, CertificateDefinition.PemCertificateMaterial(chainValue, keyValue, password))
         | _ -> invalidArg "pemCertificate" "A PEM certificate requires exactly one chain and privateKey and cannot declare bundle."
 
 [<Sealed>]
-type Pkcs12CertificateBuilder internal (name: string) =
+type Pkcs12CertificateBuilder internal (name: string, usage: string) =
     member _.Yield(part: CertificatePart) = [ part ]
     member _.YieldFrom(parts: seq<CertificatePart>) = Seq.toList parts
     member _.Zero() = []
@@ -253,7 +259,7 @@ type Pkcs12CertificateBuilder internal (name: string) =
         if bundles.Length <> 1 || keys.Length > 0 || chains.Length > 0 || passwords.Length > 1 then
             invalidArg "pkcs12Certificate" "A PKCS#12 certificate requires exactly one bundle and at most one password."
 
-        TraefikCertificateSpec(name, CertificateDefinition.Pkcs12CertificateMaterial(bundles.Head, List.tryHead passwords))
+        TraefikCertificateSpec(name, usage, CertificateDefinition.Pkcs12CertificateMaterial(bundles.Head, List.tryHead passwords))
 
 module private TraefikOutput =
     let outputOfInput = function
@@ -320,10 +326,9 @@ module private TraefikOutput =
         }
 
 module private TraefikValidation =
-    let private namePattern = System.Text.RegularExpressions.Regex("^[A-Za-z0-9][A-Za-z0-9._-]{0,62}$", System.Text.RegularExpressions.RegexOptions.CultureInvariant)
 
     let validateName parameterName (value: string) =
-        if String.IsNullOrWhiteSpace value || not (namePattern.IsMatch value) then
+        if not (TraefikHttpGraphModel.isValidName 63 value) then
             invalidArg parameterName "Traefik names must be 1–63 ASCII letters, digits, dots, underscores, or hyphens and begin with a letter or digit."
 
     let validateNameWithReserved parameterName (reserved: string list) (value: string) =
@@ -412,7 +417,8 @@ type TraefikSpec internal (
     resolvers: TraefikAcmeResolverSpec list,
     routers: RouterDefinition list,
     certificates: TraefikCertificateSpec list,
-    adminPort: int
+    adminPort: int,
+    configuration: TraefikConfigurationSpec option
 ) =
     member _.Resolve(cancellationToken: CancellationToken) =
         let entryPointNames = entryPoints |> Seq.map (fun item -> item.Name) |> Set.ofSeq
@@ -490,6 +496,8 @@ type TraefikSpec internal (
                                 if not (Set.contains resolver.Name resolverNames) then
                                     invalidArg "router" "An ACME TLS router must reference a declared resolver."
                                 { Kind = "acme"; Name = resolver.Name }
+                            | TraefikTlsMode.Provided certificate when certificate.Usage = "client" ->
+                                invalidArg "router" "An outbound client identity cannot be used for inbound TLS."
                             | TraefikTlsMode.Provided certificate ->
                                 if not (Set.contains certificate.Name certificateNames) then
                                     invalidArg "router" "A provided TLS router must reference a declared certificate."
@@ -525,11 +533,21 @@ type TraefikSpec internal (
                                     let password = passwordInput |> Option.map (fun _ -> consumeInput ())
                                     let chain = System.Text.Encoding.UTF8.GetString(chainBytes)
                                     let key = System.Text.Encoding.UTF8.GetString(keyBytes)
-                                    normalizedCertificates.Add(CertificateMaterial.normalizePem declaration.Name chain key password)
+                                    let normalize =
+                                        match declaration.Usage with
+                                        | "server" -> CertificateMaterial.normalizePem
+                                        | "client" -> CertificateMaterial.normalizeClientPem
+                                        | _ -> invalidOp "Certificate validation failed."
+                                    normalizedCertificates.Add(normalize declaration.Name chain key password)
                                 | CertificateDefinition.Pkcs12CertificateMaterial(bundleSource, passwordInput) ->
                                     let! bundleBytes = TraefikOutput.resolveContent cancellationToken consumeInput bundleSource
                                     let password = passwordInput |> Option.map (fun _ -> consumeInput ())
-                                    normalizedCertificates.Add(CertificateMaterial.normalizePkcs12 declaration.Name bundleBytes password)
+                                    let normalize =
+                                        match declaration.Usage with
+                                        | "server" -> CertificateMaterial.normalizePkcs12
+                                        | "client" -> CertificateMaterial.normalizeClientPkcs12
+                                        | _ -> invalidOp "Certificate validation failed."
+                                    normalizedCertificates.Add(normalize declaration.Name bundleBytes password)
 
                             let normalizedCertificates = normalizedCertificates |> Seq.toList
                             CertificateMaterial.validateNormalizedCertificates normalizedCertificates
@@ -576,6 +594,7 @@ type TraefikSpec internal (
           Resolvers = resolversOutput
           Routers = routersOutput
           Certificates = certificatesOutput
+          Configuration = configuration |> Option.map TraefikConfiguration.resolve
           AdminPort = adminPort }
 [<RequireQualifiedAccess>]
 module TraefikSpec =
@@ -591,11 +610,13 @@ type TraefikBuilder() =
     member _.Yield(router: RouterDefinition) = [ TraefikDeclaration.Router router ]
     member _.Yield(resolver: TraefikAcmeResolverSpec) = [ TraefikDeclaration.Resolver resolver ]
     member _.Yield(certificate: TraefikCertificateSpec) = [ TraefikDeclaration.Certificate certificate ]
+    member _.Yield(configuration: TraefikConfigurationSpec) = [ TraefikDeclaration.Configuration configuration ]
     member _.YieldFrom(declarations: seq<TraefikDeclaration>) = Seq.toList declarations
     member _.YieldFrom(entryPoints: seq<EntryPointDefinition>) = entryPoints |> Seq.map TraefikDeclaration.EntryPoint |> Seq.toList
     member _.YieldFrom(routers: seq<RouterDefinition>) = routers |> Seq.map TraefikDeclaration.Router |> Seq.toList
     member _.YieldFrom(resolvers: seq<TraefikAcmeResolverSpec>) = resolvers |> Seq.map TraefikDeclaration.Resolver |> Seq.toList
     member _.YieldFrom(certificates: seq<TraefikCertificateSpec>) = certificates |> Seq.map TraefikDeclaration.Certificate |> Seq.toList
+    member _.YieldFrom(configurations: seq<TraefikConfigurationSpec>) = configurations |> Seq.map TraefikDeclaration.Configuration |> Seq.toList
     member _.Yield(part: TraefikRootPart) = [ TraefikDeclaration.AdminPort(match part with TraefikRootPart.AdminPort port -> port) ]
     member _.Zero() = []
     member _.Combine(left: TraefikDeclaration list, right: TraefikDeclaration list) = left @ right
@@ -607,12 +628,17 @@ type TraefikBuilder() =
         let routers = declarations |> List.choose (function TraefikDeclaration.Router value -> Some value | _ -> None)
         let resolvers = declarations |> List.choose (function TraefikDeclaration.Resolver value -> Some value | _ -> None)
         let certificates = declarations |> List.choose (function TraefikDeclaration.Certificate value -> Some value | _ -> None)
+        let configurations = declarations |> List.choose (function TraefikDeclaration.Configuration value -> Some value | _ -> None)
         let adminPorts = declarations |> List.choose (function TraefikDeclaration.AdminPort value -> Some value | _ -> None)
 
         for entryPoint in entryPoints do
             TraefikValidation.validateNameWithReserved "entryPoint" [ "keroosha-admin"; "traefik" ] entryPoint.Name
         for router in routers do
             TraefikValidation.validateNameWithReserved "router" [ "keroosha-admin" ] router.Name
+            match router.Tls with
+            | TraefikTlsMode.Provided certificate when certificate.Usage = "client" ->
+                invalidArg "router" "An outbound client identity cannot be used for inbound TLS."
+            | _ -> ()
             router.ExcludedPathSubtree
             |> Option.iter (fun value ->
                 if not (TraefikPathModel.isCanonicalSubtree value) then
@@ -631,7 +657,15 @@ type TraefikBuilder() =
         validateUnique "resolver" (resolvers |> Seq.map (fun item -> item.Name))
         validateUnique "certificate" (certificates |> Seq.map (fun certificate -> certificate.Name))
 
-        if entryPoints.IsEmpty then invalidArg "traefik" "At least one entry point is required."
+        let configuration =
+            match configurations with
+            | [] -> None
+            | [ value ] -> Some value
+            | _ -> invalidArg "traefik" "Structured Traefik configuration may be declared only once."
+
+        if entryPoints.IsEmpty
+           && not (configuration |> Option.exists (fun value -> value.HasStaticEntryPoints)) then
+            invalidArg "traefik" "At least one entry point is required."
         if adminPorts.Length > 1 then invalidArg "traefik" "Admin port may be declared only once."
 
         let listenPorts = entryPoints |> List.map (fun entryPoint -> entryPoint.Listen)
@@ -641,7 +675,7 @@ type TraefikBuilder() =
         if adminPort < 1 || adminPort > 65535 || (entryPoints |> List.exists (fun entryPoint -> entryPoint.Listen = adminPort)) then
             invalidArg "traefik" "The loopback admin port must be between 1 and 65535 and differ from entry-point listen ports."
 
-        TraefikSpec(entryPoints, resolvers, routers, certificates, adminPort)
+        TraefikSpec(entryPoints, resolvers, routers, certificates, adminPort, configuration)
 
 
 
@@ -732,15 +766,25 @@ module TraefikBuilders =
     let inline caServer (value: ^T) : ResolverPart =
         ((^T or TraefikFields) : (static member CaServer : ^T -> ResolverPart) value)
 
-    /// Begins a PEM certificate and private-key declaration.
+    /// Begins a server-authenticated PEM certificate declaration for inbound TLS.
     let pemCertificate name =
         TraefikValidation.validateName "pemCertificate" name
-        PemCertificateBuilder(name)
+        PemCertificateBuilder(name, "server")
 
-    /// Begins a PKCS#12 bundle declaration.
+    /// Begins an outbound-only client-authenticated PEM identity declaration.
+    let pemClientCertificate name =
+        TraefikValidation.validateName "pemClientCertificate" name
+        PemCertificateBuilder(name, "client")
+
+    /// Begins a server-authenticated PKCS#12 certificate declaration for inbound TLS.
     let pkcs12Certificate name =
         TraefikValidation.validateName "pkcs12Certificate" name
-        Pkcs12CertificateBuilder(name)
+        Pkcs12CertificateBuilder(name, "server")
+
+    /// Begins an outbound-only client-authenticated PKCS#12 identity declaration.
+    let pkcs12ClientCertificate name =
+        TraefikValidation.validateName "pkcs12ClientCertificate" name
+        Pkcs12CertificateBuilder(name, "client")
 
     /// Sets a PEM certificate chain source.
     let chain content = CertificatePart.Chain content

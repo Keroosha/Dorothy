@@ -31,9 +31,19 @@ jobs:
           sudo apt-get install --yes sudo zstd
       - name: Build DSL
         run: dotnet build src/Dorothy.DSL/Dorothy.DSL.fsproj --configuration Release
+      - name: Compile Traefik guest consumers (no deployment)
+        run: |
+          dotnet build tests/Traefik.Acceptance/Traefik.Acceptance.fsproj --configuration Release
+          dotnet build tests/Traefik.Acceptance/review/Traefik.Review.Acceptance.fsproj --configuration Release
       # CLI fixtures resolve their provider and program from Release output paths.
       - name: Run tests
         run: dotnet test tests/Dorothy.Tests --configuration Release
+      - name: Verify explicit local issuers in compiled acceptance configuration
+        run: |
+          review="$PWD/tests/Traefik.Acceptance/review/bin/Release/net10.0"
+          dotnet fsi --nologo -I:"$review" -r:Pulumi.dll -r:Dorothy.DSL.dll -r:Traefik.Review.Acceptance.dll \
+            -r:"$PWD/src/Dorothy.HostHelper/bin/Release/net10.0/keroosha-iac-helper.dll" \
+            tests/Traefik.Acceptance/review/check-issuers.fsx
 
   native-aot:
     name: Clean Native AOT publish (linux-x64)
@@ -51,3 +61,7 @@ jobs:
           sudo apt-get install --yes clang zlib1g-dev
       - name: Publish host helper
         run: bash scripts/publish-host-helper.sh linux-x64
+      - name: Execute published Traefik capability probe
+        run: |
+          src/Dorothy.DSL.Providers/Provider/helper/linux-x64/keroosha-iac-helper traefik-capabilities \
+            | jq -e '.protocol == "dorothy-traefik" and .version == 2 and (.capabilities | index("traefik-v2") != null)'

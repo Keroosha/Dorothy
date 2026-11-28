@@ -12,9 +12,15 @@
         <Compile Include="FirewalldModel.fs" />
         <Compile Include="FirewalldGateModel.fs" />
         <Compile Include="TraefikPathModel.fs" />
+        <Compile Include="TraefikHttpGraphModel.fs" />
+        <Compile Include="TraefikStatic.fs" />
+        <Compile Include="TraefikTlsSettings.fs" />
+        <Compile Include="TraefikDynamic.fs" />
+        <Compile Include="TraefikSettings.fs" />
         <Compile Include="Firewalld.fs" />
         <Compile Include="Cloudflare.fs" />
         <Compile Include="Certificates.fs" />
+        <Compile Include="TraefikConfiguration.fs" />
         <Compile Include="Traefik.fs" />
         <Compile Include="Docker.fs" />
         <Compile Include="Swapfile.fs" />

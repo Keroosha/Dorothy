@@ -55,7 +55,8 @@ type NormalizedCertificate =
     { Name: string
       CertificatePem: string
       PrivateKeyPem: string
-      Fingerprint: string }
+      Fingerprint: string
+      Usage: string }
 
 module internal CertificateMaterial =
     let private genericFailure () =
@@ -125,12 +126,33 @@ module internal CertificateMaterial =
         if used.Count <> certificates.Length then genericFailure ()
         ordered.ToArray()
 
-    let private verifyChain (ordered: X509Certificate2 array) =
+    let private usageOid (usage: string) =
+        match usage with
+        | "server" -> "1.3.6.1.5.5.7.3.1"
+        | "client" -> "1.3.6.1.5.5.7.3.2"
+        | _ -> genericFailure ()
+
+    let private validateUsage (usage: string) (certificate: X509Certificate2) =
+        let extensions =
+            certificate.Extensions
+            |> Seq.cast<X509Extension>
+            |> Seq.filter (fun extension ->
+                not (isNull extension.Oid)
+                && String.Equals(extension.Oid.Value, "2.5.29.37", StringComparison.Ordinal))
+            |> Seq.toArray
+
+        if extensions.Length <> 1 then genericFailure ()
+        let enhanced = X509EnhancedKeyUsageExtension(extensions[0], extensions[0].Critical)
+        let requiredOid = usageOid usage
+        if not (enhanced.EnhancedKeyUsages |> Seq.cast<Oid> |> Seq.exists (fun oid -> String.Equals(oid.Value, requiredOid, StringComparison.Ordinal))) then
+            genericFailure ()
+
+    let private verifyChain (usage: string) (ordered: X509Certificate2 array) =
         use chain = new X509Chain()
         chain.ChainPolicy.RevocationMode <- X509RevocationMode.NoCheck
         chain.ChainPolicy.VerificationFlags <- X509VerificationFlags.AllowUnknownCertificateAuthority
         chain.ChainPolicy.DisableCertificateDownloads <- true
-        chain.ChainPolicy.ApplicationPolicy.Add(Oid("1.3.6.1.5.5.7.3.1")) |> ignore
+        chain.ChainPolicy.ApplicationPolicy.Add(Oid(usageOid usage)) |> ignore
 
         for index in 1 .. ordered.Length - 1 do
             chain.ChainPolicy.ExtraStore.Add(ordered[index]) |> ignore
@@ -148,6 +170,7 @@ module internal CertificateMaterial =
             |> Array.exists (fun status -> (int status.Status &&& (~~~allowedStatusMask)) <> 0)
 
         if invalidStatus || (not built && chain.ChainStatus.Length = 0) then genericFailure ()
+        validateUsage usage ordered[0]
 
     let private normalizePrivateKey (certificate: X509Certificate2) =
         match certificate.GetRSAPrivateKey() with
@@ -205,10 +228,10 @@ module internal CertificateMaterial =
         else
             X509Certificate2.CreateFromPem(certificateText.AsSpan(), privateKeyPem.AsSpan())
 
-    let private normalized (name: string) (certificates: X509Certificate2 array) (leafWithKey: X509Certificate2) =
+    let private normalized (usage: string) (name: string) (certificates: X509Certificate2 array) (leafWithKey: X509Certificate2) =
         let ordered = orderChain certificates
         if not (ordered |> Array.forall isCurrent) then genericFailure ()
-        verifyChain ordered
+        verifyChain usage ordered
 
         let leaf = ordered[0]
         if not (fixedTimeEqual leaf.RawData leafWithKey.RawData) || not leafWithKey.HasPrivateKey then
@@ -222,9 +245,9 @@ module internal CertificateMaterial =
         { Name = name
           CertificatePem = normalizedChain
           PrivateKeyPem = normalizePrivateKey leafWithKey
-          Fingerprint = fingerprint leaf }
-
-    let normalizePem (name: string) (certificatePemText: string) (privateKeyPem: string) (password: string option) =
+          Fingerprint = fingerprint leaf
+          Usage = usage }
+    let private normalizePemForUsage usage (name: string) (certificatePemText: string) (privateKeyPem: string) (password: string option) =
         try
             if isNull certificatePemText || isNull privateKeyPem then genericFailure ()
 
@@ -234,14 +257,20 @@ module internal CertificateMaterial =
             try
                 let ordered = orderChain certificates
                 use leafWithKey = attachPemKey ordered[0] privateKeyPem password
-                normalized name certificates leafWithKey
+                normalized usage name certificates leafWithKey
             finally
                 for certificate in certificates do certificate.Dispose()
         with
         | :? OperationCanceledException -> reraise ()
         | _ -> genericFailure ()
 
-    let normalizePkcs12 (name: string) (pfxBytes: byte array) (password: string option) =
+    let normalizePem name certificatePemText privateKeyPem password =
+        normalizePemForUsage "server" name certificatePemText privateKeyPem password
+
+    let normalizeClientPem name certificatePemText privateKeyPem password =
+        normalizePemForUsage "client" name certificatePemText privateKeyPem password
+
+    let private normalizePkcs12ForUsage usage (name: string) (pfxBytes: byte array) (password: string option) =
         try
             if isNull pfxBytes then genericFailure ()
             let limits = Pkcs12LoaderLimits()
@@ -260,12 +289,18 @@ module internal CertificateMaterial =
                 let ordered = orderChain certificates
                 let leafWithKey = privateKeys[0]
                 if not (fixedTimeEqual ordered[0].RawData leafWithKey.RawData) then genericFailure ()
-                normalized name certificates leafWithKey
+                normalized usage name certificates leafWithKey
             finally
                 for certificate in certificates do certificate.Dispose()
         with
         | :? OperationCanceledException -> reraise ()
         | _ -> genericFailure ()
+
+    let normalizePkcs12 name pfxBytes password =
+        normalizePkcs12ForUsage "server" name pfxBytes password
+
+    let normalizeClientPkcs12 name pfxBytes password =
+        normalizePkcs12ForUsage "client" name pfxBytes password
 
     let private wildcardMatches (pattern: string) (host: string) =
         if pattern.StartsWith("*.", StringComparison.Ordinal) then
@@ -294,7 +329,7 @@ module internal CertificateMaterial =
         try
             let ordered = orderChain certificates
             use leafWithKey = attachPemKey ordered[0] certificate.PrivateKeyPem None
-            let parsed = normalized certificate.Name certificates leafWithKey
+            let parsed = normalized certificate.Usage certificate.Name certificates leafWithKey
             if not (String.Equals(parsed.Fingerprint, certificate.Fingerprint, StringComparison.Ordinal)) then
                 genericFailure ()
             let dns, ips = sanNames ordered[0]
@@ -311,8 +346,9 @@ module internal CertificateMaterial =
             for certificate in values do
                 if not (names.Add certificate.Name) then genericFailure ()
                 let _, dnsNames, ipAddresses = metadata certificate
-                for domain in dnsNames do domains.Add(certificate.Name, domain)
-                for address in ipAddresses do domains.Add(certificate.Name, "ip:" + address)
+                if certificate.Usage = "server" then
+                    for domain in dnsNames do domains.Add(certificate.Name, domain)
+                    for address in ipAddresses do domains.Add(certificate.Name, "ip:" + address)
 
             for leftIndex in 0 .. domains.Count - 1 do
                 for rightIndex in leftIndex + 1 .. domains.Count - 1 do
@@ -330,6 +366,7 @@ module internal CertificateMaterial =
 
             for _, host, certificateName in routers do
                 match Map.tryFind certificateName byName with
+                | Some certificate when certificate.Usage <> "server" -> genericFailure ()
                 | None -> genericFailure ()
                 | Some certificate ->
                     let _, dnsNames, ipAddresses = metadata certificate

@@ -389,9 +389,13 @@ type PulumiCliTests() =
         project.RunWith([ "up"; "--stack"; project.StackName; "--yes"; "--non-interactive"; "--color=never" ], secretEnvironment)
         |> fun result -> Assert.That(result.ExitCode, Is.EqualTo(0), result.StandardOutput + result.StandardError)
         project.SetConfig("scenario", "traefik")
+        PulumiCliTestData.seedTraefikState project certificate
+        let legacyUrn = sprintf "urn:pulumi:%s::%s::keroosha:debian:Traefik::sandbox" project.StackName project.ProjectName
+        let unchanged =
+            project.RunWith(PulumiCliTestData.previewArguments @ [ "--target"; legacyUrn; "--expect-no-changes" ], secretEnvironment)
+        Assert.That(unchanged.ExitCode, Is.EqualTo(0), unchanged.StandardOutput + unchanged.StandardError)
         project.SetConfig("backend", "http://127.0.0.1:12346")
         project.SetConfig("adminPort", "19081")
-        PulumiCliTestData.seedTraefikState project certificate
 
         // Act
         let previewResult = project.RunWith(PulumiCliTestData.previewArguments, secretEnvironment)

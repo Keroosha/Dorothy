@@ -100,63 +100,144 @@ type TraefikBackendTests() =
         SHA256.HashData(Encoding.UTF8.GetBytes(value))
         |> Convert.ToHexString
         |> fun result -> result.ToLowerInvariant()
+    let apiConfigurationFromJson adminPort (rawDataText: string) (entryPointsText: string) (versionText: string) : Traefik.ApiConfiguration =
+        use rawData = JsonDocument.Parse(rawDataText)
+        use entryPoints = JsonDocument.Parse(entryPointsText)
+        use version = JsonDocument.Parse(versionText)
+        { RawData = rawData.RootElement.Clone()
+          EntryPoints = entryPoints.RootElement.Clone()
+          Version = version.RootElement.Clone()
+          AdminPort = adminPort }
 
-    let sandboxConnection () =
-        let address = Environment.GetEnvironmentVariable("KEROOSHA_TRAEFIK_SANDBOX_ADDRESS")
-        if String.IsNullOrWhiteSpace(address) then
-            invalidOp "Set KEROOSHA_TRAEFIK_SANDBOX_ADDRESS to a dedicated disposable host before running the Sandbox integration test."
-        let identityFile =
-            match Environment.GetEnvironmentVariable("KEROOSHA_TRAEFIK_SANDBOX_IDENTITY") with
+    let apiConfigurationFromArrays (routers: JsonElement) (services: JsonElement) (middlewares: JsonElement) =
+        let resources isRouter (items: JsonElement) =
+            let result = JsonObject()
+            for item in items.EnumerateArray() do
+                let name = item.GetProperty("name").GetString()
+                match JsonNode.Parse(item.GetRawText()) with
+                | :? JsonObject as value ->
+                    let mutable parentRefs = Unchecked.defaultof<JsonElement>
+                    let rootRouter =
+                        not (item.TryGetProperty("parentRefs", &parentRefs))
+                        || parentRefs.ValueKind = JsonValueKind.Null
+                    if isRouter && rootRouter && not (value.ContainsKey("observability")) then
+                        let observability = JsonObject()
+                        observability["accessLogs"] <- JsonValue.Create(true)
+                        observability["metrics"] <- JsonValue.Create(true)
+                        observability["tracing"] <- JsonValue.Create(true)
+                        observability["traceVerbosity"] <- JsonValue.Create("minimal")
+                        value["observability"] <- observability
+                    value.Remove("name") |> ignore
+                    value.Remove("provider") |> ignore
+                    value.Remove("type") |> ignore
+                    result[name] <- value
+                | _ -> invalidOp "API fixture resource must be an object."
+            result
+        let rawData = JsonObject()
+        rawData["routers"] <- resources true routers
+        rawData["services"] <- resources false services
+        rawData["middlewares"] <- resources false middlewares
+        rawData["tcpRouters"] <- JsonObject()
+        rawData["tcpServices"] <- JsonObject()
+        rawData["tcpMiddlewares"] <- JsonObject()
+        rawData["udpRouters"] <- JsonObject()
+        rawData["udpServices"] <- JsonObject()
+        apiConfigurationFromJson
+            19080
+            (rawData.ToJsonString())
+            "[]"
+            """{"Version":"3.7.16"}"""
+
+    let acceptanceFile path =
+        let file = FileInfo(path)
+        if not file.Exists || not (String.IsNullOrEmpty(file.LinkTarget)) then
+            invalidOp "The sealed acceptance state contains a missing or linked file."
+        path
+
+    let verifiedAcceptanceStateDirectory () =
+        let stateValue =
+            match Environment.GetEnvironmentVariable("DOROTHY_TRAEFIK_ACCEPTANCE_STATE_DIR") with
             | null
-            | "" -> None
-            | value -> Some value
-        { Address = address
-          User = "root"
-          Port = 22
-          IdentityFile = identityFile }
+            | "" -> invalidOp "Set DOROTHY_TRAEFIK_ACCEPTANCE_STATE_DIR to a fresh prepare.sh state directory."
+            | value -> value
+        let stateDirectory = Path.GetFullPath(stateValue)
+        let tempRoot = Path.GetFullPath(Path.GetTempPath()).TrimEnd([| Path.DirectorySeparatorChar |])
+        let directoryName = Path.GetFileName(stateDirectory)
+        let prefix = "dorothy-traefik-acceptance."
+        let suffix = if directoryName.StartsWith(prefix, StringComparison.Ordinal) then directoryName.Substring(prefix.Length) else ""
+        let directory = DirectoryInfo(stateDirectory)
+        if Path.GetDirectoryName(stateDirectory) <> tempRoot
+           || suffix.Length = 0
+           || not (suffix |> Seq.forall (fun character -> Char.IsAsciiLetterOrDigit(character)))
+           || not directory.Exists
+           || not (String.IsNullOrEmpty(directory.LinkTarget)) then
+            invalidOp "Refusing to run outside the private sealed acceptance state root."
+        if (int (File.GetUnixFileMode(stateDirectory)) &&& 0o077) <> 0 then
+            invalidOp "The sealed acceptance state directory is not private."
+        let owner = acceptanceFile (Path.Combine(stateDirectory, ".owner"))
+        if (FileInfo(owner)).Length > 128L
+           || File.ReadAllText(owner).Trim() <> "dorothy-traefik-acceptance-owned-state-v1" then
+            invalidOp "The sealed acceptance ownership marker is invalid."
+        for filename in [ "handle.env"; "legacy-checkpoint.json"; "legacy-resource-id.txt" ] do
+            acceptanceFile (Path.Combine(stateDirectory, filename)) |> ignore
+        if Directory.EnumerateFiles(stateDirectory, "candidate-helper-*.sha256", SearchOption.TopDirectoryOnly) |> Seq.isEmpty |> not then
+            invalidOp "Refusing to repeat the sealed full acceptance run in a used per-run state directory."
+        stateDirectory
 
-    let runSandboxSsh (connection: SshConnection) (remoteCommand: string) (input: string option) =
-        let startInfo = ProcessStartInfo("ssh")
+    let verifiedCandidateProviderDirectory () =
+        let providerValue =
+            match Environment.GetEnvironmentVariable("DOROTHY_TRAEFIK_ACCEPTANCE_PROVIDER_DIR") with
+            | null
+            | "" -> invalidOp "Set DOROTHY_TRAEFIK_ACCEPTANCE_PROVIDER_DIR to the candidate provider directory."
+            | value -> value
+        let providerDirectory = Path.GetFullPath(providerValue)
+        let directory = DirectoryInfo(providerDirectory)
+        if not directory.Exists || not (String.IsNullOrEmpty(directory.LinkTarget)) then
+            invalidOp "The candidate provider directory is missing or linked."
+        for filename in [ "pulumi-resource-keroosha"; "helper/linux-x64/keroosha-iac-helper" ] do
+            acceptanceFile (Path.Combine(providerDirectory, filename)) |> ignore
+        providerDirectory
+
+    let publicAcceptanceRunner () =
+        let rec find (directory: DirectoryInfo) =
+            if isNull directory then invalidOp "The public sealed acceptance runner was not found in the source tree."
+            let candidate = Path.Combine(directory.FullName, "tests", "Traefik.Acceptance", "run.sh")
+            if File.Exists(candidate) then
+                acceptanceFile candidate
+            else
+                match directory.Parent with
+                | null -> invalidOp "The public sealed acceptance runner was not found in the source tree."
+                | parent -> find parent
+        find (DirectoryInfo(AppContext.BaseDirectory))
+
+    let runPublicAcceptance (stateDirectory: string) (providerDirectory: string) =
+        let runner = publicAcceptanceRunner ()
+        let startInfo = ProcessStartInfo("/usr/bin/bash")
         startInfo.UseShellExecute <- false
-        startInfo.RedirectStandardInput <- true
         startInfo.RedirectStandardOutput <- true
         startInfo.RedirectStandardError <- true
         startInfo.CreateNoWindow <- true
-        for argument in [ "-T"; "-o"; "BatchMode=yes"; "-o"; "StrictHostKeyChecking=yes"; "-o"; "ConnectTimeout=15"; "-p"; string connection.Port ] do
+        startInfo.WorkingDirectory <- Path.GetDirectoryName(runner)
+        for name in
+            [ "SSH_CONFIG"; "SSH_HOST"; "SSH_PORT"; "SSH_USER"; "GUEST_ROOT"
+              "DOROTHY_ACCEPTANCE_SSH_CONFIG"; "DOROTHY_ACCEPTANCE_SSH_PORT"
+              "UPSTREAM_CA_FILE"; "CLIENT_CA_FILE"; "DNS_TSIG_SECRET_FILE"; "PULUMI_PASSPHRASE_FILE"
+              "PULUMI_CONFIG_PASSPHRASE"; "PULUMI_ACCESS_TOKEN"; "BASH_ENV"; "ENV"
+              "HTTP_PROXY"; "HTTPS_PROXY"; "ALL_PROXY"; "http_proxy"; "https_proxy"; "all_proxy" ] do
+            startInfo.Environment.Remove(name) |> ignore
+        for argument in [ runner; stateDirectory; providerDirectory; "full" ] do
             startInfo.ArgumentList.Add(argument)
-        match connection.IdentityFile with
-        | Some path ->
-            startInfo.ArgumentList.Add("-i")
-            startInfo.ArgumentList.Add(path)
-        | None -> ()
-        startInfo.ArgumentList.Add(connection.User + "@" + connection.Address)
-        startInfo.ArgumentList.Add(remoteCommand)
-        use childProcess = new Process(StartInfo = startInfo)
-        if not (childProcess.Start()) then invalidOp "Unable to start the SSH client for the Sandbox Traefik test."
-        let stdout = childProcess.StandardOutput.ReadToEndAsync()
-        let stderr = childProcess.StandardError.ReadToEndAsync()
-        match input with
-        | Some value -> childProcess.StandardInput.Write(value); childProcess.StandardInput.Flush()
-        | None -> ()
-        childProcess.StandardInput.Close()
-        if not (childProcess.WaitForExit(60000)) then
-            childProcess.Kill(true)
-            childProcess.WaitForExit()
-            invalidOp "Sandbox SSH command timed out."
-        let output = stdout.GetAwaiter().GetResult()
-        let error = stderr.GetAwaiter().GetResult()
-        if childProcess.ExitCode <> 0 then
-            invalidOp ("Sandbox SSH command failed: " + error.Trim())
-        output
-
-    let sandboxHelper (connection: SshConnection) (request: JsonObject) =
-        SshTransport.runHelper
-            connection
-            "traefik"
-            "Sandbox Traefik lifecycle test"
-            (request.ToJsonString())
-            CancellationToken.None
-        |> fun operation -> operation.GetAwaiter().GetResult()
+        use child = new Process(StartInfo = startInfo)
+        if not (child.Start()) then invalidOp "Could not start the public sealed QEMU acceptance runner."
+        let standardOutput = child.StandardOutput.BaseStream.CopyToAsync(Stream.Null)
+        let standardError = child.StandardError.BaseStream.CopyToAsync(Stream.Null)
+        child.WaitForExit()
+        standardOutput.GetAwaiter().GetResult()
+        standardError.GetAwaiter().GetResult()
+        if child.ExitCode <> 0 then
+            invalidOp "The sealed Traefik acceptance runner failed; inspect its private per-run logs."
+        for filename in [ "candidate-helper-full.sha256"; "deleted-checkpoint.json"; "secret-hygiene-metrics.json" ] do
+            acceptanceFile (Path.Combine(stateDirectory, filename)) |> ignore
 
     [<Test>]
     member _.``Traefik archive extraction streams the exact binary and rejects unsafe or malformed members``() =
@@ -239,7 +320,10 @@ type TraefikBackendTests() =
         let acme = staticConfig.RootElement.GetProperty("certificatesResolvers").GetProperty("le").GetProperty("acme")
         Assert.That(acme.GetProperty("caServer").GetString(), Is.EqualTo("http://localhost:14000/dir"))
         Assert.That(acme.GetProperty("httpChallenge").GetProperty("entryPoint").GetString(), Is.EqualTo("web"))
-        Assert.That(acme.GetProperty("storage").GetString(), Does.StartWith(paths.StateDir + string Path.DirectorySeparatorChar))
+        Assert.That(
+            acme.GetProperty("storage").GetString(),
+            Is.EqualTo(TraefikTlsSettings.acmeStoragePath paths.StateDir "le" "http://localhost:14000/dir")
+        )
         let router = dynamicConfig.RootElement.GetProperty("http").GetProperty("routers").GetProperty("site")
         Assert.That(router.GetProperty("tls").GetProperty("certResolver").GetString(), Is.EqualTo("le"))
         let serviceName = "keroosha-backend-" + digest "http://127.0.0.1:9000"
@@ -251,6 +335,125 @@ type TraefikBackendTests() =
         let firstServer = servers[0]
         let actualUrl = firstServer.GetProperty("url").GetString()
         Assert.That(actualUrl, Is.EqualTo("http://127.0.0.1:9000"))
+
+
+    [<Test>]
+    member _.``OTLP application and access logs derive only the OTLPLogs experimental gate``() =
+        let requestFor settings =
+            sprintf
+                """{"operation":"apply","ownerId":"unit-test-traefik","entryPoints":{"web":31080},"resolvers":{},"routers":{},"certificates":{},"adminPort":19080,"configuration":{"static":%s}}"""
+                settings
+        let render settings =
+            use request = JsonDocument.Parse(requestFor settings)
+            JsonDocument.Parse(Traefik.renderStaticConfig request.RootElement paths "127.0.0.1")
+        let log = """{"log":{"otlp":{"http":{"endpoint":"http://127.0.0.1:4318/v1/logs"}}}}"""
+        let accessLog = """{"accessLog":{"otlp":{"http":{"endpoint":"http://127.0.0.1:4318/v1/logs"}}}}"""
+
+        for settings in [ log; accessLog; """{"log":{"otlp":{"http":{"endpoint":"http://127.0.0.1:4318/v1/logs"}}},"accessLog":{"otlp":{"http":{"endpoint":"http://127.0.0.1:4318/v1/logs"}}}}""" ] do
+            use rendered = render settings
+            let experimental = rendered.RootElement.GetProperty("experimental")
+            Assert.That(experimental.GetProperty("otlpLogs").GetBoolean(), Is.True)
+            let experimentalNames: string[] =
+                experimental.EnumerateObject() |> Seq.map (fun field -> field.Name) |> Seq.toArray
+            Assert.That(experimentalNames, Is.EquivalentTo([| "otlpLogs" |]))
+
+        use unrelatedSignals =
+            render """{"metrics":{"otlp":{"http":{"endpoint":"http://127.0.0.1:4318/v1/metrics"}}},"tracing":{"otlp":{"http":{"endpoint":"http://127.0.0.1:4318/v1/traces"}}}}"""
+        Assert.That(
+            unrelatedSignals.RootElement.EnumerateObject() |> Seq.exists (fun field -> field.Name = "experimental"),
+            Is.False
+        )
+    [<Test>]
+    member _.``Read renders expired inline CA state but Apply still rejects it``() =
+        use key = RSA.Create(2048)
+        let request = System.Security.Cryptography.X509Certificates.CertificateRequest("CN=expired read root", key, HashAlgorithmName.SHA256, RSASignaturePadding.Pkcs1)
+        request.CertificateExtensions.Add(System.Security.Cryptography.X509Certificates.X509BasicConstraintsExtension(true, true, 1, true)) |> ignore
+        use expiredRoot = request.CreateSelfSigned(DateTimeOffset.UtcNow.AddDays(-2.0), DateTimeOffset.UtcNow.AddDays(-1.0))
+        let configuration = JsonObject()
+        let settings = JsonObject()
+        let transport = JsonObject()
+        let rootCAs = JsonArray()
+        rootCAs.Add(JsonValue.Create(expiredRoot.ExportCertificatePem()))
+        transport["rootCAs"] <- rootCAs
+        settings["serversTransport"] <- transport
+        configuration["static"] <- settings
+        let makeRequest (operation: string) =
+            let request = JsonObject()
+            request["operation"] <- JsonValue.Create(operation)
+            request["ownerId"] <- JsonValue.Create("unit-test-traefik")
+            let entryPoints = JsonObject()
+            entryPoints["web"] <- JsonValue.Create(31080)
+            request["entryPoints"] <- entryPoints
+            request["resolvers"] <- JsonObject()
+            request["routers"] <- JsonObject()
+            request["certificates"] <- JsonObject()
+            request["adminPort"] <- JsonValue.Create(19080)
+            request["configuration"] <- configuration.DeepClone()
+            request
+
+        use readRequest = JsonDocument.Parse((makeRequest "read").ToJsonString())
+        use readStatic = JsonDocument.Parse(Traefik.renderStaticConfig readRequest.RootElement paths "127.0.0.1")
+        Assert.That(
+            readStatic.RootElement.GetProperty("serversTransport").GetProperty("rootCAs").[0].GetString(),
+            Is.EqualTo(expiredRoot.ExportCertificatePem())
+        )
+
+        let applyFailure =
+            TestDelegate(fun () ->
+                use applyRequest = JsonDocument.Parse((makeRequest "apply").ToJsonString())
+                Traefik.renderStaticConfig applyRequest.RootElement paths "127.0.0.1" |> ignore)
+        Assert.Catch<Exception>(applyFailure) |> ignore
+
+    [<Test>]
+    member _.``Legacy HTTP graph lowering preserves exact generated config bytes``() =
+        use request =
+            JsonDocument.Parse("""{
+              "operation":"apply","ownerId":"unit-test-traefik","entryPoints":{"web":31080},"resolvers":{},
+              "routers":{"site":{"host":"site.example.test","entryPoint":"web","backend":"http://127.0.0.1:9000","tls":{"kind":"none","name":""}}},
+              "certificates":{},"adminPort":19080
+            }""")
+        let serviceName = "keroosha-backend-" + digest "http://127.0.0.1:9000"
+        let expectedTemplate =
+            """{
+  "http": {
+    "routers": {
+      "keroosha-admin": {
+        "entryPoints": [
+          "keroosha-admin"
+        ],
+        "priority": 1000000,
+        "rule": "PathPrefix(`/api`) || PathPrefix(`/dashboard`)",
+        "service": "api@internal"
+      },
+      "site": {
+        "entryPoints": [
+          "web"
+        ],
+        "rule": "Host(`site.example.test`)",
+        "service": "@SERVICE@"
+      }
+    },
+    "services": {
+      "@SERVICE@": {
+        "loadBalancer": {
+          "servers": [
+            {
+              "url": "http://127.0.0.1:9000"
+            }
+          ]
+        }
+      }
+    }
+  },
+  "tls": {
+    "certificates": []
+  }
+}"""
+        let expected = expectedTemplate.Replace("@SERVICE@", serviceName, StringComparison.Ordinal) + "\n"
+        let actual = Traefik.renderHistoricalDynamicConfig request.RootElement paths
+        let actualBytes = Encoding.UTF8.GetBytes(actual)
+        let expectedBytes = Encoding.UTF8.GetBytes(expected)
+        Assert.That(actualBytes, Is.EqualTo(expectedBytes :> obj))
 
 
     [<Test>]
@@ -329,6 +532,20 @@ type TraefikBackendTests() =
         use collision = JsonDocument.Parse("""{
           "operation":"apply","ownerId":"unit-test-traefik","entryPoints":{"web":31080},"resolvers":{},"routers":{},"certificates":{},"adminPort":31080
         }""")
+        let proxyDestinationFailure (backend: string) =
+            let requestNode =
+                JsonNode.Parse("""{
+                  "operation":"apply","ownerId":"unit-test-traefik","entryPoints":{"web":31080},"resolvers":{},
+                  "routers":{"site":{"host":"site.example.test","entryPoint":"web","backend":"http://127.0.0.1:9000","tls":{"kind":"none","name":""}}},
+                  "certificates":{},"adminPort":19080
+                }""") :?> JsonObject
+            let router = (requestNode["routers"] :?> JsonObject)["site"] :?> JsonObject
+            router["backend"] <- JsonValue.Create(backend)
+            use request = JsonDocument.Parse(requestNode.ToJsonString())
+            Traefik.renderDynamicConfig request.RootElement paths |> ignore
+        let proxyFailures =
+            [ "http://admin-alias.example.test:19080"; "https://127.0.0.1:19080" ]
+            |> List.map (fun backend -> TestDelegate(fun () -> proxyDestinationFailure backend))
 
         // Act
         let unsafeFailure = TestDelegate(fun () -> Traefik.renderDynamicConfig unsafeName.RootElement paths |> ignore)
@@ -337,6 +554,8 @@ type TraefikBackendTests() =
         // Assert
         Assert.Throws<Traefik.BackendError>(unsafeFailure) |> ignore
         Assert.Throws<Traefik.BackendError>(collisionFailure) |> ignore
+        for proxyFailure in proxyFailures do
+            Assert.Throws<Traefik.BackendError>(proxyFailure) |> ignore
 
     [<Test>]
     member _.``Dynamic configuration contains versioned certificate paths but never key material``() =
@@ -382,6 +601,80 @@ type TraefikBackendTests() =
         Assert.That(Traefik.renderSystemdUnit paths, Does.Contain("User=keroosha-traefik\nGroup=keroosha-traefik"))
 
     [<Test>]
+    member _.``Client-only identities are protected outbound material and never inbound registrations``() =
+        let now = DateTimeOffset.UtcNow
+        let client =
+            TestSupport.createCertificateFixture
+                "review-client"
+                [ "review-client.example.test" ]
+                (now.AddDays(-1.0))
+                (now.AddDays(30.0))
+                [ "1.3.6.1.5.5.7.3.2" ]
+
+        let certificateNode = JsonObject()
+        certificateNode["certificatePem"] <- JsonValue.Create(client.ChainPem)
+        certificateNode["privateKeyPem"] <- JsonValue.Create(client.PrivateKeyPem)
+        certificateNode["fingerprint"] <- JsonValue.Create(client.Fingerprint)
+        certificateNode["usage"] <- JsonValue.Create("client")
+        let certificates = JsonObject()
+        certificates["review-client"] <- certificateNode
+
+        let certificateReference = JsonObject()
+        certificateReference["certificate"] <- JsonValue.Create("review-client")
+        let transportCertificates = JsonArray()
+        transportCertificates.Add(certificateReference)
+        let rootCAs = JsonArray()
+        rootCAs.Add(JsonValue.Create(client.RootCertificatePem))
+        let transport = JsonObject()
+        transport["rootCAs"] <- rootCAs
+        transport["certificates"] <- transportCertificates
+        let transports = JsonObject()
+        transports["verified-upstream"] <- transport
+        let http = JsonObject()
+        http["serversTransports"] <- transports
+        let dynamic = JsonObject()
+        dynamic["http"] <- http
+        let configuration = JsonObject()
+        configuration["dynamic"] <- dynamic
+
+        let requestFor (nativeConfiguration: JsonObject) =
+            let requestNode = JsonObject()
+            requestNode["operation"] <- JsonValue.Create("apply")
+            requestNode["ownerId"] <- JsonValue.Create("unit-test-traefik")
+            let entryPoints = JsonObject()
+            entryPoints["web"] <- JsonValue.Create(31080)
+            requestNode["entryPoints"] <- entryPoints
+            requestNode["resolvers"] <- JsonObject()
+            requestNode["routers"] <- JsonObject()
+            requestNode["certificates"] <- certificates.DeepClone()
+            requestNode["adminPort"] <- JsonValue.Create(19080)
+            requestNode["configuration"] <- nativeConfiguration.DeepClone()
+            JsonDocument.Parse(requestNode.ToJsonString())
+
+        use request = requestFor configuration
+        let dynamicText = Traefik.renderDynamicConfig request.RootElement paths
+        use dynamicConfig = JsonDocument.Parse(dynamicText)
+        let tlsCertificates = dynamicConfig.RootElement.GetProperty("tls").GetProperty("certificates")
+        let outbound = dynamicConfig.RootElement.GetProperty("http").GetProperty("serversTransports").GetProperty("verified-upstream").GetProperty("certificates")[0]
+        let inboundConfiguration = JsonObject()
+        let inboundDynamic = JsonObject()
+        let inboundTls = JsonObject()
+        let inboundReferences = JsonArray()
+        inboundReferences.Add(certificateReference.DeepClone())
+        inboundTls["certificates"] <- inboundReferences
+        inboundDynamic["tls"] <- inboundTls
+        inboundConfiguration["dynamic"] <- inboundDynamic
+        use inboundRequest = requestFor inboundConfiguration
+        let inboundFailure =
+            TestDelegate(fun () -> Traefik.renderDynamicConfig inboundRequest.RootElement paths |> ignore)
+
+        Assert.That(tlsCertificates.GetArrayLength(), Is.EqualTo(0))
+        Assert.That(outbound.GetProperty("certFile").GetString(), Does.EndWith(".crt"))
+        Assert.That(outbound.GetProperty("keyFile").GetString(), Does.EndWith(".key"))
+        Assert.That(dynamicText, Does.Not.Contain(client.PrivateKeyPem))
+        Assert.Throws<Traefik.BackendError>(inboundFailure) |> ignore
+
+    [<Test>]
     member _.``API comparison accepts Traefik provider suffixes and default TLS normalization``() =
         // Arrange
         use request = JsonDocument.Parse("""{
@@ -390,26 +683,309 @@ type TraefikBackendTests() =
           "routers":{"site":{"host":"site.example.test","entryPoint":"web","backend":"http://127.0.0.1:9000","excludedPathSubtree":"/admin","tls":{"kind":"acme","name":"le"}}},
           "certificates":{},"adminPort":19080
         }""")
-        let dynamicBytes = Encoding.UTF8.GetBytes(Traefik.renderDynamicConfig request.RootElement paths)
+        let dynamicBytes = Encoding.UTF8.GetBytes(Traefik.renderHistoricalDynamicConfig request.RootElement paths)
         let serviceName = "keroosha-backend-" + digest "http://127.0.0.1:9000"
+        let siteRule = "Host(`site.example.test`) && !PathRegexp(`^(/|%2[fF])+admin($|/|%2[fF])`)"
         use routers = JsonDocument.Parse($"""[
-          {{"name":"keroosha-admin@file","provider":"file","rule":"PathPrefix(`/api`) || PathPrefix(`/dashboard`)","entryPoints":["keroosha-admin"],"service":"api@internal","status":"enabled","middlewares":[]}},
-          {{"name":"site@file","provider":"file","rule":"Host(`site.example.test`) && !PathRegexp(`^(/|%%2[fF])+admin($|/|%%2[fF])`)","entryPoints":["web"],"service":"{serviceName}","status":"enabled","middlewares":[],"tls":{{"certResolver":"le","options":"default"}}}}
+          {{"name":"keroosha-admin@file","provider":"file","rule":"PathPrefix(`/api`) || PathPrefix(`/dashboard`)","entryPoints":["keroosha-admin"],"service":"api@internal","priority":1000000,"status":"enabled","middlewares":[]}},
+          {{"name":"site@file","provider":"file","rule":"{siteRule}","entryPoints":["web"],"service":"{serviceName}","priority":{Encoding.UTF8.GetByteCount(siteRule)},"status":"enabled","middlewares":[],"tls":{{"certResolver":"le","options":"default"}}}}
         ]""")
         use services = JsonDocument.Parse($"""[
-          {{"name":"{serviceName}@file","provider":"file","status":"enabled","type":"loadbalancer","loadBalancer":{{"servers":[{{"url":"http://127.0.0.1:9000"}}]}}}}
+          {{"name":"{serviceName}@file","provider":"file","status":"enabled","type":"loadbalancer","loadBalancer":{{"servers":[{{"url":"http://127.0.0.1:9000"}}]}},"usedBy":["site@file"]}}
         ]""")
         use middlewares = JsonDocument.Parse("[]")
-        let api: Traefik.ApiConfiguration =
-            { Routers = routers.RootElement.Clone()
-              Services = services.RootElement.Clone()
-              Middlewares = middlewares.RootElement.Clone() }
+        let api = apiConfigurationFromArrays routers.RootElement services.RootElement middlewares.RootElement
 
         // Act
         let matches = Traefik.apiMatchesDynamic (Some api) (Some dynamicBytes)
 
         // Assert
         Assert.That(matches, Is.True)
+
+        use wrongPassHostService = JsonDocument.Parse($"""[{{"name":"{serviceName}@file","status":"enabled","type":"loadbalancer","loadBalancer":{{"servers":[{{"url":"http://127.0.0.1:9000"}}],"passHostHeader":false}},"usedBy":["site@file"]}}]""")
+        let wrongPassHost = apiConfigurationFromArrays routers.RootElement wrongPassHostService.RootElement middlewares.RootElement
+        Assert.That(Traefik.apiMatchesDynamic (Some wrongPassHost) (Some dynamicBytes), Is.False)
+
+    [<Test>]
+    member _.``API comparison matches HTTP TCP and UDP rawdata resources and verifies static binds``() =
+        let dynamic =
+            """{
+              "http":{
+                "routers":{
+                  "keroosha-admin":{"rule":"PathPrefix(`/api`) || PathPrefix(`/dashboard`)","entryPoints":["keroosha-admin"],"service":"api@internal","priority":1000000},
+                  "healthy":{"rule":"Host(`healthy.test`)","entryPoints":["web"],"middlewares":["observe"],"service":"healthy-service"}
+                },
+                "services":{"healthy-service":{"loadBalancer":{"servers":[{"url":"http://127.0.0.1:9000"}]}}},
+                "middlewares":{"observe":{"addPrefix":{"prefix":"/check"}}}
+              },
+              "tcp":{
+                "routers":{"stream":{"rule":"HostSNI(`*`)","entryPoints":["tcp"],"service":"stream","tls":{"passthrough":true}}},
+                "services":{"stream":{"loadBalancer":{"servers":[{"address":"127.0.0.1:9001"}]}}}
+              },
+              "udp":{
+                "routers":{"datagrams":{"entryPoints":["udp"],"service":"datagrams"}},
+                "services":{"datagrams":{"loadBalancer":{"servers":[{"address":"127.0.0.1:9002"}]}}}
+              },
+              "tls":{"certificates":[]}
+            }"""
+        let rawData =
+            """{
+              "routers":{
+                "keroosha-admin@file":{"rule":"PathPrefix(`/api`) || PathPrefix(`/dashboard`)","entryPoints":["keroosha-admin"],"service":"api@internal","priority":1000000,"observability":{"accessLogs":true,"metrics":true,"tracing":true,"traceVerbosity":"minimal"},"status":"enabled"},
+                "healthy@file":{"entryPoints":["web"],"middlewares":["observe@file"],"service":"healthy-service","rule":"Host(`healthy.test`)","priority":20,"observability":{"accessLogs":true,"metrics":true,"tracing":true,"traceVerbosity":"minimal"},"status":"enabled","using":["web"]}
+              },
+              "services":{
+                "api@internal":{"status":"enabled","usedBy":["keroosha-admin@file"]},
+                "healthy-service@file":{"loadBalancer":{"servers":[{"url":"http://127.0.0.1:9000"}],"strategy":"wrr","passHostHeader":true,"responseForwarding":{"flushInterval":"100ms"}},"status":"enabled","type":"loadbalancer","usedBy":["healthy@file"],"serverStatus":{"http://127.0.0.1:9000":"UP"}},
+                "dashboard@internal":{"status":"enabled"},
+                "noop@internal":{"status":"enabled"}
+              },
+              "middlewares":{"observe@file":{"addPrefix":{"prefix":"/check"},"status":"enabled","usedBy":["healthy@file"]}},
+              "tcpRouters":{"stream@file":{"rule":"HostSNI(`*`)","entryPoints":["tcp"],"service":"stream","priority":-1,"tls":{"passthrough":true,"options":"default"},"status":"enabled","using":["tcp"]}},
+              "tcpServices":{"stream@file":{"loadBalancer":{"servers":[{"address":"127.0.0.1:9001"}]},"status":"enabled","usedBy":["stream@file"]}},
+              "tcpMiddlewares":{},
+              "udpRouters":{"datagrams@file":{"entryPoints":["udp"],"service":"datagrams","status":"enabled","using":["udp"]}},
+              "udpServices":{"datagrams@file":{"loadBalancer":{"servers":[{"address":"127.0.0.1:9002"}]},"status":"enabled","usedBy":["datagrams@file"]}}
+            }"""
+        let apiEntryPoint name address =
+            sprintf
+                """{"name":"%s","address":"%s","transport":{"lifeCycle":{"graceTimeOut":"10s"},"respondingTimeouts":{"readTimeout":"1m0s","idleTimeout":"3m0s"}},"forwardedHeaders":{},"http":{"sanitizePath":true,"maxHeaderBytes":1048576},"http2":{"maxConcurrentStreams":250,"maxDecoderHeaderTableSize":4096,"maxEncoderHeaderTableSize":4096},"udp":{"timeout":"3s"}}"""
+                name
+                address
+        let endpoints =
+            "["
+            + String.concat ","
+                [ apiEntryPoint "keroosha-admin" "127.0.0.1:19080"
+                  apiEntryPoint "web" "127.0.0.1:43000"
+                  apiEntryPoint "tcp" "127.0.0.1:43001"
+                  apiEntryPoint "udp" "127.0.0.1:43002/udp" ]
+            + "]"
+        let staticData =
+            Encoding.UTF8.GetBytes(
+                """{"entryPoints":{"keroosha-admin":{"address":"127.0.0.1:19080"},"web":{"address":"127.0.0.1:43000"},"tcp":{"address":"127.0.0.1:43001"},"udp":{"address":"127.0.0.1:43002/udp"}}}""")
+        let dynamicBytes = Encoding.UTF8.GetBytes(dynamic)
+        let matchesRawData candidate =
+            let api = apiConfigurationFromJson 19080 candidate endpoints """{"Version":"3.7.16"}"""
+            Traefik.apiMatchesRuntime (Some api) (Some staticData) (Some dynamicBytes)
+        let mutateRawData (update: JsonObject -> unit) =
+            let candidate = JsonNode.Parse(rawData) :?> JsonObject
+            update candidate
+            matchesRawData (candidate.ToJsonString())
+
+        Assert.That(matchesRawData rawData, Is.True)
+
+        let driftedRawData = rawData.Replace("127.0.0.1:9002", "127.0.0.1:9003", StringComparison.Ordinal)
+        Assert.That(matchesRawData driftedRawData, Is.False)
+
+        let driftedEndpoints = endpoints.Replace("127.0.0.1:43002/udp", "127.0.0.1:43003/udp", StringComparison.Ordinal)
+        let wrongBind =
+            apiConfigurationFromJson 19080 rawData driftedEndpoints """{"Version":"3.7.16"}"""
+        Assert.That(Traefik.apiMatchesStatic (Some wrongBind) (Some staticData), Is.False)
+
+        let wrongVersion =
+            apiConfigurationFromJson 19080 rawData endpoints """{"Version":"3.7.15"}"""
+        Assert.That(
+            Traefik.apiMatchesRuntime (Some wrongVersion) (Some staticData) (Some dynamicBytes),
+            Is.False)
+
+        let setRouterStatus (section: string) (name: string) (status: string) =
+            mutateRawData (fun root ->
+                let routers = root[section] :?> JsonObject
+                let router = routers[name] :?> JsonObject
+                router["status"] <- JsonValue.Create(status))
+        let omitRouter (section: string) (name: string) =
+            mutateRawData (fun root ->
+                let routers = root[section] :?> JsonObject
+                routers.Remove(name) |> ignore)
+
+        Assert.That(setRouterStatus "tcpRouters" "stream@file" "disabled", Is.False)
+        Assert.That(omitRouter "tcpRouters" "stream@file", Is.False)
+        Assert.That(setRouterStatus "udpRouters" "datagrams@file" "disabled", Is.False)
+        Assert.That(omitRouter "udpRouters" "datagrams@file", Is.False)
+
+        let setUdpServiceUsers (users: string list) =
+            mutateRawData (fun root ->
+                let services = root["udpServices"] :?> JsonObject
+                let service = services["datagrams@file"] :?> JsonObject
+                let usedBy = JsonArray()
+                for user in users do usedBy.Add(JsonValue.Create(user))
+                service["usedBy"] <- usedBy)
+        Assert.That(setUdpServiceUsers [ "other@file" ], Is.False)
+        Assert.That(setUdpServiceUsers [ "datagrams@file"; "stale@file" ], Is.False)
+        let omitServiceUsers (section: string) (name: string) =
+            mutateRawData (fun root ->
+                let services = root[section] :?> JsonObject
+                let service = services[name] :?> JsonObject
+                service.Remove("usedBy") |> ignore)
+        Assert.That(omitServiceUsers "services" "healthy-service@file", Is.False)
+        Assert.That(omitServiceUsers "tcpServices" "stream@file", Is.False)
+        Assert.That(omitServiceUsers "udpServices" "datagrams@file", Is.False)
+
+
+    [<Test>]
+    member _.``static API comparison checks effective listener policy and defaults``() =
+        let staticText =
+            """{"entryPoints":{"keroosha-admin":{"address":"127.0.0.1:19080"},"front":{"address":"127.0.0.1:43001","asDefault":true,"proxyProtocol":{"trustedIPs":["192.0.2.4/32"]},"forwardedHeaders":{"trustedIPs":["127.0.0.1/32"]},"transport":{"lifeCycle":{"graceTimeOut":"10s"},"respondingTimeouts":{"readTimeout":"1m"}},"http2":{"maxConcurrentStreams":512},"http3":{"advertisedPort":43001},"udp":{"timeout":"3s"}}}}"""
+        let apiEndpoints =
+            """[{"name":"keroosha-admin","address":"127.0.0.1:19080","transport":{"lifeCycle":{"graceTimeOut":"10s"},"respondingTimeouts":{"readTimeout":"1m0s","idleTimeout":"3m0s"}},"forwardedHeaders":{},"http":{"sanitizePath":true,"maxHeaderBytes":1048576},"http2":{"maxConcurrentStreams":250,"maxDecoderHeaderTableSize":4096,"maxEncoderHeaderTableSize":4096},"udp":{"timeout":"3s"}},{"name":"front","address":"127.0.0.1:43001","asDefault":true,"proxyProtocol":{"trustedIPs":["192.0.2.4/32"]},"forwardedHeaders":{"trustedIPs":["127.0.0.1/32"]},"transport":{"lifeCycle":{"graceTimeOut":"10s"},"respondingTimeouts":{"readTimeout":"1m0s","idleTimeout":"3m0s"}},"http":{"sanitizePath":true,"maxHeaderBytes":1048576},"http2":{"maxConcurrentStreams":512,"maxDecoderHeaderTableSize":4096,"maxEncoderHeaderTableSize":4096},"http3":{"advertisedPort":43001},"udp":{"timeout":"3s"}}]"""
+        let api =
+            apiConfigurationFromJson 19080 "{}" apiEndpoints """{"Version":"3.7.16"}"""
+        let matches (configuration: string) =
+            Traefik.apiMatchesStatic (Some api) (Some(Encoding.UTF8.GetBytes(configuration)))
+
+        Assert.That(matches staticText, Is.True)
+        let driftedSettings =
+            [ staticText.Replace("127.0.0.1/32", "127.0.0.2/32", StringComparison.Ordinal)
+              staticText.Replace("192.0.2.4/32", "192.0.2.5/32", StringComparison.Ordinal)
+              staticText.Replace("\"readTimeout\":\"1m\"", "\"readTimeout\":\"30s\"", StringComparison.Ordinal)
+              staticText.Replace("\"maxConcurrentStreams\":512", "\"maxConcurrentStreams\":1024", StringComparison.Ordinal)
+              staticText.Replace("\"advertisedPort\":43001", "\"advertisedPort\":43002", StringComparison.Ordinal)
+              staticText.Replace("\"asDefault\":true", "\"asDefault\":false", StringComparison.Ordinal) ]
+        for settings in driftedSettings do
+            Assert.That(matches settings, Is.False)
+
+    [<Test>]
+    member _.``UDP withdrawal restarts only when a bound listener loses its final router``() =
+        let staticData =
+            Encoding.UTF8.GetBytes(
+                """{"entryPoints":{"udp-a":{"address":"127.0.0.1:43001/udp"},"udp-b":{"address":"127.0.0.1:43002/udp"}}}""")
+        let dynamic (routes: (string * string list) list) (destination: string) (httpRule: string option) =
+            let root = JsonObject()
+            let udp = JsonObject()
+            let routers = JsonObject()
+            for name, entryPoints in routes do
+                let router = JsonObject()
+                let values = JsonArray()
+                for entryPoint in entryPoints do values.Add(JsonValue.Create(entryPoint))
+                router["entryPoints"] <- values
+                router["service"] <- JsonValue.Create("echo")
+                routers[name] <- router
+            udp["routers"] <- routers
+            let services = JsonObject()
+            let service = JsonObject()
+            let loadBalancer = JsonObject()
+            let servers = JsonArray()
+            let server = JsonObject()
+            server["address"] <- JsonValue.Create(destination)
+            servers.Add(server)
+            loadBalancer["servers"] <- servers
+            service["loadBalancer"] <- loadBalancer
+            services["echo"] <- service
+            udp["services"] <- services
+            root["udp"] <- udp
+            match httpRule with
+            | Some rule ->
+                let http = JsonObject()
+                let httpRouters = JsonObject()
+                let httpRouter = JsonObject()
+                httpRouter["rule"] <- JsonValue.Create(rule)
+                httpRouters["site"] <- httpRouter
+                http["routers"] <- httpRouters
+                root["http"] <- http
+            | None -> ()
+            Encoding.UTF8.GetBytes(root.ToJsonString())
+        let requires previous next =
+            Traefik.udpWithdrawalRequiresRestart (Some previous) (Some next) (Some staticData)
+        let shared = dynamic [ "first", [ "udp-a" ]; "second", [ "udp-a" ] ] "127.0.0.1:9000" None
+        let oneReferenceRemains = dynamic [ "second", [ "udp-a" ] ] "127.0.0.1:9000" None
+        let noRoutes = dynamic [] "127.0.0.1:9000" None
+        let routeA = dynamic [ "stream", [ "udp-a" ] ] "127.0.0.1:9000" None
+        let routeB = dynamic [ "stream", [ "udp-b" ] ] "127.0.0.1:9000" None
+        let tcpOnlyStatic =
+            Encoding.UTF8.GetBytes("""{"entryPoints":{"web":{"address":"127.0.0.1:8080"}}}""")
+
+        let multipleEndpoints = dynamic [ "stream", [ "udp-a"; "udp-b" ] ] "127.0.0.1:9000" None
+        let remainingEndpoint = dynamic [ "stream", [ "udp-b" ] ] "127.0.0.1:9000" None
+        Assert.That(
+            requires multipleEndpoints remainingEndpoint,
+            Is.True,
+            "A router leaving one of its entrypoints must clear the old listener handler.")
+        Assert.That(requires shared oneReferenceRemains, Is.False, "Removing one of multiple routers must preserve the listener handler.")
+        Assert.That(requires shared noRoutes, Is.True, "Removing the final router must restart the still-bound listener.")
+        Assert.That(requires routeA routeB, Is.True, "Moving a router must clear the old listener handler.")
+        Assert.That(requires routeB routeA, Is.True, "Rollback of a move must clear the candidate listener handler.")
+        Assert.That(requires noRoutes routeA, Is.False, "Adding a UDP route must not restart the service.")
+        Assert.That(requires routeA noRoutes, Is.True, "Rollback that removes an added route must restart the service.")
+        Assert.That(
+            requires routeA (dynamic [ "stream", [ "udp-a" ] ] "127.0.0.1:9001" None),
+            Is.False,
+            "Changing only the UDP service must not restart the service.")
+        Assert.That(
+            requires
+                (dynamic [ "stream", [ "udp-a" ] ] "127.0.0.1:9000" (Some "Host(`old.example.test`)"))
+                (dynamic [ "stream", [ "udp-a" ] ] "127.0.0.1:9000" (Some "Host(`new.example.test`)")),
+            Is.False,
+            "An unrelated HTTP-only route change must not restart the service.")
+        Assert.That(requires noRoutes noRoutes, Is.False, "An already-unrouted UDP listener is idle.")
+        Assert.That(
+            Traefik.udpWithdrawalRequiresRestart (Some routeA) (Some noRoutes) (Some tcpOnlyStatic),
+            Is.False,
+            "A withdrawn route must not restart Traefik when its listener is no longer bound.")
+
+        let malformedPrevious =
+            Encoding.UTF8.GetBytes(
+                """{"udp":{"routers":{"broken":{"entryPoints":"udp-a","service":"echo"}},"services":{"echo":{"loadBalancer":{"servers":[{"address":"127.0.0.1:9000"}]}}}}}""")
+        Assert.That(
+            Traefik.udpWithdrawalRequiresRestart (Some malformedPrevious) (Some noRoutes) (Some staticData),
+            Is.True,
+            "An ambiguous prior UDP graph must conservatively restart bound UDP listeners.")
+        Assert.That(
+            requires routeB routeB,
+            Is.False,
+            "Comparing only drifted disk state to the requested graph cannot detect the accepted router's withdrawal.")
+        Assert.That(
+            Traefik.udpWithdrawalRequiresRestartForAcceptedEntryPoints
+                (Set.ofList [ "udp-a"; "udp-b" ])
+                (Some routeB)
+                (Some staticData),
+            Is.True,
+            "The prior accepted entrypoint set must detect withdrawal after the on-disk graph drifted.")
+        let managed accepted disk desired =
+            Traefik.udpUpdateRequiresRestart accepted (Some disk) (Some desired) (Some staticData)
+        Assert.That(managed (Some (set ["udp-a"; "udp-b"])) routeB routeB, Is.True,
+            "Drift already removed the checkpoint's handler from disk, not necessarily from the daemon.")
+        Assert.That(managed (Some (set ["udp-b"])) multipleEndpoints routeB, Is.True,
+            "An extra handler loaded from external drift must not survive restoration of the checkpoint.")
+        Assert.That(managed None routeB routeB, Is.True,
+            "Missing prior inputs leave an idle listener's previous handler indeterminate.")
+        Assert.That(managed (Some (set ["udp-b"])) routeB routeB, Is.False,
+            "A known idle listener does not force a restart on an unrelated update.")
+
+    [<Test>]
+    member _.``API comparison requires the generation marker for API-masked TLS options``() =
+        use request = JsonDocument.Parse("""{
+          "operation":"apply","ownerId":"unit-test-traefik","entryPoints":{"web":31080},
+          "resolvers":{},"routers":{},"certificates":{},"adminPort":19080,
+          "configuration":{"dynamic":{"tls":{"options":{"custom":{"minVersion":"VersionTLS13","sniStrict":true}}}}}
+        }""")
+        let dynamicBytes = Encoding.UTF8.GetBytes(Traefik.renderDynamicConfig request.RootElement paths)
+        use dynamic = JsonDocument.Parse(dynamicBytes)
+        let admin = dynamic.RootElement.GetProperty("http").GetProperty("routers").GetProperty("keroosha-admin")
+        let adminNode = JsonNode.Parse(admin.GetRawText()) :?> JsonObject
+        adminNode["status"] <- JsonValue.Create("enabled")
+        adminNode["observability"] <- JsonNode.Parse("""{"accessLogs":true,"metrics":true,"tracing":true,"traceVerbosity":"minimal"}""")
+        let routers = JsonObject()
+        routers["keroosha-admin@file"] <- adminNode
+        let rawData = JsonObject()
+        rawData["routers"] <- routers
+        rawData["services"] <- JsonObject()
+        rawData["middlewares"] <- JsonObject()
+        rawData["tcpRouters"] <- JsonObject()
+        rawData["tcpServices"] <- JsonObject()
+        rawData["tcpMiddlewares"] <- JsonObject()
+        rawData["udpRouters"] <- JsonObject()
+        rawData["udpServices"] <- JsonObject()
+        let api = apiConfigurationFromJson 19080 (rawData.ToJsonString()) "[]" """{"Version":"3.7.16"}"""
+
+        Assert.That(Traefik.apiMatchesDynamic (Some api) (Some dynamicBytes), Is.True)
+
+        let changedBytes =
+            Encoding.UTF8.GetString(dynamicBytes)
+                .Replace("VersionTLS13", "VersionTLS12", StringComparison.Ordinal)
+                |> Encoding.UTF8.GetBytes
+        Assert.That(Traefik.apiMatchesDynamic (Some api) (Some changedBytes), Is.False)
+        Assert.That(Traefik.loadedRollbackGraph (Some api) (Some dynamicBytes), Is.True)
+        Assert.That(Traefik.loadedRollbackGraph (Some api) (Some changedBytes), Is.False, "Matching routers do not attest modified TLS options.")
 
     [<Test>]
     member _.``API comparison rejects a suffixed router service identifier``() =
@@ -422,15 +998,12 @@ type TraefikBackendTests() =
         let dynamicBytes = Encoding.UTF8.GetBytes(Traefik.renderDynamicConfig request.RootElement paths)
         let serviceName = "keroosha-backend-" + digest "http://127.0.0.1:9000"
         use routers = JsonDocument.Parse($"""[
-          {{"name":"keroosha-admin@file","rule":"PathPrefix(`/api`) || PathPrefix(`/dashboard`)","entryPoints":["keroosha-admin"],"service":"api@internal","status":"enabled","middlewares":[]}},
+          {{"name":"keroosha-admin@file","rule":"PathPrefix(`/api`) || PathPrefix(`/dashboard`)","entryPoints":["keroosha-admin"],"service":"api@internal","priority":1000000,"status":"enabled","middlewares":[]}},
           {{"name":"site@file","rule":"Host(`site.example.test`)","entryPoints":["web"],"service":"{serviceName}@file","status":"enabled","middlewares":[]}}
         ]""")
-        use services = JsonDocument.Parse($"""[{{"name":"{serviceName}@file","status":"enabled","type":"loadbalancer","loadBalancer":{{"servers":[{{"url":"http://127.0.0.1:9000"}}]}}}}]""")
+        use services = JsonDocument.Parse($"""[{{"name":"{serviceName}@file","status":"enabled","type":"loadbalancer","loadBalancer":{{"servers":[{{"url":"http://127.0.0.1:9000"}}]}},"usedBy":["site@file"]}}]""")
         use middlewares = JsonDocument.Parse("[]")
-        let api: Traefik.ApiConfiguration =
-            { Routers = routers.RootElement.Clone()
-              Services = services.RootElement.Clone()
-              Middlewares = middlewares.RootElement.Clone() }
+        let api = apiConfigurationFromArrays routers.RootElement services.RootElement middlewares.RootElement
 
         // Act
         let matches = Traefik.apiMatchesDynamic (Some api) (Some dynamicBytes)
@@ -567,7 +1140,7 @@ type TraefikBackendTests() =
           "routers":{"site":{"host":"redirect.example.test","entryPoint":"web","redirect":{"kind":"permanentToOrigin","origin":"https://destination.example.test"},"tls":{"kind":"none","name":""}}},
           "certificates":{},"adminPort":19080
         }""")
-        let dynamicBytes = Encoding.UTF8.GetBytes(Traefik.renderDynamicConfig request.RootElement paths)
+        let dynamicBytes = Encoding.UTF8.GetBytes(Traefik.renderHistoricalDynamicConfig request.RootElement paths)
         let middlewareName = "keroosha-redirect-" + digest "site\nhttps://destination.example.test"
         let regex = "^https?://[^/?#]+(.*)$"
         let replacement = "https://destination.example.test${1}"
@@ -577,6 +1150,7 @@ type TraefikBackendTests() =
             router["provider"] <- JsonValue.Create("file")
             router["status"] <- JsonValue.Create("enabled")
             router["rule"] <- JsonValue.Create(rule)
+            router["priority"] <- JsonValue.Create(Encoding.UTF8.GetByteCount(rule))
             let entryPoints = JsonArray()
             entryPoints.Add(JsonValue.Create(entryPoint))
             router["entryPoints"] <- entryPoints
@@ -587,7 +1161,9 @@ type TraefikBackendTests() =
             router
         let buildApi (includeMiddleware: bool) (actualReplacement: string) (actualPermanent: bool option) (routeAssociation: bool) (middlewareUsers: string[]) : Traefik.ApiConfiguration =
             let routers = JsonArray()
-            routers.Add(makeRouter "keroosha-admin@file" "PathPrefix(`/api`) || PathPrefix(`/dashboard`)" "keroosha-admin" "api@internal" [])
+            let adminRouter = makeRouter "keroosha-admin@file" "PathPrefix(`/api`) || PathPrefix(`/dashboard`)" "keroosha-admin" "api@internal" []
+            adminRouter["priority"] <- JsonValue.Create(1000000)
+            routers.Add(adminRouter)
             let routeMiddlewares = if routeAssociation then [ middlewareName + "@file" ] else []
             routers.Add(makeRouter "site@file" "Host(`redirect.example.test`)" "web" "noop@internal" routeMiddlewares)
             let middlewares = JsonArray()
@@ -611,9 +1187,7 @@ type TraefikBackendTests() =
             use routerDocument = JsonDocument.Parse(routers.ToJsonString())
             use serviceDocument = JsonDocument.Parse("[]")
             use middlewareDocument = JsonDocument.Parse(middlewares.ToJsonString())
-            { Routers = routerDocument.RootElement.Clone()
-              Services = serviceDocument.RootElement.Clone()
-              Middlewares = middlewareDocument.RootElement.Clone() }
+            apiConfigurationFromArrays routerDocument.RootElement serviceDocument.RootElement middlewareDocument.RootElement
 
         // Act
         let correct = buildApi true replacement (Some true) true [| "site@file" |]
@@ -630,43 +1204,78 @@ type TraefikBackendTests() =
             Assert.That(Traefik.apiMatchesDynamic (Some drifted) (Some dynamicBytes), Is.False)
 
     [<Test>]
-    member _.``ACME certificate lookup is resolver-keyed and honors the host clock``() =
-        // Arrange
+    member _.``ACME certificate lookup validates issuer account leaf key and storage metadata``() =
         use temporary = new TemporaryDirectory("traefik-acme-")
         let now = DateTimeOffset(2030, 1, 1, 0, 0, 0, TimeSpan.Zero)
         let valid = TestSupport.createCertificateFixture "site.example.test" [ "site.example.test" ] (now.AddDays(-1.0)) (now.AddDays(30.0)) [ "1.3.6.1.5.5.7.3.1" ]
         let expired = TestSupport.createCertificateFixture "site.example.test" [ "site.example.test" ] (now.AddDays(-30.0)) (now.AddDays(-1.0)) [ "1.3.6.1.5.5.7.3.1" ]
-        Directory.CreateDirectory(temporary.Path) |> ignore
-        let storagePath = Path.Combine(temporary.Path, "acme-" + digest "le" + ".json")
-        let writeStorage (certificatePem: string) =
-            let encoded = Convert.ToBase64String(Encoding.ASCII.GetBytes(certificatePem))
+        let resolverName = "le"
+        let resolverEmail = "ops@example.test"
+        let caServer = "https://ca.example.test/directory"
+        let storagePath = TraefikTlsSettings.acmeStoragePath temporary.Path resolverName caServer
+        use accountKey = RSA.Create(2048)
+        let accountKeyBase64 = Convert.ToBase64String(accountKey.ExportRSAPrivateKey())
+        let writeStorage (certificatePem: string) (privateKeyPem: string) (registrationUri: string) =
             let domain = JsonObject()
             domain["main"] <- JsonValue.Create("site.example.test")
             domain["sans"] <- JsonArray()
             let entry = JsonObject()
             entry["domain"] <- domain
-            entry["certificate"] <- JsonValue.Create(encoded)
+            entry["certificate"] <- JsonValue.Create(Convert.ToBase64String(Encoding.ASCII.GetBytes(certificatePem)))
+            entry["key"] <- JsonValue.Create(Convert.ToBase64String(Encoding.ASCII.GetBytes(privateKeyPem)))
             let certificates = JsonArray()
             certificates.Add(entry)
+            let registration = JsonObject()
+            registration["body"] <- JsonObject()
+            registration["uri"] <- JsonValue.Create(registrationUri)
+            let account = JsonObject()
+            account["Email"] <- JsonValue.Create(resolverEmail)
+            account["Registration"] <- registration
+            account["PrivateKey"] <- JsonValue.Create(accountKeyBase64)
             let resolver = JsonObject()
+            resolver["Account"] <- account
             resolver["Certificates"] <- certificates
             let storage = JsonObject()
-            storage["le"] <- resolver
+            storage[resolverName] <- resolver
             File.WriteAllText(storagePath, storage.ToJsonString())
+            File.SetUnixFileMode(storagePath, enum<UnixFileMode>(0o600))
+
+        let run (command: string) (arguments: string list) (stdin: string option) =
+            if command = "getent" then { ExitCode = 2; Stdout = ""; Stderr = "" }
+            elif command = "id" then HostEnvironment.system.Run command arguments stdin
+            else { ExitCode = 2; Stdout = ""; Stderr = "" }
         let paths = { paths with StateDir = temporary.Path }
-        let environment = TestSupport.fakeHostEnvironment "/" (fun _ _ _ -> { ExitCode = 0; Stdout = ""; Stderr = "" }) (fun () -> now)
-        writeStorage valid.LeafCertificatePem
+        let environment = TestSupport.fakeHostEnvironment "/" run (fun () -> now)
+        let validRegistration = "https://ca.example.test/acme/account/1"
+        writeStorage valid.LeafCertificatePem valid.PrivateKeyPem validRegistration
 
-        // Act
-        let validFingerprint = Traefik.acmeCertificateFingerprint environment paths "le" "site.example.test"
-        let wrongResolver = Traefik.acmeCertificateFingerprint environment paths "other" "site.example.test"
-        writeStorage expired.LeafCertificatePem
-        let expiredFingerprint = Traefik.acmeCertificateFingerprint environment paths "le" "site.example.test"
+        let validFingerprint =
+            Traefik.acmeCertificateFingerprint environment paths resolverName resolverEmail caServer "site.example.test"
+        let wrongResolver =
+            Traefik.acmeCertificateFingerprint environment paths "other" resolverEmail caServer "site.example.test"
+        let wrongDirectory =
+            Traefik.acmeCertificateFingerprint environment paths resolverName resolverEmail "https://ca.example.test/other-directory" "site.example.test"
+        writeStorage expired.LeafCertificatePem expired.PrivateKeyPem validRegistration
+        let expiredFingerprint =
+            Traefik.acmeCertificateFingerprint environment paths resolverName resolverEmail caServer "site.example.test"
+        writeStorage valid.LeafCertificatePem expired.PrivateKeyPem validRegistration
+        let mismatchedKey =
+            Traefik.acmeCertificateFingerprint environment paths resolverName resolverEmail caServer "site.example.test"
+        writeStorage valid.LeafCertificatePem valid.PrivateKeyPem "https://other.example.test/acme/account/1"
+        let wrongAccount =
+            Traefik.acmeCertificateFingerprint environment paths resolverName resolverEmail caServer "site.example.test"
+        writeStorage valid.LeafCertificatePem valid.PrivateKeyPem validRegistration
+        File.SetUnixFileMode(storagePath, enum<UnixFileMode>(0o644))
+        let unsafeMetadata =
+            Traefik.acmeCertificateFingerprint environment paths resolverName resolverEmail caServer "site.example.test"
 
-        // Assert
         Assert.That(validFingerprint, Is.EqualTo(Some valid.Fingerprint))
         Assert.That(wrongResolver, Is.EqualTo(None))
+        Assert.That(wrongDirectory, Is.EqualTo(None))
         Assert.That(expiredFingerprint, Is.EqualTo(None))
+        Assert.That(mismatchedKey, Is.EqualTo(None))
+        Assert.That(wrongAccount, Is.EqualTo(None))
+        Assert.That(unsafeMetadata, Is.EqualTo(None))
 
     [<Test>]
     member _.``Protected material rejects permission drift``() =
@@ -728,205 +1337,288 @@ type TraefikBackendTests() =
         // Assert
         Assert.Throws<Traefik.BackendError>(failure) |> ignore
 
-    [<Test; Explicit("Runs a real Traefik lifecycle only on the dedicated Sandbox host."); Category("Sandbox")>]
-    member _.``Sandbox apply redirect-only transition rollback read and Delete retain ACME storage and prove SNI``() =
-        // Arrange
-        if Environment.GetEnvironmentVariable("KEROOSHA_RUN_SANDBOX_TRAEFIK_TESTS") <> "1" then
-            Assert.Ignore("Set KEROOSHA_RUN_SANDBOX_TRAEFIK_TESTS=1 to run the explicit Sandbox integration test.")
-        let connection = sandboxConnection ()
-        let ownerId = "keroosha-iac-nunit-traefik-" + Guid.NewGuid().ToString("N")
-        TestContext.Progress.WriteLine("Sandbox Traefik test ownerId: " + ownerId)
-        let adminPort = RandomNumberGenerator.GetInt32(45000, 50000)
-        let webPort = RandomNumberGenerator.GetInt32(30000, 38000)
-        let nextWebPort = RandomNumberGenerator.GetInt32(38001, 44000)
-        let securePort = RandomNumberGenerator.GetInt32(50001, 60000)
-        let certificate = TestSupport.createValidCertificateFixture "sandbox.example.test" [ "sandbox.example.test" ]
-        let makeRequest (operation: string) (httpPort: int) (tlsPort: int) (backend: string option) (redirectOrigin: string option) : JsonObject =
-            let entryPoints = JsonObject()
-            entryPoints["web"] <- JsonValue.Create(httpPort)
-            entryPoints["websecure"] <- JsonValue.Create(tlsPort)
-            let tls = JsonObject()
-            tls["kind"] <- JsonValue.Create("provided")
-            tls["name"] <- JsonValue.Create("sandbox-cert")
-            let router = JsonObject()
-            router["host"] <- JsonValue.Create("sandbox.example.test")
-            router["entryPoint"] <- JsonValue.Create("websecure")
-            match backend, redirectOrigin with
-            | Some value, None -> router["backend"] <- JsonValue.Create(value)
-            | None, Some origin ->
-                let redirect = JsonObject()
-                redirect["kind"] <- JsonValue.Create("permanentToOrigin")
-                redirect["origin"] <- JsonValue.Create(origin)
-                router["redirect"] <- redirect
-            | _ -> invalidOp "Sandbox Traefik route must have exactly one target."
-            router["tls"] <- tls
-            let routers = JsonObject()
-            routers["site"] <- router
-            let certificateValue = JsonObject()
-            certificateValue["certificatePem"] <- JsonValue.Create(certificate.LeafCertificatePem)
-            certificateValue["privateKeyPem"] <- JsonValue.Create(certificate.PrivateKeyPem)
-            certificateValue["fingerprint"] <- JsonValue.Create(certificate.Fingerprint)
-            let certificates = JsonObject()
-            certificates["sandbox-cert"] <- certificateValue
-            let request = JsonObject()
-            request["operation"] <- JsonValue.Create(operation)
-            request["ownerId"] <- JsonValue.Create(ownerId)
-            request["entryPoints"] <- entryPoints
-            request["resolvers"] <- JsonObject()
-            request["routers"] <- routers
-            request["certificates"] <- certificates
-            request["adminPort"] <- JsonValue.Create(adminPort)
-            request
-        let applyRequest = makeRequest "apply" webPort securePort (Some "http://127.0.0.1:1") None
-        let redirectRequest = makeRequest "apply" webPort securePort None (Some "https://destination.example.test")
-        let dynamicUpdate = makeRequest "apply" webPort securePort (Some "http://127.0.0.1:2") None
-        let startupUpdate = makeRequest "apply" nextWebPort securePort (Some "http://127.0.0.1:2") None
-        let readRequest = makeRequest "read" nextWebPort securePort (Some "http://127.0.0.1:2") None
-        let failedUpdate = makeRequest "apply" nextWebPort 22 (Some "http://127.0.0.1:2") None
-        let deleteRequest = JsonObject()
-        deleteRequest["operation"] <- JsonValue.Create("delete")
-        deleteRequest["ownerId"] <- JsonValue.Create(ownerId)
-        let resolverName = "sandbox-nunit-" + Guid.NewGuid().ToString("N")
-        let resolverHash = digest resolverName
-        let acmeName = "acme-" + resolverHash + ".json"
-        let acmePath = "/var/lib/keroosha-traefik/" + acmeName
-        let acmeResolver = JsonObject()
-        acmeResolver["Certificates"] <- JsonArray()
-        let acmeStorage = JsonObject()
-        acmeStorage[resolverName] <- acmeResolver
-        let acmeContents = acmeStorage.ToJsonString()
-        let ownerHash = digest ownerId
-        let ownershipGuard =
-            String.concat "\n" [
-                "set -eu"
-                "for path in /etc/keroosha-iac/traefik /var/lib/keroosha-traefik /usr/local/libexec/keroosha-iac/traefik /etc/systemd/system/keroosha-traefik.service; do"
-                "  if [ -e \"$path\" ] || [ -L \"$path\" ]; then exit 73; fi"
-                "done"
-                "if getent passwd keroosha-traefik >/dev/null 2>&1 || getent group keroosha-traefik >/dev/null 2>&1; then exit 73; fi"
-                "if systemctl is-active --quiet keroosha-traefik.service || systemctl is-enabled --quiet keroosha-traefik.service; then exit 73; fi"
-                "echo safe"
-            ]
-        let cleanupOwnedSandbox =
-            String.concat "\n" [
-                "set -eu"
-                "owner='" + ownerHash + "'"
-                "state=/var/lib/keroosha-traefik"
-                "acme='" + acmePath + "'"
-                "expected='" + acmeContents + "'"
-                "for path in /etc/keroosha-iac/traefik /usr/local/libexec/keroosha-iac/traefik /etc/systemd/system/keroosha-traefik.service; do"
-                "  if [ -e \"$path\" ] || [ -L \"$path\" ]; then exit 73; fi"
-                "done"
-                "if systemctl is-active --quiet keroosha-traefik.service || systemctl is-enabled --quiet keroosha-traefik.service; then exit 73; fi"
-                "if [ -e \"$state\" ] || [ -L \"$state\" ]; then"
-                "  [ -d \"$state\" ] && [ ! -L \"$state\" ] || exit 73"
-                "  marker=\"$state/.keroosha-owner\""
-                "  [ -f \"$marker\" ] && [ ! -L \"$marker\" ] && [ \"$(cat -- \"$marker\")\" = \"$owner\" ] || exit 73"
-                "  if [ -e \"$acme\" ] || [ -L \"$acme\" ]; then"
-                "    [ -f \"$acme\" ] && [ ! -L \"$acme\" ] && [ \"$(cat -- \"$acme\")\" = \"$expected\" ] || exit 73"
-                "    rm -- \"$acme\""
-                "  fi"
-                "  [ \"$(find \"$state\" -mindepth 1 -maxdepth 1 -printf '%f\\n')\" = .keroosha-owner ] || exit 73"
-                "  rm -- \"$marker\""
-                "  rmdir -- \"$state\""
-                "fi"
-                "account=$(getent passwd keroosha-traefik || true)"
-                "group=$(getent group keroosha-traefik || true)"
-                "if [ -n \"$account\" ]; then"
-                "  uid=$(printf '%s\\n' \"$account\" | cut -d: -f3)"
-                "  primary_gid=$(printf '%s\\n' \"$account\" | cut -d: -f4)"
-                "  home=$(printf '%s\\n' \"$account\" | cut -d: -f6)"
-                "  shell=$(printf '%s\\n' \"$account\" | cut -d: -f7)"
-                "  group_gid=$(printf '%s\\n' \"$group\" | cut -d: -f3)"
-                "  [ \"$uid\" -ne 0 ] && [ \"$primary_gid\" = \"$group_gid\" ] && [ \"$home\" = /var/lib/keroosha-traefik ] && [ \"$shell\" = /usr/sbin/nologin ] || exit 73"
-                "  userdel keroosha-traefik"
-                "  if getent group keroosha-traefik >/dev/null 2>&1; then groupdel keroosha-traefik; fi"
-                "elif [ -n \"$group\" ]; then"
-                "  [ -z \"$(printf '%s\\n' \"$group\" | cut -d: -f4)\" ] || exit 73"
-                "  groupdel keroosha-traefik"
-                "fi"
-                ":"
-            ]
+    [<Test; Explicit("Invokes only the public sealed QEMU acceptance harness."); Category("Sandbox")>]
+    member _.``Sandbox lifecycle delegates to the sealed full acceptance runner``() =
+        if Environment.GetEnvironmentVariable("DOROTHY_RUN_SEALED_TRAEFIK_ACCEPTANCE") <> "1" then
+            Assert.Ignore("Set DOROTHY_RUN_SEALED_TRAEFIK_ACCEPTANCE=1 to invoke the explicit sealed acceptance harness.")
+        let stateDirectory = verifiedAcceptanceStateDirectory ()
+        let providerDirectory = verifiedCandidateProviderDirectory ()
+        runPublicAcceptance stateDirectory providerDirectory
+    [<Test>]
+    member _.``API comparison projects effective entrypoint routes and native middleware references``() =
+        let dynamic =
+            """{
+              "http":{
+                "routers":{
+                  "keroosha-admin":{"rule":"PathPrefix(`/api`) || PathPrefix(`/dashboard`)","entryPoints":["keroosha-admin"],"service":"api@internal","priority":1000000},
+                  "app":{"rule":"Host(`app.test`)","entryPoints":["a","b"],"middlewares":["chain"],"service":"app","priority":0},
+                  "parent":{"rule":"Host(`parent.test`)","entryPoints":["a","b"],"middlewares":["mark"]},
+                  "child":{"rule":"Header(`middlewares`,`literal-value`)","parentRefs":["parent"],"service":"app"}
+                },
+                "services":{
+                  "app":{"middlewares":["mark"],"loadBalancer":{"servers":[{"url":"http://127.0.0.1:8080"}]}}
+                },
+                "middlewares":{
+                  "mark":{"headers":{"customRequestHeaders":{"middlewares":"literal-value"}}},
+                  "prefix":{"addPrefix":{"prefix":"/first"}},
+                  "chain":{"chain":{"middlewares":["prefix","mark"]}}
+                }
+              },
+              "tcp":{
+                "routers":{"echo":{"entryPoints":["t"],"rule":"HostSNI(\"*\")","middlewares":["one"],"service":"echo","priority":0,"tls":{"passthrough":false}}},
+                "middlewares":{"one":{"ipAllowList":{"sourceRange":["127.0.0.1/32"]}}},
+                "services":{"echo":{"loadBalancer":{"servers":[{"address":"127.0.0.1:19001"}]}}}
+              }
+            }"""
+        let rawData =
+            """{
+              "routers":{
+                "a-app@file":{"entryPoints":["a"],"middlewares":["mark@file","chain@file"],"service":"app","rule":"Host(`app.test`)","priority":16,"tls":{"options":"default"},"observability":{"accessLogs":true,"metrics":true,"tracing":true,"traceVerbosity":"minimal"},"status":"enabled","using":["a"]},
+                "a-parent@file":{"entryPoints":["a"],"middlewares":["mark@file","mark@file"],"rule":"Host(`parent.test`)","priority":19,"tls":{"options":"default"},"observability":{"accessLogs":true,"metrics":true,"tracing":true,"traceVerbosity":"minimal"},"status":"enabled","using":["a"]},
+                "b-app@file":{"entryPoints":["b"],"middlewares":["mark@file","chain@file"],"service":"app","rule":"Host(`app.test`)","priority":16,"tls":{"options":"default"},"observability":{"accessLogs":true,"metrics":true,"tracing":true,"traceVerbosity":"minimal"},"status":"enabled","using":["b"]},
+                "b-parent@file":{"entryPoints":["b"],"middlewares":["mark@file","mark@file"],"rule":"Host(`parent.test`)","priority":19,"tls":{"options":"default"},"observability":{"accessLogs":true,"metrics":true,"tracing":true,"traceVerbosity":"minimal"},"status":"enabled","using":["b"]},
+                "child@file":{"service":"app","rule":"Header(`middlewares`,`literal-value`)","parentRefs":["a-parent@file","b-parent@file"],"priority":37,"status":"enabled"},
+                "keroosha-admin@file":{"entryPoints":["keroosha-admin"],"service":"api@internal","rule":"PathPrefix(`/api`) || PathPrefix(`/dashboard`)","priority":1000000,"observability":{"accessLogs":true,"metrics":true,"tracing":true,"traceVerbosity":"minimal"},"status":"enabled","using":["keroosha-admin"]}
+              },
+              "middlewares":{
+                "chain@file":{"chain":{"middlewares":["prefix@file","mark@file"]},"status":"enabled","usedBy":["a-app@file","b-app@file"]},
+                "mark@file":{"headers":{"customRequestHeaders":{"middlewares":"literal-value"}},"status":"enabled","usedBy":["a-app@file","a-parent@file","a-parent@file","b-app@file","b-parent@file","b-parent@file"]},
+                "prefix@file":{"addPrefix":{"prefix":"/first"},"status":"enabled"}
+              },
+              "services":{
+                "api@internal":{"status":"enabled","usedBy":["keroosha-admin@file"]},
+                "app@file":{"middlewares":["mark@file"],"loadBalancer":{"servers":[{"url":"http://127.0.0.1:8080"}],"strategy":"wrr","passHostHeader":true,"responseForwarding":{"flushInterval":"100ms"}},"status":"enabled","type":"loadbalancer","usedBy":["a-app@file","b-app@file","child@file"],"serverStatus":{"http://127.0.0.1:8080":"UP"}},
+                "dashboard@internal":{"status":"enabled"},
+                "noop@internal":{"status":"enabled"}
+              },
+              "tcpRouters":{"echo@file":{"entryPoints":["t"],"middlewares":["one@file"],"service":"echo","rule":"HostSNI(\"*\")","priority":-1,"tls":{"options":"default"},"status":"enabled","using":["t"]}},
+              "tcpMiddlewares":{"one@file":{"ipAllowList":{"sourceRange":["127.0.0.1/32"]},"status":"enabled"}},
+              "tcpServices":{"echo@file":{"loadBalancer":{"servers":[{"address":"127.0.0.1:19001"}]},"status":"enabled","usedBy":["echo@file"]}}
+            }"""
+        let entryPoints =
+            """[
+              {"name":"a","address":"127.0.0.1:38308","http":{"middlewares":["mark@file"],"tls":{"options":"default"}}},
+              {"name":"b","address":"127.0.0.1:38309","http":{"middlewares":["mark@file"],"tls":{"options":"default"}}},
+              {"name":"keroosha-admin","address":"127.0.0.1:38307"},
+              {"name":"t","address":"127.0.0.1:38310"}
+            ]"""
+        let apiFor raw =
+            apiConfigurationFromJson 19080 raw entryPoints """{"Version":"3.7.16"}"""
+        Assert.That(Traefik.loadedRollbackGraph (Some(apiFor rawData)) (Some(Encoding.UTF8.GetBytes(dynamic))), Is.False,
+                    "An unmarked file without TLS cannot attest that the running process has no certificate registrations.")
+        let marked = JsonNode.Parse(dynamic).AsObject()
+        marked["http"].["middlewares"].["mark"].["headers"].["frameDeny"] <- JsonValue.Create(false)
+        let rule = Traefik.stampDynamicGeneration marked
+        let dynamic = marked.ToJsonString()
+        let api = JsonNode.Parse(rawData)
+        api["routers"].["keroosha-admin@file"].["rule"] <- JsonValue.Create(rule)
+        let rawData = api.ToJsonString()
+        let matches raw =
+            Traefik.apiMatchesDynamic
+                (Some(apiFor raw))
+                (Some(Encoding.UTF8.GetBytes(dynamic)))
 
-        let invoke request =
-            let response = sandboxHelper connection request
-            use document = JsonDocument.Parse(response)
-            document.RootElement.Clone()
-        let mainPid () =
-            runSandboxSsh connection "systemctl show keroosha-traefik.service --property=MainPID --value" None |> fun value -> value.Trim()
+        Assert.That(matches rawData, Is.True)
+        let recoverable (disk: string) =
+            Traefik.loadedRollbackGraph (Some(apiFor rawData)) (Some(Encoding.UTF8.GetBytes(disk)))
+        Assert.That(recoverable dynamic, Is.True)
+        Assert.That(recoverable "{\"http\":[", Is.False, "Serving a good graph cannot make malformed disk bytes recoverable.")
+        Assert.That(recoverable (dynamic.Replace("127.0.0.1:19001", "127.0.0.1:19002")), Is.False, "A different live backend is not the disk preimage.")
+        for value in [ "false"; "null" ] do
+            let changed = JsonNode.Parse(dynamic)
+            changed["http"].["services"].["app"].["loadBalancer"].AsObject().Add("unknownNativeKey", JsonNode.Parse(value))
+            Assert.That(recoverable (changed.ToJsonString()), Is.False, $"Unobserved field {value} must not attribute the file.")
+            changed["http"].["services"].["app"].["loadBalancer"].AsObject().Remove("unknownNativeKey") |> ignore
+            changed["http"].["middlewares"].["mark"].["headers"].AsObject().Add("removeHeader", JsonNode.Parse(value))
+            Assert.That(recoverable (changed.ToJsonString()), Is.False, "A known auth boolean is not a headers default.")
+        for status in [ "warning"; "disabled" ] do
+            let live = JsonNode.Parse(rawData)
+            let route = live["routers"].["a-app@file"]
+            route["status"] <- JsonValue.Create(status)
+            route["error"] <- JsonNode.Parse("""["router configuration error"]""")
+            let raw = live.ToJsonString()
+            Assert.That(matches raw, Is.False, "Unhealthy is never successful activation.")
+            Assert.That(Traefik.loadedRollbackGraph (Some(apiFor raw)) (Some(Encoding.UTF8.GetBytes(dynamic))), Is.True)
+            let services = JsonNode.Parse(rawData)
+            let service = services["services"].["app@file"]
+            service["status"] <- JsonValue.Create(status)
+            service["error"] <- JsonNode.Parse("""["service middleware unavailable"]""")
+            let serviceRaw = services.ToJsonString()
+            Assert.That(matches serviceRaw, Is.False)
+            Assert.That(Traefik.loadedRollbackGraph (Some(apiFor serviceRaw)) (Some(Encoding.UTF8.GetBytes(dynamic))), Is.True)
 
-        let guardStatus = runSandboxSsh connection ownershipGuard None
-        Assert.That(guardStatus.Trim(), Is.EqualTo("safe"))
-        // Act
-        let sshListeners = runSandboxSsh connection "ss -H -ltn 'sport = :22'" None
-        if String.IsNullOrWhiteSpace(sshListeners) then
-            Assert.Ignore("The rollback scenario requires the Sandbox SSH daemon to retain port 22.")
-        let mutable cleanupCompleted = false
-        try
-            let applied = invoke applyRequest
-            let initialPid = mainPid ()
+        let priorityDrift = JsonNode.Parse(rawData) :?> JsonObject
+        let routers = priorityDrift["routers"] :?> JsonObject
+        let app = routers["a-app@file"] :?> JsonObject
+        app["priority"] <- JsonValue.Create(15)
+        Assert.That(matches (priorityDrift.ToJsonString()), Is.False)
 
-            // Assert
-            Assert.That(applied.GetProperty("inSync").GetBoolean(), Is.True)
-            Assert.That(applied.GetProperty("certificateFingerprints").GetProperty("sandbox-cert").GetString(), Is.EqualTo(certificate.Fingerprint))
+        let extraHeader = JsonNode.Parse(rawData) :?> JsonObject
+        let resources = extraHeader["middlewares"] :?> JsonObject
+        let mark = resources["mark@file"] :?> JsonObject
+        let headers = mark["headers"] :?> JsonObject
+        let customRequestHeaders = headers["customRequestHeaders"] :?> JsonObject
+        customRequestHeaders["x-review-extra"] <- JsonValue.Create("literal")
+        Assert.That(matches (extraHeader.ToJsonString()), Is.False)
 
-            let writeAcme =
-                "set -eu; umask 077; temporary=$(mktemp /var/lib/keroosha-traefik/.acme.XXXXXX); trap 'rm -f -- \"$temporary\"' EXIT; cat > \"$temporary\"; chown keroosha-traefik:keroosha-traefik -- \"$temporary\"; chmod 0600 -- \"$temporary\"; mv -f -- \"$temporary\" '" + acmePath + "'; trap - EXIT"
-            runSandboxSsh connection writeAcme (Some acmeContents) |> ignore
-            let redirectResult = invoke redirectRequest
-            Assert.That(redirectResult.GetProperty("inSync").GetBoolean(), Is.True)
-            Assert.That(redirectResult.GetProperty("actualConfigHash").GetString(), Is.Not.EqualTo(applied.GetProperty("actualConfigHash").GetString()))
-            Assert.That(mainPid (), Is.EqualTo(initialPid), "A redirect-only dynamic update must not restart Traefik.")
+        let extraService = JsonNode.Parse(rawData) :?> JsonObject
+        let services = extraService["services"] :?> JsonObject
+        services["unexpected@file"] <- JsonObject()
+        Assert.That(matches (extraService.ToJsonString()), Is.False)
 
+    [<Test>]
+    member _.``API comparison treats equivalent Go durations as the same effective load balancer value``() =
+        let dynamic =
+            """{
+              "http":{
+                "routers":{"keroosha-admin":{"rule":"PathPrefix(`/api`) || PathPrefix(`/dashboard`)","entryPoints":["keroosha-admin"],"service":"api@internal","priority":1000000}},
+                "services":{"timed":{"loadBalancer":{"servers":[{"url":"http://127.0.0.1:9000"}],"responseForwarding":{"flushInterval":"60s"}}}}
+              }
+            }"""
+        let rawData =
+            """{
+              "routers":{"keroosha-admin@file":{"entryPoints":["keroosha-admin"],"service":"api@internal","rule":"PathPrefix(`/api`) || PathPrefix(`/dashboard`)","priority":1000000,"observability":{"accessLogs":true,"metrics":true,"tracing":true,"traceVerbosity":"minimal"},"status":"enabled"}},
+              "services":{"timed@file":{"loadBalancer":{"servers":[{"url":"http://127.0.0.1:9000"}],"strategy":"wrr","passHostHeader":true,"responseForwarding":{"flushInterval":"1m0s"}},"status":"enabled","type":"loadbalancer"}},
+              "middlewares":{}
+            }"""
+        let api =
+            apiConfigurationFromJson 19080 rawData "[]" """{"Version":"3.7.16"}"""
+        Assert.That(
+            Traefik.apiMatchesDynamic (Some api) (Some(Encoding.UTF8.GetBytes(dynamic))),
+            Is.True)
+        let explicitEmptyUsers = JsonNode.Parse(rawData) :?> JsonObject
+        let timedServices = explicitEmptyUsers["services"] :?> JsonObject
+        let timed = timedServices["timed@file"] :?> JsonObject
+        timed["usedBy"] <- JsonArray()
+        let apiWithEmptyUsers =
+            apiConfigurationFromJson 19080 (explicitEmptyUsers.ToJsonString()) "[]" """{"Version":"3.7.16"}"""
+        Assert.That(
+            Traefik.apiMatchesDynamic (Some apiWithEmptyUsers) (Some(Encoding.UTF8.GetBytes(dynamic))),
+            Is.True)
+    [<Test>]
+    member _.``API comparison applies root observability precedence and observation-only listener splitting``() =
+        let dynamic =
+            """{
+              "http":{
+                "routers":{
+                  "keroosha-admin":{"rule":"PathPrefix(`/api`) || PathPrefix(`/dashboard`)","entryPoints":["keroosha-admin"],"service":"api@internal","priority":1000000},
+                  "site":{"entryPoints":["front","other"],"rule":"Host(`obs.test`)","service":"app","observability":{"tracing":true}},
+                  "parent":{"entryPoints":["front","other"],"rule":"Host(`parent.test`)"},
+                  "child":{"parentRefs":["parent"],"rule":"Header(`x`,`child`)","service":"app"}
+                },
+                "services":{"app":{"loadBalancer":{"servers":[{"url":"http://127.0.0.1:9000"}]}}}
+              }
+            }"""
+        let rawData =
+            """{
+              "routers":{
+                "keroosha-admin@file":{"entryPoints":["keroosha-admin"],"service":"api@internal","rule":"PathPrefix(`/api`) || PathPrefix(`/dashboard`)","priority":1000000,"observability":{"accessLogs":true,"metrics":true,"tracing":true,"traceVerbosity":"minimal"},"status":"enabled","using":["keroosha-admin"]},
+                "front-site@file":{"entryPoints":["front"],"service":"app","rule":"Host(`obs.test`)","priority":16,"observability":{"accessLogs":false,"metrics":true,"tracing":true,"traceVerbosity":"minimal"},"status":"enabled","using":["front"]},
+                "site@file":{"entryPoints":["other"],"service":"app","rule":"Host(`obs.test`)","priority":16,"observability":{"accessLogs":true,"metrics":true,"tracing":true,"traceVerbosity":"minimal"},"status":"enabled","using":["other"]},
+                "front-parent@file":{"entryPoints":["front"],"rule":"Host(`parent.test`)","priority":19,"observability":{"accessLogs":false,"metrics":true,"tracing":false,"traceVerbosity":"minimal"},"status":"enabled","using":["front"]},
+                "parent@file":{"entryPoints":["other"],"rule":"Host(`parent.test`)","priority":19,"observability":{"accessLogs":true,"metrics":true,"tracing":true,"traceVerbosity":"minimal"},"status":"enabled","using":["other"]},
+                "child@file":{"service":"app","rule":"Header(`x`,`child`)","parentRefs":["front-parent@file","parent@file"],"priority":19,"status":"enabled"}
+              },
+              "services":{
+                "app@file":{"loadBalancer":{"servers":[{"url":"http://127.0.0.1:9000"}],"strategy":"wrr","passHostHeader":true,"responseForwarding":{"flushInterval":"100ms"}},"status":"enabled","type":"loadbalancer","usedBy":["child@file","front-site@file","site@file"]}
+              },
+              "middlewares":{}
+            }"""
+        let entryPoints =
+            """[
+              {"name":"keroosha-admin","address":"127.0.0.1:19080"},
+              {"name":"front","address":"127.0.0.1:18081","observability":{"accessLogs":false,"tracing":false}},
+              {"name":"other","address":"127.0.0.1:18082"}
+            ]"""
+        let matches (raw: string) =
+            let api = apiConfigurationFromJson 19080 raw entryPoints """{"Version":"3.7.16"}"""
+            Traefik.apiMatchesDynamic (Some api) (Some(Encoding.UTF8.GetBytes(dynamic)))
+        let mutate (update: JsonObject -> unit) =
+            let candidate = JsonNode.Parse(rawData) :?> JsonObject
+            update candidate
+            matches (candidate.ToJsonString())
+        let mutateObservability (routerName: string) (update: JsonObject -> unit) =
+            mutate (fun root ->
+                let routers = root["routers"] :?> JsonObject
+                let route = routers[routerName] :?> JsonObject
+                let observability = route["observability"] :?> JsonObject
+                update observability)
 
-            let dynamicResult = invoke dynamicUpdate
-            Assert.That(dynamicResult.GetProperty("inSync").GetBoolean(), Is.True)
-            Assert.That(dynamicResult.GetProperty("actualConfigHash").GetString(), Is.Not.EqualTo(applied.GetProperty("actualConfigHash").GetString()))
-            Assert.That(mainPid (), Is.EqualTo(initialPid), "A dynamic-only update must not restart Traefik.")
+        Assert.That(matches rawData, Is.True)
+        Assert.That(
+            mutateObservability "front-site@file" (fun observability ->
+                observability["accessLogs"] <- JsonValue.Create(true)),
+            Is.False,
+            "The router inherits listener values where it has no explicit override.")
+        Assert.That(
+            mutateObservability "front-site@file" (fun observability ->
+                observability["tracing"] <- JsonValue.Create(false)),
+            Is.False,
+            "An explicit router value takes precedence over the listener model.")
+        Assert.That(
+            mutateObservability "site@file" (fun observability ->
+                observability["metrics"] <- JsonValue.Create(false)),
+            Is.False,
+            "Unmodeled root routers retain native observability defaults.")
+        Assert.That(
+            mutateObservability "site@file" (fun observability ->
+                observability["stale"] <- JsonValue.Create(false)),
+            Is.False,
+            "Unknown observability fields remain drift.")
 
-            let startupResult = invoke startupUpdate
-            Assert.That(startupResult.GetProperty("inSync").GetBoolean(), Is.True)
-            Assert.That(startupResult.GetProperty("certificateFingerprints").GetProperty("sandbox-cert").GetString(), Is.EqualTo(certificate.Fingerprint))
-            Assert.That(mainPid (), Is.Not.EqualTo(initialPid), "An entry-point change must restart Traefik.")
+        let missingNativeDefaultBlock =
+            mutate (fun root ->
+                let routers = root["routers"] :?> JsonObject
+                let route = routers["parent@file"] :?> JsonObject
+                route.Remove("observability") |> ignore)
+        Assert.That(missingNativeDefaultBlock, Is.False, "Root routers must expose the complete native observability block.")
 
-            // Act
-            let rollbackAction = TestDelegate(fun () -> sandboxHelper connection failedUpdate |> ignore)
+        let missingListenerModel =
+            mutate (fun root ->
+                let routers = root["routers"] :?> JsonObject
+                let route = routers["front-site@file"] :?> JsonObject
+                route.Remove("observability") |> ignore)
+        Assert.That(missingListenerModel, Is.False, "A configured non-default model cannot be omitted.")
 
-            // Assert
-            Assert.Throws<NativeHelperBackendException>(rollbackAction) |> ignore
-            let restored = invoke readRequest
-            Assert.That(restored.GetProperty("inSync").GetBoolean(), Is.True)
-            Assert.That(restored.GetProperty("certificateFingerprints").GetProperty("sandbox-cert").GetString(), Is.EqualTo(certificate.Fingerprint))
+        let childWithObservability =
+            mutate (fun root ->
+                let routers = root["routers"] :?> JsonObject
+                let child = routers["child@file"] :?> JsonObject
+                let observability = JsonObject()
+                observability["accessLogs"] <- JsonValue.Create(true)
+                observability["metrics"] <- JsonValue.Create(true)
+                observability["tracing"] <- JsonValue.Create(true)
+                observability["traceVerbosity"] <- JsonValue.Create("minimal")
+                child["observability"] <- observability)
+        Assert.That(childWithObservability, Is.False, "Child routers do not inherit root defaults.")
 
-            let deletion = invoke deleteRequest
-            Assert.That(deletion.ValueKind, Is.EqualTo(JsonValueKind.Object))
-            let retained =
-                runSandboxSsh
-                    connection
-                    ("test -f /var/lib/keroosha-traefik/.keroosha-owner && [ \"$(cat -- /var/lib/keroosha-traefik/.keroosha-owner)\" = '" + ownerHash + "' ] && cat -- '" + acmePath + "'")
-                    None
+    [<Test>]
+    member _.``Only the identical bound dynamic step can resume across rename``() =
+        let accepts bound before after = Traefik.recoveryDiskAccepted bound "candidate" before after
+        Assert.That(accepts None true false, Is.True)
+        Assert.That(accepts None false true, Is.False, "An unbound journal cannot adopt an already installed candidate.")
+        Assert.That(accepts (Some "different") true false, Is.False, "The preimage must not reopen target selection.")
+        Assert.That(accepts (Some "candidate") true false, Is.True, "Interrupted before rename.")
+        Assert.That(accepts (Some "candidate") false true, Is.True, "Interrupted after rename.")
+        Assert.That(accepts (Some "candidate") false false, Is.False, "Foreign bytes after binding.")
 
-            // Assert
-            Assert.That(retained, Is.EqualTo(acmeContents))
-            runSandboxSsh connection cleanupOwnedSandbox None |> ignore
-            let postCleanupGuard = runSandboxSsh connection ownershipGuard None
-            Assert.That(postCleanupGuard.Trim(), Is.EqualTo("safe"))
-            cleanupCompleted <- true
-        finally
-            if not cleanupCompleted then
-                try
-                    sandboxHelper connection deleteRequest |> ignore
-                    runSandboxSsh connection cleanupOwnedSandbox None |> ignore
-                    runSandboxSsh connection ownershipGuard None |> ignore
-                    cleanupCompleted <- true
-                with error ->
-                    let detail =
-                        match error with
-                        | :? NativeHelperBackendException -> error.Message
-                        | _ -> error.GetType().Name
-                    let diagnostic =
-                        "Sandbox Traefik cleanup failed for ownerId "
-                        + ownerId
-                        + " ("
-                        + detail
-                        + ")."
-                    TestContext.Progress.WriteLine(diagnostic)
+    [<Test>]
+    member _.``Pending start is not failed by an empty PID but a recorded exit belongs to its exact invocation``() =
+        let id = String('a',32)
+        let mutable completed = false
+        let mutable exited = false
+        let env = TestSupport.fakeHostEnvironment "/" (fun cmd args _ ->
+            let text =
+                if cmd = "systemctl" then "InvocationID=" + id + "\nMainPID=0"
+                elif List.contains "JOB_ID=123" args then
+                    if completed then "{\"MESSAGE_ID\":\"39f53479d3a045ac8e11786248231fbf\",\"JOB_RESULT\":\"done\",\"JOB_TYPE\":\"start\",\"INVOCATION_ID\":\"" + id + "\"}"
+                    else "{\"MESSAGE_ID\":\"9d1aaa27d60140bd96365438aad20286\",\"JOB_RESULT\":\"done\",\"JOB_TYPE\":\"restart\",\"INVOCATION_ID\":\"bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb\"}"
+                elif List.contains ("INVOCATION_ID=" + id) args && exited then "{\"UNIT_RESULT\":\"exit-code\"}"
+                else ""
+            { ExitCode=0; Stdout=text; Stderr="" }) (fun () -> DateTimeOffset.UtcNow)
+        Assert.That(Traefik.checkActivationJob env "123" None, Is.EqualTo(None:string option))
+        completed <- true
+        Assert.That(Traefik.checkActivationJob env "123" None, Is.EqualTo(Some id))
+        exited <- true
+        let error = Assert.Throws<Traefik.BackendError>(fun () -> Traefik.checkActivationJob env "123" (Some id) |> ignore)
+        Assert.That(error.Message, Does.Contain(id + " failed: exit-code"))

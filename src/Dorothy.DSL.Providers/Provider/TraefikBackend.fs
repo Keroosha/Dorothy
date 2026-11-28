@@ -14,11 +14,13 @@ type TraefikConfig =
       Resolvers: ImmutableDictionary<string, TraefikResolver>
       Routers: ImmutableDictionary<string, TraefikRouter>
       Certificates: ImmutableDictionary<string, NormalizedCertificate>
+      Configuration: Nodes.JsonObject option
       AdminPort: int }
 
 type TraefikSnapshot =
     { InSync: bool
       ActualConfigHash: string
+      TlsProbeSummary: ImmutableDictionary<string, int>
       CertificateFingerprints: ImmutableDictionary<string, string> }
 
 module TraefikBackend =
@@ -35,7 +37,7 @@ module TraefikBackend =
             writeValue writer value
         writer.WriteEndObject()
 
-    let private serializeRequest (operation: string) (ownerId: string) (desired: TraefikConfig) =
+    let internal serializeRequest (operation: string) (ownerId: string) (desired: TraefikConfig) (previousUdpEntryPoints: string[] option) =
         use stream = new MemoryStream()
         use writer = new Utf8JsonWriter(stream)
         writer.WriteStartObject()
@@ -75,11 +77,23 @@ module TraefikBackend =
         writeInputMap writer "certificates" desired.Certificates (fun json certificate ->
             json.WriteStartObject()
             json.WriteString("certificatePem", certificate.CertificatePem)
+            json.WriteString("usage", certificate.Usage)
             json.WriteString("privateKeyPem", certificate.PrivateKeyPem)
             json.WriteString("fingerprint", certificate.Fingerprint)
             json.WriteEndObject())
 
         writer.WriteNumber("adminPort", desired.AdminPort)
+        match desired.Configuration with
+        | Some configuration ->
+            writer.WritePropertyName("configuration")
+            configuration.WriteTo(writer)
+        | None -> ()
+        match operation, previousUdpEntryPoints with
+        | "apply", Some entryPoints ->
+            writer.WriteStartArray("previousUdpEntryPoints")
+            for entryPoint in entryPoints do writer.WriteStringValue(entryPoint)
+            writer.WriteEndArray()
+        | _ -> ()
         writer.WriteEndObject()
         writer.Flush()
         Encoding.UTF8.GetString(stream.GetBuffer(), 0, int stream.Length)
@@ -110,14 +124,14 @@ module TraefikBackend =
             |> Seq.forall (fun character ->
                 isAsciiLetterOrDigit character || character = '.' || character = '_' || character = '-'))
 
-    let private parseSnapshot (expectedCertificateNames: Set<string>) (output: string) =
+    let internal parseSnapshot (expectedCertificateNames: Set<string>) (output: string) =
         use document = JsonDocument.Parse(output)
         let root = document.RootElement
         if root.ValueKind <> JsonValueKind.Object then
             invalidOp "Remote Traefik response must be an object."
 
         let properties = root.EnumerateObject() |> Seq.toArray
-        let expected = Set.ofList [ "inSync"; "actualConfigHash"; "certificateFingerprints" ]
+        let expected = Set.ofList [ "inSync"; "actualConfigHash"; "certificateFingerprints"; "tlsObservations" ]
         let names = properties |> Array.map (fun property -> property.Name) |> Set.ofArray
         if names <> expected || properties.Length <> expected.Count then
             invalidOp "Remote Traefik response has an invalid shape."
@@ -145,8 +159,29 @@ module TraefikBackend =
                 invalidOp "Remote Traefik response contains an invalid certificate fingerprint."
             fingerprints <- fingerprints.Add(property.Name, fingerprint)
 
+        let report = root.GetProperty("tlsObservations")
+        if report.ValueKind <> JsonValueKind.Object then invalidOp "Invalid Traefik TLS observation report."
+        let reportProperties = report.EnumerateObject() |> Seq.toArray
+        let expectedReportProperties =
+            Set.ofList [ "legacyProbesAttempted"; "nativeProbesAttempted"; "unprobedCount"; "opaqueRouterCount"; "truncated" ]
+        let reportNames = reportProperties |> Array.map (fun property -> property.Name) |> Set.ofArray
+        if reportNames <> expectedReportProperties || reportProperties.Length <> expectedReportProperties.Count then
+            invalidOp "Invalid Traefik TLS observation report."
+        let summary = ImmutableDictionary.CreateBuilder<string, int>(StringComparer.Ordinal)
+        for name in [ "legacyProbesAttempted"; "nativeProbesAttempted"; "unprobedCount"; "opaqueRouterCount" ] do
+            let field = report.GetProperty(name)
+            let mutable value = 0
+            if field.ValueKind <> JsonValueKind.Number || not (field.TryGetInt32(&value)) || value < 0 then
+                invalidOp "Invalid Traefik TLS observation count."
+            summary.Add(name, value)
+        let truncated = report.GetProperty("truncated")
+        if truncated.ValueKind <> JsonValueKind.True && truncated.ValueKind <> JsonValueKind.False then
+            invalidOp "Invalid Traefik TLS observation count."
+        summary.Add("truncated", if truncated.GetBoolean() then 1 else 0)
+
         { InSync = inSyncElement.GetBoolean()
           ActualConfigHash = hash
+          TlsProbeSummary = summary.ToImmutable()
           CertificateFingerprints = fingerprints }
 
     let private parseDeleteResponse (output: string) =
@@ -157,17 +192,27 @@ module TraefikBackend =
         let properties = root.EnumerateObject() |> Seq.toArray
         if properties.Length <> 0 then
             invalidOp "Remote Traefik delete response has an invalid shape."
+    let internal serializeDeleteRequest (ownerId: string) =
+        use stream = new MemoryStream()
+        use writer = new Utf8JsonWriter(stream)
+        writer.WriteStartObject()
+        writer.WriteString("operation", "delete")
+        writer.WriteString("ownerId", ownerId)
+        writer.WriteEndObject()
+        writer.Flush()
+        Encoding.UTF8.GetString(stream.GetBuffer(), 0, int stream.Length)
 
     let private invoke
         (connection: SshConnection)
         (operation: string)
         (ownerId: string)
         (desired: TraefikConfig)
+        (previousUdpEntryPoints: string[] option)
         (cancellationToken: CancellationToken)
         : Task<TraefikSnapshot> =
         task {
             cancellationToken.ThrowIfCancellationRequested()
-            let payload = serializeRequest operation ownerId desired
+            let payload = serializeRequest operation ownerId desired previousUdpEntryPoints
             try
                 let! output =
                     SshTransport.runHelper connection "traefik" "Traefik" payload cancellationToken
@@ -185,16 +230,16 @@ module TraefikBackend =
                     )
         }
 
-    let apply (connection: SshConnection) (ownerId: string) (desired: TraefikConfig) (cancellationToken: CancellationToken) : Task<TraefikSnapshot> =
-        invoke connection "apply" ownerId desired cancellationToken
+    let apply (connection: SshConnection) (ownerId: string) (desired: TraefikConfig) (previousUdpEntryPoints: string[] option) (cancellationToken: CancellationToken) : Task<TraefikSnapshot> =
+        invoke connection "apply" ownerId desired previousUdpEntryPoints cancellationToken
 
     let read (connection: SshConnection) (ownerId: string) (desired: TraefikConfig) (cancellationToken: CancellationToken) : Task<TraefikSnapshot> =
-        invoke connection "read" ownerId desired cancellationToken
+        invoke connection "read" ownerId desired None cancellationToken
 
-    let delete (connection: SshConnection) (ownerId: string) (desired: TraefikConfig) (cancellationToken: CancellationToken) : Task<unit> =
+    let delete (connection: SshConnection) (ownerId: string) (cancellationToken: CancellationToken) : Task<unit> =
         task {
             cancellationToken.ThrowIfCancellationRequested()
-            let payload = serializeRequest "delete" ownerId desired
+            let payload = serializeDeleteRequest ownerId
             try
                 let! output =
                     SshTransport.runHelper connection "traefik" "Traefik" payload cancellationToken

@@ -1,0 +1,16 @@
+<Project Sdk="Microsoft.NET.Sdk">
+  <PropertyGroup>
+    <OutputType>Exe</OutputType>
+    <TargetFramework>net10.0</TargetFramework>
+    <AssemblyName>Traefik.Review.Acceptance</AssemblyName>
+    <RootNamespace>Dorothy.Traefik.Acceptance.Review</RootNamespace>
+    <WarningsAsErrors>$(WarningsAsErrors);FS0020;FS3221</WarningsAsErrors>
+  </PropertyGroup>
+  <ItemGroup>
+    <ProjectReference Include="../../../src/Dorothy.DSL/Dorothy.DSL.fsproj" />
+  </ItemGroup>
+  <ItemGroup>
+    <Compile Include="ReviewTls.fs" />
+    <Compile Include="ReviewProgram.fs" />
+  </ItemGroup>
+</Project>
